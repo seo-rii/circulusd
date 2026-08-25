@@ -1,0 +1,43 @@
+{
+  "format": "circulusd.protocol-types.v1alpha1-golden",
+  "hashAlgorithm": "sha256",
+  "structuredDigestPrefix": ["circulusd.hash", 1],
+  "vectors": [
+    {
+      "name": "null",
+      "domain": "fixture",
+      "schemaVersion": 1,
+      "payload": { "kind": "json", "value": null },
+      "payloadCborHex": "f6",
+      "digestInputCborHex": "856e63697263756c7573642e6861736801676669787475726501f6",
+      "digest": "sha256:1cf7acc856521a0e4cd749b2b1777605bba55d6e01899b1883314dcec48c37c4"
+    },
+    {
+      "name": "canonical-map-key-order",
+      "domain": "fixture",
+      "schemaVersion": 1,
+      "payload": { "kind": "json", "value": { "aa": 1, "b": 2 } },
+      "payloadCborHex": "a261620262616101",
+      "digestInputCborHex": "856e63697263756c7573642e6861736801676669787475726501a261620262616101",
+      "digest": "sha256:1c74f1d0451fa5622422c3218e0bf146a6355e4bf34b9825d10d8b0047d6df95"
+    },
+    {
+      "name": "nfc-text",
+      "domain": "unicode",
+      "schemaVersion": 1,
+      "payload": { "kind": "json", "value": "é" },
+      "payloadCborHex": "62c3a9",
+      "digestInputCborHex": "856e63697263756c7573642e686173680167756e69636f64650162c3a9",
+      "digest": "sha256:1ed6372cee8f4eef4eaed2a42ae2a6184515fc84d5c7fa69abe0b105fdeec048"
+    },
+    {
+      "name": "opaque-bytes",
+      "domain": "bytes",
+      "schemaVersion": 1,
+      "payload": { "kind": "bytes", "hex": "0001ff" },
+      "payloadCborHex": "430001ff",
+      "digestInputCborHex": "856e63697263756c7573642e686173680165627974657301430001ff",
+      "digest": "sha256:326b229ad17423a3adfc6fdb77ccca505084a6386f867e0cb917561a7b1d14cb"
+    }
+  ]
+}

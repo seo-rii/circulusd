@@ -18,6 +18,8 @@ importers:
         specifier: 4.1.11
         version: 4.1.11(vite@8.2.2)
 
+  packages/protocol-types: {}
+
 packages:
 
   '@jridgewell/sourcemap-codec@1.5.5':
