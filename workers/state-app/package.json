@@ -6,7 +6,8 @@
   "sideEffects": false,
   "exports": {
     "./session": "./src/session/index.ts",
-    "./workspace": "./src/workspace/index.ts"
+    "./workspace": "./src/workspace/index.ts",
+    "./control": "./src/control/index.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",
