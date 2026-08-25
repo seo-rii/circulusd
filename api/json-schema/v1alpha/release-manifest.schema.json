@@ -105,11 +105,17 @@
       "then": {
         "required": ["protocolCompatibility", "signatures"],
         "properties": {
+          "toolchains": {
+            "required": ["protocGenGo", "protocGenConnectGo"]
+          },
           "components": {
             "items": {
               "properties": {
                 "artifacts": {
-                  "minItems": 1
+                  "minItems": 1,
+                  "items": {
+                    "required": ["signature"]
+                  }
                 }
               }
             },
@@ -263,7 +269,7 @@
     "component": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "license", "source", "qualification", "artifacts"],
+      "required": ["name", "version", "commit", "license", "source", "qualification", "artifacts"],
       "properties": {
         "name": {
           "type": "string",
@@ -274,7 +280,7 @@
         },
         "commit": {
           "type": "string",
-          "pattern": "^[a-f0-9]{40,64}$"
+          "pattern": "^[a-f0-9]{40}$"
         },
         "license": {
           "type": "string",
@@ -283,7 +289,8 @@
         },
         "source": {
           "type": "string",
-          "format": "uri"
+          "format": "uri",
+          "pattern": "^https://"
         },
         "qualification": {
           "type": "string",
@@ -310,7 +317,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 255,
-          "pattern": "^[^/]+$"
+          "pattern": "^[^/\\\\]+$"
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -385,12 +392,15 @@
         "keyId": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
         },
         "value": {
           "type": "string",
           "contentEncoding": "base64",
-          "minLength": 1
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
         }
       }
     }

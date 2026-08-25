@@ -857,6 +857,13 @@ def validate_json_schemas() -> None:
             ) from error
 
         signed_release = json.loads(json.dumps(release_instance))
+        valid_signature = {
+            "algorithm": "ed25519",
+            "keyId": "test-release-key",
+            "value": ("A" * 86) + "==",
+        }
+        signed_release["toolchains"]["protocGenGo"] = "1.36.10"
+        signed_release["toolchains"]["protocGenConnectGo"] = "1.19.1"
         existing_components = {
             component["name"] for component in signed_release["components"]
         }
@@ -882,8 +889,12 @@ def validate_json_schemas() -> None:
                         "architecture": "any",
                         "name": f"{component['name']}.tar.zst",
                         "sha256": "0" * 64,
+                        "signature": valid_signature,
                     }
                 ]
+            else:
+                for artifact in component["artifacts"]:
+                    artifact["signature"] = valid_signature
         signed_release["protocolCompatibility"] = [
             {
                 "pair": pair,
@@ -899,9 +910,7 @@ def validate_json_schemas() -> None:
                 "state-app-schema",
             )
         ]
-        signed_release["signatures"] = [
-            {"algorithm": "ed25519", "keyId": "test-release-key", "value": "AA=="}
-        ]
+        signed_release["signatures"] = [valid_signature]
         signed_release["unresolvedArtifacts"] = []
 
         for status in ("candidate", "production"):
@@ -947,6 +956,50 @@ def validate_json_schemas() -> None:
             raise ContractError(
                 "release-manifest.schema.json accepted an artifactless production component"
             )
+
+        unsigned_artifact_release = json.loads(json.dumps(signed_release))
+        unsigned_artifact_release["release"]["status"] = "candidate"
+        del unsigned_artifact_release["components"][0]["artifacts"][0]["signature"]
+        if validator.is_valid(unsigned_artifact_release):
+            raise ContractError(
+                "release-manifest.schema.json accepted an unsigned candidate artifact"
+            )
+
+        short_signature_release = json.loads(json.dumps(signed_release))
+        short_signature_release["release"]["status"] = "production"
+        short_signature_release["signatures"][0]["value"] = "AA=="
+        if validator.is_valid(short_signature_release):
+            raise ContractError(
+                "release-manifest.schema.json accepted a malformed Ed25519 signature"
+            )
+
+        missing_generator_release = json.loads(json.dumps(signed_release))
+        missing_generator_release["release"]["status"] = "candidate"
+        del missing_generator_release["toolchains"]["protocGenGo"]
+        if validator.is_valid(missing_generator_release):
+            raise ContractError(
+                "release-manifest.schema.json accepted a candidate without pinned generators"
+            )
+
+        invalid_components = []
+        missing_commit_release = json.loads(json.dumps(release_instance))
+        del missing_commit_release["components"][0]["commit"]
+        invalid_components.append(("a component without commit", missing_commit_release))
+        non_https_release = json.loads(json.dumps(release_instance))
+        non_https_release["components"][0]["source"] = "ftp://example.invalid/source"
+        invalid_components.append(("a non-HTTPS source", non_https_release))
+        backslash_artifact_release = json.loads(json.dumps(release_instance))
+        backslash_artifact_release["components"][0]["artifacts"][0]["name"] = (
+            "directory\\artifact.tar.zst"
+        )
+        invalid_components.append(
+            ("a backslash-containing artifact name", backslash_artifact_release)
+        )
+        for description, invalid_release in invalid_components:
+            if validator.is_valid(invalid_release):
+                raise ContractError(
+                    f"release-manifest.schema.json accepted {description}"
+                )
 
 
 def validate_checked_descriptor(descriptor_bytes: bytes) -> None:
