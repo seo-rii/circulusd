@@ -10,14 +10,16 @@ import (
 )
 
 var (
-	ErrInvalidSpec     = errors.New("invalid sandbox spec")
-	ErrUnavailable     = errors.New("execution provider unavailable")
-	ErrDevelopmentOnly = errors.New("development-only execution provider")
-	ErrBackendMismatch = errors.New("execution backend mismatch")
-	ErrUnknownHandle   = errors.New("unknown sandbox handle")
-	ErrStaleHandle     = errors.New("stale sandbox handle")
-	ErrSandboxDraining = errors.New("sandbox is draining")
-	ErrSandboxStopped  = errors.New("sandbox is stopped")
+	ErrInvalidSpec        = errors.New("invalid sandbox spec")
+	ErrUnavailable        = errors.New("execution provider unavailable")
+	ErrDevelopmentOnly    = errors.New("development-only execution provider")
+	ErrBackendMismatch    = errors.New("execution backend mismatch")
+	ErrBackendUnavailable = errors.New("requested execution backend is unavailable")
+	ErrSecurityDowngrade  = errors.New("execution backend security downgrade is not permitted")
+	ErrUnknownHandle      = errors.New("unknown sandbox handle")
+	ErrStaleHandle        = errors.New("stale sandbox handle")
+	ErrSandboxDraining    = errors.New("sandbox is draining")
+	ErrSandboxStopped     = errors.New("sandbox is stopped")
 )
 
 // Backend identifies one native execution implementation. Mock is reserved
@@ -38,6 +40,62 @@ const (
 	DeploymentDevelopment DeploymentMode = "development"
 	DeploymentProduction  DeploymentMode = "production"
 )
+
+// IsolationClass is the minimum kernel-isolation boundary a tool policy may
+// require. NsJail and Docker are both shared-kernel backends; neither is
+// treated as universally stronger than the other.
+type IsolationClass string
+
+const (
+	IsolationSharedKernel IsolationClass = "shared-kernel"
+	IsolationMicroVM      IsolationClass = "microvm"
+)
+
+// FallbackMode determines whether a failed exact backend choice may consider
+// an administrator-declared ordered alternative list.
+type FallbackMode string
+
+const (
+	FallbackDisabled FallbackMode = "disabled"
+	FallbackExplicit FallbackMode = "explicit"
+)
+
+// BackendFallbackPolicy is explicit configuration, never an implicit retry
+// strategy. Mock cannot be a fallback for a native backend.
+type BackendFallbackPolicy struct {
+	Mode                   FallbackMode
+	Order                  []Backend
+	AllowSecurityDowngrade bool
+}
+
+// BackendSelection contains every independent availability constraint from
+// SPEC.md section 19.2. An empty higher-priority preference falls through to
+// the next default, but every constraint set itself must be explicit.
+type BackendSelection struct {
+	Mode                 DeploymentMode
+	ToolOrSession        Backend
+	WorkspaceDefault     Backend
+	UserDefault          Backend
+	ServerDefault        Backend
+	ServerAllowed        []Backend
+	RegistryAllowed      []Backend
+	ExtensionSupported   []Backend
+	EnvironmentArtifacts []Backend
+	HostCapabilities     []Capability
+	MinimumIsolation     IsolationClass
+	Fallback             BackendFallbackPolicy
+}
+
+// BackendSelectionResult records both sides of a fallback decision for API
+// responses and audit. Eligible is canonical and ordered independently of
+// caller slice ordering.
+type BackendSelectionResult struct {
+	Requested         Backend
+	Resolved          Backend
+	Eligible          []Backend
+	FallbackUsed      bool
+	SecurityDowngrade bool
+}
 
 // WorkspaceAccess is the authority granted to the sandbox projection.
 type WorkspaceAccess string
