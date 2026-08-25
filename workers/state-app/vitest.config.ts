@@ -10,6 +10,6 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["test/session*.test.ts"],
+    include: ["test/session*.test.ts", "test/workspace*.test.ts"],
   },
 });

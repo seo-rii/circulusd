@@ -5,7 +5,8 @@
   "type": "module",
   "sideEffects": false,
   "exports": {
-    "./session": "./src/session/index.ts"
+    "./session": "./src/session/index.ts",
+    "./workspace": "./src/workspace/index.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",

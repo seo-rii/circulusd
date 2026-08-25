@@ -6,5 +6,5 @@
     },
     "rootDir": "../.."
   },
-  "include": ["src/session/**/*.ts"]
+  "include": ["src/session/**/*.ts", "src/workspace/**/*.ts"]
 }
