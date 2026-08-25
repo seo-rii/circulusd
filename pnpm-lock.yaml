@@ -20,6 +20,20 @@ importers:
 
   packages/protocol-types: {}
 
+  workers/pi-runtime:
+    dependencies:
+      '@circulusd/protocol-types':
+        specifier: workspace:*
+        version: link:../../packages/protocol-types
+
+  workers/session-host: {}
+
+  workers/state-app:
+    dependencies:
+      '@circulusd/protocol-types':
+        specifier: workspace:*
+        version: link:../../packages/protocol-types
+
 packages:
 
   '@jridgewell/sourcemap-codec@1.5.5':
