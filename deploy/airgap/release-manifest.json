@@ -1,0 +1,156 @@
+{
+  "schemaVersion": 1,
+  "release": {
+    "version": "0.3.0",
+    "status": "development",
+    "architectures": ["x86_64", "aarch64"]
+  },
+  "toolchains": {
+    "go": "1.25.3",
+    "node": "24.1.0",
+    "pnpm": "10.30.0",
+    "protoc": "3.21.12"
+  },
+  "components": [
+    {
+      "name": "pi-agent-core",
+      "version": "0.84.3",
+      "commit": "4e58f324fae8ebfa98a3d45181fb248072a2afac",
+      "license": "MIT",
+      "source": "https://github.com/earendil-works/pi",
+      "qualification": "phase-0-required",
+      "artifacts": [
+        {
+          "architecture": "any",
+          "name": "pi-0.84.3-source.tar.gz",
+          "sha256": "056f84c467450fb5700ad4df9c8cc669bf7f6046976eed7a19eadbc7553b6500"
+        }
+      ]
+    },
+    {
+      "name": "workerd",
+      "version": "1.20260825.1",
+      "commit": "2a7670e8428d86d9adc603f43a584737a4855ce6",
+      "license": "Apache-2.0",
+      "source": "https://github.com/cloudflare/workerd",
+      "qualification": "phase-0-required",
+      "artifacts": [
+        {
+          "architecture": "x86_64",
+          "name": "workerd-linux-64.gz",
+          "sha256": "45fb5f0e630c224884311d7321c477cbabab1951ba0d894bd8c6ea6f99ad5143"
+        },
+        {
+          "architecture": "aarch64",
+          "name": "workerd-linux-arm64.gz",
+          "sha256": "c66f93f5b524c9b091e7298d9f02360331c4bcdc9489734d868810a6478f076f"
+        }
+      ]
+    },
+    {
+      "name": "celld",
+      "version": "0.3.0",
+      "commit": "89e4ffc53a14ecb496d2ca5014ff9d19b0061ad9",
+      "license": "Apache-2.0",
+      "source": "https://github.com/denoland/celld",
+      "qualification": "alpha-conformance-required",
+      "artifacts": [
+        {
+          "architecture": "x86_64",
+          "name": "celld-x86_64-unknown-linux-gnu.gz",
+          "sha256": "cbfcfa5f6d7551b5316f6f4c9d7751c741a9ba2a2305dde8d5cb4d1b37fb34a6"
+        },
+        {
+          "architecture": "aarch64",
+          "name": "celld-aarch64-unknown-linux-gnu.gz",
+          "sha256": "88a35070144408f902036076b7f88df38548ce4dda073fff27a6dd1f6d2bae28"
+        }
+      ]
+    },
+    {
+      "name": "nsjail",
+      "version": "3.6",
+      "commit": "f78475530b46d0186111a9096b30725f816b55fe",
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/nsjail",
+      "qualification": "source-build-required",
+      "artifacts": []
+    },
+    {
+      "name": "kafel",
+      "version": "git",
+      "commit": "76d0f41bf3eb5c4008713d64b9767b461a9129a3",
+      "license": "Apache-2.0",
+      "source": "https://github.com/google/kafel",
+      "qualification": "nsjail-submodule",
+      "artifacts": []
+    },
+    {
+      "name": "docker-engine",
+      "version": "29.7.2",
+      "commit": "6a43e3d5afddf4111da0f864bbc7cae5d7e95001",
+      "license": "Apache-2.0",
+      "source": "https://github.com/moby/moby",
+      "qualification": "phase-1b",
+      "artifacts": [
+        {
+          "architecture": "x86_64",
+          "name": "docker-29.7.2-linux-x86_64.tgz",
+          "sha256": "803d433f226db4776e1768fd319fc6c6e4935a456acf84fcc0080818b854bc8f"
+        },
+        {
+          "architecture": "aarch64",
+          "name": "docker-29.7.2-linux-aarch64.tgz",
+          "sha256": "43d143448adf2c2787704e7d7704fd6d62d367a54c5edaef0a3f75509cb0938d"
+        }
+      ]
+    },
+    {
+      "name": "firecracker",
+      "version": "1.16.1",
+      "commit": "2038188f145fb81b8d098147a10e9d9f392fd22f",
+      "license": "Apache-2.0",
+      "source": "https://github.com/firecracker-microvm/firecracker",
+      "qualification": "phase-3",
+      "artifacts": [
+        {
+          "architecture": "x86_64",
+          "name": "firecracker-v1.16.1-x86_64.tgz",
+          "sha256": "382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+        },
+        {
+          "architecture": "aarch64",
+          "name": "firecracker-v1.16.1-aarch64.tgz",
+          "sha256": "8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e"
+        }
+      ]
+    },
+    {
+      "name": "seaweedfs",
+      "version": "4.44",
+      "commit": "3563738699f29fd1c9efde6fcbf4ba253439cac8",
+      "license": "Apache-2.0",
+      "source": "https://github.com/seaweedfs/seaweedfs",
+      "qualification": "provisional-object-store",
+      "artifacts": [
+        {
+          "architecture": "x86_64",
+          "name": "seaweedfs-4.44-linux-amd64.tar.gz",
+          "sha256": "f46b3c6c5b1c9137f4d79e1152d70cc1d8575378b8c4aa76d1e2036d66bd7aab"
+        },
+        {
+          "architecture": "aarch64",
+          "name": "seaweedfs-4.44-linux-arm64.tar.gz",
+          "sha256": "46943c95c32355038e12f94ba676fdbc010167609d9ab89bc6b74675270fc860"
+        }
+      ]
+    }
+  ],
+  "unresolvedArtifacts": [
+    "nsjail reproducible x86_64 and aarch64 binaries",
+    "curated execution-environment rootfs",
+    "Firecracker guest kernel and rootfs",
+    "sandboxd binaries",
+    "signed SBOM and release signatures"
+  ]
+}
