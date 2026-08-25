@@ -309,10 +309,26 @@ func (table *GuardTable) CompleteDeletion(deletion Deletion) error {
 	defer table.mu.Unlock()
 
 	guard, found := table.guards[deletion.Key]
-	if !found || guard.state != Deleting || guard.generation != deletion.GuardGeneration || guard.deletionEpoch != deletion.Epoch {
+	if found && guard.state == Deleted && deletionMatchesGuard(deletion, guard) {
+		return nil
+	}
+	if !found || guard.state != Deleting || !deletionMatchesGuard(deletion, guard) {
 		return fmt.Errorf("complete deletion of %s: %w", deletion.Key.Digest, ErrStaleDeletion)
 	}
 	guard.state = Deleted
+	return nil
+}
+
+func (table *GuardTable) ValidateDeletion(deletion Deletion) error {
+	if err := validateKey(deletion.Key); err != nil {
+		return err
+	}
+	table.mu.RLock()
+	defer table.mu.RUnlock()
+	guard, found := table.guards[deletion.Key]
+	if !found || (guard.state != Deleting && guard.state != Deleted) || !deletionMatchesGuard(deletion, guard) {
+		return fmt.Errorf("validate deletion of %s: %w", deletion.Key.Digest, ErrStaleDeletion)
+	}
 	return nil
 }
 
@@ -344,4 +360,8 @@ func validateKey(key Key) error {
 		return fmt.Errorf("blob digest %q is not canonical SHA-256", key.Digest)
 	}
 	return nil
+}
+
+func deletionMatchesGuard(deletion Deletion, guard *guardRecord) bool {
+	return guard.generation == deletion.GuardGeneration && guard.deletionEpoch == deletion.Epoch
 }
