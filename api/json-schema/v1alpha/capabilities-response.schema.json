@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://circulusd.local/schemas/v1alpha/capabilities-response.schema.json",
+  "title": "Circulus Capabilities Response v1alpha",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "protocol",
+    "agentIsolation",
+    "executionBackends",
+    "executionEnvironments",
+    "resourceProfiles",
+    "extensions",
+    "models",
+    "mcpServers"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "v1alpha"
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor", "descriptorDigest", "maximumFrameSize"],
+      "properties": {
+        "major": {
+          "$ref": "#/$defs/uint64"
+        },
+        "minor": {
+          "$ref": "#/$defs/uint64"
+        },
+        "descriptorDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "maximumFrameSize": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "agentIsolation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["processScope", "outerIsolation", "status"],
+        "properties": {
+          "processScope": {
+            "type": "string",
+            "enum": ["shared", "tenant", "session"]
+          },
+          "outerIsolation": {
+            "type": "string",
+            "enum": ["none", "nsjail", "docker", "firecracker"]
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          }
+        }
+      }
+    },
+    "executionBackends": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nsjail", "docker", "firecracker"],
+      "properties": {
+        "nsjail": {
+          "$ref": "#/$defs/backendCapability"
+        },
+        "docker": {
+          "$ref": "#/$defs/backendCapability"
+        },
+        "firecracker": {
+          "$ref": "#/$defs/backendCapability"
+        }
+      }
+    },
+    "executionEnvironments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "digest", "architecture", "availableBackends", "status"],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/opaqueId"
+          },
+          "digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "architecture": {
+            "type": "string",
+            "enum": ["x86_64", "aarch64"]
+          },
+          "availableBackends": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/$defs/backend"
+            }
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          }
+        }
+      }
+    },
+    "resourceProfiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "limitsByBackend"],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/opaqueId"
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          },
+          "limitsByBackend": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "nsjail": {
+                "$ref": "#/$defs/resourceLimits"
+              },
+              "docker": {
+                "$ref": "#/$defs/resourceLimits"
+              },
+              "firecracker": {
+                "$ref": "#/$defs/resourceLimits"
+              }
+            }
+          }
+        }
+      }
+    },
+    "extensions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/namedCapability"
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/namedCapability"
+      }
+    },
+    "mcpServers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/namedCapability"
+      }
+    }
+  },
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9_.:/-]*$"
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["nsjail", "docker", "firecracker"]
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability"],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": ["available", "unavailable", "degraded", "forbidden"]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean", "null"]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "availability": {
+                "const": "available"
+              }
+            },
+            "required": ["availability"]
+          },
+          "then": {
+            "not": {
+              "required": ["reason"]
+            }
+          },
+          "else": {
+            "required": ["reason"]
+          }
+        }
+      ]
+    },
+    "backendCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "hostKernelShared", "features"],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "hostKernelShared": {
+          "type": "boolean"
+        },
+        "features": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "process-streaming",
+              "workspace-materialization",
+              "overlayfs-diff",
+              "read-only-workspace",
+              "network-policy"
+            ]
+          }
+        }
+      }
+    },
+    "resourceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpuMillis", "memoryBytes", "pids", "wallClockMs", "outputBytes"],
+      "properties": {
+        "cpuMillis": {
+          "$ref": "#/$defs/uint64"
+        },
+        "memoryBytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "pids": {
+          "$ref": "#/$defs/uint64"
+        },
+        "wallClockMs": {
+          "$ref": "#/$defs/uint64"
+        },
+        "outputBytes": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "namedCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        }
+      }
+    }
+  }
+}

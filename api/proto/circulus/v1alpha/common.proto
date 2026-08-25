@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package circulus.api.v1alpha;
+
+option go_package = "github.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alpha";
+
+// OpaqueId is the common binary representation for identifiers. Callers must
+// not parse, concatenate, or derive authorization from its contents.
+message OpaqueId {
+  bytes value = 1;
+
+  reserved 2;
+  reserved "text";
+}
+
+enum DigestAlgorithm {
+  DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  DIGEST_ALGORITHM_SHA256 = 1;
+
+  reserved 2 to 15;
+}
+
+message Digest {
+  DigestAlgorithm algorithm = 1;
+  bytes value = 2;
+
+  reserved 3;
+  reserved "hex";
+}
+
+message AuthorityHandle {
+  bytes value = 1;
+
+  // Raw claims were intentionally excluded from the public wire contract.
+  reserved 2;
+  reserved "claims";
+}
+
+message ProtocolVersion {
+  uint64 major = 1;
+  uint64 minor = 2;
+}
+
+enum ProtocolPeer {
+  PROTOCOL_PEER_UNSPECIFIED = 0;
+  PROTOCOL_PEER_PLATFORMD = 1;
+  PROTOCOL_PEER_AGENTD = 2;
+  PROTOCOL_PEER_EXECUTORD = 3;
+  PROTOCOL_PEER_SANDBOXD = 4;
+  PROTOCOL_PEER_PLATFORMCTL = 5;
+  PROTOCOL_PEER_STATE_APP = 6;
+  PROTOCOL_PEER_SESSION_HOST = 7;
+
+  reserved 8 to 31;
+}
+
+// Values are bit positions in Handshake{Request,Response}.feature_bitmap.
+enum ProtocolFeature {
+  PROTOCOL_FEATURE_UNSPECIFIED = 0;
+  PROTOCOL_FEATURE_PROCESS_STREAMING = 1;
+  PROTOCOL_FEATURE_WORKSPACE_PROTECTION_PERMIT = 2;
+  PROTOCOL_FEATURE_INVOCATION_LEDGER = 3;
+  PROTOCOL_FEATURE_AUTHORITY_RENEWAL = 4;
+  PROTOCOL_FEATURE_OVERLAYFS_DIFF = 5;
+  PROTOCOL_FEATURE_READ_ONLY_INVOCATION = 6;
+
+  reserved 7 to 31;
+}
+
+enum ExecutionBackend {
+  EXECUTION_BACKEND_UNSPECIFIED = 0;
+  EXECUTION_BACKEND_NSJAIL = 1;
+  EXECUTION_BACKEND_DOCKER = 2;
+  EXECUTION_BACKEND_FIRECRACKER = 3;
+
+  reserved 4 to 15;
+}
+
+enum CapabilityAvailability {
+  CAPABILITY_AVAILABILITY_UNSPECIFIED = 0;
+  CAPABILITY_AVAILABILITY_AVAILABLE = 1;
+  CAPABILITY_AVAILABILITY_UNAVAILABLE = 2;
+  CAPABILITY_AVAILABILITY_DEGRADED = 3;
+  CAPABILITY_AVAILABILITY_FORBIDDEN = 4;
+
+  reserved 5 to 15;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_UNAUTHENTICATED = 2;
+  ERROR_CODE_PERMISSION_DENIED = 3;
+  ERROR_CODE_NOT_FOUND = 4;
+  ERROR_CODE_ALREADY_EXISTS = 5;
+  ERROR_CODE_CONFLICT = 6;
+  ERROR_CODE_FAILED_PRECONDITION = 7;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 8;
+  ERROR_CODE_ABORTED = 9;
+  ERROR_CODE_DEADLINE_EXCEEDED = 10;
+  ERROR_CODE_UNAVAILABLE = 11;
+  ERROR_CODE_INTERNAL = 12;
+  ERROR_CODE_DATA_LOSS = 13;
+  ERROR_CODE_UNSUPPORTED_PROTOCOL = 14;
+  ERROR_CODE_STALE_GENERATION = 15;
+  ERROR_CODE_DIGEST_MISMATCH = 16;
+  ERROR_CODE_IDEMPOTENCY_CONFLICT = 17;
+  ERROR_CODE_NEEDS_CONFIRMATION = 18;
+
+  reserved 19 to 31;
+}
+
+message PublicError {
+  ErrorCode code = 1;
+  string reason = 2;
+  string message = 3;
+  bool retryable = 4;
+  uint64 retry_after_ms = 5;
+  map<string, string> metadata = 6;
+  OpaqueId request_id = 7;
+
+  reserved 8 to 15;
+}
+
+message CapabilityStatus {
+  string name = 1;
+  CapabilityAvailability availability = 2;
+  PublicError unavailable_reason = 3;
+  map<string, string> attributes = 4;
+
+  reserved 5 to 15;
+}
+
+message HandshakeRequest {
+  ProtocolPeer peer = 1;
+  ProtocolVersion minimum_version = 2;
+  ProtocolVersion maximum_version = 3;
+  uint64 feature_bitmap = 4;
+  uint64 maximum_frame_size = 5;
+  Digest descriptor_digest = 6;
+  bytes one_time_nonce = 7;
+  OpaqueId sandbox_id = 8;
+  uint64 sandbox_generation = 9;
+
+  // Long-lived bearer credentials are never part of handshake payloads.
+  reserved 10;
+  reserved "bearer_token";
+}
+
+message HandshakeResponse {
+  ProtocolVersion selected_version = 1;
+  uint64 feature_bitmap = 2;
+  uint64 maximum_frame_size = 3;
+  Digest descriptor_digest = 4;
+  CapabilityStatus status = 5;
+  bytes nonce_proof = 6;
+
+  reserved 7 to 15;
+}
+
+message RpcRequestMeta {
+  OpaqueId request_id = 1;
+  Digest request_digest = 2;
+  uint64 deadline_unix_ms = 3;
+  bytes idempotency_key = 4;
+  ProtocolVersion protocol_version = 5;
+
+  reserved 6 to 15;
+}
+
+message RpcResponseMeta {
+  OpaqueId request_id = 1;
+  uint64 server_sequence = 2;
+  Digest descriptor_digest = 3;
+
+  reserved 4 to 15;
+}
+
+message GetCapabilitiesRequest {
+  RpcRequestMeta meta = 1;
+}
+
+message GetCapabilitiesResponse {
+  RpcResponseMeta meta = 1;
+  repeated CapabilityStatus capabilities = 2;
+  ProtocolVersion protocol_version = 3;
+  Digest descriptor_digest = 4;
+
+  reserved 5 to 15;
+}
+
+message Empty {}
+
+service ControlService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}

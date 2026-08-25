@@ -1,0 +1,355 @@
+syntax = "proto3";
+
+package circulus.api.v1alpha;
+
+import "circulus/v1alpha/common.proto";
+import "circulus/v1alpha/session.proto";
+
+option go_package = "github.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alpha";
+
+enum WorkspaceAccessMode {
+  WORKSPACE_ACCESS_MODE_UNSPECIFIED = 0;
+  WORKSPACE_ACCESS_MODE_READ_ONLY = 1;
+  WORKSPACE_ACCESS_MODE_READ_WRITE = 2;
+
+  reserved 3 to 15;
+}
+
+enum WorkspaceLeaseWaitPolicy {
+  WORKSPACE_LEASE_WAIT_POLICY_UNSPECIFIED = 0;
+  WORKSPACE_LEASE_WAIT_POLICY_QUEUE = 1;
+  WORKSPACE_LEASE_WAIT_POLICY_FAIL = 2;
+
+  reserved 3 to 15;
+}
+
+enum WorkspaceEntryType {
+  WORKSPACE_ENTRY_TYPE_UNSPECIFIED = 0;
+  WORKSPACE_ENTRY_TYPE_FILE = 1;
+  WORKSPACE_ENTRY_TYPE_DIRECTORY = 2;
+  WORKSPACE_ENTRY_TYPE_SYMLINK = 3;
+
+  // Device, FIFO, and socket entries are intentionally unrepresentable.
+  reserved 4 to 15;
+}
+
+enum WorkspaceMutationKind {
+  WORKSPACE_MUTATION_KIND_UNSPECIFIED = 0;
+  WORKSPACE_MUTATION_KIND_PUT_FILE = 1;
+  WORKSPACE_MUTATION_KIND_DELETE = 2;
+  WORKSPACE_MUTATION_KIND_CREATE_DIRECTORY = 3;
+  WORKSPACE_MUTATION_KIND_PUT_SYMLINK = 4;
+  WORKSPACE_MUTATION_KIND_CHMOD = 5;
+
+  reserved 6 to 15;
+}
+
+enum WorkspaceInvocationStatus {
+  WORKSPACE_INVOCATION_STATUS_UNSPECIFIED = 0;
+  WORKSPACE_INVOCATION_STATUS_COMMITTED = 1;
+  WORKSPACE_INVOCATION_STATUS_REJECTED = 2;
+
+  reserved 3 to 15;
+}
+
+message WorkspaceTreeEntry {
+  string path = 1;
+  WorkspaceEntryType type = 2;
+  uint32 mode = 3;
+  uint64 size = 4;
+  Digest content_digest = 5;
+  string symlink_target = 6;
+  Digest child_tree_digest = 7;
+
+  reserved 8 to 15;
+}
+
+message WorkspaceSnapshotRef {
+  OpaqueId workspace_id = 1;
+  uint64 revision = 2;
+  Digest root_digest = 3;
+  uint64 entry_count = 4;
+
+  reserved 5 to 15;
+}
+
+// dispatch_attempt and turn_lease_generation are respectively the effect and
+// session generations named by ADR-005; sandbox/projection generations fence
+// stale materializations independently.
+message WorkspaceWriteLease {
+  OpaqueId lease_id = 1;
+  OpaqueId workspace_id = 2;
+  OpaqueId tenant_id = 3;
+  OpaqueId user_id = 4;
+  OpaqueId invocation_id = 5;
+  Digest request_digest = 6;
+  OpaqueId effect_id = 7;
+  OpaqueId session_id = 8;
+  OpaqueId sandbox_id = 9;
+  ExecutionBackend backend = 10;
+  uint64 base_revision = 11;
+  uint64 lease_generation = 12;
+  uint64 dispatch_attempt = 13;
+  uint64 turn_lease_generation = 14;
+  uint64 placement_generation = 15;
+  uint64 sandbox_generation = 16;
+  uint64 projection_generation = 17;
+  uint64 authorization_generation = 18;
+  uint64 issued_at_unix_ms = 19;
+  uint64 expires_at_unix_ms = 20;
+  uint64 maximum_hold_deadline_unix_ms = 21;
+  uint64 renewal_sequence = 22;
+  uint64 enqueue_sequence = 23;
+
+  reserved 24 to 31;
+}
+
+// WorkspaceProtectionPermit is issued only after authority/ACL checks. The
+// value is opaque and authenticated; callers may inspect the explicit bounds
+// but cannot widen them. A read-write permit is always tied to a write lease.
+message WorkspaceProtectionPermit {
+  bytes value = 1;
+  OpaqueId tenant_id = 2;
+  OpaqueId user_id = 3;
+  OpaqueId workspace_id = 4;
+  OpaqueId lease_id = 5;
+  OpaqueId invocation_id = 6;
+  Digest request_digest = 7;
+  OpaqueId effect_id = 8;
+  OpaqueId session_id = 9;
+  OpaqueId sandbox_id = 10;
+  ExecutionBackend backend = 11;
+  WorkspaceAccessMode access_mode = 12;
+  uint64 pinned_revision = 13;
+  uint64 lease_generation = 14;
+  uint64 dispatch_attempt = 15;
+  uint64 turn_lease_generation = 16;
+  uint64 placement_generation = 17;
+  uint64 sandbox_generation = 18;
+  uint64 projection_generation = 19;
+  uint64 authorization_generation = 20;
+  uint64 issued_at_unix_ms = 21;
+  uint64 expires_at_unix_ms = 22;
+  uint64 maximum_hold_deadline_unix_ms = 23;
+  uint64 renewal_sequence = 24;
+  uint64 enqueue_sequence = 25;
+
+  reserved 26 to 31;
+  reserved "claims", "host_path";
+}
+
+message WorkspaceProtectionGrant {
+  WorkspaceProtectionPermit permit = 1;
+  WorkspaceSnapshotRef snapshot = 2;
+  WorkspaceWriteLease write_lease = 3;
+
+  reserved 4 to 15;
+}
+
+message WorkspaceLeaseConflict {
+  uint64 current_generation = 1;
+  uint64 expires_at_unix_ms = 2;
+  OpaqueId holder_session_id = 3;
+  bool holder_identity_redacted = 4;
+
+  reserved 5 to 15;
+}
+
+// The opaque value authenticates the original enqueue decision. Retrying with
+// the same token preserves enqueue_sequence instead of allocating a new place.
+message WorkspaceLeaseQueueToken {
+  bytes value = 1;
+  OpaqueId invocation_id = 2;
+  Digest request_digest = 3;
+  uint64 enqueue_sequence = 4;
+  uint64 expires_at_unix_ms = 5;
+
+  reserved 6 to 15;
+}
+
+message WorkspaceLeaseQueued {
+  WorkspaceLeaseQueueToken queue_token = 1;
+  uint64 enqueue_sequence = 2;
+  uint64 queue_position = 3;
+  uint64 retry_after_ms = 4;
+
+  reserved 5 to 15;
+}
+
+message AcquireWorkspaceProtectionRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  DispatchPermit dispatch_permit = 3;
+  OpaqueId sandbox_id = 4;
+  OpaqueId invocation_id = 5;
+  Digest request_digest = 6;
+  WorkspaceAccessMode access_mode = 7;
+  uint64 requested_revision = 8;
+  bool use_latest_revision = 9;
+  ExecutionBackend backend = 10;
+  WorkspaceLeaseWaitPolicy wait_policy = 11;
+  uint64 acquire_timeout_ms = 12;
+  uint64 requested_lease_ttl_ms = 13;
+  WorkspaceLeaseQueueToken queue_token = 14;
+  uint64 requested_maximum_hold_ms = 15;
+  uint64 projection_generation = 16;
+
+  // Workspace and tenant identity are captured by turn_authority.
+  reserved 17 to 31;
+  reserved "workspace_id", "tenant_id";
+}
+
+message AcquireWorkspaceProtectionResponse {
+  RpcResponseMeta meta = 1;
+
+  oneof outcome {
+    WorkspaceProtectionGrant granted = 2;
+    WorkspaceLeaseConflict conflict = 3;
+    WorkspaceLeaseQueued queued = 4;
+  }
+
+  reserved 5 to 15;
+}
+
+// next_renewal_sequence must be current+1. Repeating the same sequence with the
+// same request returns the prior expiry instead of extending the lease twice.
+message RenewWorkspaceLeaseRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  WorkspaceProtectionPermit current_permit = 3;
+  uint64 requested_lease_ttl_ms = 4;
+  uint64 next_renewal_sequence = 5;
+
+  reserved 6 to 15;
+}
+
+message RenewWorkspaceLeaseResponse {
+  RpcResponseMeta meta = 1;
+  WorkspaceProtectionGrant renewed = 2;
+  bool idempotent_retry = 3;
+
+  reserved 4 to 15;
+}
+
+message ReleaseWorkspaceLeaseRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  WorkspaceProtectionPermit permit = 3;
+
+  reserved 4 to 15;
+}
+
+message ReleaseWorkspaceLeaseResponse {
+  RpcResponseMeta meta = 1;
+  bool released = 2;
+
+  reserved 3 to 15;
+}
+
+message WorkspaceMutation {
+  WorkspaceMutationKind kind = 1;
+  string path = 2;
+  uint32 mode = 3;
+  uint64 size = 4;
+  Digest content_digest = 5;
+  string symlink_target = 6;
+  Digest expected_entry_digest = 7;
+
+  reserved 8 to 15;
+}
+
+message WorkspaceCommitResult {
+  OpaqueId workspace_commit_id = 1;
+  uint64 revision = 2;
+  Digest root_digest = 3;
+
+  reserved 4 to 15;
+}
+
+message WorkspaceInvocationRecord {
+  OpaqueId invocation_id = 1;
+  Digest request_digest = 2;
+  uint64 base_revision = 3;
+  WorkspaceInvocationStatus status = 4;
+  WorkspaceCommitResult result = 5;
+  PublicError rejection = 6;
+
+  reserved 7 to 15;
+}
+
+message CommitWorkspaceRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  WorkspaceProtectionPermit protection_permit = 3;
+  OpaqueId invocation_id = 4;
+  Digest request_digest = 5;
+  uint64 base_revision = 6;
+  uint64 lease_generation = 7;
+  repeated WorkspaceMutation mutations = 8;
+  Digest post_execution_root_digest = 9;
+
+  reserved 10 to 15;
+}
+
+message CommitWorkspaceResponse {
+  RpcResponseMeta meta = 1;
+  WorkspaceInvocationRecord invocation = 2;
+  bool deduplicated = 3;
+
+  reserved 4 to 15;
+}
+
+message GetWorkspaceInvocationRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  OpaqueId invocation_id = 3;
+  Digest request_digest = 4;
+
+  // Workspace scope is derived from the authority, never this request body.
+  reserved 5 to 15;
+  reserved "workspace_id";
+}
+
+message GetWorkspaceInvocationResponse {
+  RpcResponseMeta meta = 1;
+  bool found = 2;
+  WorkspaceInvocationRecord invocation = 3;
+
+  reserved 4 to 15;
+}
+
+message BlobUploadPermit {
+  bytes value = 1;
+  OpaqueId workspace_id = 2;
+  OpaqueId invocation_id = 3;
+  uint64 reserved_bytes = 4;
+  uint64 expires_at_unix_ms = 5;
+
+  reserved 6 to 15;
+  reserved "object_key";
+}
+
+message PrepareBlobUploadRequest {
+  RpcRequestMeta meta = 1;
+  WorkspaceProtectionPermit protection_permit = 2;
+  uint64 expected_size_bytes = 3;
+  Digest expected_digest = 4;
+
+  reserved 5 to 15;
+}
+
+message PrepareBlobUploadResponse {
+  RpcResponseMeta meta = 1;
+  BlobUploadPermit upload_permit = 2;
+
+  reserved 3 to 15;
+}
+
+service WorkspaceStateService {
+  rpc AcquireProtection(AcquireWorkspaceProtectionRequest) returns (AcquireWorkspaceProtectionResponse);
+  rpc RenewLease(RenewWorkspaceLeaseRequest) returns (RenewWorkspaceLeaseResponse);
+  rpc ReleaseLease(ReleaseWorkspaceLeaseRequest) returns (ReleaseWorkspaceLeaseResponse);
+  rpc Commit(CommitWorkspaceRequest) returns (CommitWorkspaceResponse);
+  rpc GetInvocation(GetWorkspaceInvocationRequest) returns (GetWorkspaceInvocationResponse);
+  rpc PrepareBlobUpload(PrepareBlobUploadRequest) returns (PrepareBlobUploadResponse);
+}

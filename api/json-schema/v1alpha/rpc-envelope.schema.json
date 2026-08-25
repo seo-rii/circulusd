@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://circulusd.local/schemas/v1alpha/rpc-envelope.schema.json",
+  "title": "Circulus RPC Envelope v1alpha",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "requestId", "protocolVersion", "descriptorDigest"],
+  "properties": {
+    "apiVersion": {
+      "const": "v1alpha"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["request", "response"]
+    },
+    "requestId": {
+      "$ref": "#/$defs/opaqueId"
+    },
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {
+          "$ref": "#/$defs/uint64"
+        },
+        "minor": {
+          "$ref": "#/$defs/uint64"
+        }
+      }
+    },
+    "descriptorDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "requestDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "deadlineUnixMs": {
+      "$ref": "#/$defs/uint64"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "payload": true,
+    "error": {
+      "$ref": "public-error.schema.json"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {
+          "const": "request"
+        }
+      },
+      "required": ["kind", "requestDigest", "deadlineUnixMs", "payload"],
+      "not": {
+        "required": ["error"]
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "response"
+        }
+      },
+      "required": ["kind", "payload"],
+      "not": {
+        "required": ["error"]
+      }
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "response"
+        }
+      },
+      "required": ["kind", "error"],
+      "not": {
+        "required": ["payload"]
+      }
+    }
+  ],
+  "$defs": {
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9_.:-]*$"
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  }
+}

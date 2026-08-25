@@ -1,0 +1,398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://circulusd.local/schemas/v1alpha/release-manifest.schema.json",
+  "title": "Circulus Air-gap Release Manifest v1alpha",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "release", "toolchains", "components"],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "status", "architectures"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["development", "candidate", "production"]
+        },
+        "architectures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/architecture"
+          }
+        }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["go", "node", "pnpm", "protoc"],
+      "properties": {
+        "go": {
+          "$ref": "#/$defs/version"
+        },
+        "node": {
+          "$ref": "#/$defs/version"
+        },
+        "pnpm": {
+          "$ref": "#/$defs/version"
+        },
+        "protoc": {
+          "$ref": "#/$defs/version"
+        },
+        "protocGenGo": {
+          "$ref": "#/$defs/version"
+        },
+        "protocGenConnectGo": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    },
+    "protocolCompatibility": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/protocolPair"
+      }
+    },
+    "signatures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/signature"
+      }
+    },
+    "unresolvedArtifacts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1024
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "release": {
+            "properties": {
+              "status": {
+                "enum": ["candidate", "production"]
+              }
+            },
+            "required": ["status"]
+          }
+        },
+        "required": ["release"]
+      },
+      "then": {
+        "required": ["protocolCompatibility", "signatures"],
+        "properties": {
+          "components": {
+            "items": {
+              "properties": {
+                "artifacts": {
+                  "minItems": 1
+                }
+              }
+            },
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "platformd"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "agentd"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "executord"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "sandboxd"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "workerd"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "name": {
+                      "const": "celld"
+                    }
+                  },
+                  "required": ["name"]
+                }
+              }
+            ]
+          },
+          "protocolCompatibility": {
+            "minItems": 5,
+            "maxItems": 5,
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "pair": {
+                      "const": "platformd-agentd"
+                    }
+                  },
+                  "required": ["pair"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "pair": {
+                      "const": "platformd-executord"
+                    }
+                  },
+                  "required": ["pair"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "pair": {
+                      "const": "session-host-dynamic-worker"
+                    }
+                  },
+                  "required": ["pair"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "pair": {
+                      "const": "executord-sandboxd"
+                    }
+                  },
+                  "required": ["pair"]
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "pair": {
+                      "const": "state-app-schema"
+                    }
+                  },
+                  "required": ["pair"]
+                }
+              }
+            ]
+          },
+          "signatures": {
+            "minItems": 1
+          },
+          "unresolvedArtifacts": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "architecture": {
+      "type": "string",
+      "enum": ["x86_64", "aarch64"]
+    },
+    "artifactArchitecture": {
+      "type": "string",
+      "enum": ["x86_64", "aarch64", "any"]
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "license", "source", "qualification", "artifacts"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40,64}$"
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "source": {
+          "type": "string",
+          "format": "uri"
+        },
+        "qualification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "name", "sha256"],
+      "properties": {
+        "architecture": {
+          "$ref": "#/$defs/artifactArchitecture"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/]+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "signature": {
+          "$ref": "#/$defs/signature"
+        }
+      }
+    },
+    "protocolPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pair", "minimum", "maximum", "descriptorSha256"],
+      "properties": {
+        "pair": {
+          "type": "string",
+          "enum": [
+            "platformd-agentd",
+            "platformd-executord",
+            "session-host-dynamic-worker",
+            "executord-sandboxd",
+            "state-app-schema"
+          ]
+        },
+        "minimum": {
+          "$ref": "#/$defs/protocolVersion"
+        },
+        "maximum": {
+          "$ref": "#/$defs/protocolVersion"
+        },
+        "descriptorSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "featureBitmap": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "value"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["ed25519"]
+        },
+        "keyId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "value": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

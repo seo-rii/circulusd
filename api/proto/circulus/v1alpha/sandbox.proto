@@ -1,0 +1,434 @@
+syntax = "proto3";
+
+package circulus.api.v1alpha;
+
+import "circulus/v1alpha/common.proto";
+import "circulus/v1alpha/session.proto";
+import "circulus/v1alpha/workspace.proto";
+
+option go_package = "github.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alpha";
+
+enum WorkspaceProjectionMode {
+  WORKSPACE_PROJECTION_MODE_UNSPECIFIED = 0;
+  WORKSPACE_PROJECTION_MODE_MATERIALIZED_MANIFEST = 1;
+  WORKSPACE_PROJECTION_MODE_FUSE_EXPERIMENTAL = 2;
+
+  reserved 3 to 15;
+}
+
+enum SandboxScope {
+  SANDBOX_SCOPE_UNSPECIFIED = 0;
+  SANDBOX_SCOPE_WORKSPACE = 1;
+  SANDBOX_SCOPE_SESSION = 2;
+  SANDBOX_SCOPE_INVOCATION = 3;
+
+  reserved 4 to 15;
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_NONE = 1;
+  NETWORK_MODE_MCP_ONLY = 2;
+  NETWORK_MODE_LAN_ALLOWLIST = 3;
+  NETWORK_MODE_CUSTOM = 4;
+
+  reserved 5 to 15;
+}
+
+enum SandboxLifecycleState {
+  SANDBOX_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  SANDBOX_LIFECYCLE_STATE_STARTING = 1;
+  SANDBOX_LIFECYCLE_STATE_READY = 2;
+  SANDBOX_LIFECYCLE_STATE_DRAINING = 3;
+  SANDBOX_LIFECYCLE_STATE_STOPPED = 4;
+  SANDBOX_LIFECYCLE_STATE_DESTROYED = 5;
+  SANDBOX_LIFECYCLE_STATE_FAILED = 6;
+
+  reserved 7 to 15;
+}
+
+enum StdinMode {
+  STDIN_MODE_UNSPECIFIED = 0;
+  STDIN_MODE_CLOSED = 1;
+  STDIN_MODE_STREAM = 2;
+
+  reserved 3 to 15;
+}
+
+enum ProcessSignal {
+  PROCESS_SIGNAL_UNSPECIFIED = 0;
+  PROCESS_SIGNAL_INTERRUPT = 1;
+  PROCESS_SIGNAL_TERMINATE = 2;
+  PROCESS_SIGNAL_KILL = 3;
+  PROCESS_SIGNAL_HANGUP = 4;
+
+  reserved 5 to 15;
+}
+
+enum ProcessLifecycleState {
+  PROCESS_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  PROCESS_LIFECYCLE_STATE_STARTING = 1;
+  PROCESS_LIFECYCLE_STATE_RUNNING = 2;
+  PROCESS_LIFECYCLE_STATE_EXITED = 3;
+  PROCESS_LIFECYCLE_STATE_FAILED = 4;
+
+  reserved 5 to 15;
+}
+
+message ExecutionCapabilities {
+  ExecutionBackend backend = 1;
+  CapabilityStatus availability = 2;
+  bool process_streaming = 3;
+  bool workspace_materialization = 4;
+  bool overlayfs_diff = 5;
+  bool read_only_workspace = 6;
+  bool network_policy = 7;
+  uint64 maximum_frame_size = 8;
+  uint64 maximum_output_bytes = 9;
+  uint64 maximum_processes = 10;
+
+  reserved 11 to 31;
+}
+
+message NetworkPolicyRef {
+  NetworkMode mode = 1;
+  Digest policy_digest = 2;
+
+  // Raw destinations and credentials are resolved by the trusted provider.
+  reserved 3 to 15;
+  reserved "destinations", "credentials";
+}
+
+message SandboxSpec {
+  ExecutionBackend backend = 1;
+  Digest execution_environment_digest = 2;
+  OpaqueId resource_profile = 3;
+  Digest resource_profile_digest = 4;
+  NetworkPolicyRef network_policy = 5;
+  WorkspaceProjectionMode workspace_projection = 6;
+  SandboxScope scope = 7;
+  uint64 idle_timeout_ms = 8;
+  uint64 maximum_lifetime_ms = 9;
+
+  // Launch authority fixes identity; no user-selected host path or resource ID.
+  reserved 10 to 15;
+  reserved "tenant_id", "workspace_id", "session_id", "sandbox_id", "host_path";
+}
+
+message SandboxHandle {
+  OpaqueId sandbox_id = 1;
+  uint64 generation = 2;
+  ExecutionBackend backend = 3;
+  Digest execution_environment_digest = 4;
+
+  reserved 5 to 15;
+}
+
+message GetExecutionCapabilitiesRequest {
+  RpcRequestMeta meta = 1;
+  ExecutionBackend backend = 2;
+}
+
+message GetExecutionCapabilitiesResponse {
+  RpcResponseMeta meta = 1;
+  ExecutionCapabilities capabilities = 2;
+}
+
+message EnsureSandboxRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle launch_authority = 2;
+  SandboxSpec spec = 3;
+
+  reserved 4 to 15;
+}
+
+message EnsureSandboxResponse {
+  RpcResponseMeta meta = 1;
+  SandboxHandle handle = 2;
+  bool reused = 3;
+
+  reserved 4 to 15;
+}
+
+message MaterializeWorkspaceRequest {
+  RpcRequestMeta meta = 1;
+  SandboxHandle sandbox = 2;
+  WorkspaceProtectionPermit protection_permit = 3;
+  WorkspaceSnapshotRef snapshot = 4;
+
+  reserved 5 to 15;
+}
+
+message MaterializeWorkspaceResponse {
+  RpcResponseMeta meta = 1;
+  uint64 materialized_revision = 2;
+  Digest materialized_root_digest = 3;
+  uint64 materialized_bytes = 4;
+  uint64 materialized_entries = 5;
+
+  reserved 6 to 15;
+}
+
+message FinalizeWorkspaceRequest {
+  RpcRequestMeta meta = 1;
+  SandboxHandle sandbox = 2;
+  WorkspaceProtectionPermit protection_permit = 3;
+
+  reserved 4 to 15;
+}
+
+message FinalizeWorkspaceResponse {
+  RpcResponseMeta meta = 1;
+  repeated WorkspaceMutation mutations = 2;
+  Digest post_execution_root_digest = 3;
+  uint64 scanned_entries = 4;
+
+  reserved 5 to 15;
+}
+
+message StopSandboxRequest {
+  RpcRequestMeta meta = 1;
+  SandboxHandle sandbox = 2;
+  string reason = 3;
+
+  reserved 4 to 15;
+}
+
+message StopSandboxResponse {
+  RpcResponseMeta meta = 1;
+  SandboxLifecycleState state = 2;
+
+  reserved 3 to 15;
+}
+
+message DestroySandboxRequest {
+  RpcRequestMeta meta = 1;
+  SandboxHandle sandbox = 2;
+  string reason = 3;
+
+  reserved 4 to 15;
+}
+
+message DestroySandboxResponse {
+  RpcResponseMeta meta = 1;
+  bool destroyed = 2;
+
+  reserved 3 to 15;
+}
+
+message SandboxHealth {
+  SandboxLifecycleState state = 1;
+  uint64 generation = 2;
+  uint64 started_at_unix_ms = 3;
+  uint64 last_activity_at_unix_ms = 4;
+  uint64 active_processes = 5;
+  CapabilityStatus control_channel = 6;
+
+  reserved 7 to 15;
+}
+
+message GetSandboxHealthRequest {
+  RpcRequestMeta meta = 1;
+  SandboxHandle sandbox = 2;
+}
+
+message GetSandboxHealthResponse {
+  RpcResponseMeta meta = 1;
+  SandboxHealth health = 2;
+}
+
+message SecretHandle {
+  bytes value = 1;
+
+  // Secret values are never embedded in this protocol message.
+  reserved 2;
+  reserved "secret", "plaintext";
+}
+
+message SpawnProcessRequest {
+  RpcRequestMeta meta = 1;
+  DispatchPermit dispatch_permit = 2;
+  SandboxHandle sandbox = 3;
+  WorkspaceProtectionPermit workspace_protection = 4;
+  OpaqueId invocation_id = 5;
+  Digest request_digest = 6;
+  string executable = 7;
+  repeated string arguments = 8;
+  string working_directory = 9;
+  repeated SecretHandle environment_handles = 10;
+  uint64 timeout_ms = 11;
+  uint64 output_limit_bytes = 12;
+  StdinMode stdin_mode = 13;
+
+  // Host PIDs, host paths, and raw environment values are forbidden.
+  reserved 14 to 15;
+  reserved "pid", "host_path", "environment";
+}
+
+message ProcessHandle {
+  OpaqueId sandbox_id = 1;
+  OpaqueId process_id = 2;
+  OpaqueId invocation_id = 3;
+  uint64 generation = 4;
+
+  reserved 5 to 15;
+  reserved "pid";
+}
+
+message SpawnProcessResponse {
+  RpcResponseMeta meta = 1;
+  ProcessHandle process = 2;
+
+  reserved 3 to 15;
+}
+
+message AttachProcessRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+  uint64 after_sequence = 3;
+
+  reserved 4 to 15;
+}
+
+message ProcessStarted {
+  uint64 started_at_unix_ms = 1;
+}
+
+message ProcessOutput {
+  bytes data = 1;
+  bool truncated = 2;
+}
+
+message ProcessUsage {
+  uint64 cpu_time_ms = 1;
+  uint64 maximum_resident_bytes = 2;
+  uint64 read_bytes = 3;
+  uint64 written_bytes = 4;
+  uint64 process_count = 5;
+
+  reserved 6 to 15;
+}
+
+message ProcessResult {
+  int32 exit_code = 1;
+  ProcessSignal terminating_signal = 2;
+  bool timed_out = 3;
+  bool cancelled = 4;
+  bool output_truncated = 5;
+  ProcessUsage usage = 6;
+  uint64 finished_at_unix_ms = 7;
+
+  reserved 8 to 15;
+}
+
+message ProcessEvent {
+  ProcessHandle process = 1;
+  uint64 sequence = 2;
+
+  oneof event {
+    ProcessStarted started = 3;
+    ProcessOutput stdout = 4;
+    ProcessOutput stderr = 5;
+    ProcessUsage resource = 6;
+    ProcessResult exit = 7;
+    PublicError error = 8;
+  }
+
+  reserved 9 to 15;
+}
+
+message WriteStdinRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+  uint64 chunk_sequence = 3;
+  bytes data = 4;
+
+  reserved 5 to 15;
+}
+
+message WriteStdinResponse {
+  RpcResponseMeta meta = 1;
+  uint64 accepted_sequence = 2;
+  uint64 accepted_bytes = 3;
+
+  reserved 4 to 15;
+}
+
+message CloseStdinRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+
+  reserved 3 to 15;
+}
+
+message CloseStdinResponse {
+  RpcResponseMeta meta = 1;
+  bool closed = 2;
+
+  reserved 3 to 15;
+}
+
+message SignalProcessRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+  ProcessSignal signal = 3;
+
+  reserved 4 to 15;
+}
+
+message SignalProcessResponse {
+  RpcResponseMeta meta = 1;
+  bool delivered = 2;
+
+  reserved 3 to 15;
+}
+
+message CancelProcessRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+  string reason = 3;
+
+  reserved 4 to 15;
+}
+
+message CancelProcessResponse {
+  RpcResponseMeta meta = 1;
+  bool process_group_termination_started = 2;
+
+  reserved 3 to 15;
+}
+
+message WaitProcessRequest {
+  RpcRequestMeta meta = 1;
+  ProcessHandle process = 2;
+
+  reserved 3 to 15;
+}
+
+message WaitProcessResponse {
+  RpcResponseMeta meta = 1;
+  ProcessLifecycleState state = 2;
+  ProcessResult result = 3;
+
+  reserved 4 to 15;
+}
+
+service ExecutionProviderService {
+  rpc GetCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
+  rpc EnsureSandbox(EnsureSandboxRequest) returns (EnsureSandboxResponse);
+  rpc Materialize(MaterializeWorkspaceRequest) returns (MaterializeWorkspaceResponse);
+  rpc FinalizeWorkspace(FinalizeWorkspaceRequest) returns (FinalizeWorkspaceResponse);
+  rpc Stop(StopSandboxRequest) returns (StopSandboxResponse);
+  rpc Destroy(DestroySandboxRequest) returns (DestroySandboxResponse);
+  rpc Health(GetSandboxHealthRequest) returns (GetSandboxHealthResponse);
+}
+
+service SandboxProcessService {
+  rpc Spawn(SpawnProcessRequest) returns (SpawnProcessResponse);
+  rpc Attach(AttachProcessRequest) returns (stream ProcessEvent);
+  rpc WriteStdin(WriteStdinRequest) returns (WriteStdinResponse);
+  rpc CloseStdin(CloseStdinRequest) returns (CloseStdinResponse);
+  rpc Signal(SignalProcessRequest) returns (SignalProcessResponse);
+  rpc Cancel(CancelProcessRequest) returns (CancelProcessResponse);
+  rpc Wait(WaitProcessRequest) returns (WaitProcessResponse);
+}

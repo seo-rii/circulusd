@@ -1,0 +1,570 @@
+syntax = "proto3";
+
+package circulus.api.v1alpha;
+
+import "circulus/v1alpha/common.proto";
+
+option go_package = "github.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alpha";
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_CREATED = 1;
+  SESSION_STATUS_STARTING = 2;
+  SESSION_STATUS_READY = 3;
+  SESSION_STATUS_RUNNING = 4;
+  SESSION_STATUS_INTERRUPTED = 5;
+  SESSION_STATUS_FAILED = 6;
+  SESSION_STATUS_CLOSED = 7;
+
+  reserved 8 to 15;
+}
+
+// TurnStatus is deliberately independent of EffectState (ADR-003).
+enum TurnStatus {
+  TURN_STATUS_UNSPECIFIED = 0;
+  TURN_STATUS_QUEUED = 1;
+  TURN_STATUS_ACTIVE = 2;
+  TURN_STATUS_NEEDS_CONFIRMATION = 3;
+  TURN_STATUS_COMPLETED = 4;
+  TURN_STATUS_FAILED = 5;
+  TURN_STATUS_ABORTED = 6;
+
+  reserved 7 to 15;
+}
+
+enum EngineKind {
+  ENGINE_KIND_UNSPECIFIED = 0;
+  ENGINE_KIND_LOW_LEVEL = 1;
+  ENGINE_KIND_AGENT_HARNESS = 2;
+
+  reserved 3 to 15;
+}
+
+enum CheckpointKind {
+  CHECKPOINT_KIND_UNSPECIFIED = 0;
+  CHECKPOINT_KIND_GENESIS = 1;
+  CHECKPOINT_KIND_ENGINE = 2;
+
+  reserved 3 to 15;
+}
+
+enum CheckpointPayloadEncoding {
+  CHECKPOINT_PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  CHECKPOINT_PAYLOAD_ENCODING_PROTOBUF = 1;
+  CHECKPOINT_PAYLOAD_ENCODING_CANONICAL_CBOR = 2;
+  CHECKPOINT_PAYLOAD_ENCODING_OPAQUE_V1 = 3;
+
+  reserved 4 to 15;
+}
+
+enum EffectService {
+  EFFECT_SERVICE_UNSPECIFIED = 0;
+  EFFECT_SERVICE_MODEL = 1;
+  EFFECT_SERVICE_WORKSPACE = 2;
+  EFFECT_SERVICE_EXECUTOR = 3;
+  EFFECT_SERVICE_MCP = 4;
+  EFFECT_SERVICE_ARTIFACT = 5;
+  EFFECT_SERVICE_EXTERNAL_TOOL = 6;
+
+  reserved 7 to 15;
+}
+
+// EffectState has no turn-terminal or uncertainty aliases. A confirm-policy
+// uncertainty is EFFECT_STATE_BLOCKED while the TurnStatus independently moves
+// to TURN_STATUS_NEEDS_CONFIRMATION.
+enum EffectState {
+  EFFECT_STATE_UNSPECIFIED = 0;
+  EFFECT_STATE_PREPARED = 1;
+  EFFECT_STATE_DISPATCHED = 2;
+  EFFECT_STATE_EXTERNALLY_COMMITTED = 3;
+  EFFECT_STATE_SETTLED = 4;
+  EFFECT_STATE_BLOCKED = 5;
+
+  reserved 6 to 15;
+}
+
+enum ReplayPolicy {
+  REPLAY_POLICY_UNSPECIFIED = 0;
+  REPLAY_POLICY_SAFE = 1;
+  REPLAY_POLICY_IDEMPOTENCY_KEY = 2;
+  REPLAY_POLICY_NEVER = 3;
+  REPLAY_POLICY_CONFIRM = 4;
+
+  reserved 5 to 15;
+}
+
+message RuntimePointer {
+  OpaqueId active_revision = 1;
+  Digest active_revision_digest = 2;
+  OpaqueId candidate_revision = 3;
+  OpaqueId previous_revision = 4;
+  uint64 switch_generation = 5;
+
+  reserved 6 to 15;
+}
+
+message TurnLease {
+  OpaqueId turn_id = 1;
+  OpaqueId owner_agentd = 2;
+  OpaqueId owner_shard = 3;
+  uint64 lease_generation = 4;
+  uint64 placement_generation = 5;
+  uint64 authorization_generation = 6;
+  uint64 issued_at_unix_ms = 7;
+  uint64 expires_at_unix_ms = 8;
+
+  reserved 9 to 15;
+}
+
+// AgentCheckpoint matches packages/protocol-types. For GENESIS, sequence is
+// zero and predecessor_digest is absent (the Protobuf representation of null).
+// For ENGINE, sequence is positive and predecessor_digest must be present.
+message AgentCheckpoint {
+  CheckpointKind kind = 1;
+  EngineKind engine_kind = 2;
+  uint64 adapter_abi_version = 3;
+  uint64 checkpoint_schema_version = 4;
+  Digest runtime_revision_digest = 5;
+  OpaqueId session_id = 6;
+  OpaqueId turn_id = 7;
+  uint64 checkpoint_sequence = 8;
+  Digest predecessor_digest = 9;
+  CheckpointPayloadEncoding payload_encoding = 10;
+  bytes payload_bytes = 11;
+  Digest payload_digest = 12;
+
+  reserved 13 to 15;
+}
+
+// EffectIntent is the engine-owned request at a durable boundary. The Session
+// authority assigns effect/invocation identity when committing this intent.
+message EffectIntent {
+  EffectService service = 1;
+  string operation = 2;
+  ReplayPolicy replay_policy = 3;
+  Digest request_digest = 4;
+  bytes payload = 5; // RFC 8949 Core Deterministic CBOR normalized value.
+  OpaqueId parent_operation_id = 6;
+  uint64 ordinal = 7;
+
+  reserved 8 to 15;
+}
+
+message EffectRecord {
+  OpaqueId tenant_id = 1;
+  OpaqueId user_id = 2;
+  OpaqueId session_id = 3;
+  OpaqueId turn_id = 4;
+  OpaqueId effect_id = 5;
+  OpaqueId invocation_id = 6;
+  Digest request_digest = 7;
+  EffectService service = 8;
+  string operation = 9;
+  ReplayPolicy replay_policy = 10;
+  OpaqueId parent_operation_id = 11;
+  uint64 ordinal = 12;
+  EffectState state = 13;
+  uint64 dispatch_attempt = 14;
+  uint64 turn_lease_generation = 15;
+  uint64 placement_generation = 16;
+  uint64 sandbox_generation = 17;
+  uint64 authorization_generation = 18;
+  uint64 deadline_unix_ms = 19;
+  OpaqueId result_ref = 20;
+  OpaqueId external_commit_id = 21;
+  OpaqueId provider_request_id = 22;
+
+  reserved 23 to 31;
+}
+
+message TurnState {
+  OpaqueId turn_id = 1;
+  uint64 sequence = 2;
+  TurnStatus status = 3;
+  TurnLease lease = 4;
+  OpaqueId active_effect_id = 5;
+  AgentCheckpoint checkpoint = 6;
+  bool abort_requested = 7;
+  uint64 enqueue_sequence = 8;
+
+  reserved 9 to 15;
+}
+
+message SessionState {
+  OpaqueId session_id = 1;
+  OpaqueId tenant_id = 2;
+  OpaqueId user_id = 3;
+  OpaqueId workspace_id = 4;
+  RuntimePointer runtime = 5;
+  ExecutionBackend execution_backend = 6;
+  OpaqueId execution_environment_revision = 7;
+  SessionStatus status = 8;
+  uint64 event_sequence = 9;
+  TurnState active_turn = 10;
+  OpaqueId latest_settled_turn = 11;
+  uint64 placement_generation = 12;
+  Digest policy_snapshot_digest = 13;
+  uint64 authorization_generation = 14;
+  Digest emergency_overlay_digest = 15;
+
+  reserved 16 to 31;
+}
+
+message GetSessionStateRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle authority = 2;
+  OpaqueId session_id = 3;
+}
+
+message GetSessionStateResponse {
+  RpcResponseMeta meta = 1;
+  SessionState state = 2;
+}
+
+message AcceptTurnRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle authority = 2;
+  OpaqueId session_id = 3;
+  OpaqueId turn_id = 4;
+  uint64 expected_event_sequence = 5;
+  bytes input = 6;
+  Digest input_digest = 7;
+
+  reserved 8 to 15;
+}
+
+message AcceptTurnResponse {
+  RpcResponseMeta meta = 1;
+  TurnState turn = 2;
+  uint64 committed_event_sequence = 3;
+  AuthorityHandle turn_authority = 4;
+  AgentCheckpoint genesis_checkpoint = 5;
+
+  reserved 6 to 15;
+}
+
+// The server clamps maximum_events to one. Ephemeral deltas may be produced up
+// to their byte limit, but only one EngineStepBoundary may be committed.
+message EngineStepBudget {
+  uint64 maximum_events = 1;
+  uint64 maximum_ephemeral_bytes = 2;
+  uint64 maximum_wall_clock_ms = 3;
+
+  reserved 4 to 15;
+}
+
+message EngineStepPermit {
+  bytes value = 1;
+  OpaqueId tenant_id = 2;
+  OpaqueId user_id = 3;
+  OpaqueId session_id = 4;
+  OpaqueId turn_id = 5;
+  uint64 turn_lease_generation = 6;
+  uint64 placement_generation = 7;
+  uint64 authorization_generation = 8;
+  uint64 expected_event_sequence = 9;
+  Digest checkpoint_digest = 10;
+  EngineStepBudget budget = 11;
+  uint64 deadline_unix_ms = 12;
+  Digest policy_snapshot_digest = 13;
+  Digest emergency_overlay_digest = 14;
+
+  reserved 15;
+}
+
+message AcquireEngineStepRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  OpaqueId session_id = 3;
+  OpaqueId turn_id = 4;
+  uint64 expected_event_sequence = 5;
+  EngineStepBudget requested_budget = 6;
+
+  reserved 7 to 15;
+}
+
+message AcquireEngineStepResponse {
+  RpcResponseMeta meta = 1;
+  EngineStepPermit permit = 2;
+  AgentCheckpoint checkpoint = 3;
+  EffectRecord unconsumed_settlement = 4;
+
+  reserved 5 to 15;
+}
+
+message TurnResult {
+  bytes value = 1; // RFC 8949 Core Deterministic CBOR normalized value.
+  Digest value_digest = 2;
+}
+
+message AgentError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  bytes details = 4; // Optional deterministic-CBOR normalized value.
+  Digest details_digest = 5;
+
+  reserved 6 to 15;
+}
+
+// Exactly one boundary arm must be present. checkpoint is outside the oneof so
+// every durable result advances the platform-owned checkpoint chain. Ephemeral
+// assistant deltas are streamed out-of-band and are intentionally unrepresentable.
+message EngineStepBoundary {
+  AgentCheckpoint checkpoint = 1;
+
+  oneof boundary {
+    Empty checkpoint_only = 2;
+    EffectIntent effect_request = 3;
+    TurnResult turn_complete = 4;
+    AgentError turn_error = 5;
+  }
+
+  reserved 6 to 15;
+  reserved "assistant_delta";
+}
+
+message CommitEngineEventRequest {
+  RpcRequestMeta meta = 1;
+  EngineStepPermit permit = 2;
+  uint64 expected_event_sequence = 3;
+  EngineStepBoundary boundary = 4;
+
+  reserved 5 to 15;
+  reserved "event", "assistant_delta";
+}
+
+// When boundary.effect_request is selected, checkpoint consumption, clearing a
+// prior settled effect, and preparing the returned effect occur atomically.
+message CommitEngineEventResponse {
+  RpcResponseMeta meta = 1;
+  TurnState turn = 2;
+  uint64 committed_event_sequence = 3;
+  EffectRecord prepared_effect = 4;
+  EffectPreparationPermit preparation_permit = 5;
+
+  reserved 6 to 15;
+}
+
+// This permit proves preparation but cannot authorize external I/O. Its
+// dispatch_attempt is the proposed next attempt that MarkEffectDispatched must
+// atomically record before returning a DispatchPermit.
+message EffectPreparationPermit {
+  bytes value = 1;
+  OpaqueId tenant_id = 2;
+  OpaqueId user_id = 3;
+  OpaqueId session_id = 4;
+  OpaqueId turn_id = 5;
+  OpaqueId effect_id = 6;
+  OpaqueId invocation_id = 7;
+  Digest request_digest = 8;
+  EffectService service = 9;
+  string operation = 10;
+  ReplayPolicy replay_policy = 11;
+  OpaqueId parent_operation_id = 12;
+  uint64 ordinal = 13;
+  uint64 dispatch_attempt = 14;
+  uint64 turn_lease_generation = 15;
+  uint64 placement_generation = 16;
+  uint64 sandbox_generation = 17;
+  uint64 authorization_generation = 18;
+  uint64 deadline_unix_ms = 19;
+
+  reserved 20 to 31;
+  reserved "workspace_id", "claims";
+}
+
+// Session DO mints this only after the EffectRecord(DISPATCHED) durability
+// barrier. deadline_unix_ms limits new admission, not an already-started effect.
+message DispatchPermit {
+  bytes value = 1;
+  OpaqueId tenant_id = 2;
+  OpaqueId user_id = 3;
+  OpaqueId session_id = 4;
+  OpaqueId turn_id = 5;
+  OpaqueId effect_id = 6;
+  OpaqueId invocation_id = 7;
+  Digest request_digest = 8;
+  EffectService service = 9;
+  string operation = 10;
+  ReplayPolicy replay_policy = 11;
+  OpaqueId parent_operation_id = 12;
+  uint64 ordinal = 13;
+  uint64 dispatch_attempt = 14;
+  uint64 turn_lease_generation = 15;
+  uint64 placement_generation = 16;
+  uint64 sandbox_generation = 17;
+  uint64 authorization_generation = 18;
+  uint64 deadline_unix_ms = 19;
+
+  reserved 20 to 31;
+  reserved "workspace_id", "claims";
+}
+
+message MarkEffectDispatchedRequest {
+  RpcRequestMeta meta = 1;
+  EffectPreparationPermit preparation_permit = 2;
+  uint64 expected_event_sequence = 3;
+  OpaqueId provider_request_id = 4;
+  uint64 dispatch_attempt = 5;
+
+  reserved 6 to 15;
+}
+
+message MarkEffectDispatchedResponse {
+  RpcResponseMeta meta = 1;
+  EffectRecord effect = 2;
+  DispatchPermit dispatch_permit = 3;
+  uint64 committed_event_sequence = 4;
+
+  reserved 5 to 15;
+}
+
+// Recovery-only: this cannot create an effect or change invocation/request
+// identity. It may issue the next preparation permit only for an existing
+// DISPATCHED/BLOCKED effect after replay-policy and confirmation checks.
+message PrepareEffectRetryRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle recovery_authority = 2;
+  OpaqueId session_id = 3;
+  OpaqueId turn_id = 4;
+  OpaqueId effect_id = 5;
+  OpaqueId invocation_id = 6;
+  Digest request_digest = 7;
+  uint64 prior_dispatch_attempt = 8;
+  uint64 sandbox_generation = 9;
+  uint64 expected_event_sequence = 10;
+  bool user_confirmed = 11;
+
+  reserved 12 to 15;
+}
+
+message PrepareEffectRetryResponse {
+  RpcResponseMeta meta = 1;
+  EffectRecord effect = 2;
+  EffectPreparationPermit preparation_permit = 3;
+  uint64 committed_event_sequence = 4;
+
+  reserved 5 to 15;
+}
+
+message MarkEffectExternallyCommittedRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  DispatchPermit dispatch_permit = 3;
+  OpaqueId external_commit_id = 4;
+  OpaqueId result_ref = 5;
+  uint64 expected_event_sequence = 6;
+
+  reserved 7 to 15;
+}
+
+message MarkEffectExternallyCommittedResponse {
+  RpcResponseMeta meta = 1;
+  EffectRecord effect = 2;
+  uint64 committed_event_sequence = 3;
+
+  reserved 4 to 15;
+}
+
+message SettleEffectRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+
+  oneof effect_authority {
+    EffectPreparationPermit preparation_permit = 3;
+    DispatchPermit dispatch_permit = 4;
+  }
+
+  OpaqueId result_ref = 5;
+  PublicError error = 6;
+  uint64 expected_event_sequence = 7;
+
+  reserved 8 to 15;
+}
+
+message SettleEffectResponse {
+  RpcResponseMeta meta = 1;
+  EffectRecord effect = 2;
+  TurnState turn = 3;
+  uint64 committed_event_sequence = 4;
+
+  reserved 5 to 15;
+}
+
+message BlockEffectRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle turn_authority = 2;
+  DispatchPermit dispatch_permit = 3;
+  PublicError reason = 4;
+  uint64 expected_event_sequence = 5;
+
+  reserved 6 to 15;
+}
+
+message BlockEffectResponse {
+  RpcResponseMeta meta = 1;
+  EffectRecord effect = 2;
+  TurnState turn = 3;
+  uint64 committed_event_sequence = 4;
+
+  reserved 5 to 15;
+}
+
+message RenewTurnAuthorityRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle current_authority = 2;
+  OpaqueId tenant_id = 3;
+  OpaqueId user_id = 4;
+  OpaqueId session_id = 5;
+  OpaqueId turn_id = 6;
+  uint64 turn_lease_generation = 7;
+  uint64 placement_generation = 8;
+  uint64 authorization_generation = 9;
+  Digest policy_snapshot_digest = 10;
+  Digest emergency_overlay_digest = 11;
+
+  reserved 12 to 15;
+}
+
+message RenewTurnAuthorityResponse {
+  RpcResponseMeta meta = 1;
+  AuthorityHandle renewed_authority = 2;
+  uint64 expires_at_unix_ms = 3;
+  uint64 authorization_generation = 4;
+
+  reserved 5 to 15;
+}
+
+message AbortTurnRequest {
+  RpcRequestMeta meta = 1;
+  AuthorityHandle authority = 2;
+  OpaqueId session_id = 3;
+  OpaqueId turn_id = 4;
+  uint64 expected_event_sequence = 5;
+  string reason = 6;
+
+  reserved 7 to 15;
+}
+
+message AbortTurnResponse {
+  RpcResponseMeta meta = 1;
+  TurnState turn = 2;
+  uint64 committed_event_sequence = 3;
+
+  reserved 4 to 15;
+}
+
+service SessionStateService {
+  rpc GetSessionState(GetSessionStateRequest) returns (GetSessionStateResponse);
+  rpc AcceptTurn(AcceptTurnRequest) returns (AcceptTurnResponse);
+  rpc AcquireEngineStep(AcquireEngineStepRequest) returns (AcquireEngineStepResponse);
+  rpc CommitEngineEvent(CommitEngineEventRequest) returns (CommitEngineEventResponse);
+  rpc PrepareEffectRetry(PrepareEffectRetryRequest) returns (PrepareEffectRetryResponse);
+  rpc MarkEffectDispatched(MarkEffectDispatchedRequest) returns (MarkEffectDispatchedResponse);
+  rpc MarkEffectExternallyCommitted(MarkEffectExternallyCommittedRequest) returns (MarkEffectExternallyCommittedResponse);
+  rpc SettleEffect(SettleEffectRequest) returns (SettleEffectResponse);
+  rpc BlockEffect(BlockEffectRequest) returns (BlockEffectResponse);
+  rpc RenewTurnAuthority(RenewTurnAuthorityRequest) returns (RenewTurnAuthorityResponse);
+  rpc AbortTurn(AbortTurnRequest) returns (AbortTurnResponse);
+}
