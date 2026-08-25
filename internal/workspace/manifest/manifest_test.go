@@ -159,6 +159,10 @@ func TestCanonicalizeValidatesEntryMetadata(t *testing.T) {
 			entry: manifest.Entry{Path: "x", Type: manifest.File, Mode: 0o644, Size: -1, ContentDigest: emptySHA256},
 		},
 		{
+			name:  "file exceeds shared integer range",
+			entry: manifest.Entry{Path: "x", Type: manifest.File, Mode: 0o644, Size: 9_007_199_254_740_992, ContentDigest: emptySHA256},
+		},
+		{
 			name:  "file missing digest",
 			entry: manifest.Entry{Path: "x", Type: manifest.File, Mode: 0o644, Size: 0},
 		},

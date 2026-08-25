@@ -4,7 +4,6 @@ package manifest
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/hancomac/circulusd/internal/canonical"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -24,6 +24,10 @@ const (
 	// MaxPathBytes is the maximum UTF-8 byte length of a canonical workspace
 	// path.
 	MaxPathBytes = 4096
+
+	// MaxFileSize is the largest exact integer shared by the Go and TypeScript
+	// deterministic-CBOR implementations.
+	MaxFileSize int64 = 9_007_199_254_740_991
 
 	rootDigestDomain = "circulusd.workspace.manifest.root"
 )
@@ -136,8 +140,14 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 
 		switch entry.Type {
 		case File:
-			if entry.Size < 0 {
-				return nil, fmt.Errorf("%w: file %q has negative size", ErrInvalidEntry, entry.Path)
+			if entry.Size < 0 || entry.Size > MaxFileSize {
+				return nil, fmt.Errorf(
+					"%w: file %q size %d is outside 0..%d",
+					ErrInvalidEntry,
+					entry.Path,
+					entry.Size,
+					MaxFileSize,
+				)
 			}
 			if entry.SymlinkTarget != "" {
 				return nil, fmt.Errorf("%w: file %q has a symlink target", ErrInvalidEntry, entry.Path)
@@ -298,96 +308,60 @@ func Validate(entries []Entry) error {
 // items. Array/text lengths and unsigned integers use the shortest RFC 8949
 // representation.
 func MarshalCanonical(entries []Entry) ([]byte, error) {
-	canonical, err := Canonicalize(entries)
+	canonicalEntries, err := Canonicalize(entries)
 	if err != nil {
 		return nil, err
 	}
-	return marshalCanonical(canonical), nil
+	return canonical.Encode(manifestValue(canonicalEntries), canonical.Options{})
 }
 
 // RootDigest returns the ADR-006 structured SHA-256 digest of the deterministic
 // CBOR representation. Its textual form is sha256:<lowercase hex>.
 func RootDigest(entries []Entry) (string, error) {
-	canonical, err := Canonicalize(entries)
+	canonicalEntries, err := Canonicalize(entries)
 	if err != nil {
 		return "", err
 	}
-
-	payload := marshalCanonical(canonical)
-	digestInput := make([]byte, 0, len(payload)+64)
-	digestInput = appendHead(digestInput, 4, 5)
-	digestInput = appendText(digestInput, "circulusd.hash")
-	digestInput = appendHead(digestInput, 0, 1)
-	digestInput = appendText(digestInput, rootDigestDomain)
-	digestInput = appendHead(digestInput, 0, 1)
-	digestInput = append(digestInput, payload...)
-	hash := sha256.Sum256(digestInput)
-	return "sha256:" + hex.EncodeToString(hash[:]), nil
+	return canonical.StructuredDigest(rootDigestDomain, 1, manifestValue(canonicalEntries))
 }
 
-// marshalCanonical accepts only entries already returned by Canonicalize.
-// Both public encoding operations call it so the wire representation and the
-// root digest cannot drift apart.
-func marshalCanonical(entries []Entry) []byte {
-	encoded := make([]byte, 0, 32+len(entries)*64)
-
-	encoded = appendHead(encoded, 4, 2)
-	encoded = appendHead(encoded, 0, 1)
-	encoded = appendHead(encoded, 4, uint64(len(entries)))
+func manifestValue(entries []Entry) canonical.Array {
+	encodedEntries := make(canonical.Array, 0, len(entries))
 	for _, entry := range entries {
-		encoded = appendHead(encoded, 4, 6)
-		encoded = appendText(encoded, entry.Path)
-
+		var typeCode int64
 		switch entry.Type {
 		case File:
-			encoded = appendHead(encoded, 0, 0)
+			typeCode = 0
 		case Directory:
-			encoded = appendHead(encoded, 0, 1)
+			typeCode = 1
 		case Symlink:
-			encoded = appendHead(encoded, 0, 2)
+			typeCode = 2
 		}
 
-		encoded = appendHead(encoded, 0, uint64(entry.Mode))
+		var size canonical.Value
 		if entry.Type == File {
-			encoded = appendHead(encoded, 0, uint64(entry.Size))
-		} else {
-			encoded = append(encoded, 0xf6)
+			size = entry.Size
 		}
+		var digest canonical.Value
 		if entry.ContentDigest == "" {
-			encoded = append(encoded, 0xf6)
+			digest = nil
 		} else {
-			encoded = appendText(encoded, entry.ContentDigest)
+			digest = entry.ContentDigest
 		}
+		var target canonical.Value
 		if entry.SymlinkTarget == "" {
-			encoded = append(encoded, 0xf6)
+			target = nil
 		} else {
-			encoded = appendText(encoded, entry.SymlinkTarget)
+			target = entry.SymlinkTarget
 		}
+		encodedEntries = append(encodedEntries, canonical.Array{
+			entry.Path,
+			typeCode,
+			int64(entry.Mode),
+			size,
+			digest,
+			target,
+		})
 	}
-
-	return encoded
-}
-
-func appendHead(encoded []byte, major byte, value uint64) []byte {
-	switch {
-	case value < 24:
-		return append(encoded, major<<5|byte(value))
-	case value <= 0xff:
-		return append(encoded, major<<5|24, byte(value))
-	case value <= 0xffff:
-		encoded = append(encoded, major<<5|25, 0, 0)
-		binary.BigEndian.PutUint16(encoded[len(encoded)-2:], uint16(value))
-	case value <= 0xffffffff:
-		encoded = append(encoded, major<<5|26, 0, 0, 0, 0)
-		binary.BigEndian.PutUint32(encoded[len(encoded)-4:], uint32(value))
-	default:
-		encoded = append(encoded, major<<5|27, 0, 0, 0, 0, 0, 0, 0, 0)
-		binary.BigEndian.PutUint64(encoded[len(encoded)-8:], value)
-	}
-	return encoded
-}
-
-func appendText(encoded []byte, value string) []byte {
-	encoded = appendHead(encoded, 3, uint64(len(value)))
-	return append(encoded, value...)
+	return canonical.Array{int64(1), encodedEntries}
 }
