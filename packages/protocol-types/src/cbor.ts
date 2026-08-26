@@ -47,6 +47,24 @@ function normalize(
     if (Object.getPrototypeOf(value) !== Uint8Array.prototype) {
       validationError(path, "bytes must be an exact Uint8Array");
     }
+    const backing = value.buffer;
+    if (
+      !(backing instanceof ArrayBuffer) ||
+      Object.getPrototypeOf(backing) !== ArrayBuffer.prototype
+    ) {
+      validationError(path, "bytes must use an ordinary ArrayBuffer");
+    }
+    if (value.byteOffset !== 0 || value.byteLength !== backing.byteLength) {
+      validationError(path, "bytes must cover their full backing buffer");
+    }
+    if (seen.has(value)) {
+      validationError(path, "cyclic or repeated object references are unsupported");
+    }
+    if (seen.has(backing)) {
+      validationError(path, "repeated byte storage is unsupported");
+    }
+    seen.add(value);
+    seen.add(backing);
     return new Uint8Array(value);
   }
   if (typeof value !== "object") {
@@ -54,43 +72,17 @@ function normalize(
   }
 
   if (seen.has(value)) {
-    validationError(path, "cyclic values are unsupported");
+    validationError(path, "cyclic or repeated object references are unsupported");
   }
   seen.add(value);
-  try {
-    if (Array.isArray(value)) {
-      const ownKeys = Reflect.ownKeys(value);
-      for (const key of ownKeys) {
-        if (key === "length") {
-          continue;
-        }
-        if (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key)) {
-          validationError(path, "arrays cannot have custom properties");
-        }
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (
-          descriptor === undefined ||
-          !descriptor.enumerable ||
-          !("value" in descriptor)
-        ) {
-          validationError(`${path}[${key}]`, "must be an enumerable data property");
-        }
+  if (Array.isArray(value)) {
+    const ownKeys = Reflect.ownKeys(value);
+    for (const key of ownKeys) {
+      if (key === "length") {
+        continue;
       }
-      if (Object.keys(value).length !== value.length) {
-        validationError(path, "sparse arrays are unsupported");
-      }
-      return value.map((entry, index) =>
-        normalize(entry, `${path}[${index}]`, depth + 1, maxDepth, seen),
-      );
-    }
-
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      validationError(path, "must be a plain object");
-    }
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== "string") {
-        validationError(path, "symbol keys are unsupported");
+      if (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key)) {
+        validationError(path, "arrays cannot have custom properties");
       }
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (
@@ -98,31 +90,53 @@ function normalize(
         !descriptor.enumerable ||
         !("value" in descriptor)
       ) {
-        validationError(`${path}.${key}`, "must be an enumerable data property");
+        validationError(`${path}[${key}]`, "must be an enumerable data property");
       }
     }
-
-    const record = value as Record<string, unknown>;
-    const result: Record<string, NormalizedValue> = {};
-    const normalizedKeys = new Set<string>();
-    for (const key of Object.keys(record)) {
-      assertUnicodeScalarString(key, `${path}.${key}`);
-      const normalizedKey = key.normalize("NFC");
-      if (normalizedKeys.has(normalizedKey)) {
-        validationError(path, `duplicate normalized key ${JSON.stringify(normalizedKey)}`);
-      }
-      normalizedKeys.add(normalizedKey);
-      Object.defineProperty(result, normalizedKey, {
-        configurable: true,
-        enumerable: true,
-        value: normalize(record[key], `${path}.${key}`, depth + 1, maxDepth, seen),
-        writable: true,
-      });
+    if (Object.keys(value).length !== value.length) {
+      validationError(path, "sparse arrays are unsupported");
     }
-    return result;
-  } finally {
-    seen.delete(value);
+    return value.map((entry, index) =>
+      normalize(entry, `${path}[${index}]`, depth + 1, maxDepth, seen),
+    );
   }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    validationError(path, "must be a plain object");
+  }
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") {
+      validationError(path, "symbol keys are unsupported");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor)
+    ) {
+      validationError(`${path}.${key}`, "must be an enumerable data property");
+    }
+  }
+
+  const record = value as Record<string, unknown>;
+  const result: Record<string, NormalizedValue> = {};
+  const normalizedKeys = new Set<string>();
+  for (const key of Object.keys(record)) {
+    assertUnicodeScalarString(key, `${path}.${key}`);
+    const normalizedKey = key.normalize("NFC");
+    if (normalizedKeys.has(normalizedKey)) {
+      validationError(path, `duplicate normalized key ${JSON.stringify(normalizedKey)}`);
+    }
+    normalizedKeys.add(normalizedKey);
+    Object.defineProperty(result, normalizedKey, {
+      configurable: true,
+      enumerable: true,
+      value: normalize(record[key], `${path}.${key}`, depth + 1, maxDepth, seen),
+      writable: true,
+    });
+  }
+  return result;
 }
 
 export function normalizeProtocolValue(

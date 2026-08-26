@@ -72,6 +72,31 @@ describe("RFC 8949 deterministic CBOR", () => {
     expect(() => encodeCanonicalCbor("\ud800")).toThrow(/Unicode scalar/);
   });
 
+  it("rejects repeated object references before a DAG can expand", () => {
+    let dag: unknown = { leaf: "bounded" };
+    for (let depth = 0; depth < 18; depth += 1) {
+      dag = { left: dag, right: dag };
+    }
+
+    expect(() => normalizeProtocolValue(dag)).toThrow(/repeated object reference/);
+
+    const repeatedBytes = new Uint8Array(1_024);
+    expect(() =>
+      normalizeProtocolValue({ first: repeatedBytes, second: repeatedBytes }),
+    ).toThrow(/repeated object reference/);
+
+    const backing = new ArrayBuffer(1_024);
+    expect(() =>
+      normalizeProtocolValue({ first: new Uint8Array(backing), second: new Uint8Array(backing) }),
+    ).toThrow(/repeated byte storage/);
+    expect(() => normalizeProtocolValue(new Uint8Array(new SharedArrayBuffer(8)))).toThrow(
+      /ordinary ArrayBuffer/,
+    );
+    expect(() => normalizeProtocolValue(new Uint8Array(new ArrayBuffer(8), 2, 2))).toThrow(
+      /full backing buffer/,
+    );
+  });
+
   it("rejects duplicate keys after NFC normalization", () => {
     expect(() => encodeCanonicalCbor({ é: 1, "e\u0301": 2 })).toThrow(
       /duplicate normalized key/,
