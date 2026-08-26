@@ -76,51 +76,76 @@ export interface SessionHostLimits {
   readonly maximumModuleBytes: number;
   readonly maximumBundleBytes: number;
   readonly maximumAuthorityBytes: number;
+  // Bounds a conservative canonical binary-size estimate for both turn input
+  // and AgentEvent snapshots before any structured clone is allocated.
   readonly maximumEventBytes: number;
 }
 
-export type AgentEvent =
-  | { readonly type: "model_request"; readonly request: unknown }
-  | { readonly type: "tool_request"; readonly request: unknown }
-  | { readonly type: "assistant_delta"; readonly delta: unknown }
+export type EphemeralAgentEvent = {
+  readonly type: "assistant_delta";
+  readonly delta: unknown;
+};
+
+export type DurableAgentEvent =
+  | {
+      readonly type: "model_request";
+      readonly checkpoint: unknown;
+      readonly request: unknown;
+    }
+  | {
+      readonly type: "tool_request";
+      readonly checkpoint: unknown;
+      readonly request: unknown;
+    }
   | { readonly type: "checkpoint"; readonly checkpoint: unknown }
-  | { readonly type: "turn_complete"; readonly result: unknown }
-  | { readonly type: "turn_error"; readonly error: unknown };
+  | {
+      readonly type: "turn_complete";
+      readonly checkpoint: unknown;
+      readonly result: unknown;
+    }
+  | {
+      readonly type: "turn_error";
+      readonly checkpoint: unknown;
+      readonly error: unknown;
+    };
+
+export type AgentEvent = EphemeralAgentEvent | DurableAgentEvent;
 
 export interface StartTurnContext {
   readonly turnId: string;
+  readonly executionId: string;
   readonly authority: Uint8Array;
+  readonly checkpoint: unknown;
 }
 
 export interface ResumeTurnContext extends StartTurnContext {
-  readonly checkpoint: unknown;
   readonly settlement: unknown;
 }
 
 export interface AgentEngine {
   startTurn(context: StartTurnContext): AsyncIterable<AgentEvent>;
   resumeTurn(context: ResumeTurnContext): AsyncIterable<AgentEvent>;
-  abortTurn(turnId: string): Promise<void>;
+  abortTurn(turnId: string, executionId?: string): Promise<void>;
 }
 
 export interface DurableEventCommitter {
-  commit(event: AgentEvent): Promise<void>;
+  commit(event: DurableAgentEvent): Promise<void>;
 }
 
 export interface EphemeralEventSink {
-  emit(event: AgentEvent): Promise<void>;
+  emit(event: EphemeralAgentEvent): Promise<void>;
 }
 
 export interface DriveTurnOptions {
   readonly turnId: string;
   readonly authority: Uint8Array;
+  readonly checkpoint: unknown;
   readonly committer: DurableEventCommitter;
   readonly ephemeralSink: EphemeralEventSink;
   readonly maximumEvents: number;
 }
 
 export interface ResumeTurnOptions extends DriveTurnOptions {
-  readonly checkpoint: unknown;
   readonly settlement: unknown;
 }
 
@@ -130,6 +155,15 @@ export interface DriveTurnResult {
     { readonly type: "model_request" | "tool_request" | "turn_complete" | "turn_error" }
   >;
   readonly eventsObserved: number;
+}
+
+interface ValidatedDriveTurnOptions {
+  readonly turnId: string;
+  readonly executionId: string;
+  readonly authority: Uint8Array;
+  readonly maximumEvents: number;
+  readonly commit: (event: DurableAgentEvent) => Promise<void>;
+  readonly emit: (event: EphemeralAgentEvent) => Promise<void>;
 }
 
 const DEFAULT_LIMITS: SessionHostLimits = {
@@ -171,8 +205,11 @@ function validatedExactKeys(
       throw new SessionHostError(code, `${field} has unknown field ${String(key)}`);
     }
     const descriptor = Object.getOwnPropertyDescriptor(record, key);
-    if (descriptor === undefined || !("value" in descriptor)) {
-      throw new SessionHostError(code, `${field}.${key} must be an accessor-free data field`);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new SessionHostError(
+        code,
+        `${field}.${key} must be an enumerable accessor-free data field`,
+      );
     }
   }
   for (const key of fields) {
@@ -181,6 +218,171 @@ function validatedExactKeys(
     }
   }
   return record;
+}
+
+function validatedStructuredClone(
+  value: unknown,
+  field: string,
+  code: SessionHostErrorCode,
+  maximumBytes: number,
+): unknown {
+  const pending: Array<{
+    readonly path: string;
+    readonly value: unknown;
+    readonly depth: number;
+  }> = [
+    { path: field, value, depth: 0 },
+  ];
+  const visited = new WeakSet<object>();
+  const maximumNodes = Math.min(maximumBytes, 65_536);
+  let estimatedBytes = 0;
+  let nodesVisited = 0;
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (candidate === undefined) continue;
+    nodesVisited += 1;
+    if (nodesVisited > maximumNodes || candidate.depth > 128) {
+      throw new SessionHostError(code, `${field} exceeds its structural budget`);
+    }
+    if (candidate.value === undefined) {
+      throw new SessionHostError(code, `${candidate.path} cannot contain undefined`);
+    }
+    if (typeof candidate.value === "number") {
+      if (!Number.isFinite(candidate.value) || Object.is(candidate.value, -0)) {
+        throw new SessionHostError(code, `${candidate.path} must be a canonical finite number`);
+      }
+      estimatedBytes += 9;
+      if (estimatedBytes > maximumBytes) {
+        throw new SessionHostError(code, `${field} exceeds its size limit`);
+      }
+      continue;
+    }
+    if (typeof candidate.value === "string") {
+      if (candidate.value.length > maximumBytes - estimatedBytes) {
+        throw new SessionHostError(code, `${field} exceeds its size limit`);
+      }
+      estimatedBytes += textEncoder.encode(candidate.value).byteLength + 9;
+      if (estimatedBytes > maximumBytes) {
+        throw new SessionHostError(code, `${field} exceeds its size limit`);
+      }
+      continue;
+    }
+    if (candidate.value === null || typeof candidate.value === "boolean") {
+      estimatedBytes += 9;
+      if (estimatedBytes > maximumBytes) {
+        throw new SessionHostError(code, `${field} exceeds its size limit`);
+      }
+      continue;
+    }
+    if (typeof candidate.value !== "object") {
+      throw new SessionHostError(code, `${candidate.path} contains an unsupported value`);
+    }
+    if (visited.has(candidate.value)) {
+      throw new SessionHostError(code, `${candidate.path} contains a repeated object reference`);
+    }
+    visited.add(candidate.value);
+    estimatedBytes += 9;
+    if (estimatedBytes > maximumBytes) {
+      throw new SessionHostError(code, `${field} exceeds its size limit`);
+    }
+
+    if (candidate.value instanceof Uint8Array) {
+      if (
+        Object.getPrototypeOf(candidate.value) !== Uint8Array.prototype ||
+        !(candidate.value.buffer instanceof ArrayBuffer) ||
+        Object.getPrototypeOf(candidate.value.buffer) !== ArrayBuffer.prototype ||
+        candidate.value.byteOffset !== 0 ||
+        candidate.value.byteLength !== candidate.value.buffer.byteLength
+      ) {
+        throw new SessionHostError(code, `${candidate.path} has an unsupported byte view`);
+      }
+      if (candidate.value.byteLength > maximumBytes - estimatedBytes) {
+        throw new SessionHostError(code, `${field} exceeds its size limit`);
+      }
+      estimatedBytes += candidate.value.byteLength;
+      if (candidate.value.byteLength <= 4_096) {
+        const byteKeys = Reflect.ownKeys(candidate.value);
+        if (byteKeys.length !== candidate.value.length) {
+          throw new SessionHostError(code, `${candidate.path} has a non-canonical byte view`);
+        }
+        for (const key of byteKeys) {
+          if (
+            typeof key !== "string" ||
+            !/^(0|[1-9][0-9]*)$/.test(key) ||
+            Number(key) >= candidate.value.length
+          ) {
+            throw new SessionHostError(code, `${candidate.path} has a non-canonical byte field`);
+          }
+          const descriptor = Object.getOwnPropertyDescriptor(candidate.value, key);
+          if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+            throw new SessionHostError(code, `${candidate.path}.${key} must be a byte data field`);
+          }
+        }
+      }
+      continue;
+    }
+    if (candidate.value instanceof ArrayBuffer) {
+      throw new SessionHostError(code, `${candidate.path} contains an unsupported raw buffer`);
+    }
+
+    const isArray = Array.isArray(candidate.value);
+    const prototype = Object.getPrototypeOf(candidate.value);
+    if (
+      (!isArray && prototype !== Object.prototype && prototype !== null) ||
+      (isArray && prototype !== Array.prototype)
+    ) {
+      throw new SessionHostError(code, `${candidate.path} contains an unsupported object`);
+    }
+    if (
+      isArray &&
+      (candidate.value.length > maximumNodes ||
+        candidate.value.length > Math.floor((maximumBytes - estimatedBytes) / 9))
+    ) {
+      throw new SessionHostError(code, `${field} exceeds its structural budget`);
+    }
+    const ownKeys = Reflect.ownKeys(candidate.value);
+    if (isArray && ownKeys.length !== candidate.value.length + 1) {
+      throw new SessionHostError(code, `${candidate.path} must be a dense canonical array`);
+    }
+    for (const key of ownKeys) {
+      if (isArray && key === "length") continue;
+      if (typeof key !== "string") {
+        throw new SessionHostError(code, `${candidate.path} contains a symbol field`);
+      }
+      if (
+        isArray &&
+        (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= candidate.value.length)
+      ) {
+        throw new SessionHostError(code, `${candidate.path} has a non-canonical array field`);
+      }
+      if (!isArray) {
+        if (key.length > maximumBytes - estimatedBytes) {
+          throw new SessionHostError(code, `${field} exceeds its size limit`);
+        }
+        estimatedBytes += textEncoder.encode(key).byteLength + 9;
+        if (estimatedBytes > maximumBytes) {
+          throw new SessionHostError(code, `${field} exceeds its size limit`);
+        }
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(candidate.value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new SessionHostError(
+          code,
+          `${candidate.path}.${key} must be an enumerable accessor-free data field`,
+        );
+      }
+      pending.push({
+        path: `${candidate.path}.${key}`,
+        value: descriptor.value,
+        depth: candidate.depth + 1,
+      });
+    }
+  }
+  try {
+    return structuredClone(value);
+  } catch (error) {
+    throw new SessionHostError(code, `${field} is not safely cloneable`, { cause: error });
+  }
 }
 
 function validatedIdentifier(value: unknown, field: string, code: SessionHostErrorCode): string {
@@ -246,6 +448,7 @@ export class SessionHost {
   readonly #verifier: RuntimeVerifier;
   readonly #bindings: BrokerBindings;
   readonly #limits: SessionHostLimits;
+  readonly #activeTurns = new WeakMap<AgentEngine, Set<string>>();
 
   constructor(config: {
     readonly loader: WorkerLoader;
@@ -489,18 +692,24 @@ export class SessionHost {
   async startTurn(engine: AgentEngine, options: DriveTurnOptions): Promise<DriveTurnResult> {
     validatedExactKeys(
       options,
-      ["turnId", "authority", "committer", "ephemeralSink", "maximumEvents"],
+      ["turnId", "authority", "checkpoint", "committer", "ephemeralSink", "maximumEvents"],
       "start turn options",
       "INVALID_TURN",
     );
     const validated = this.#validatedTurnOptions(options);
+    const checkpoint = this.#cloneTurnValue(options.checkpoint, "checkpoint");
+    if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint)) {
+      throw new SessionHostError("INVALID_TURN", "checkpoint must be an object");
+    }
     return this.#beginDriving(
       engine,
-      options,
+      validated,
       () =>
         engine.startTurn({
           turnId: validated.turnId,
+          executionId: validated.executionId,
           authority: validated.authority,
+          checkpoint,
         }),
     );
   }
@@ -521,64 +730,154 @@ export class SessionHost {
       "INVALID_TURN",
     );
     const validated = this.#validatedTurnOptions(options);
+    const checkpoint = this.#cloneTurnValue(options.checkpoint, "checkpoint");
+    if (typeof checkpoint !== "object" || checkpoint === null || Array.isArray(checkpoint)) {
+      throw new SessionHostError("INVALID_TURN", "checkpoint must be an object");
+    }
+    const settlement = this.#cloneTurnValue(options.settlement, "settlement");
     return this.#beginDriving(
       engine,
-      options,
+      validated,
       () =>
         engine.resumeTurn({
           turnId: validated.turnId,
+          executionId: validated.executionId,
           authority: validated.authority,
-          checkpoint: structuredClone(options.checkpoint),
-          settlement: structuredClone(options.settlement),
+          checkpoint,
+          settlement,
         }),
     );
   }
 
   async #beginDriving(
     engine: AgentEngine,
-    options: DriveTurnOptions,
+    options: ValidatedDriveTurnOptions,
     begin: () => AsyncIterable<AgentEvent>,
   ): Promise<DriveTurnResult> {
-    let events: AsyncIterable<AgentEvent>;
-    try {
-      events = begin();
-    } catch (error) {
-      try {
-        await engine.abortTurn(options.turnId);
-      } catch {
-        // Session state remains the durable failure authority when an isolate
-        // cannot acknowledge the best-effort execution interrupt.
-      }
-      throw new SessionHostError("INVALID_AGENT_EVENT", "AgentEngine failed to start", {
-        cause: error,
-      });
+    const abortTurn = engine.abortTurn.bind(engine);
+    let engineTurns = this.#activeTurns.get(engine);
+    if (engineTurns === undefined) {
+      engineTurns = new Set<string>();
+      this.#activeTurns.set(engine, engineTurns);
     }
-    return this.#driveEvents(engine, events, options);
+    if (engineTurns.has(options.turnId)) {
+      throw new SessionHostError("INVALID_TURN", "turn already has an admitted execution");
+    }
+    engineTurns.add(options.turnId);
+    try {
+      try {
+        const events = begin();
+        return await this.#driveEvents(abortTurn, events, options);
+      } catch (error) {
+        if (error instanceof SessionHostError) throw error;
+        try {
+          await abortTurn(options.turnId, options.executionId);
+        } catch {
+          // Session state remains the durable failure authority when an isolate
+          // cannot acknowledge the best-effort execution interrupt.
+        }
+        throw new SessionHostError("INVALID_AGENT_EVENT", "AgentEngine failed to start", {
+          cause: error,
+        });
+      }
+    } finally {
+      engineTurns.delete(options.turnId);
+      if (engineTurns.size === 0) {
+        this.#activeTurns.delete(engine);
+      }
+    }
   }
 
   #validatedTurnOptions(options: DriveTurnOptions): {
     readonly turnId: string;
+    readonly executionId: string;
     readonly authority: Uint8Array;
+    readonly maximumEvents: number;
+    readonly commit: (event: DurableAgentEvent) => Promise<void>;
+    readonly emit: (event: EphemeralAgentEvent) => Promise<void>;
   } {
     const turnId = validatedIdentifier(options.turnId, "turnId", "INVALID_TURN");
+    const committer = options.committer;
+    const commit = committer?.commit;
+    const ephemeralSink = options.ephemeralSink;
+    const emit = ephemeralSink?.emit;
+    let authority: Uint8Array;
+    try {
+      const candidate = options.authority;
+      if (
+        !(candidate instanceof Uint8Array) ||
+        Object.getPrototypeOf(candidate) !== Uint8Array.prototype ||
+        !(candidate.buffer instanceof ArrayBuffer) ||
+        Object.getPrototypeOf(candidate.buffer) !== ArrayBuffer.prototype ||
+        Reflect.ownKeys(candidate.buffer).length !== 0 ||
+        candidate.byteOffset !== 0 ||
+        candidate.byteLength !== candidate.buffer.byteLength ||
+        candidate.byteLength === 0 ||
+        candidate.byteLength > this.#limits.maximumAuthorityBytes
+      ) {
+        throw new SessionHostError("INVALID_TURN", "turn authority storage is invalid");
+      }
+      const authorityKeys = Reflect.ownKeys(candidate);
+      if (authorityKeys.length !== candidate.byteLength) {
+        throw new SessionHostError("INVALID_TURN", "turn authority byte view is not canonical");
+      }
+      for (const key of authorityKeys) {
+        if (
+          typeof key !== "string" ||
+          !/^(0|[1-9][0-9]*)$/.test(key) ||
+          Number(key) >= candidate.byteLength
+        ) {
+          throw new SessionHostError("INVALID_TURN", "turn authority has an unknown byte field");
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+        if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+          throw new SessionHostError("INVALID_TURN", "turn authority has a non-data byte field");
+        }
+      }
+      authority = new Uint8Array(candidate);
+    } catch (error) {
+      if (error instanceof SessionHostError) throw error;
+      throw new SessionHostError("INVALID_TURN", "turn authority storage is invalid", {
+        cause: error,
+      });
+    }
     if (
-      !(options.authority instanceof Uint8Array) ||
-      options.authority.byteLength === 0 ||
-      options.authority.byteLength > this.#limits.maximumAuthorityBytes ||
       !Number.isSafeInteger(options.maximumEvents) ||
       options.maximumEvents <= 0 ||
-      typeof options.committer?.commit !== "function" ||
-      typeof options.ephemeralSink?.emit !== "function"
+      typeof commit !== "function" ||
+      typeof emit !== "function"
     ) {
       throw new SessionHostError("INVALID_TURN", "turn authority, ports, or event budget is invalid");
     }
-    return { turnId, authority: new Uint8Array(options.authority) };
+    const maximumEvents = options.maximumEvents;
+    const executionEntropy = new Uint8Array(16);
+    crypto.getRandomValues(executionEntropy);
+    const executionId = `exec_${Array.from(executionEntropy, (value) =>
+      value.toString(16).padStart(2, "0"),
+    ).join("")}`;
+    return {
+      turnId,
+      executionId,
+      authority,
+      maximumEvents,
+      commit: (event) => commit.call(committer, event),
+      emit: (event) => emit.call(ephemeralSink, event),
+    };
+  }
+
+  #cloneTurnValue(value: unknown, field: string): unknown {
+    return validatedStructuredClone(
+      value,
+      field,
+      "INVALID_TURN",
+      this.#limits.maximumEventBytes,
+    );
   }
 
   async #driveEvents(
-    engine: AgentEngine,
+    abortTurn: (turnId: string, executionId?: string) => Promise<void>,
     events: AsyncIterable<AgentEvent>,
-    options: DriveTurnOptions,
+    options: ValidatedDriveTurnOptions,
   ): Promise<DriveTurnResult> {
     const turnId = options.turnId;
     let iterator: AsyncIterator<AgentEvent> | undefined;
@@ -616,7 +915,7 @@ export class SessionHost {
         switch (typeDescriptor.value) {
           case "model_request":
           case "tool_request":
-            fields = ["type", "request"];
+            fields = ["type", "checkpoint", "request"];
             break;
           case "assistant_delta":
             fields = ["type", "delta"];
@@ -625,34 +924,47 @@ export class SessionHost {
             fields = ["type", "checkpoint"];
             break;
           case "turn_complete":
-            fields = ["type", "result"];
+            fields = ["type", "checkpoint", "result"];
             break;
           case "turn_error":
-            fields = ["type", "error"];
+            fields = ["type", "checkpoint", "error"];
             break;
           default:
             throw new SessionHostError("INVALID_AGENT_EVENT", "AgentEngine emitted an unknown event");
         }
         validatedExactKeys(event, fields, "AgentEvent", "INVALID_AGENT_EVENT");
-        let encoded: string | undefined;
+        const checkpointValue = Object.getOwnPropertyDescriptor(event, "checkpoint")?.value;
+        if (
+          typeDescriptor.value !== "assistant_delta" &&
+          (typeof checkpointValue !== "object" ||
+            checkpointValue === null ||
+            Array.isArray(checkpointValue))
+        ) {
+          throw new SessionHostError(
+            "INVALID_AGENT_EVENT",
+            "durable AgentEvent.checkpoint must be an object",
+          );
+        }
+        let cloned: AgentEvent;
         try {
-          encoded = JSON.stringify(event);
-          structuredClone(event);
+          cloned = validatedStructuredClone(
+            event,
+            "AgentEvent",
+            "INVALID_AGENT_EVENT",
+            this.#limits.maximumEventBytes,
+          ) as AgentEvent;
         } catch (error) {
+          if (error instanceof SessionHostError) throw error;
           throw new SessionHostError("INVALID_AGENT_EVENT", "AgentEvent is not serializable", {
             cause: error,
           });
         }
-        if (encoded === undefined || textEncoder.encode(encoded).byteLength > this.#limits.maximumEventBytes) {
-          throw new SessionHostError("INVALID_AGENT_EVENT", "AgentEvent exceeds its size limit");
-        }
-        const cloned = structuredClone(event);
-        if (event.type === "assistant_delta") {
-          await options.ephemeralSink.emit(cloned);
+        if (cloned.type === "assistant_delta") {
+          await options.emit(cloned as EphemeralAgentEvent);
           continue;
         }
         try {
-          await options.committer.commit(cloned);
+          await options.commit(structuredClone(cloned) as DurableAgentEvent);
         } catch (error) {
           throw new SessionHostError(
             "DURABLE_COMMIT_FAILED",
@@ -661,35 +973,43 @@ export class SessionHost {
           );
         }
         if (
-          event.type === "model_request" ||
-          event.type === "tool_request" ||
-          event.type === "turn_complete" ||
-          event.type === "turn_error"
+          cloned.type === "model_request" ||
+          cloned.type === "tool_request" ||
+          cloned.type === "turn_complete" ||
+          cloned.type === "turn_error"
         ) {
-          if (iterator.return !== undefined) {
-            await iterator.return();
-          }
           iteratorClosed = true;
+          try {
+            const returnIterator = iterator.return;
+            if (typeof returnIterator === "function") {
+              void Promise.resolve(returnIterator.call(iterator)).catch(() => undefined);
+            }
+          } catch {
+            // The terminal durable commit is already authoritative. Iterator
+            // cleanup cannot convert it back into a failed drive.
+          }
           return {
-            boundary: structuredClone(event) as DriveTurnResult["boundary"],
+            boundary: cloned as DriveTurnResult["boundary"],
             eventsObserved,
           };
         }
       }
     } catch (error) {
-      if (!iteratorClosed && iterator?.return !== undefined) {
-        try {
-          await iterator.return();
-        } catch {
-          // The durable failure below remains authoritative; iterator cleanup
-          // is best-effort and cannot convert it into a successful step.
-        }
-      }
       try {
-        await engine.abortTurn(turnId);
+        await abortTurn(turnId, options.executionId);
       } catch {
         // abortTurn is an execution interrupt. Session state remains the
         // durable abort/failure authority even if the isolate cannot respond.
+      }
+      if (!iteratorClosed && iterator !== undefined) {
+        try {
+          const returnIterator = iterator.return;
+          if (typeof returnIterator === "function") {
+            void Promise.resolve(returnIterator.call(iterator)).catch(() => undefined);
+          }
+        } catch {
+          // Cleanup is best-effort and cannot block or replace the failure.
+        }
       }
       if (error instanceof SessionHostError) {
         throw error;
