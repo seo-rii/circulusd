@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/text/unicode/norm"
 )
@@ -53,7 +54,52 @@ type Gateway struct {
 	providers    map[string]Provider
 }
 
+// NewGateway constructs the explicitly selected in-process reference gateway.
+// Production code must use NewProductionGateway so an arbitrary dependency
+// cannot enter the graph by returning optimistic Durability booleans.
 func NewGateway(configuration Configuration, dependencies Dependencies) (*Gateway, error) {
+	if !configuration.AllowReferenceMemory {
+		return nil, ErrStateDependenciesNotDurable
+	}
+	return newGateway(configuration, dependencies, false)
+}
+
+func NewProductionGateway(configuration Configuration, dependencies ProductionDependencies) (*Gateway, error) {
+	if configuration.AllowReferenceMemory {
+		return nil, fmt.Errorf("%w: production gateway cannot enable reference memory", ErrInvalidConfiguration)
+	}
+	authority, _, err := dependencies.Authority.Open()
+	if err != nil {
+		return nil, ErrStateDependenciesNotDurable
+	}
+	quota, _, err := dependencies.Quota.Open()
+	if err != nil {
+		return nil, ErrStateDependenciesNotDurable
+	}
+	dispatches, _, err := dependencies.Dispatches.Open()
+	if err != nil {
+		return nil, ErrStateDependenciesNotDurable
+	}
+	checks := []struct {
+		group   dependency.AtomicGroup
+		binding dependency.Binding
+	}{
+		{group: AtomicModelAuthorityFence, binding: dependencies.Authority},
+		{group: AtomicModelQuotaSettlement, binding: dependencies.Quota},
+		{group: AtomicModelEffectLifecycle, binding: dependencies.Dispatches},
+	}
+	for _, check := range checks {
+		if _, err := dependency.RequireAtomicDomain([]dependency.AtomicGroup{check.group}, check.binding); err != nil {
+			return nil, ErrStateDependenciesNotDurable
+		}
+	}
+	return newGateway(configuration, Dependencies{
+		Authority: authority, TokenCounter: dependencies.TokenCounter, Quota: quota,
+		Dispatches: dispatches, Providers: dependencies.Providers,
+	}, true)
+}
+
+func newGateway(configuration Configuration, dependencies Dependencies, verifiedProduction bool) (*Gateway, error) {
 	bounds := configuration.Bounds
 	if bounds.MaxAuthorityBytes == 0 || bounds.MaxAuthorityBytes > hardMaxAuthorityBytes ||
 		bounds.MaxMessages == 0 || bounds.MaxMessages > hardMaxMessages ||
@@ -92,19 +138,19 @@ func NewGateway(configuration Configuration, dependencies Dependencies) (*Gatewa
 	}
 	authorityDurability := dependencies.Authority.Durability()
 	authorityIsDurable := authorityDurability.CrashDurable && authorityDurability.CurrentGenerationFencing && !authorityDurability.ReferenceMemory
-	authorityIsAllowedReference := configuration.AllowReferenceMemory && !authorityDurability.CrashDurable &&
+	authorityIsAllowedReference := !verifiedProduction && configuration.AllowReferenceMemory && !authorityDurability.CrashDurable &&
 		authorityDurability.CurrentGenerationFencing && authorityDurability.ReferenceMemory
 	quotaDurability := dependencies.Quota.Durability()
 	quotaIsDurable := quotaDurability.CrashDurable && quotaDurability.AtomicReservationSettlement && !quotaDurability.ReferenceMemory
-	quotaIsAllowedReference := configuration.AllowReferenceMemory && !quotaDurability.CrashDurable &&
+	quotaIsAllowedReference := !verifiedProduction && configuration.AllowReferenceMemory && !quotaDurability.CrashDurable &&
 		quotaDurability.AtomicReservationSettlement && quotaDurability.ReferenceMemory
 	dispatchDurability := dependencies.Dispatches.Durability()
 	dispatchIsDurable := dispatchDurability.CrashDurable && dispatchDurability.AtomicEffectTransitions &&
 		dispatchDurability.ExclusiveDispatchClaim && !dispatchDurability.ReferenceMemory
-	dispatchIsAllowedReference := configuration.AllowReferenceMemory && !dispatchDurability.CrashDurable &&
+	dispatchIsAllowedReference := !verifiedProduction && configuration.AllowReferenceMemory && !dispatchDurability.CrashDurable &&
 		dispatchDurability.AtomicEffectTransitions && dispatchDurability.ExclusiveDispatchClaim && dispatchDurability.ReferenceMemory
-	if (!authorityIsDurable && !authorityIsAllowedReference) || (!quotaIsDurable && !quotaIsAllowedReference) ||
-		(!dispatchIsDurable && !dispatchIsAllowedReference) {
+	if (verifiedProduction && (!authorityIsDurable || !quotaIsDurable || !dispatchIsDurable)) ||
+		(!verifiedProduction && (!authorityIsAllowedReference || !quotaIsAllowedReference || !dispatchIsAllowedReference)) {
 		return nil, ErrStateDependenciesNotDurable
 	}
 	providers := make(map[string]Provider, len(dependencies.Providers))

@@ -125,7 +125,7 @@ func TestGatewayRejectsReferenceMemoryStateDependenciesWithoutAnExplicitGate(t *
 	}
 }
 
-func TestGatewayAcceptsCrashDurableAtomicStateDependenciesInProduction(t *testing.T) {
+func TestGatewayRejectsSelfReportedCrashDurabilityInProduction(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
 	configuration := fixture.configuration()
@@ -135,8 +135,8 @@ func TestGatewayAcceptsCrashDurableAtomicStateDependenciesInProduction(t *testin
 	dependencies.Quota = crashDurableQuota{QuotaAdmitter: dependencies.Quota}
 	dependencies.Dispatches = crashDurableDispatchCoordinator{DispatchCoordinator: dependencies.Dispatches}
 
-	if _, err := NewGateway(configuration, dependencies); err != nil {
-		t.Fatalf("NewGateway(crash durable dependencies) error = %v", err)
+	if _, err := NewGateway(configuration, dependencies); !errors.Is(err, ErrStateDependenciesNotDurable) {
+		t.Fatalf("NewGateway(self-reported crash durability) error = %v, want ErrStateDependenciesNotDurable", err)
 	}
 }
 
@@ -167,8 +167,8 @@ func TestGatewayRejectsAReferenceAuthorityInProduction(t *testing.T) {
 	}
 
 	dependencies.Authority = crashDurableAuthority{AuthorityValidator: dependencies.Authority}
-	if _, err := NewGateway(configuration, dependencies); err != nil {
-		t.Fatalf("NewGateway(crash-durable authority) error = %v", err)
+	if _, err := NewGateway(configuration, dependencies); !errors.Is(err, ErrStateDependenciesNotDurable) {
+		t.Fatalf("NewGateway(self-reported crash-durable authority) error = %v, want ErrStateDependenciesNotDurable", err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 )
 
@@ -290,6 +291,42 @@ type Dependencies struct {
 	TokenCounter TokenCounter
 	Quota        QuotaAdmitter
 	Dispatches   DispatchCoordinator
+	Providers    map[string]Provider
+}
+
+const (
+	AtomicModelAuthorityFence  dependency.AtomicGroup = "model-authority-fence"
+	AtomicModelEffectLifecycle dependency.AtomicGroup = "model-effect-lifecycle"
+	AtomicModelQuotaSettlement dependency.AtomicGroup = "model-quota-settlement"
+)
+
+// Production interfaces extend each exact runtime adapter with the live probe
+// contract. A verified wrapper therefore contains the same object that serves
+// requests; evidence for an unrelated probe cannot be paired with a raw
+// gateway dependency.
+type ProductionAuthorityValidator interface {
+	AuthorityValidator
+	dependency.ProductionProbe
+}
+
+type ProductionQuotaAdmitter interface {
+	QuotaAdmitter
+	dependency.ProductionProbe
+}
+
+type ProductionDispatchCoordinator interface {
+	DispatchCoordinator
+	dependency.ProductionProbe
+}
+
+// ProductionDependencies cannot be populated from self-reported durability
+// flags. The wrappers are minted only by dependency.VerifyDependency after
+// signed conformance and live runtime verification.
+type ProductionDependencies struct {
+	Authority    dependency.Verified[ProductionAuthorityValidator]
+	TokenCounter TokenCounter
+	Quota        dependency.Verified[ProductionQuotaAdmitter]
+	Dispatches   dependency.Verified[ProductionDispatchCoordinator]
 	Providers    map[string]Provider
 }
 
