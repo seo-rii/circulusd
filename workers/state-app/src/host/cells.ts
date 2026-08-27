@@ -28,6 +28,7 @@ import {
   applyExtensionStateCommand,
   applyUserCommand,
   assertCurrentCapabilityGeneration,
+  controlError,
   createCapabilityGenerationState,
   createExtensionState,
   createUserState,
@@ -54,6 +55,7 @@ import {
   type UserCommand,
   type UserCommandOutcome,
 } from "../control/index.ts";
+import { validatedAuthority } from "../control/validation.ts";
 import {
   HostContractError,
   type AggregateAdapter,
@@ -300,6 +302,44 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
       request,
       typedPayload<SessionCommand>,
       (command) => this.kernel.execute(command),
+    );
+  }
+
+  readSession(
+    request: unknown,
+  ): Promise<HostRpcResponse<SessionAggregateState>> {
+    return invokeHostRpc(
+      "session.read",
+      request,
+      (payload) => exactQueryPayload<AuthorizedControlQuery>(
+        payload,
+        ["authority", "now"],
+      ),
+      (input) => this.kernel.query(
+        input,
+        (state, query) => {
+          const authority = validatedAuthority(
+            query.authority,
+            {
+              tenantId: state.tenantId,
+              subjectKind: "session",
+              subjectId: state.sessionId,
+            },
+            query.now,
+            "session.read",
+          );
+          if (
+            authority.currentAuthorizationGeneration !==
+            state.authorizationGeneration
+          ) {
+            controlError(
+              "STALE_GENERATION",
+              "session read authority is stale",
+            );
+          }
+          return state;
+        },
+      ),
     );
   }
 }

@@ -111,6 +111,7 @@ const CONTROL_ROLES: readonly ControlRole[] = [
 ];
 
 const CONTROL_PERMISSIONS: readonly ControlPermission[] = [
+  "session.read",
   "user.read",
   "user.preferences.write",
   "user.quota.write",

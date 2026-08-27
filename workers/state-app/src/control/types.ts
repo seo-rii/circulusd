@@ -11,6 +11,7 @@ export type ControlRole =
   | "user";
 
 export type ControlPermission =
+  | "session.read"
   | "user.read"
   | "user.preferences.write"
   | "user.quota.write"

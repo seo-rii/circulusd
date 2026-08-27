@@ -330,6 +330,25 @@ function userAuthority(
   };
 }
 
+function sessionAuthority(
+  overrides: Partial<ControlAuthoritySnapshot> = {},
+): ControlAuthoritySnapshot {
+  return {
+    serviceBinding: "state",
+    tenantId: "tenant-1",
+    actorUserId: "user-1",
+    subjectKind: "session",
+    subjectId: "session-1",
+    roles: ["user"],
+    permissions: ["session.read"],
+    authorizationGeneration: 6,
+    currentAuthorizationGeneration: 6,
+    issuedAt: 1,
+    expiresAt: 10_000,
+    ...overrides,
+  };
+}
+
 function userCommand(
   commandId = "command-preferences-1",
   overrides: Partial<UserCommand> = {},
@@ -1130,8 +1149,54 @@ describe("named aggregate cells", () => {
     expect(replayed).toMatchObject({ version: 1, replayed: true });
     expect(replayed.outcome).toEqual(committed.outcome);
     expect(storage.values.size).toBe(3);
-    expect("readSession" in cell).toBe(false);
+    const snapshot = await hostRpcResult(
+      "session.read",
+      { authority: sessionAuthority(), now: 200 },
+      (request) => cell.readSession(request),
+    );
+    expect(snapshot).toMatchObject({
+      tenantId: "tenant-1",
+      sessionId: "session-1",
+      authorizationGeneration: 6,
+      eventSequence: 1,
+      activeTurn: { turnId: "turn-1" },
+      queuedTurns: [],
+    });
     expect("load" in cell || "save" in cell || "patch" in cell).toBe(false);
+  });
+
+  it("fails closed when a Session read authority is forged, expired, or stale", async () => {
+    const storage = new FakeTransactionalStorage();
+    const route = routedCellContext(
+      storage,
+      "SESSION_CELL",
+      sessionCellName("tenant-1", "session-1"),
+    );
+    const cell = new SessionCell(route.state, route.environment);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+
+    const invalidAuthorities = [
+      sessionAuthority({ tenantId: "tenant-2" }),
+      sessionAuthority({ subjectId: "session-2" }),
+      sessionAuthority({ expiresAt: 200 }),
+      sessionAuthority({
+        authorizationGeneration: 5,
+        currentAuthorizationGeneration: 5,
+      }),
+    ];
+    for (const authority of invalidAuthorities) {
+      await expect(hostRpcResult(
+        "session.read",
+        { authority, now: 200 },
+        (request) => cell.readSession(request),
+      )).rejects.toMatchObject({
+        code: expect.stringMatching(/^(?:PERMISSION_DENIED|STALE_GENERATION)$/),
+      });
+    }
   });
 
   it("routes Workspace commands and only exposes its authorized invocation lookup", async () => {

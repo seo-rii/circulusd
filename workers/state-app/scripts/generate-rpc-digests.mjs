@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const OPERATIONS = Object.freeze([
   "session.initialize",
   "session.execute",
+  "session.read",
   "workspace.initialize",
   "workspace.execute",
   "workspace.lookup-invocation",
