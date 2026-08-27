@@ -11,24 +11,25 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/executor"
+	"github.com/hancomac/circulusd/internal/identity"
 )
 
 const (
-	planDigestDomain = "circulusd.executor.nsjail-launch-plan.v1\x00"
-	mebibyte         = uint64(1 << 20)
+	planDigestDomain        = "circulusd.executor.nsjail-launch-plan.v1\x00"
+	mebibyte                = uint64(1 << 20)
+	maximumSharedGeneration = uint64(9_007_199_254_740_991)
+	handshakeNonceFD        = 3
 )
 
 var (
 	ErrInvalidConfig  = errors.New("invalid NsJail planner config")
 	ErrInvalidRequest = errors.New("invalid NsJail launch request")
-
-	sandboxIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$`)
+	ErrPlanTampered   = errors.New("NsJail launch plan integrity check failed")
 )
 
 // Config fixes every host and in-jail path at trusted executord bootstrap.
@@ -71,10 +72,11 @@ type ResourceLimits struct {
 // allocated host credentials, and effective policy. Host paths are derived by
 // Planner from Config and cannot be supplied here.
 type Request struct {
-	SandboxID            string
+	SandboxID            identity.ID
 	Generation           uint64
 	RootfsDigest         string
 	SeccompProfileDigest string
+	SandboxdDigest       string
 	HostUID              uint32
 	HostGID              uint32
 	WorkspaceAccess      executor.WorkspaceAccess
@@ -87,11 +89,66 @@ type Request struct {
 // protobuf-text NsJail config, and Digest binds the binary, config path, and
 // exact bytes for audit.
 type LaunchPlan struct {
-	Executable    string
-	Arguments     []string
-	ConfigPath    string
-	Configuration []byte
-	Digest        string
+	executable    string
+	arguments     []string
+	configPath    string
+	configuration []byte
+	digest        string
+
+	sandboxID            identity.ID
+	generation           uint64
+	environmentRoot      string
+	sandboxRoot          string
+	cgroupPath           string
+	rootfsPath           string
+	seccompPath          string
+	sandboxdHostPath     string
+	rootfsDigest         string
+	seccompProfileDigest string
+	sandboxdDigest       string
+	hostUID              uint32
+	hostGID              uint32
+}
+
+// Executable returns the trusted NsJail binary path.
+func (plan LaunchPlan) Executable() string {
+	return plan.executable
+}
+
+// Arguments returns a defensive copy of the only permitted launcher argv.
+func (plan LaunchPlan) Arguments() []string {
+	return append([]string(nil), plan.arguments...)
+}
+
+// ConfigPath returns the generation-scoped config destination.
+func (plan LaunchPlan) ConfigPath() string {
+	return plan.configPath
+}
+
+// Configuration returns a defensive copy of the sealed protobuf-text bytes.
+func (plan LaunchPlan) Configuration() []byte {
+	return append([]byte(nil), plan.configuration...)
+}
+
+// Digest returns the content identity of the complete launch command and its
+// trusted launch metadata. The one-time handshake nonce is deliberately not a
+// serializable plan field.
+func (plan LaunchPlan) Digest() string {
+	return plan.digest
+}
+
+// Validate rechecks plan integrity immediately before filesystem mutation or
+// exec. LaunchPlan has no exported mutable storage, but this also detects
+// accidental corruption inside the trusted process.
+func (plan LaunchPlan) Validate() error {
+	if plan.sandboxID.Kind() != identity.Sandbox || plan.sandboxID.String() == "" ||
+		plan.generation == 0 || plan.generation > maximumSharedGeneration ||
+		plan.executable == "" || plan.configPath == "" || len(plan.configuration) == 0 ||
+		len(plan.arguments) != 2 || plan.arguments[0] != "--config" || plan.arguments[1] != plan.configPath ||
+		plan.digest == "" || plan.digest != digestLaunchPlan(plan) {
+		return ErrPlanTampered
+	}
+	return nil
 }
 
 // Planner is immutable and safe for concurrent Build calls.
@@ -162,7 +219,8 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	if planner == nil {
 		return LaunchPlan{}, fmt.Errorf("%w: nil planner", ErrInvalidRequest)
 	}
-	if !sandboxIDPattern.MatchString(request.SandboxID) || request.Generation == 0 {
+	if request.SandboxID.Kind() != identity.Sandbox || request.SandboxID.String() == "" ||
+		request.Generation == 0 || request.Generation > maximumSharedGeneration {
 		return LaunchPlan{}, fmt.Errorf("%w: invalid sandbox identity or generation", ErrInvalidRequest)
 	}
 	digests := []struct {
@@ -171,6 +229,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	}{
 		{name: "rootfs", value: request.RootfsDigest},
 		{name: "seccomp profile", value: request.SeccompProfileDigest},
+		{name: "sandboxd", value: request.SandboxdDigest},
 	}
 	for _, digest := range digests {
 		if len(digest.value) != len("sha256:")+sha256.Size*2 ||
@@ -182,7 +241,8 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 			return LaunchPlan{}, fmt.Errorf("%w: malformed %s digest", ErrInvalidRequest, digest.name)
 		}
 	}
-	if request.HostUID == 0 || request.HostGID == 0 {
+	if request.HostUID == 0 || request.HostGID == 0 ||
+		request.HostUID == ^uint32(0) || request.HostGID == ^uint32(0) {
 		return LaunchPlan{}, fmt.Errorf("%w: sandbox host UID and GID must be unprivileged", ErrInvalidRequest)
 	}
 	if request.WorkspaceAccess != executor.WorkspaceReadOnly && request.WorkspaceAccess != executor.WorkspaceReadWrite {
@@ -212,24 +272,37 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 		"seccomp",
 		request.SeccompProfileDigest+".policy",
 	)
-	sandboxPath := filepath.Join(planner.config.SandboxRoot, request.SandboxID)
+	generationPath := fmt.Sprintf("generation-%016x", request.Generation)
+	sandboxPath := filepath.Join(planner.config.SandboxRoot, request.SandboxID.String(), generationPath)
 	workspacePath := filepath.Join(sandboxPath, "workspace")
 	controlPath := filepath.Join(sandboxPath, "control")
 	configPath := filepath.Join(sandboxPath, "nsjail.pbtxt")
-	for _, generated := range []string{rootfsPath, seccompPath, sandboxPath, workspacePath, controlPath, configPath} {
+	cgroupPath := filepath.Join(planner.config.CgroupRoot, request.SandboxID.String(), generationPath)
+	sandboxdHostPath := filepath.Join(rootfsPath, filepath.FromSlash(strings.TrimPrefix(planner.config.SandboxdPath, "/")))
+	for _, generated := range []string{
+		rootfsPath,
+		seccompPath,
+		sandboxPath,
+		workspacePath,
+		controlPath,
+		configPath,
+		cgroupPath,
+		sandboxdHostPath,
+	} {
 		if len(generated) > 4096 || !filepath.IsAbs(generated) || filepath.Clean(generated) != generated {
 			return LaunchPlan{}, fmt.Errorf("%w: derived host path exceeds platform bounds", ErrInvalidRequest)
 		}
 	}
 
 	var configuration strings.Builder
-	_, _ = fmt.Fprintf(&configuration, "name: %s\n", strconv.Quote("circulusd-"+request.SandboxID))
+	_, _ = fmt.Fprintf(&configuration, "name: %s\n", strconv.Quote("circulusd-"+request.SandboxID.String()+"-"+generationPath))
 	_, _ = configuration.WriteString("mode: ONCE\n")
-	_, _ = fmt.Fprintf(&configuration, "hostname: %s\n", strconv.Quote("circulusd-"+request.SandboxID))
+	_, _ = fmt.Fprintf(&configuration, "hostname: %s\n", strconv.Quote(fmt.Sprintf("circulusd-%x", request.Generation)))
 	_, _ = configuration.WriteString("cwd: \"/\"\n")
 	_, _ = fmt.Fprintf(&configuration, "time_limit: %d\n", limits.MaximumLifetimeSeconds)
 	_, _ = configuration.WriteString("daemon: false\nkeep_env: false\nkeep_caps: false\ndisable_no_new_privs: false\n")
 	_, _ = configuration.WriteString("skip_setsid: false\nforward_signals: false\n")
+	_, _ = fmt.Fprintf(&configuration, "pass_fd: %d\n", handshakeNonceFD)
 	_, _ = fmt.Fprintf(&configuration, "rlimit_as: %d\nrlimit_as_type: VALUE\n", (limits.MemoryBytes+mebibyte-1)/mebibyte)
 	_, _ = configuration.WriteString("rlimit_core: 0\nrlimit_core_type: VALUE\n")
 	_, _ = fmt.Fprintf(&configuration, "rlimit_cpu: %d\nrlimit_cpu_type: VALUE\n", limits.MaximumLifetimeSeconds)
@@ -245,7 +318,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = configuration.WriteString("seccomp_log: true\n")
 	_, _ = fmt.Fprintf(&configuration, "cgroup_mem_max: %d\ncgroup_mem_swap_max: 0\n", limits.MemoryBytes)
 	_, _ = fmt.Fprintf(&configuration, "cgroup_pids_max: %d\ncgroup_cpu_ms_per_sec: %d\n", limits.MaximumProcesses, limits.CPUMillisPerSecond)
-	_, _ = fmt.Fprintf(&configuration, "cgroupv2_mount: %s\nuse_cgroupv2: true\ndetect_cgroupv2: false\n", strconv.Quote(planner.config.CgroupRoot))
+	_, _ = fmt.Fprintf(&configuration, "cgroupv2_mount: %s\nuse_cgroupv2: true\ndetect_cgroupv2: false\n", strconv.Quote(cgroupPath))
 	_, _ = configuration.WriteString("iface_no_lo: false\n")
 	_, _ = fmt.Fprintf(&configuration, "mount {\n  src: %s\n  dst: \"/\"\n  is_bind: true\n  rw: false\n  mandatory: true\n  nosuid: true\n  nodev: true\n}\n", strconv.Quote(rootfsPath))
 	_, _ = fmt.Fprintf(&configuration, "mount {\n  src: %s\n  dst: \"/workspace\"\n  is_bind: true\n  rw: %t\n  mandatory: true\n  nosuid: true\n  nodev: true\n}\n", strconv.Quote(workspacePath), request.WorkspaceAccess == executor.WorkspaceReadWrite)
@@ -260,31 +333,65 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = configuration.WriteString("envar: \"HOME=/scratch\"\nenvar: \"TMPDIR=/tmp\"\n")
 	_, _ = fmt.Fprintf(&configuration, "exec_bin {\n  path: %s\n", strconv.Quote(planner.config.SandboxdPath))
 	_, _ = configuration.WriteString("  arg: \"--control-socket\"\n  arg: \"/run/circulusd/control/control.sock\"\n")
-	_, _ = fmt.Fprintf(&configuration, "  arg: \"--sandbox-id\"\n  arg: %s\n", strconv.Quote(request.SandboxID))
+	_, _ = fmt.Fprintf(&configuration, "  arg: \"--sandbox-id\"\n  arg: %s\n", strconv.Quote(request.SandboxID.String()))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--generation\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(request.Generation, 10)))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--protocol-version\"\n  arg: %s\n}\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.ProtocolVersion), 10)))
 
-	configurationBytes := []byte(configuration.String())
-	arguments := []string{"--config", configPath}
+	plan := LaunchPlan{
+		executable:           planner.config.BinaryPath,
+		arguments:            []string{"--config", configPath},
+		configPath:           configPath,
+		configuration:        []byte(configuration.String()),
+		sandboxID:            request.SandboxID,
+		generation:           request.Generation,
+		environmentRoot:      planner.config.EnvironmentRoot,
+		sandboxRoot:          planner.config.SandboxRoot,
+		cgroupPath:           cgroupPath,
+		rootfsPath:           rootfsPath,
+		seccompPath:          seccompPath,
+		sandboxdHostPath:     sandboxdHostPath,
+		rootfsDigest:         request.RootfsDigest,
+		seccompProfileDigest: request.SeccompProfileDigest,
+		sandboxdDigest:       request.SandboxdDigest,
+		hostUID:              request.HostUID,
+		hostGID:              request.HostGID,
+	}
+	plan.digest = digestLaunchPlan(plan)
+	return plan, nil
+}
+
+func digestLaunchPlan(plan LaunchPlan) string {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(planDigestDomain))
 	fields := [][]byte{
-		[]byte(planner.config.BinaryPath),
-		[]byte(configPath),
-		configurationBytes,
+		[]byte(plan.executable),
+		[]byte(strconv.Itoa(len(plan.arguments))),
 	}
+	for _, argument := range plan.arguments {
+		fields = append(fields, []byte(argument))
+	}
+	fields = append(fields,
+		[]byte(plan.configPath),
+		plan.configuration,
+		[]byte(plan.sandboxID.String()),
+		[]byte(strconv.FormatUint(plan.generation, 10)),
+		[]byte(plan.environmentRoot),
+		[]byte(plan.sandboxRoot),
+		[]byte(plan.cgroupPath),
+		[]byte(plan.rootfsPath),
+		[]byte(plan.seccompPath),
+		[]byte(plan.sandboxdHostPath),
+		[]byte(plan.rootfsDigest),
+		[]byte(plan.seccompProfileDigest),
+		[]byte(plan.sandboxdDigest),
+		[]byte(strconv.FormatUint(uint64(plan.hostUID), 10)),
+		[]byte(strconv.FormatUint(uint64(plan.hostGID), 10)),
+	)
 	var length [8]byte
 	for _, field := range fields {
 		binary.BigEndian.PutUint64(length[:], uint64(len(field)))
 		_, _ = hash.Write(length[:])
 		_, _ = hash.Write(field)
 	}
-
-	return LaunchPlan{
-		Executable:    planner.config.BinaryPath,
-		Arguments:     arguments,
-		ConfigPath:    configPath,
-		Configuration: configurationBytes,
-		Digest:        "sha256:" + hex.EncodeToString(hash.Sum(nil)),
-	}, nil
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
