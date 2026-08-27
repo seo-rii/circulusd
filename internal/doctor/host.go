@@ -251,17 +251,17 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 			},
 		},
 		{
-			Component: "host.project-quota",
+			Component: "host.scratch-quota",
 			Run: func(ctx context.Context) conformance.Result {
-				if result, canceled := canceledHostProbe(ctx, "host.project-quota"); canceled {
+				if result, canceled := canceledHostProbe(ctx, "host.scratch-quota"); canceled {
 					return result
 				}
 				if sources.OperatingSystem != "linux" {
-					return conformance.Result{Component: "host.project-quota", Status: conformance.Unavailable, Reason: "project quota inspection requires Linux"}
+					return conformance.Result{Component: "host.scratch-quota", Status: conformance.Unavailable, Reason: "project quota inspection requires Linux"}
 				}
 				mountInfo, err := sources.ReadFile("/proc/self/mountinfo", maximumMountInfoBytes)
 				if err != nil {
-					return conformance.Result{Component: "host.project-quota", Status: conformance.Unavailable, Reason: "filesystem mount options cannot be read"}
+					return conformance.Result{Component: "host.scratch-quota", Status: conformance.Unavailable, Reason: "filesystem mount options cannot be read"}
 				}
 				bestMountLength := -1
 				bestFilesystem := ""
@@ -296,7 +296,7 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 					bestOptions = fields[5] + "," + fields[separator+3]
 				}
 				if bestMountLength < 0 || bestFilesystem != "ext4" && bestFilesystem != "xfs" {
-					return conformance.Result{Component: "host.project-quota", Status: conformance.Unavailable, Reason: "data filesystem does not expose supported project quota"}
+					return conformance.Result{Component: "host.scratch-quota", Status: conformance.Unavailable, Reason: "data filesystem does not expose supported project quota"}
 				}
 				quotaEnabled := false
 				for _, option := range strings.Split(bestOptions, ",") {
@@ -306,9 +306,9 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 					}
 				}
 				if !quotaEnabled {
-					return conformance.Result{Component: "host.project-quota", Status: conformance.Unavailable, Reason: "project quota is not enabled on the data filesystem"}
+					return conformance.Result{Component: "host.scratch-quota", Status: conformance.Unavailable, Reason: "project quota is not enabled on the data filesystem"}
 				}
-				return conformance.Result{Component: "host.project-quota", Status: conformance.Pass}
+				return conformance.Result{Component: "host.scratch-quota", Status: conformance.Pass, Reason: "project quota is enabled for scratch isolation"}
 			},
 		},
 		{

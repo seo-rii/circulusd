@@ -119,7 +119,7 @@ func TestHostProbesFailOrReportUnavailableWithoutOverclaiming(t *testing.T) {
 		"host.cgroup-v2":         conformance.Fail,
 		"host.namespace-handles": conformance.Fail,
 		"host.disk":              conformance.Fail,
-		"host.project-quota":     conformance.Unavailable,
+		"host.scratch-quota":     conformance.Unavailable,
 		"host.nftables-tool":     conformance.Unavailable,
 		"host.kvm-access":        conformance.Unavailable,
 	}
