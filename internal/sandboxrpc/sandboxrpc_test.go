@@ -7,15 +7,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/sandboxd"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,6 +52,259 @@ func TestClientReadyAuthenticatesOneSessionConcurrently(t *testing.T) {
 	server.handler.handshakeMu.Unlock()
 	if !nonceUsed || !sessionEstablished {
 		t.Fatal("Ready() did not establish exactly one authenticated server session")
+	}
+}
+
+func TestClientPinnedEndpointFencesPathnameABA(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authorityPath := filepath.Join(root, "control.sock")
+	decoyPath := filepath.Join(root, "decoy.sock")
+	parkedPath := filepath.Join(root, "parked.sock")
+	nonce := bytes.Repeat([]byte{0x6b}, handshakeNonceBytes)
+	paths := []string{authorityPath, decoyPath}
+	servers := make([]*Server, len(paths))
+	for index, socketPath := range paths {
+		workspace := filepath.Join(root, "workspace-"+string(rune('a'+index)))
+		if err := os.Mkdir(workspace, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
+			Authority:         sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 7},
+			WorkspaceRoot:     workspace,
+			Commands:          map[string]string{"echo": "/bin/echo"},
+			Runner:            sandboxd.NewFakeRunner(),
+			ReplayLimitBytes:  1 << 20,
+			ReplayLimitEvents: 128,
+			SubscriberBuffer:  16,
+			ReadChunkBytes:    4096,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, err := ListenServer(ServerConfig{
+			SocketPath:        socketPath,
+			AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
+			SandboxID:         []byte("sandbox-alpha"),
+			SandboxGeneration: 7,
+			OneTimeNonce:      nonce,
+			Supervisor:        supervisor,
+		})
+		if err != nil {
+			t.Fatalf("ListenServer(%q) error = %v", socketPath, err)
+		}
+		servers[index] = server
+		serveContext, cancelServe := context.WithCancel(context.Background())
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve(serveContext) }()
+		t.Cleanup(func() {
+			cancelServe()
+			_ = server.Close()
+			select {
+			case err := <-serveDone:
+				if err != nil {
+					t.Errorf("Serve(%q) error = %v", socketPath, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("Serve(%q) did not stop", socketPath)
+			}
+		})
+	}
+
+	var swaps atomic.Int32
+	client, err := newClientWithDependencies(ClientConfig{
+		SocketPath:        authorityPath,
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      nonce,
+	}, -1, clientDependencies{
+		dialUnix: func(ctx context.Context, socketPath string) (net.Conn, error) {
+			if !swaps.CompareAndSwap(0, 1) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			}
+			if err := os.Rename(authorityPath, parkedPath); err != nil {
+				return nil, err
+			}
+			if err := os.Rename(decoyPath, authorityPath); err != nil {
+				return nil, errors.Join(err, os.Rename(parkedPath, authorityPath))
+			}
+			connection, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			restoreErr := errors.Join(
+				os.Rename(authorityPath, decoyPath),
+				os.Rename(parkedPath, authorityPath),
+			)
+			if restoreErr != nil {
+				_ = connection.Close()
+				return nil, errors.Join(dialErr, restoreErr)
+			}
+			return connection, dialErr
+		},
+	})
+	if err != nil {
+		t.Fatalf("newClientWithDependencies() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	readyContext, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelReady()
+	if err := client.Ready(readyContext); err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	if swaps.Load() != 1 {
+		t.Fatalf("pathname swaps = %d, want 1", swaps.Load())
+	}
+	servers[0].handler.handshakeMu.Lock()
+	authorityUsed := servers[0].handler.nonceUsed
+	servers[0].handler.handshakeMu.Unlock()
+	servers[1].handler.handshakeMu.Lock()
+	decoyUsed := servers[1].handler.nonceUsed
+	servers[1].handler.handshakeMu.Unlock()
+	if !authorityUsed || decoyUsed {
+		t.Fatalf("authenticated endpoints authority/decoy = %t/%t, want true/false", authorityUsed, decoyUsed)
+	}
+}
+
+func TestClientPinnedEndpointFailsClosedWhenProcFDDialIsUnavailable(t *testing.T) {
+	server, unusedClient, _ := startTestTransport(t)
+	if err := unusedClient.Close(); err != nil {
+		t.Fatalf("Close(unused client) error = %v", err)
+	}
+	var dialCalls atomic.Int32
+	var dialPath atomic.Value
+	client, err := newClientWithDependencies(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, handshakeNonceBytes),
+	}, -1, clientDependencies{
+		dialUnix: func(_ context.Context, socketPath string) (net.Conn, error) {
+			dialCalls.Add(1)
+			dialPath.Store(socketPath)
+			return nil, os.ErrPermission
+		},
+	})
+	if err != nil {
+		t.Fatalf("newClientWithDependencies() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Ready(context.Background()); err == nil {
+		t.Fatal("Ready() error = nil, want fail-closed procfd dial error")
+	}
+	if dialCalls.Load() != 1 {
+		t.Fatalf("dial calls = %d, want 1 without pathname fallback", dialCalls.Load())
+	}
+	path, _ := dialPath.Load().(string)
+	if !strings.HasPrefix(path, "/proc/self/fd/") {
+		t.Fatalf("dial path = %q, want process-owned descriptor path", path)
+	}
+	server.handler.handshakeMu.Lock()
+	nonceUsed := server.handler.nonceUsed
+	server.handler.handshakeMu.Unlock()
+	if nonceUsed {
+		t.Fatal("server consumed the nonce after the pinned endpoint dial failed")
+	}
+}
+
+func TestClientFromPinnedSocketFDSurvivesPathRenameDuringConstruction(t *testing.T) {
+	server, unusedClient, _ := startTestTransport(t)
+	if err := unusedClient.Close(); err != nil {
+		t.Fatalf("Close(unused client) error = %v", err)
+	}
+	pinnedFD, err := unix.Open(server.SocketPath(), unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatalf("Open(pinned socket) error = %v", err)
+	}
+	socketDirectory := filepath.Dir(server.SocketPath())
+	parkedDirectory := socketDirectory + ".parked"
+	if err := os.Rename(socketDirectory, parkedDirectory); err != nil {
+		_ = unix.Close(pinnedFD)
+		t.Fatalf("Rename(socket directory) error = %v", err)
+	}
+
+	client, err := NewClientFromPinnedSocketFD(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, handshakeNonceBytes),
+	}, pinnedFD)
+	restoreErr := os.Rename(parkedDirectory, socketDirectory)
+	closeErr := unix.Close(pinnedFD)
+	if restoreErr != nil {
+		if client != nil {
+			_ = client.Close()
+		}
+		t.Fatalf("restore socket directory error = %v", restoreErr)
+	}
+	if err != nil {
+		t.Fatalf("NewClientFromPinnedSocketFD(renamed path) error = %v", err)
+	}
+	if closeErr != nil {
+		_ = client.Close()
+		t.Fatalf("Close(borrowed socket FD) error = %v", closeErr)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ready(ctx); err != nil {
+		t.Fatalf("Ready() through duplicated pinned endpoint error = %v", err)
+	}
+}
+
+func TestClientCloseKeepsInFlightDialDescriptorAlive(t *testing.T) {
+	server, unusedClient, _ := startTestTransport(t)
+	if err := unusedClient.Close(); err != nil {
+		t.Fatalf("Close(unused client) error = %v", err)
+	}
+	dialEntered := make(chan string, 1)
+	releaseDial := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseDial:
+		default:
+			close(releaseDial)
+		}
+	}()
+	dialError := errors.New("dial released")
+	client, err := newClientWithDependencies(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, handshakeNonceBytes),
+	}, -1, clientDependencies{
+		dialUnix: func(_ context.Context, socketPath string) (net.Conn, error) {
+			dialEntered <- socketPath
+			<-releaseDial
+			return nil, dialError
+		},
+	})
+	if err != nil {
+		t.Fatalf("newClientWithDependencies() error = %v", err)
+	}
+	dialResult := make(chan error, 1)
+	go func() {
+		_, dialErr := client.dialContext(context.Background(), "", "")
+		dialResult <- dialErr
+	}()
+	var descriptorPath string
+	select {
+	case descriptorPath = <-dialEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dial did not duplicate the pinned endpoint")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("in-flight dial descriptor was closed early: %v", err)
+	}
+	close(releaseDial)
+	if err := <-dialResult; !errors.Is(err, dialError) {
+		t.Fatalf("dial error = %v, want injected error", err)
 	}
 }
 

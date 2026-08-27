@@ -20,10 +20,15 @@ import (
 )
 
 const (
-	planDigestDomain        = "circulusd.executor.nsjail-launch-plan.v1\x00"
-	mebibyte                = uint64(1 << 20)
-	maximumSharedGeneration = uint64(9_007_199_254_740_991)
-	handshakeNonceFD        = 3
+	planDigestDomain            = "circulusd.executor.nsjail-launch-plan.v1\x00"
+	mebibyte                    = uint64(1 << 20)
+	maximumSharedGeneration     = uint64(9_007_199_254_740_991)
+	handshakeNonceFD            = 3
+	maximumUnixSocketPathBytes  = 107
+	sandboxControlSocketName    = "rpc.sock"
+	sandboxControlMountPath     = "/run/circulusd/control"
+	sandboxControlSocketPath    = sandboxControlMountPath + "/" + sandboxControlSocketName
+	maximumSandboxIdentityBytes = len("sandbox_") + 26
 )
 
 var (
@@ -219,6 +224,16 @@ func NewPlanner(config Config) (*Planner, error) {
 		(binaryFromSandbox != ".." && !strings.HasPrefix(binaryFromSandbox, ".."+string(filepath.Separator))) {
 		return nil, fmt.Errorf("%w: NsJail binary cannot be loaded from the mutable sandbox root", ErrInvalidConfig)
 	}
+	worstCaseControlSocketPath := filepath.Join(
+		config.SandboxRoot,
+		strings.Repeat("s", maximumSandboxIdentityBytes),
+		fmt.Sprintf("generation-%016x", maximumSharedGeneration),
+		"control",
+		sandboxControlSocketName,
+	)
+	if len(worstCaseControlSocketPath) > maximumUnixSocketPathBytes {
+		return nil, fmt.Errorf("%w: derived sandbox control socket exceeds the Linux sockaddr limit", ErrInvalidConfig)
+	}
 
 	return &Planner{config: config}, nil
 }
@@ -337,14 +352,14 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = fmt.Fprintf(&configuration, "mount {\n  dst: \"/scratch\"\n  fstype: \"tmpfs\"\n  options: %s\n  rw: true\n  mandatory: true\n  nosuid: true\n  nodev: true\n}\n", strconv.Quote(fmt.Sprintf("size=%d,mode=0700,nosuid,nodev", limits.ScratchBytes)))
 	_, _ = fmt.Fprintf(&configuration, "mount {\n  dst: \"/tmp\"\n  fstype: \"tmpfs\"\n  options: %s\n  rw: true\n  mandatory: true\n  nosuid: true\n  nodev: true\n  noexec: true\n}\n", strconv.Quote(fmt.Sprintf("size=%d,mode=1777,nosuid,nodev,noexec", limits.TemporaryBytes)))
 	_, _ = fmt.Fprintf(&configuration, "mount {\n  dst: \"/run\"\n  fstype: \"tmpfs\"\n  options: %s\n  rw: true\n  mandatory: true\n  nosuid: true\n  nodev: true\n  noexec: true\n}\n", strconv.Quote(fmt.Sprintf("size=%d,mode=0755,nosuid,nodev,noexec", limits.RunBytes)))
-	_, _ = fmt.Fprintf(&configuration, "mount {\n  src: %s\n  dst: \"/run/circulusd/control\"\n  is_bind: true\n  rw: true\n  mandatory: true\n  nosuid: true\n  nodev: true\n  noexec: true\n}\n", strconv.Quote(controlPath))
+	_, _ = fmt.Fprintf(&configuration, "mount {\n  src: %s\n  dst: %s\n  is_bind: true\n  rw: true\n  mandatory: true\n  nosuid: true\n  nodev: true\n  noexec: true\n}\n", strconv.Quote(controlPath), strconv.Quote(sandboxControlMountPath))
 	for _, device := range []string{"/dev/null", "/dev/zero", "/dev/urandom"} {
 		_, _ = fmt.Fprintf(&configuration, "mount {\n  src: %s\n  dst: %s\n  is_bind: true\n  rw: true\n  mandatory: true\n  nosuid: true\n}\n", strconv.Quote(device), strconv.Quote(device))
 	}
 	_, _ = configuration.WriteString("envar: \"PATH=/usr/local/bin:/usr/bin:/bin\"\n")
 	_, _ = configuration.WriteString("envar: \"HOME=/scratch\"\nenvar: \"TMPDIR=/tmp\"\n")
 	_, _ = fmt.Fprintf(&configuration, "exec_bin {\n  path: %s\n", strconv.Quote(planner.config.SandboxdPath))
-	_, _ = configuration.WriteString("  arg: \"--control-socket\"\n  arg: \"/run/circulusd/control/control.sock\"\n")
+	_, _ = fmt.Fprintf(&configuration, "  arg: \"--control-socket\"\n  arg: %s\n", strconv.Quote(sandboxControlSocketPath))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--sandbox-id\"\n  arg: %s\n", strconv.Quote(request.SandboxID.String()))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--generation\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(request.Generation, 10)))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--protocol-version\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.ProtocolVersion), 10)))

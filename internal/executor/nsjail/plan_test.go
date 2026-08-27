@@ -3,7 +3,9 @@ package nsjail
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -79,7 +81,7 @@ func TestPlannerBuildsExplicitFailClosedProductionPlan(t *testing.T) {
 		"envar: \"PATH=/usr/local/bin:/usr/bin:/bin\"",
 		"path: \"/usr/lib/circulusd/sandboxd\"",
 		"arg: \"--control-socket\"",
-		"arg: \"/run/circulusd/control/control.sock\"",
+		"arg: \"/run/circulusd/control/rpc.sock\"",
 		"arg: \"--sandbox-id\"",
 		"arg: \"" + request.SandboxID.String() + "\"",
 		"arg: \"--generation\"",
@@ -117,6 +119,37 @@ func TestPlannerBuildsExplicitFailClosedProductionPlan(t *testing.T) {
 		if !strings.Contains(configuration, "src: \""+device+"\"\n  dst: \""+device+"\"") {
 			t.Errorf("configuration does not explicitly mount %s", device)
 		}
+	}
+}
+
+func TestPlannerEnforcesWorstCaseControlSocketPathBudget(t *testing.T) {
+	t.Parallel()
+	request := validRequest(t)
+	generationDirectory := fmt.Sprintf("generation-%016x", maximumSharedGeneration)
+	relativeSocketPath := filepath.Join(
+		strings.Repeat("s", len(request.SandboxID.String())),
+		generationDirectory,
+		"control",
+		sandboxControlSocketName,
+	)
+	maximumRootBytes := maximumUnixSocketPathBytes - len(relativeSocketPath) - 1
+	if maximumRootBytes < 2 {
+		t.Fatalf("test path budget is invalid: %d", maximumRootBytes)
+	}
+
+	config := validConfig()
+	config.SandboxRoot = "/" + strings.Repeat("s", maximumRootBytes-1)
+	worstCasePath := filepath.Join(config.SandboxRoot, relativeSocketPath)
+	if len(worstCasePath) != maximumUnixSocketPathBytes {
+		t.Fatalf("boundary socket path bytes = %d, want %d", len(worstCasePath), maximumUnixSocketPathBytes)
+	}
+	if _, err := NewPlanner(config); err != nil {
+		t.Fatalf("NewPlanner(boundary path) error = %v", err)
+	}
+
+	config.SandboxRoot += "s"
+	if _, err := NewPlanner(config); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewPlanner(overlong socket path) error = %v, want ErrInvalidConfig", err)
 	}
 }
 

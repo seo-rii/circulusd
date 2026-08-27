@@ -507,8 +507,13 @@ func TestLauncherRegistersNonceBeforeStartAndRevokesFailedLaunch(t *testing.T) {
 	if len(registrations) != 1 || len(registrations[0].nonce) != handshakeNonceBytes || registrations[0].revocations != 1 {
 		t.Fatalf("registrations = %#v, want one revoked %d-byte nonce", registrations, handshakeNonceBytes)
 	}
-	if registrations[0].sandboxID != fixture.plan.sandboxID.String() || registrations[0].generation != fixture.plan.generation {
-		t.Fatalf("registered scope = %s/%d", registrations[0].sandboxID, registrations[0].generation)
+	wantSocketPath := filepath.Join(fixture.sandboxPath, "control", sandboxControlSocketName)
+	if registrations[0].request.SandboxID != fixture.plan.sandboxID.String() ||
+		registrations[0].request.Generation != fixture.plan.generation ||
+		registrations[0].request.SocketPath != wantSocketPath ||
+		registrations[0].request.ServerUID != fixture.plan.hostUID {
+		t.Fatalf("registered authority = %v, want sandbox %s generation %d socket %s UID %d",
+			registrations[0].request, fixture.plan.sandboxID.String(), fixture.plan.generation, wantSocketPath, fixture.plan.hostUID)
 	}
 	if _, statErr := os.Lstat(fixture.sandboxPath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("failed registered launch left sandbox path: %v", statErr)
@@ -767,7 +772,15 @@ type launcherFixture struct {
 
 func newLauncherFixture(t *testing.T) launcherFixture {
 	t.Helper()
-	base := t.TempDir()
+	base, err := os.MkdirTemp("/tmp", "n")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(base); err != nil {
+			t.Errorf("RemoveAll(%q) error = %v", base, err)
+		}
+	})
 	environmentRoot := filepath.Join(base, "environments")
 	sandboxRoot := filepath.Join(base, "sandboxes")
 	cgroupRoot := filepath.Join(base, "cgroup")
@@ -903,8 +916,7 @@ func (starter *recordingProcessStarter) Start(command launchCommand) (launchedPr
 
 type recordedHandshakeNonceRegistration struct {
 	registry    *recordingHandshakeNonceRegistry
-	sandboxID   string
-	generation  uint64
+	request     HandshakeNonceRegistrationRequest
 	nonce       []byte
 	revocations int
 }
@@ -923,9 +935,7 @@ func newLauncher(starter processStarter) *Launcher {
 
 func (registry *recordingHandshakeNonceRegistry) RegisterHandshakeNonce(
 	_ context.Context,
-	sandboxID string,
-	generation uint64,
-	nonce []byte,
+	request HandshakeNonceRegistrationRequest,
 ) (HandshakeNonceRegistration, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
@@ -933,7 +943,7 @@ func (registry *recordingHandshakeNonceRegistry) RegisterHandshakeNonce(
 		return nil, registry.registerErr
 	}
 	registration := &recordedHandshakeNonceRegistration{
-		registry: registry, sandboxID: sandboxID, generation: generation, nonce: append([]byte(nil), nonce...),
+		registry: registry, request: request, nonce: append([]byte(nil), request.OneTimeNonce...),
 	}
 	registry.registrations = append(registry.registrations, registration)
 	return registration, nil
@@ -972,6 +982,7 @@ func (registry *recordingHandshakeNonceRegistry) snapshot() []recordedHandshakeN
 	for index, registration := range registry.registrations {
 		result[index] = *registration
 		result[index].registry = nil
+		result[index].request.OneTimeNonce = nil
 		result[index].nonce = append([]byte(nil), registration.nonce...)
 	}
 	return result

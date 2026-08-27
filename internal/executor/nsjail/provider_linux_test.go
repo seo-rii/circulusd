@@ -1079,9 +1079,7 @@ type typedNilBroker struct{}
 
 func (*typedNilBroker) RegisterHandshakeNonce(
 	context.Context,
-	string,
-	uint64,
-	[]byte,
+	HandshakeNonceRegistrationRequest,
 ) (HandshakeNonceRegistration, error) {
 	return nil, errors.New("unused")
 }

@@ -71,15 +71,37 @@ type HandshakeNonceRegistration interface {
 	Revoke(context.Context) error
 }
 
-// HandshakeNonceRegistry synchronously snapshots a raw nonce under the exact
-// sandbox generation before NsJail is started. The broker can later consume it
-// while authenticating sandboxd on the private control UDS.
+// HandshakeNonceRegistrationRequest is launch-time authority captured only
+// after Launcher has securely materialized the exact control directory. Its
+// formatting deliberately redacts the one-time nonce.
+type HandshakeNonceRegistrationRequest struct {
+	SandboxID    string
+	Generation   uint64
+	SocketPath   string
+	ServerUID    uint32
+	OneTimeNonce []byte
+}
+
+func (request HandshakeNonceRegistrationRequest) String() string {
+	return formatRedactedHandshakeRegistration(request, "")
+}
+
+func (request HandshakeNonceRegistrationRequest) GoString() string {
+	return formatRedactedHandshakeRegistration(request, "nsjail.HandshakeNonceRegistrationRequest")
+}
+
+func formatRedactedHandshakeRegistration(request HandshakeNonceRegistrationRequest, prefix string) string {
+	return fmt.Sprintf("%s{SandboxID:%q Generation:%d SocketPath:%q ServerUID:%d OneTimeNonce:<redacted>}",
+		prefix, request.SandboxID, request.Generation, request.SocketPath, request.ServerUID)
+}
+
+// HandshakeNonceRegistry synchronously snapshots a raw nonce, the exact sealed
+// host socket path, and its expected server UID before NsJail is started. The
+// broker can later consume that launch authority while authenticating sandboxd.
 type HandshakeNonceRegistry interface {
 	RegisterHandshakeNonce(
 		context.Context,
-		string,
-		uint64,
-		[]byte,
+		HandshakeNonceRegistrationRequest,
 	) (HandshakeNonceRegistration, error)
 }
 
@@ -397,9 +419,13 @@ func (launcher *Launcher) Start(ctx context.Context, plan LaunchPlan) (*Instance
 	registryNonce := append([]byte(nil), nonce...)
 	nonceRegistration, registrationErr := launcher.nonceRegistry.RegisterHandshakeNonce(
 		ctx,
-		plan.sandboxID.String(),
-		plan.generation,
-		registryNonce,
+		HandshakeNonceRegistrationRequest{
+			SandboxID:    plan.sandboxID.String(),
+			Generation:   plan.generation,
+			SocketPath:   filepath.Join(sandboxPath, "control", sandboxControlSocketName),
+			ServerUID:    plan.hostUID,
+			OneTimeNonce: registryNonce,
+		},
 	)
 	zeroBytes(registryNonce)
 	if registrationErr != nil || nonceRegistration == nil {

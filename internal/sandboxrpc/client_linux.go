@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"connectrpc.com/connect"
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	v1connect "github.com/hancomac/circulusd/api/generated/circulus/v1alpha/circulusv1alphaconnect"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -26,6 +29,10 @@ type ClientConfig struct {
 	SandboxID         []byte
 	SandboxGeneration uint64
 	OneTimeNonce      []byte
+}
+
+type clientDependencies struct {
+	dialUnix func(context.Context, string) (net.Conn, error)
 }
 
 // Client owns one use of a launch capability nonce. It never retries a failed
@@ -39,7 +46,10 @@ type Client struct {
 	transport      *http.Transport
 	control        v1connect.ControlServiceClient
 	process        v1connect.SandboxProcessServiceClient
+	dialUnix       func(context.Context, string) (net.Conn, error)
 	closed         atomic.Bool
+	endpointMu     sync.Mutex
+	endpointFD     int
 
 	handshakeMu        sync.Mutex
 	nonce              [handshakeNonceBytes]byte
@@ -65,17 +75,30 @@ type ProcessEventStream struct {
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
-	if err := validateCanonicalSocketPath(config.SocketPath); err != nil {
-		return nil, err
+	return newClientWithDependencies(config, -1, clientDependencies{})
+}
+
+// NewClientFromPinnedSocketFD constructs a client whose dial authority is the
+// Unix socket inode referenced by pinnedSocketFD. The descriptor is borrowed
+// only for this call and is duplicated before the function returns.
+func NewClientFromPinnedSocketFD(config ClientConfig, pinnedSocketFD int) (*Client, error) {
+	if pinnedSocketFD < 0 {
+		return nil, fmt.Errorf("sandboxrpc: pinned Unix socket descriptor is invalid")
 	}
-	identity, err := inspectSocket(config.SocketPath)
-	if err != nil {
-		return nil, err
+	return newClientWithDependencies(config, pinnedSocketFD, clientDependencies{})
+}
+
+func newClientWithDependencies(
+	config ClientConfig,
+	pinnedSocketFD int,
+	dependencies clientDependencies,
+) (*Client, error) {
+	if dependencies.dialUnix == nil {
+		dependencies.dialUnix = func(ctx context.Context, socketPath string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}
 	}
-	if identity.uid != config.ServerUID {
-		return nil, fmt.Errorf("sandboxrpc: Unix socket owner does not match the expected server UID")
-	}
-	if err := validateClientSocketPath(config.SocketPath, config.ServerUID); err != nil {
+	if err := validateCanonicalSocketPathSyntax(config.SocketPath); err != nil {
 		return nil, err
 	}
 	if !validOpaqueID(config.SandboxID, 256) || config.SandboxGeneration == 0 {
@@ -84,12 +107,60 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if len(config.OneTimeNonce) != handshakeNonceBytes {
 		return nil, fmt.Errorf("sandboxrpc: client one-time nonce must be 32 bytes")
 	}
+	ownedSocketFD := -1
+	var err error
+	if pinnedSocketFD >= 0 {
+		ownedSocketFD, err = unix.FcntlInt(uintptr(pinnedSocketFD), unix.F_DUPFD_CLOEXEC, 0)
+	} else {
+		directoryFD, openDirectoryErr := unix.Openat2(unix.AT_FDCWD, filepath.Dir(config.SocketPath), &unix.OpenHow{
+			Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC),
+			Resolve: uint64(unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS),
+		})
+		if openDirectoryErr != nil {
+			return nil, fmt.Errorf("sandboxrpc: pin Unix socket directory: %w", openDirectoryErr)
+		}
+		var directoryStatus unix.Stat_t
+		if err := unix.Fstat(directoryFD, &directoryStatus); err != nil {
+			_ = unix.Close(directoryFD)
+			return nil, fmt.Errorf("sandboxrpc: inspect pinned Unix socket directory: %w", err)
+		}
+		if directoryStatus.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStatus.Mode&0o777 != 0o700 ||
+			directoryStatus.Uid != config.ServerUID {
+			_ = unix.Close(directoryFD)
+			return nil, fmt.Errorf("sandboxrpc: socket directory must be private and owned by the server UID")
+		}
+		ownedSocketFD, err = unix.Openat(
+			directoryFD,
+			filepath.Base(config.SocketPath),
+			unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+			0,
+		)
+		closeDirectoryErr := unix.Close(directoryFD)
+		if err == nil && closeDirectoryErr != nil {
+			_ = unix.Close(ownedSocketFD)
+			return nil, fmt.Errorf("sandboxrpc: release pinned Unix socket directory: %w", closeDirectoryErr)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sandboxrpc: pin Unix socket endpoint: %w", err)
+	}
+	identity, err := inspectSocketFD(ownedSocketFD)
+	if err != nil {
+		_ = unix.Close(ownedSocketFD)
+		return nil, err
+	}
+	if identity.uid != config.ServerUID {
+		_ = unix.Close(ownedSocketFD)
+		return nil, fmt.Errorf("sandboxrpc: Unix socket owner does not match the expected server UID")
+	}
 	client := &Client{
 		socketPath:     config.SocketPath,
 		socketIdentity: identity,
 		serverUID:      config.ServerUID,
 		sandboxID:      append([]byte(nil), config.SandboxID...),
 		generation:     config.SandboxGeneration,
+		dialUnix:       dependencies.dialUnix,
+		endpointFD:     ownedSocketFD,
 	}
 	copy(client.nonce[:], config.OneTimeNonce)
 	client.transport = &http.Transport{
@@ -120,11 +191,19 @@ func (client *Client) Close() error {
 		return nil
 	}
 	client.transport.CloseIdleConnections()
+	client.endpointMu.Lock()
+	endpointFD := client.endpointFD
+	client.endpointFD = -1
+	client.endpointMu.Unlock()
+	var closeErr error
+	if endpointFD >= 0 {
+		closeErr = unix.Close(endpointFD)
+	}
 	client.handshakeMu.Lock()
 	clear(client.nonce[:])
 	client.handshakeSession = ""
 	client.handshakeMu.Unlock()
-	return nil
+	return closeErr
 }
 
 // Ready establishes and authenticates the client's single-use sandbox session.
@@ -401,17 +480,29 @@ func (client *Client) Wait(ctx context.Context, message *v1.WaitProcessRequest) 
 }
 
 func (client *Client) dialContext(ctx context.Context, _, _ string) (net.Conn, error) {
-	before, err := inspectSocket(client.socketPath)
+	client.endpointMu.Lock()
+	if client.closed.Load() || client.endpointFD < 0 {
+		client.endpointMu.Unlock()
+		return nil, fmt.Errorf("sandboxrpc: client is closed")
+	}
+	endpointFD, err := unix.FcntlInt(uintptr(client.endpointFD), unix.F_DUPFD_CLOEXEC, 0)
+	client.endpointMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("sandboxrpc: duplicate pinned Unix socket endpoint: %w", err)
+	}
+	defer unix.Close(endpointFD)
+	identity, err := inspectSocketFD(endpointFD)
 	if err != nil {
 		return nil, err
 	}
-	if before != client.socketIdentity || before.uid != client.serverUID {
+	if identity != client.socketIdentity || identity.uid != client.serverUID {
 		return nil, fmt.Errorf("sandboxrpc: Unix socket identity changed")
 	}
-	if err := validateClientSocketPath(client.socketPath, client.serverUID); err != nil {
-		return nil, err
+	dialPath := "/proc/self/fd/" + strconv.Itoa(endpointFD)
+	if len(dialPath) > maximumUnixSocketPathBytes {
+		return nil, fmt.Errorf("sandboxrpc: pinned Unix socket descriptor path exceeds Linux sockaddr limit")
 	}
-	connection, err := (&net.Dialer{}).DialContext(ctx, "unix", client.socketPath)
+	connection, err := client.dialUnix(ctx, dialPath)
 	if err != nil {
 		return nil, err
 	}
@@ -420,12 +511,25 @@ func (client *Client) dialContext(ctx context.Context, _, _ string) (net.Conn, e
 		_ = connection.Close()
 		return nil, err
 	}
-	after, err := inspectSocket(client.socketPath)
-	if err != nil || after != before || credential.uid != client.serverUID {
+	if credential.uid != client.serverUID {
 		_ = connection.Close()
 		return nil, fmt.Errorf("sandboxrpc: Unix socket peer identity mismatch")
 	}
 	return connection, nil
+}
+
+func inspectSocketFD(fd int) (socketIdentity, error) {
+	if fd < 0 {
+		return socketIdentity{}, fmt.Errorf("sandboxrpc: Unix socket descriptor is invalid")
+	}
+	var status unix.Stat_t
+	if err := unix.Fstat(fd, &status); err != nil {
+		return socketIdentity{}, fmt.Errorf("sandboxrpc: inspect pinned Unix socket: %w", err)
+	}
+	if status.Mode&unix.S_IFMT != unix.S_IFSOCK || status.Mode&0o777 != 0o600 {
+		return socketIdentity{}, fmt.Errorf("sandboxrpc: endpoint must be a mode 0600 Unix socket")
+	}
+	return socketIdentity{device: uint64(status.Dev), inode: status.Ino, uid: status.Uid}, nil
 }
 
 func callClient[T any](client *Client, ctx context.Context, invoke func(string) (*connect.Response[T], error)) (*connect.Response[T], error) {

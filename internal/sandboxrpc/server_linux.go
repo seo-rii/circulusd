@@ -974,11 +974,8 @@ func redactedError(err error) error {
 }
 
 func validateCanonicalSocketPath(path string) error {
-	if path == "" || strings.IndexByte(path, 0) >= 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
-		return fmt.Errorf("sandboxrpc: socket path must be canonical and absolute")
-	}
-	if len(path) > maximumUnixSocketPathBytes {
-		return fmt.Errorf("sandboxrpc: socket path exceeds Linux sockaddr limit")
+	if err := validateCanonicalSocketPathSyntax(path); err != nil {
+		return err
 	}
 	parent := filepath.Dir(path)
 	resolved, err := filepath.EvalSymlinks(parent)
@@ -987,6 +984,16 @@ func validateCanonicalSocketPath(path string) error {
 	}
 	if resolved != parent {
 		return fmt.Errorf("sandboxrpc: socket directory contains a symbolic link")
+	}
+	return nil
+}
+
+func validateCanonicalSocketPathSyntax(path string) error {
+	if path == "" || strings.IndexByte(path, 0) >= 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return fmt.Errorf("sandboxrpc: socket path must be canonical and absolute")
+	}
+	if len(path) > maximumUnixSocketPathBytes {
+		return fmt.Errorf("sandboxrpc: socket path exceeds Linux sockaddr limit")
 	}
 	return nil
 }
