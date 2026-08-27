@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/canonical"
@@ -124,6 +125,11 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 					MaxComponentBytes,
 				)
 			}
+			for _, character := range component {
+				if unicode.IsControl(character) {
+					return nil, fmt.Errorf("%w: %q contains a control character", ErrInvalidPath, entry.Path)
+				}
+			}
 		}
 
 		if _, exists := kinds[entry.Path]; exists {
@@ -229,6 +235,11 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 						component,
 						MaxComponentBytes,
 					)
+				}
+				for _, character := range component {
+					if unicode.IsControl(character) {
+						return nil, fmt.Errorf("%w: symlink %q target contains a control character", ErrInvalidEntry, entry.Path)
+					}
 				}
 			}
 
