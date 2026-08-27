@@ -10,11 +10,13 @@
   "scripts": {
     "build": "pnpm -r --if-present build",
     "check": "pnpm -r --if-present check",
+    "generate:workerd-fixture": "esbuild internal/conformance/workerd/fixture/pi-worker.entry.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:sockets --outfile=internal/conformance/workerd/fixture/pi-worker.mjs",
     "lint": "oxlint --deny-warnings --no-error-on-unmatched-pattern packages workers",
     "test": "pnpm -r --if-present test",
     "test:unit": "pnpm -r --if-present test:unit"
   },
   "devDependencies": {
+    "esbuild": "0.28.1",
     "oxlint": "1.80.0",
     "typescript": "7.0.2",
     "vitest": "4.1.11",

@@ -1,0 +1,26 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const phase0 :Workerd.Config = (
+  services = [
+    (
+      name = "phase0",
+      worker = (
+        compatibilityDate = "@COMPATIBILITY_DATE@",
+        compatibilityFlags = [@COMPATIBILITY_FLAGS@],
+        modules = [
+          (name = "session-host.mjs", esModule = embed "session-host.mjs"),
+          (name = "pi-worker-source", text = embed "pi-worker.mjs")
+        ],
+        bindings = [
+          (name = "LOADER", workerLoader = (id = "circulusd-phase0"))
+        ],
+        globalOutbound = "deny"
+      )
+    ),
+    (
+      name = "deny",
+      external = (address = "unix:/dev/null", http = ())
+    )
+  ],
+  sockets = []
+);

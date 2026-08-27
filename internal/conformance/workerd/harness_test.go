@@ -1,0 +1,534 @@
+package workerd
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/hancomac/circulusd/internal/conformance"
+)
+
+func TestRunReportsEveryRequiredProbeUnavailableWhenWorkerdIsMissing(t *testing.T) {
+	t.Parallel()
+
+	harness, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	harness.lookPath = func(string) (string, error) { return "", fs.ErrNotExist }
+	var commands atomic.Int32
+	harness.runCommand = func(context.Context, string, []string, string) commandOutput {
+		commands.Add(1)
+		return commandOutput{}
+	}
+
+	first := harness.Run(t.Context())
+	second := harness.Run(t.Context())
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("Run() is nondeterministic:\nfirst:  %+v\nsecond: %+v", first, second)
+	}
+	if commands.Load() != 0 {
+		t.Fatalf("commands = %d, want 0", commands.Load())
+	}
+	assertUniformResults(t, first, conformance.Unavailable, "workerd executable is unavailable")
+}
+
+func TestRunRejectsAnUnpinnedBinaryWithoutExecutingIt(t *testing.T) {
+	t.Parallel()
+
+	binary := writeExecutable(t, []byte("not the pinned workerd"))
+	config := testConfig()
+	config.BinaryPath = binary
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var commands atomic.Int32
+	harness.runCommand = func(context.Context, string, []string, string) commandOutput {
+		commands.Add(1)
+		return commandOutput{}
+	}
+
+	report := harness.Run(t.Context())
+	if commands.Load() != 0 {
+		t.Fatalf("commands = %d, want 0", commands.Load())
+	}
+	assertUniformResults(t, report, conformance.Fail, "workerd binary digest does not match the release pin")
+	actual := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("not the pinned workerd")))
+	for _, result := range report.Results {
+		if result.Evidence.BinaryDigest != actual || result.Evidence.Mock {
+			t.Fatalf("result evidence = %+v, want actual non-mock digest %q", result.Evidence, actual)
+		}
+	}
+}
+
+func TestRunRequiresThePinnedVersionBeforeExecutingProbes(t *testing.T) {
+	t.Parallel()
+
+	contents := []byte("fake workerd")
+	binary := writeExecutable(t, contents)
+	config := testConfig()
+	config.BinaryPath = binary
+	config.ExpectedBinaryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(contents))
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var commands atomic.Int32
+	harness.runCommand = func(_ context.Context, _ string, arguments []string, _ string) commandOutput {
+		commands.Add(1)
+		if !reflect.DeepEqual(arguments, []string{"--version"}) {
+			t.Fatalf("arguments = %q, want version probe", arguments)
+		}
+		return commandOutput{stdout: []byte("workerd 1900-01-01\n")}
+	}
+
+	report := harness.Run(t.Context())
+	if commands.Load() != 1 {
+		t.Fatalf("commands = %d, want 1", commands.Load())
+	}
+	assertUniformResults(t, report, conformance.Fail, "workerd version does not match the release pin")
+}
+
+func TestRunAcceptsThePinnedWorkerdVerifiedFDVersionDiagnostic(t *testing.T) {
+	t.Parallel()
+
+	contents := []byte("fake pinned workerd")
+	binary := writeExecutable(t, contents)
+	config := testConfig()
+	config.BinaryPath = binary
+	config.ExpectedBinaryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(contents))
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	harness.runCommand = func(_ context.Context, _ string, arguments []string, _ string) commandOutput {
+		if reflect.DeepEqual(arguments, []string{"--version"}) {
+			return commandOutput{
+				stdout: []byte(config.ExpectedVersion + "\n"),
+				stderr: []byte("Unable to find and open the program executable, so unable to determine if there is a compiled-in config file. Proceeding on the assumption that there is not.\n"),
+			}
+		}
+		return commandOutput{}
+	}
+
+	report := harness.Run(t.Context())
+	for _, result := range report.Results {
+		if result.Status == conformance.Fail {
+			t.Fatalf("result = %+v, want verified-fd diagnostic accepted", result)
+		}
+		if result.Evidence.Version != config.ExpectedVersion {
+			t.Fatalf("result version = %q, want %q", result.Evidence.Version, config.ExpectedVersion)
+		}
+	}
+}
+
+func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *testing.T) {
+	t.Parallel()
+
+	contents := []byte("fake pinned workerd")
+	binary := writeExecutable(t, contents)
+	config := testConfig()
+	config.BinaryPath = binary
+	config.ExpectedBinaryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(contents))
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var mutex sync.Mutex
+	seen := make(map[string]int)
+	harness.runCommand = func(_ context.Context, command string, arguments []string, directory string) commandOutput {
+		executed, readErr := os.ReadFile(command)
+		if readErr != nil {
+			t.Fatalf("ReadFile(%q) error = %v", command, readErr)
+		}
+		if !bytes.Equal(executed, contents) {
+			t.Fatalf("executed bytes = %q, want pinned bytes %q", executed, contents)
+		}
+		if len(arguments) == 1 && arguments[0] == "--version" {
+			return commandOutput{stdout: []byte(config.ExpectedVersion + "\n")}
+		}
+		if len(arguments) != 7 || arguments[0] != "test" ||
+			arguments[1] != "--experimental" || arguments[2] != "--predictable" ||
+			arguments[3] != "--no-verbose" || arguments[4] != "-I"+directory ||
+			arguments[5] != filepath.Join(directory, "phase0.capnp") {
+			t.Fatalf("probe arguments = %q", arguments)
+		}
+		entrypoint := strings.TrimPrefix(arguments[6], "phase0:")
+		mutex.Lock()
+		seen[entrypoint]++
+		mutex.Unlock()
+		if entrypoint == "outboundDenial" {
+			return commandOutput{err: errors.New("exit status 1")}
+		}
+		return commandOutput{stderr: []byte("stock workerd test diagnostics\n")}
+	}
+
+	report := harness.Run(t.Context())
+	runnableProbes := 0
+	for _, probe := range requiredProbes {
+		if probe.entrypoint != "" {
+			runnableProbes++
+		}
+	}
+	if len(seen) != runnableProbes {
+		t.Fatalf("executed probes = %v, want %d distinct probes", seen, runnableProbes)
+	}
+	for _, probe := range requiredProbes {
+		if probe.entrypoint == "" {
+			continue
+		}
+		if seen[probe.entrypoint] != 1 {
+			t.Fatalf("probe %q calls = %d, want 1", probe.entrypoint, seen[probe.entrypoint])
+		}
+	}
+	for _, result := range report.Results {
+		wantStatus := conformance.Pass
+		wantReason := ""
+		wantMock := false
+		switch result.Component {
+		case "workerd.agent-adapter-smoke":
+			wantMock = true
+		case "workerd.agent-engine":
+			wantStatus = conformance.NotRun
+			wantReason = "real pinned Pi package probe is not configured"
+		case "workerd.outbound-denial":
+			wantStatus = conformance.Fail
+			wantReason = "stock workerd probe returned a non-zero exit status"
+		case "workerd.shard-recycle":
+			wantStatus = conformance.NotRun
+			wantReason = "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"
+		case "workerd.stable-broker-binding":
+			wantStatus = conformance.NotRun
+			wantReason = "stable broker RPC probe is not configured"
+		}
+		if result.Status != wantStatus || result.Reason != wantReason {
+			t.Fatalf("result %q = %+v, want status=%s reason=%q", result.Component, result, wantStatus, wantReason)
+		}
+		if result.Evidence.BinaryDigest != config.ExpectedBinaryDigest ||
+			result.Evidence.Version != config.ExpectedVersion ||
+			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock != wantMock {
+			t.Fatalf("result %q evidence = %+v", result.Component, result.Evidence)
+		}
+	}
+}
+
+func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
+	t.Parallel()
+
+	componentsByEntrypoint := make(map[string]string)
+	notRunReasons := make(map[string]string)
+	for _, candidate := range requiredProbes {
+		if candidate.entrypoint == "" {
+			notRunReasons[candidate.component] = candidate.notRunReason
+			continue
+		}
+		componentsByEntrypoint[candidate.entrypoint] = candidate.component
+	}
+
+	if got := componentsByEntrypoint["agentEngine"]; got != "workerd.agent-adapter-smoke" {
+		t.Fatalf("agentEngine component = %q, want adapter smoke", got)
+	}
+	if got := componentsByEntrypoint["shardRecycle"]; got != "" {
+		t.Fatalf("shardRecycle component = %q, want no runnable substitute for the agentd cgroup gate", got)
+	}
+	wantNotRun := map[string]string{
+		"workerd.agent-engine":          "real pinned Pi package probe is not configured",
+		"workerd.shard-recycle":         "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
+		"workerd.stable-broker-binding": "stable broker RPC probe is not configured",
+	}
+	if !reflect.DeepEqual(notRunReasons, wantNotRun) {
+		t.Fatalf("NOT_RUN checks = %#v, want %#v", notRunReasons, wantNotRun)
+	}
+}
+
+func TestEnvironmentDigestBindsProbeInventory(t *testing.T) {
+	original := append([]probe(nil), requiredProbes...)
+	defer func() { requiredProbes = original }()
+
+	first, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New(first) error = %v", err)
+	}
+	requiredProbes = append([]probe(nil), requiredProbes...)
+	requiredProbes[0].component = "workerd.changed-probe-contract"
+	second, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New(second) error = %v", err)
+	}
+	if first.environmentDigest == second.environmentDigest {
+		t.Fatalf("environment digest did not bind probe inventory: %q", first.environmentDigest)
+	}
+	first.lookPath = func(string) (string, error) { return "", fs.ErrNotExist }
+	firstReport := first.Run(t.Context())
+	for _, result := range firstReport.Results {
+		if result.Component == "workerd.changed-probe-contract" {
+			t.Fatal("constructed harness did not retain its digested probe inventory")
+		}
+	}
+}
+
+func TestRunExecutesTheVerifiedOpenBinaryAfterPathReplacement(t *testing.T) {
+	t.Parallel()
+
+	original := []byte("verified workerd inode")
+	replacement := []byte("different executable at the configured path")
+	binary := writeExecutable(t, original)
+	config := testConfig()
+	config.BinaryPath = binary
+	config.ExpectedBinaryDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(original))
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var replaceOnce sync.Once
+	var observed [][]byte
+	var mutex sync.Mutex
+	harness.runCommand = func(_ context.Context, command string, arguments []string, _ string) commandOutput {
+		replaceOnce.Do(func() {
+			replacementPath := binary + ".replacement"
+			if writeErr := os.WriteFile(replacementPath, replacement, 0o700); writeErr != nil {
+				t.Errorf("WriteFile(replacement) error = %v", writeErr)
+				return
+			}
+			if renameErr := os.Rename(replacementPath, binary); renameErr != nil {
+				t.Errorf("Rename(replacement) error = %v", renameErr)
+			}
+		})
+		contents, readErr := os.ReadFile(command)
+		if readErr != nil {
+			t.Errorf("ReadFile(executed binary) error = %v", readErr)
+		}
+		mutex.Lock()
+		observed = append(observed, contents)
+		mutex.Unlock()
+		if len(arguments) == 1 && arguments[0] == "--version" {
+			return commandOutput{stdout: []byte(config.ExpectedVersion + "\n")}
+		}
+		return commandOutput{}
+	}
+
+	report := harness.Run(t.Context())
+	if len(observed) == 0 {
+		t.Fatal("Run() did not execute the verified binary")
+	}
+	for index, contents := range observed {
+		if !bytes.Equal(contents, original) {
+			t.Fatalf("executed binary[%d] = %q, want verified bytes %q", index, contents, original)
+		}
+	}
+	for _, result := range report.Results {
+		if result.Status == conformance.Fail {
+			t.Fatalf("result = %+v, want no execution failure", result)
+		}
+	}
+}
+
+func TestRunIsConcurrentAndCanceledRunsNeverStartWorkerd(t *testing.T) {
+	t.Parallel()
+
+	harness, err := New(testConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var lookups atomic.Int32
+	harness.lookPath = func(string) (string, error) {
+		lookups.Add(1)
+		return "", fs.ErrNotExist
+	}
+
+	const runs = 32
+	reports := make(chan conformance.Report, runs)
+	var wait sync.WaitGroup
+	for range runs {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			reports <- harness.Run(context.Background())
+		}()
+	}
+	wait.Wait()
+	close(reports)
+	var first *conformance.Report
+	for report := range reports {
+		if first == nil {
+			copy := report
+			first = &copy
+			continue
+		}
+		if !reflect.DeepEqual(*first, report) {
+			t.Fatalf("concurrent reports differ: %+v != %+v", *first, report)
+		}
+	}
+	if lookups.Load() != runs {
+		t.Fatalf("lookups = %d, want %d", lookups.Load(), runs)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := lookups.Load()
+	report := harness.Run(canceled)
+	if lookups.Load() != before {
+		t.Fatal("canceled Run() looked up workerd")
+	}
+	assertUniformResults(t, report, conformance.NotRun, "conformance run was canceled")
+}
+
+func TestNewRejectsAmbiguousOrUnboundedConfiguration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "relative binary", mutate: func(config *Config) { config.BinaryPath = "workerd" }},
+		{name: "digest", mutate: func(config *Config) { config.ExpectedBinaryDigest = "sha256:ABC" }},
+		{name: "version", mutate: func(config *Config) { config.ExpectedVersion = "workerd\nforged" }},
+		{name: "date", mutate: func(config *Config) { config.CompatibilityDate = "latest" }},
+		{name: "impossible date", mutate: func(config *Config) { config.CompatibilityDate = "2026-02-30" }},
+		{name: "flag", mutate: func(config *Config) { config.CompatibilityFlags = []string{"nodejs-compat"} }},
+		{name: "duplicate flag", mutate: func(config *Config) { config.CompatibilityFlags = []string{"a", "a"} }},
+		{name: "unsorted flag", mutate: func(config *Config) { config.CompatibilityFlags = []string{"z", "a"} }},
+		{name: "timeout", mutate: func(config *Config) { config.ProbeTimeout = 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			config := testConfig()
+			test.mutate(&config)
+			if _, err := New(config); err == nil {
+				t.Fatal("New() error = nil")
+			}
+		})
+	}
+}
+
+func TestWorkerFixtureContainsTheLowLevelAdapterSmoke(t *testing.T) {
+	t.Parallel()
+
+	worker, err := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	for _, required := range []string{
+		"var LowLevelPiAgentEngine = class",
+		"circulusd.session.agent-checkpoint",
+		"createOpaqueTurnAuthority",
+	} {
+		if !bytes.Contains(worker, []byte(required)) {
+			t.Fatalf("worker fixture does not contain %q from the low-level adapter", required)
+		}
+	}
+	if bytes.Contains(worker, []byte("modelRequests: 1,\n        toolRequests: 1")) {
+		t.Fatal("worker fixture contains the old synthetic turn result")
+	}
+}
+
+func TestEmbeddedFixtureDoesNotCarryAnUnboundedShardRecycleSubstitute(t *testing.T) {
+	t.Parallel()
+
+	host, err := fixtureFiles.ReadFile("fixture/session-host.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(session host) error = %v", err)
+	}
+	worker, err := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(worker) error = %v", err)
+	}
+	for name, candidate := range map[string][]byte{
+		"host shard entrypoint": bytes.TrimSpace([]byte("export const shardRecycle")),
+		"worker spin route":     bytes.TrimSpace([]byte(`path === "/spin"`)),
+	} {
+		if bytes.Contains(host, candidate) || bytes.Contains(worker, candidate) {
+			t.Fatalf("embedded fixture contains %s %q", name, candidate)
+		}
+	}
+}
+
+func TestStockWorkerdFixture(t *testing.T) {
+	binary := os.Getenv("CIRCULUSD_WORKERD_PATH")
+	digest := os.Getenv("CIRCULUSD_WORKERD_SHA256")
+	version := os.Getenv("CIRCULUSD_WORKERD_VERSION")
+	if binary == "" || digest == "" || version == "" {
+		t.Skip("set CIRCULUSD_WORKERD_PATH, CIRCULUSD_WORKERD_SHA256, and CIRCULUSD_WORKERD_VERSION")
+	}
+	config := testConfig()
+	config.BinaryPath = binary
+	config.ExpectedBinaryDigest = digest
+	config.ExpectedVersion = version
+	config.CompatibilityFlags = nil
+	config.ProbeTimeout = 15 * time.Second
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	runCommand := harness.runCommand
+	harness.runCommand = func(ctx context.Context, command string, arguments []string, directory string) commandOutput {
+		output := runCommand(ctx, command, arguments, directory)
+		if output.err != nil || reflect.DeepEqual(arguments, []string{"--version"}) {
+			t.Logf("command %q failed: %v\nstdout:\n%s\nstderr:\n%s", arguments, output.err, output.stdout, output.stderr)
+		}
+		return output
+	}
+	report := harness.Run(t.Context())
+	for _, result := range report.Results {
+		switch result.Component {
+		case "workerd.agent-engine", "workerd.shard-recycle", "workerd.stable-broker-binding":
+			if result.Status != conformance.NotRun {
+				t.Fatalf("external-boundary result = %+v, want NOT_RUN", result)
+			}
+		default:
+			if result.Status != conformance.Pass {
+				t.Fatalf("stock workerd result = %+v", result)
+			}
+		}
+	}
+}
+
+func testConfig() Config {
+	return Config{
+		ExpectedBinaryDigest: "sha256:" + strings.Repeat("a", 64),
+		ExpectedVersion:      "workerd 2026-08-25",
+		CompatibilityDate:    "2026-08-26",
+		CompatibilityFlags:   []string{"nodejs_compat", "streams_enable_constructors"},
+		ProbeTimeout:         time.Second,
+	}
+}
+
+func writeExecutable(t *testing.T, contents []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "workerd")
+	if err := os.WriteFile(path, contents, 0o700); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
+}
+
+func assertUniformResults(t *testing.T, report conformance.Report, status conformance.Status, reason string) {
+	t.Helper()
+	if len(report.Results) != len(requiredProbes) {
+		t.Fatalf("len(results) = %d, want %d", len(report.Results), len(requiredProbes))
+	}
+	components := make([]string, 0, len(requiredProbes))
+	for _, probe := range requiredProbes {
+		components = append(components, probe.component)
+	}
+	sort.Strings(components)
+	for index, result := range report.Results {
+		if result.Component != components[index] || result.Status != status || result.Reason != reason {
+			t.Fatalf("result[%d] = %+v, want component=%q status=%s reason=%q", index, result, components[index], status, reason)
+		}
+	}
+}
