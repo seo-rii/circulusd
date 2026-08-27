@@ -41,6 +41,21 @@ describe("RFC 8949 deterministic CBOR", () => {
     }
   });
 
+  it("reserves framing depth when hashing a depth-64 protocol value", async () => {
+    const payload: Record<string, unknown> = {};
+    let cursor = payload;
+    for (let depth = 0; depth < 64; depth += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.next = next;
+      cursor = next;
+    }
+
+    expect(() => encodeCanonicalCbor(payload, { maxDepth: 64 })).not.toThrow();
+    await expect(
+      digestStructuredValue("circulusd.depth-budget", 1, payload),
+    ).resolves.toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
   it("uses length-first then bytewise map-key ordering", () => {
     expect(encodeHex(encodeCanonicalCbor({ z: 0, aa: 1, b: 2 }))).toBe(
       "a3616202617a0062616101",
@@ -119,6 +134,15 @@ describe("RFC 8949 deterministic CBOR", () => {
   it("enforces explicit depth and encoded-size limits", () => {
     expect(() => encodeCanonicalCbor([[0]], { maxDepth: 1 })).toThrow(/depth/);
     expect(() => encodeCanonicalCbor("abcd", { maxBytes: 4 })).toThrow(/size/);
+  });
+
+  it("enforces the same aggregate item budget while encoding as decoding", () => {
+    const value = [null, null];
+
+    expect(() => encodeCanonicalCbor(value, { maxItems: 2 })).toThrow(/item limit/);
+    expect(encodeCanonicalCbor(value, { maxItems: 3 })).toEqual(
+      encodeCanonicalCbor(value),
+    );
   });
 });
 

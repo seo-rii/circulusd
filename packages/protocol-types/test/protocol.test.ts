@@ -140,6 +140,13 @@ describe("protocol constants and RPC envelopes", () => {
         { maxEncodedBytes: 16 },
       ),
     ).toThrow(/size/);
+    expect(() =>
+      parseRpcEnvelope(
+        { ...envelope, payload: new Array<null>(50).fill(null) },
+        parseNormalizedValue,
+        { maxItems: 20 },
+      ),
+    ).toThrow(/item limit/);
   });
 });
 

@@ -24,6 +24,7 @@ import type {
 
 const DEFAULT_RPC_MAX_DEPTH = 64;
 const DEFAULT_RPC_MAX_ENCODED_BYTES = 1_048_576;
+const DEFAULT_RPC_MAX_ITEMS = 100_000;
 const MAX_IDENTIFIER_BYTES = 256;
 const MAX_OPERATION_BYTES = 256;
 const MAX_CHECKPOINT_PAYLOAD_BYTES = 4 * 1_048_576;
@@ -139,6 +140,16 @@ export function parseRpcEnvelope<T>(
   payloadParser: ValueParser<T>,
   options: RpcValidationOptions = {},
 ): RpcEnvelope<T> {
+  const maxDepth = options.maxDepth ?? DEFAULT_RPC_MAX_DEPTH;
+  const maxEncodedBytes = options.maxEncodedBytes ?? DEFAULT_RPC_MAX_ENCODED_BYTES;
+  const maxItems = options.maxItems ?? DEFAULT_RPC_MAX_ITEMS;
+  // Bound the untrusted graph before a semantic payload parser can clone or
+  // otherwise traverse it. The trusted parser result is checked again below.
+  encodeCanonicalCbor(value, {
+    maxBytes: maxEncodedBytes,
+    maxDepth,
+    maxItems,
+  });
   const record = exactRecord(
     value,
     ["protocol", "major", "minor", "schemaDigest", "requestId", "payload"],
@@ -162,9 +173,11 @@ export function parseRpcEnvelope<T>(
     payload: payloadParser(record.payload),
   };
 
-  const maxDepth = options.maxDepth ?? DEFAULT_RPC_MAX_DEPTH;
-  const maxEncodedBytes = options.maxEncodedBytes ?? DEFAULT_RPC_MAX_ENCODED_BYTES;
-  encodeCanonicalCbor(envelope, { maxBytes: maxEncodedBytes, maxDepth });
+  encodeCanonicalCbor(envelope, {
+    maxBytes: maxEncodedBytes,
+    maxDepth,
+    maxItems,
+  });
   return envelope;
 }
 

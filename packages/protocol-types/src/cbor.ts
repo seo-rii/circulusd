@@ -30,11 +30,16 @@ function normalize(
   path: string,
   depth: number,
   maxDepth: number,
+  itemBudget: { items: number; readonly maxItems: number },
   seen: WeakSet<object>,
 ): NormalizedValue {
   if (depth > maxDepth) {
     validationError(path, `maximum depth ${maxDepth} exceeded`);
   }
+  if (itemBudget.items >= itemBudget.maxItems) {
+    validationError(path, `encoded item limit ${itemBudget.maxItems} exceeded`);
+  }
+  itemBudget.items += 1;
   if (value === null || typeof value === "boolean") {
     return value;
   }
@@ -105,7 +110,7 @@ function normalize(
       validationError(path, "sparse arrays are unsupported");
     }
     return value.map((entry, index) =>
-      normalize(entry, `${path}[${index}]`, depth + 1, maxDepth, seen),
+      normalize(entry, `${path}[${index}]`, depth + 1, maxDepth, itemBudget, seen),
     );
   }
 
@@ -131,6 +136,10 @@ function normalize(
   const result: Record<string, NormalizedValue> = {};
   const normalizedKeys = new Set<string>();
   for (const key of Object.keys(record)) {
+    if (itemBudget.items >= itemBudget.maxItems) {
+      validationError(path, `encoded item limit ${itemBudget.maxItems} exceeded`);
+    }
+    itemBudget.items += 1;
     assertUnicodeScalarString(key, `${path}.${key}`);
     const normalizedKey = key.normalize("NFC");
     if (normalizedKeys.has(normalizedKey)) {
@@ -140,7 +149,14 @@ function normalize(
     Object.defineProperty(result, normalizedKey, {
       configurable: true,
       enumerable: true,
-      value: normalize(record[key], `${path}.${key}`, depth + 1, maxDepth, seen),
+      value: normalize(
+        record[key],
+        `${path}.${key}`,
+        depth + 1,
+        maxDepth,
+        itemBudget,
+        seen,
+      ),
       writable: true,
     });
   }
@@ -149,10 +165,22 @@ function normalize(
 
 export function normalizeProtocolValue(
   value: unknown,
-  options: Pick<CanonicalCborOptions, "maxDepth"> = {},
+  options: Pick<CanonicalCborOptions, "maxDepth" | "maxItems"> = {},
 ): NormalizedValue {
   const maxDepth = checkedLimit(options.maxDepth, DEFAULT_MAX_DEPTH, "maxDepth");
-  return normalize(value, "$", 0, maxDepth, new WeakSet<object>());
+  const maxItems = checkedLimit(
+    options.maxItems,
+    Number.MAX_SAFE_INTEGER,
+    "maxItems",
+  );
+  return normalize(
+    value,
+    "$",
+    0,
+    maxDepth,
+    { items: 0, maxItems },
+    new WeakSet<object>(),
+  );
 }
 
 export const parseNormalizedValue = normalizeProtocolValue;
@@ -320,7 +348,12 @@ export function encodeCanonicalCbor(
 ): Uint8Array {
   const maxDepth = checkedLimit(options.maxDepth, DEFAULT_MAX_DEPTH, "maxDepth");
   const maxBytes = checkedLimit(options.maxBytes, Number.MAX_SAFE_INTEGER, "maxBytes");
-  const normalized = normalizeProtocolValue(value, { maxDepth });
+  const maxItems = checkedLimit(
+    options.maxItems,
+    Number.MAX_SAFE_INTEGER,
+    "maxItems",
+  );
+  const normalized = normalizeProtocolValue(value, { maxDepth, maxItems });
   const writer = new ByteWriter(maxBytes);
   writeValue(writer, normalized);
   return writer.finish();

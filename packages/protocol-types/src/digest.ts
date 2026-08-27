@@ -41,13 +41,10 @@ export async function digestStructuredValue(
     validationError("$schemaVersion", "must be a positive safe integer");
   }
   return digestBytes(
-    encodeCanonicalCbor([
-      "circulusd.hash",
-      1,
-      domain,
-      schemaVersion,
-      normalizedPayload,
-    ]),
+    encodeCanonicalCbor(
+      ["circulusd.hash", 1, domain, schemaVersion, normalizedPayload],
+      { maxDepth: 72 },
+    ),
   );
 }
 

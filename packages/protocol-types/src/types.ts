@@ -135,12 +135,14 @@ export type ConformanceStatus =
 export interface CanonicalCborOptions {
   readonly maxDepth?: number;
   readonly maxBytes?: number;
+  readonly maxItems?: number;
 }
 
 export interface RpcValidationOptions {
   readonly expectedSchemaDigest?: string;
   readonly maxDepth?: number;
   readonly maxEncodedBytes?: number;
+  readonly maxItems?: number;
 }
 
 export type ValueParser<T> = (value: unknown) => T;
