@@ -82,11 +82,14 @@ func ConformanceProfile(
 		"uds.protocol",
 		"workerd.agent-engine",
 		"workerd.content-addressed-replacement",
+		"workerd.cpu-limit",
 		"workerd.dynamic-worker",
 		"workerd.extension-order",
 		"workerd.isolate-separation",
 		"workerd.outbound-denial",
+		"workerd.rss-cold-start",
 		"workerd.shard-recycle",
+		"workerd.stable-broker-binding",
 	} {
 		required[component] = struct{}{}
 	}

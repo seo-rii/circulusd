@@ -2,9 +2,11 @@ package doctor
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hancomac/circulusd/internal/config"
+	"github.com/hancomac/circulusd/internal/conformance"
 )
 
 func TestConformanceProfileSelectsOnlyTheConfiguredBackendGates(t *testing.T) {
@@ -77,7 +79,10 @@ func TestConformanceProfileSelectsOnlyTheConfiguredBackendGates(t *testing.T) {
 				"host.scratch-quota",
 				"state.kill-durability",
 				"object-store.concurrent-cas",
+				"workerd.cpu-limit",
 				"workerd.dynamic-worker",
+				"workerd.rss-cold-start",
+				"workerd.stable-broker-binding",
 				"effect-recovery.boundary-matrix",
 				"auth.durable-credentials",
 				"audit.durable-chain",
@@ -120,5 +125,31 @@ func TestConformanceProfileRejectsAmbiguousBackendMatrices(t *testing.T) {
 		if _, err := ConformanceProfile(test.profile, test.backends); err == nil {
 			t.Fatalf("ConformanceProfile(tests[%d]) error = nil", index)
 		}
+	}
+}
+
+func TestProductionProfileRejectsMockStableBrokerEvidence(t *testing.T) {
+	t.Parallel()
+
+	profile, err := ConformanceProfile(
+		config.InstallProfileLightweight,
+		[]config.Backend{config.BackendNsJail},
+	)
+	if err != nil {
+		t.Fatalf("ConformanceProfile() error = %v", err)
+	}
+	collector := conformance.NewCollector()
+	for _, component := range profile.Required {
+		result := conformance.Result{Component: component, Status: conformance.Pass}
+		if component == "workerd.stable-broker-binding" {
+			result.Evidence.Mock = true
+		}
+		if err := collector.Add(result); err != nil {
+			t.Fatalf("Add(%q) error = %v", component, err)
+		}
+	}
+	if err := collector.Evaluate(profile); err == nil ||
+		!strings.Contains(err.Error(), "workerd.stable-broker-binding") {
+		t.Fatalf("Evaluate() error = %v, want stable mock rejection", err)
 	}
 }
