@@ -1,10 +1,8 @@
 package release
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -110,20 +108,9 @@ func Load(path string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("release manifest exceeds %d bytes", maxManifestBytes)
 	}
 
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.DisallowUnknownFields()
-
 	var manifest Manifest
-	if err := decoder.Decode(&manifest); err != nil {
-		return Manifest{}, fmt.Errorf("decode release manifest: %w", err)
-	}
-
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return Manifest{}, fmt.Errorf("decode release manifest: trailing JSON value")
-		}
-		return Manifest{}, fmt.Errorf("decode release manifest trailer: %w", err)
+	if err := decodeStrictJSON(encoded, "release manifest", &manifest); err != nil {
+		return Manifest{}, err
 	}
 
 	return manifest, nil

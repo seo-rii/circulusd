@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +17,7 @@ import (
 	"github.com/hancomac/circulusd/internal/config"
 	"github.com/hancomac/circulusd/internal/conformance"
 	"github.com/hancomac/circulusd/internal/doctor"
+	"github.com/hancomac/circulusd/internal/release"
 )
 
 func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T) {
@@ -26,6 +30,7 @@ func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T
 		"doctor",
 		"--config", "/etc/pi-platform/config.yaml",
 		"--release-manifest", "/usr/lib/pi-platform/release-manifest.json",
+		"--release-trust-roots", "/etc/pi-platform/release-trust-roots.json",
 		"--profile", "lightweight",
 	}, commandDependencies{
 		stdout: &stdout,
@@ -40,9 +45,10 @@ func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T
 				backends:      []config.Backend{config.BackendNsJail},
 			}, digest, nil
 		},
-		loadRelease: func(path string, production bool) (doctor.Probe, string, error) {
-			if path != "/usr/lib/pi-platform/release-manifest.json" || !production {
-				t.Fatalf("loadRelease(%q, %t)", path, production)
+		loadRelease: func(path string, trustRootsPath string, production bool) (doctor.Probe, string, error) {
+			if path != "/usr/lib/pi-platform/release-manifest.json" ||
+				trustRootsPath != "/etc/pi-platform/release-trust-roots.json" || !production {
+				t.Fatalf("loadRelease(%q, %q, %t)", path, trustRootsPath, production)
 			}
 			return doctor.Probe{
 				Component: "release.signature",
@@ -118,7 +124,7 @@ func TestDoctorCommandExitsZeroOnlyWhenEverySelectedProductionGatePasses(t *test
 		loadConfiguration: func(string, config.InstallProfile) (configurationSnapshot, string, error) {
 			return configurationSnapshot{dataDirectory: "/var/lib/circulusd", backends: []config.Backend{config.BackendNsJail}}, digest, nil
 		},
-		loadRelease: func(string, bool) (doctor.Probe, string, error) {
+		loadRelease: func(string, string, bool) (doctor.Probe, string, error) {
 			return doctor.Probe{
 				Component: "release.signature",
 				Run: func(context.Context) conformance.Result {
@@ -155,7 +161,7 @@ func TestDoctorCommandRejectsInvalidInputBeforeRunningHostProbes(t *testing.T) {
 			executed = true
 			return configurationSnapshot{}, "", errors.New("must not run")
 		},
-		loadRelease: func(string, bool) (doctor.Probe, string, error) {
+		loadRelease: func(string, string, bool) (doctor.Probe, string, error) {
 			executed = true
 			return doctor.Probe{}, "", errors.New("must not run")
 		},
@@ -174,6 +180,7 @@ func TestDoctorCommandRejectsInvalidInputBeforeRunningHostProbes(t *testing.T) {
 		{"unknown"},
 		{"doctor", "--profile", "future"},
 		{"doctor", "--config", "relative", "--profile", "lightweight"},
+		{"doctor", "--release-trust-roots", "relative", "--profile", "lightweight"},
 		{"doctor", "unexpected"},
 	}
 	for index, arguments := range invalidArguments {
@@ -194,7 +201,11 @@ func TestDefaultReleaseProbeKeepsDevelopmentEvidenceReferenceOnly(t *testing.T) 
 		t.Fatalf("Abs() error = %v", err)
 	}
 	dependencies := defaultDependencies()
-	referenceProbe, digest, err := dependencies.loadRelease(manifestPath, false)
+	referenceProbe, digest, err := dependencies.loadRelease(
+		manifestPath,
+		filepath.Join(t.TempDir(), "missing-roots.json"),
+		false,
+	)
 	if err != nil {
 		t.Fatalf("loadRelease(reference) error = %v", err)
 	}
@@ -205,13 +216,162 @@ func TestDefaultReleaseProbeKeepsDevelopmentEvidenceReferenceOnly(t *testing.T) 
 	if reference.Status != conformance.Pass || !reference.Evidence.Mock {
 		t.Fatalf("reference release result = %+v", reference)
 	}
-	productionProbe, _, err := dependencies.loadRelease(manifestPath, true)
+	productionProbe, _, err := dependencies.loadRelease(
+		manifestPath,
+		filepath.Join(t.TempDir(), "missing-roots.json"),
+		true,
+	)
 	if err != nil {
 		t.Fatalf("loadRelease(production) error = %v", err)
 	}
 	production := productionProbe.Run(t.Context())
 	if production.Status != conformance.Fail || production.Evidence.Mock {
 		t.Fatalf("production release result = %+v", production)
+	}
+}
+
+func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) {
+	t.Parallel()
+
+	privateKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	manifest := release.Manifest{
+		SchemaVersion: 1,
+		Release: release.Release{
+			Version:       "0.3.0",
+			Status:        "production",
+			Architectures: []string{"x86_64"},
+		},
+		Toolchains: map[string]string{
+			"go":                 "1.25.3",
+			"node":               "24.1.0",
+			"pnpm":               "10.30.0",
+			"protoc":             "3.21.12",
+			"protocGenGo":        "1.36.10",
+			"protocGenConnectGo": "1.19.1",
+		},
+	}
+	for _, componentName := range []string{
+		"platformd", "agentd", "executord", "sandboxd", "workerd", "celld",
+	} {
+		component := release.Component{
+			Name:          componentName,
+			Version:       "0.3.0",
+			Commit:        strings.Repeat("0", 40),
+			License:       "Apache-2.0",
+			Source:        "https://example.invalid/" + componentName,
+			Qualification: "conformance-pass",
+			Artifacts: []release.Artifact{{
+				Architecture: "any",
+				Name:         componentName + ".tar.zst",
+				SHA256:       strings.Repeat("1", 64),
+			}},
+		}
+		digest, err := release.ArtifactSigningDigest(
+			manifest.Release,
+			component,
+			component.Artifacts[0],
+		)
+		if err != nil {
+			t.Fatalf("ArtifactSigningDigest() error = %v", err)
+		}
+		component.Artifacts[0].Signature = &release.Signature{
+			Algorithm: "ed25519",
+			KeyID:     "release-root-1",
+			Value: base64.StdEncoding.EncodeToString(
+				ed25519.Sign(privateKey, []byte(digest)),
+			),
+		}
+		manifest.Components = append(manifest.Components, component)
+	}
+	for _, pair := range []string{
+		"platformd-agentd",
+		"platformd-executord",
+		"session-host-dynamic-worker",
+		"executord-sandboxd",
+		"state-app-schema",
+	} {
+		manifest.ProtocolCompatibility = append(
+			manifest.ProtocolCompatibility,
+			release.ProtocolCompatibility{
+				Pair:             pair,
+				Minimum:          release.ProtocolVersion{Major: 1},
+				Maximum:          release.ProtocolVersion{Major: 1},
+				DescriptorSHA256: strings.Repeat("2", 64),
+			},
+		)
+	}
+	manifestDigest, err := release.ManifestSigningDigest(manifest)
+	if err != nil {
+		t.Fatalf("ManifestSigningDigest() error = %v", err)
+	}
+	manifest.Signatures = []release.Signature{{
+		Algorithm: "ed25519",
+		KeyID:     "release-root-1",
+		Value: base64.StdEncoding.EncodeToString(
+			ed25519.Sign(privateKey, []byte(manifestDigest)),
+		),
+	}}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal(manifest) error = %v", err)
+	}
+	temporaryDirectory := t.TempDir()
+	manifestPath := filepath.Join(temporaryDirectory, "release-manifest.json")
+	if err := os.WriteFile(manifestPath, manifestBytes, 0o600); err != nil {
+		t.Fatalf("WriteFile(manifest) error = %v", err)
+	}
+	rootBytes, err := json.Marshal(map[string]any{
+		"schemaVersion": 1,
+		"roots": []map[string]string{{
+			"keyId":     "release-root-1",
+			"algorithm": "ed25519",
+			"publicKey": base64.StdEncoding.EncodeToString(
+				privateKey.Public().(ed25519.PublicKey),
+			),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal(roots) error = %v", err)
+	}
+	rootsPath := filepath.Join(temporaryDirectory, "release-trust-roots.json")
+	if err := os.WriteFile(rootsPath, rootBytes, 0o600); err != nil {
+		t.Fatalf("WriteFile(roots) error = %v", err)
+	}
+
+	probe, digest, err := defaultDependencies().loadRelease(
+		manifestPath,
+		rootsPath,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("loadRelease() error = %v", err)
+	}
+	result := probe.Run(t.Context())
+	if result.Status != conformance.Pass || result.Evidence.Mock ||
+		result.Evidence.BinaryDigest != digest {
+		t.Fatalf("production release result = %+v, digest = %q", result, digest)
+	}
+	missingProbe, _, err := defaultDependencies().loadRelease(
+		manifestPath,
+		filepath.Join(temporaryDirectory, "missing-roots.json"),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("loadRelease(missing roots) error = %v", err)
+	}
+	if missing := missingProbe.Run(t.Context()); missing.Status != conformance.NotRun {
+		t.Fatalf("missing root result = %+v", missing)
+	}
+
+	if err := os.WriteFile(rootsPath, []byte(`{"schemaVersion":1,"roots":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(invalid roots) error = %v", err)
+	}
+	invalidProbe, _, err := defaultDependencies().loadRelease(manifestPath, rootsPath, true)
+	if err != nil {
+		t.Fatalf("loadRelease(invalid roots) error = %v", err)
+	}
+	if invalid := invalidProbe.Run(t.Context()); invalid.Status != conformance.Fail {
+		t.Fatalf("invalid root result = %+v", invalid)
 	}
 }
 

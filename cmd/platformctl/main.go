@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 const (
 	defaultConfigurationPath = "/etc/pi-platform/config.yaml"
 	defaultReleasePath       = "/usr/lib/pi-platform/release-manifest.json"
+	defaultReleaseRootsPath  = "/etc/pi-platform/release-trust-roots.json"
 	minimumDoctorFreeBytes   = 5 << 30
 	minimumDoctorFreeInodes  = 100_000
 )
@@ -39,7 +42,7 @@ type commandDependencies struct {
 	stderr            io.Writer
 	clock             func() time.Time
 	loadConfiguration func(string, config.InstallProfile) (configurationSnapshot, string, error)
-	loadRelease       func(string, bool) (doctor.Probe, string, error)
+	loadRelease       func(string, string, bool) (doctor.Probe, string, error)
 	hostSources       doctor.HostSources
 	additionalProbes  []doctor.Probe
 	runID             func() (string, error)
@@ -63,6 +66,7 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	flags.SetOutput(dependencies.stderr)
 	configurationPath := flags.String("config", defaultConfigurationPath, "absolute platform configuration path")
 	releasePath := flags.String("release-manifest", defaultReleasePath, "absolute release manifest path")
+	releaseRootsPath := flags.String("release-trust-roots", defaultReleaseRootsPath, "absolute offline release trust-root path")
 	profileName := flags.String("profile", string(config.InstallProfileFull), "install profile")
 	if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
 		return 2
@@ -72,9 +76,12 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 		*configurationPath == string(filepath.Separator) ||
 		!filepath.IsAbs(*releasePath) ||
 		filepath.Clean(*releasePath) != *releasePath ||
-		*releasePath == string(filepath.Separator) {
+		*releasePath == string(filepath.Separator) ||
+		!filepath.IsAbs(*releaseRootsPath) ||
+		filepath.Clean(*releaseRootsPath) != *releaseRootsPath ||
+		*releaseRootsPath == string(filepath.Separator) {
 		if dependencies.stderr != nil {
-			fmt.Fprintln(dependencies.stderr, "platformctl: configuration and release paths must be canonical absolute files")
+			fmt.Fprintln(dependencies.stderr, "platformctl: configuration, release, and trust-root paths must be canonical absolute files")
 		}
 		return 2
 	}
@@ -112,6 +119,7 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	}
 	releaseProbe, releaseDigest, err := dependencies.loadRelease(
 		*releasePath,
+		*releaseRootsPath,
 		conformanceProfile.Production,
 	)
 	if err != nil {
@@ -200,7 +208,7 @@ func defaultDependencies() commandDependencies {
 				backends:      append([]config.Backend(nil), configuration.Execution.AllowedBackends...),
 			}, "sha256:" + hex.EncodeToString(hasher.Sum(nil)), nil
 		},
-		loadRelease: func(path string, production bool) (doctor.Probe, string, error) {
+		loadRelease: func(path string, trustRootsPath string, production bool) (doctor.Probe, string, error) {
 			manifest, err := release.Load(path)
 			if err != nil {
 				return doctor.Probe{}, "", err
@@ -216,7 +224,10 @@ func defaultDependencies() commandDependencies {
 				Component: "release.signature",
 				Status:    conformance.NotRun,
 				Reason:    "offline release signature trust roots are not configured",
-				Evidence:  conformance.Evidence{Version: manifest.Release.Version},
+				Evidence: conformance.Evidence{
+					BinaryDigest: digest,
+					Version:      manifest.Release.Version,
+				},
 			}
 			if manifest.Release.Status == "development" {
 				if production {
@@ -226,6 +237,20 @@ func defaultDependencies() commandDependencies {
 					result.Status = conformance.Pass
 					result.Reason = "unsigned development manifest is reference-only"
 					result.Evidence.Mock = true
+				}
+			} else {
+				trustStore, trustErr := release.LoadTrustStore(trustRootsPath)
+				switch {
+				case errors.Is(trustErr, fs.ErrNotExist):
+				case trustErr != nil:
+					result.Status = conformance.Fail
+					result.Reason = "offline release signature trust roots are invalid or unreadable"
+				case trustStore.VerifyPromotion(manifest) != nil:
+					result.Status = conformance.Fail
+					result.Reason = "release manifest or artifact signature verification failed"
+				default:
+					result.Status = conformance.Pass
+					result.Reason = "release manifest and artifacts match a configured offline trust root"
 				}
 			}
 			return doctor.Probe{
