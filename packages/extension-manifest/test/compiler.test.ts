@@ -220,6 +220,38 @@ describe("extension manifest compiler", () => {
     await expect(compileExtensionManifest(raw, files())).rejects.toThrow(/comparator range/i);
   });
 
+  it.each(["3.x", "3.2.x"])(
+    "accepts the canonical wildcard native package range %s",
+    async (version) => {
+      const raw = manifest();
+      const execution = (raw.permissions as Record<string, unknown>).execution as Record<
+        string,
+        unknown
+      >;
+      execution.packages = [{ id: "document-tools", version }];
+
+      const compiled = await compileExtensionManifest(await signedManifest(raw), files());
+
+      expect(compiled.manifest.permissions.execution.packages).toEqual([
+        { id: "document-tools", version },
+      ]);
+    },
+  );
+
+  it.each(["3.2.0-beta.1", ">=3.2.0-beta.1"])(
+    "rejects the unsupported prerelease native package range %s",
+    async (version) => {
+      const raw = manifest();
+      const execution = (raw.permissions as Record<string, unknown>).execution as Record<
+        string,
+        unknown
+      >;
+      execution.packages = [{ id: "document-tools", version }];
+
+      await expect(compileExtensionManifest(raw, files())).rejects.toThrow(/comparator range/i);
+    },
+  );
+
   it("rejects duplicate tools and incomplete or invalid replay declarations", async () => {
     const tool = (manifest().tools as unknown[])[0];
     await expect(
