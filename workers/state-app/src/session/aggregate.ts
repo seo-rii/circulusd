@@ -543,6 +543,27 @@ export async function effectRequestDigest(request: Omit<EffectIntent, "requestDi
 }
 
 export function createSessionState(input: CreateSessionStateInput): SessionAggregateState {
+  validatedExactFields(
+    input,
+    [
+      "sessionId",
+      "tenantId",
+      "userId",
+      "workspaceId",
+      "runtimeRevisionDigest",
+      "policySnapshotDigest",
+      "emergencyOverlayDigest",
+      "engineKind",
+      "adapterAbiVersion",
+      "checkpointSchemaVersion",
+      "placementGeneration",
+      "sandboxGeneration",
+      "authorizationGeneration",
+    ],
+    [],
+    "initialization",
+    "INVALID_ARGUMENT",
+  );
   const state: SessionAggregateState = {
     schemaVersion: SESSION_STATE_SCHEMA_VERSION,
     sessionId: validatedIdentifier(input.sessionId, "sessionId"),

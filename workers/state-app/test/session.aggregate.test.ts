@@ -211,6 +211,25 @@ async function dispatchActiveEffect(
 }
 
 describe("Session authoritative aggregate", () => {
+  it("rejects unknown initialization fields at the aggregate boundary", () => {
+    expect(() => createSessionState({
+      sessionId: "sess_01",
+      tenantId: "tenant_01",
+      userId: "user_01",
+      workspaceId: "workspace_01",
+      runtimeRevisionDigest: RUNTIME_DIGEST,
+      policySnapshotDigest: POLICY_DIGEST,
+      emergencyOverlayDigest: EMERGENCY_DIGEST,
+      engineKind: "low-level",
+      adapterAbiVersion: 1,
+      checkpointSchemaVersion: 1,
+      placementGeneration: 4,
+      sandboxGeneration: 5,
+      authorizationGeneration: 6,
+      unknownField: "must-not-be-ignored",
+    } as never)).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+  });
+
   it("requires trusted admission time, a live lease, and a positive lease generation", async () => {
     const initial = newSession();
     const input = { message: "turn_01" };
