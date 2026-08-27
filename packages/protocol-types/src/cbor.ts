@@ -3,7 +3,15 @@ import { assertUnicodeScalarString } from "./text.ts";
 import type { CanonicalCborOptions, NormalizedValue } from "./types.ts";
 
 const DEFAULT_MAX_DEPTH = 64;
+const DEFAULT_MAX_DECODED_ITEMS = 1_000_000;
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+export interface CanonicalCborDecodeOptions {
+  readonly maxBytes?: number;
+  readonly maxDepth?: number;
+  readonly maxItems?: number;
+}
 
 function checkedLimit(
   value: number | undefined,
@@ -295,6 +303,262 @@ export function encodeCanonicalCbor(
   const writer = new ByteWriter(maxBytes);
   writeValue(writer, normalized);
   return writer.finish();
+}
+
+class CanonicalCborDecoder {
+  readonly #bytes: Uint8Array;
+  readonly #maxDepth: number;
+  readonly #maxItems: number;
+  #items = 0;
+  #offset = 0;
+
+  constructor(bytes: Uint8Array, maxDepth: number, maxItems: number) {
+    this.#bytes = bytes;
+    this.#maxDepth = maxDepth;
+    this.#maxItems = maxItems;
+  }
+
+  decode(): NormalizedValue {
+    const result = this.#readValue("$", 0);
+    if (this.#offset !== this.#bytes.byteLength) {
+      validationError("$", "trailing bytes after the canonical CBOR value");
+    }
+    return result;
+  }
+
+  #readValue(path: string, depth: number): NormalizedValue {
+    if (depth > this.#maxDepth) {
+      validationError(path, `maximum depth ${this.#maxDepth} exceeded`);
+    }
+    if (this.#items >= this.#maxItems) {
+      validationError(path, `decoded item limit ${this.#maxItems} exceeded`);
+    }
+    this.#items += 1;
+
+    const initial = this.#readByte(path);
+    const major = initial >> 5;
+    const additional = initial & 0x1f;
+
+    if (major === 7) {
+      if (initial === 0xf4) {
+        return false;
+      }
+      if (initial === 0xf5) {
+        return true;
+      }
+      if (initial === 0xf6) {
+        return null;
+      }
+      if (additional >= 28 && additional <= 30) {
+        validationError(path, "reserved CBOR additional information is unsupported");
+      }
+      validationError(path, "unsupported CBOR simple, floating-point, or break value");
+    }
+    if (major === 6) {
+      validationError(path, "CBOR tags are unsupported");
+    }
+
+    const argument = this.#readArgument(additional, path);
+    if (major === 0) {
+      if (argument > BigInt(Number.MAX_SAFE_INTEGER)) {
+        validationError(path, "integer must be a safe integer");
+      }
+      return Number(argument);
+    }
+    if (major === 1) {
+      const value = -1n - argument;
+      if (value < BigInt(Number.MIN_SAFE_INTEGER)) {
+        validationError(path, "integer must be a safe integer");
+      }
+      return Number(value);
+    }
+    if (major === 2 || major === 3) {
+      const remaining = this.#bytes.byteLength - this.#offset;
+      if (argument > BigInt(remaining)) {
+        validationError(
+          path,
+          `declared ${major === 2 ? "byte string" : "text string"} length exceeds remaining input`,
+        );
+      }
+      const length = Number(argument);
+      const start = this.#offset;
+      this.#offset += length;
+      const encoded = this.#bytes.subarray(start, this.#offset);
+      if (major === 2) {
+        return encoded.slice();
+      }
+
+      let value: string;
+      try {
+        value = textDecoder.decode(encoded);
+      } catch {
+        validationError(path, "text string must contain valid UTF-8");
+      }
+      assertUnicodeScalarString(value, path);
+      if (value !== value.normalize("NFC")) {
+        validationError(path, "text string must already be NFC-normalized");
+      }
+      return value;
+    }
+    if (major === 4) {
+      const remaining = this.#bytes.byteLength - this.#offset;
+      const availableItems = this.#maxItems - this.#items;
+      if (argument > BigInt(remaining)) {
+        validationError(path, "declared array length exceeds remaining input");
+      }
+      if (argument > BigInt(availableItems)) {
+        validationError(path, `decoded item limit ${this.#maxItems} exceeded`);
+      }
+      const length = Number(argument);
+      const result: NormalizedValue[] = [];
+      for (let index = 0; index < length; index += 1) {
+        result.push(this.#readValue(`${path}[${index}]`, depth + 1));
+      }
+      return result;
+    }
+    if (major === 5) {
+      const remaining = this.#bytes.byteLength - this.#offset;
+      const availableItems = this.#maxItems - this.#items;
+      if (argument * 2n > BigInt(remaining)) {
+        validationError(path, "declared map length exceeds remaining input");
+      }
+      if (argument * 2n > BigInt(availableItems)) {
+        validationError(path, `decoded item limit ${this.#maxItems} exceeded`);
+      }
+      const length = Number(argument);
+      const result: Record<string, NormalizedValue> = {};
+      const keys = new Set<string>();
+      let previousKeyStart = -1;
+      let previousKeyEnd = -1;
+      for (let index = 0; index < length; index += 1) {
+        const keyStart = this.#offset;
+        const keyInitial = this.#bytes[this.#offset];
+        if (keyInitial === undefined) {
+          validationError(`${path}{key:${index}}`, "truncated CBOR input");
+        }
+        if (keyInitial >> 5 !== 3) {
+          validationError(`${path}{key:${index}}`, "map keys must be text strings");
+        }
+        const key = this.#readValue(`${path}{key:${index}}`, depth + 1);
+        if (typeof key !== "string") {
+          validationError(`${path}{key:${index}}`, "map keys must be text strings");
+        }
+        const keyEnd = this.#offset;
+        if (keys.has(key)) {
+          validationError(path, `duplicate map key ${JSON.stringify(key)}`);
+        }
+        keys.add(key);
+
+        if (previousKeyStart >= 0) {
+          const previousLength = previousKeyEnd - previousKeyStart;
+          const currentLength = keyEnd - keyStart;
+          let ordering = previousLength - currentLength;
+          if (ordering === 0) {
+            for (let offset = 0; offset < currentLength; offset += 1) {
+              const previousByte = this.#bytes[previousKeyStart + offset];
+              const currentByte = this.#bytes[keyStart + offset];
+              if (previousByte === undefined || currentByte === undefined) {
+                validationError(path, "map key comparison exceeded the input");
+              }
+              ordering = previousByte - currentByte;
+              if (ordering !== 0) {
+                break;
+              }
+            }
+          }
+          if (ordering >= 0) {
+            validationError(path, "map key order is not RFC 8949 deterministic order");
+          }
+        }
+        previousKeyStart = keyStart;
+        previousKeyEnd = keyEnd;
+
+        const item = this.#readValue(`${path}.${key}`, depth + 1);
+        Object.defineProperty(result, key, {
+          configurable: true,
+          enumerable: true,
+          value: item,
+          writable: true,
+        });
+      }
+      return result;
+    }
+
+    validationError(path, `unsupported CBOR major type ${major}`);
+  }
+
+  #readArgument(additional: number, path: string): bigint {
+    if (additional < 24) {
+      return BigInt(additional);
+    }
+    if (additional > 27) {
+      if (additional === 31) {
+        validationError(path, "indefinite-length CBOR is unsupported");
+      }
+      validationError(path, "reserved CBOR additional information is unsupported");
+    }
+
+    const width = 1 << (additional - 24);
+    if (this.#bytes.byteLength - this.#offset < width) {
+      validationError(path, "truncated CBOR argument");
+    }
+    let value = 0n;
+    for (let index = 0; index < width; index += 1) {
+      value = (value << 8n) | BigInt(this.#readByte(path));
+    }
+    const minimum =
+      width === 1
+        ? 24n
+        : width === 2
+          ? 0x100n
+          : width === 4
+            ? 0x1_0000n
+            : 0x1_0000_0000n;
+    if (value < minimum) {
+      validationError(path, "non-minimal CBOR argument encoding");
+    }
+    return value;
+  }
+
+  #readByte(path: string): number {
+    const value = this.#bytes[this.#offset];
+    if (value === undefined) {
+      validationError(path, "truncated CBOR input");
+    }
+    this.#offset += 1;
+    return value;
+  }
+}
+
+export function decodeCanonicalCbor(
+  bytes: Uint8Array,
+  options: CanonicalCborDecodeOptions = {},
+): NormalizedValue {
+  if (!(bytes instanceof Uint8Array) || Object.getPrototypeOf(bytes) !== Uint8Array.prototype) {
+    validationError("$", "encoded input must be an exact Uint8Array");
+  }
+  const backing = bytes.buffer;
+  if (
+    !(backing instanceof ArrayBuffer) ||
+    Object.getPrototypeOf(backing) !== ArrayBuffer.prototype
+  ) {
+    validationError("$", "encoded input must use an ordinary ArrayBuffer");
+  }
+  if (bytes.byteOffset !== 0 || bytes.byteLength !== backing.byteLength) {
+    validationError("$", "encoded input must cover its full backing buffer");
+  }
+
+  const maxBytes = checkedLimit(options.maxBytes, Number.MAX_SAFE_INTEGER, "maxBytes");
+  const maxDepth = checkedLimit(options.maxDepth, DEFAULT_MAX_DEPTH, "maxDepth");
+  const maxItems = checkedLimit(
+    options.maxItems,
+    DEFAULT_MAX_DECODED_ITEMS,
+    "maxItems",
+  );
+  if (bytes.byteLength > maxBytes) {
+    validationError("$", `encoded size exceeds ${maxBytes} bytes`);
+  }
+  return new CanonicalCborDecoder(bytes, maxDepth, maxItems).decode();
 }
 
 export function encodeHex(bytes: Uint8Array): string {
