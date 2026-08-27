@@ -142,7 +142,7 @@ describe("protocol constants and RPC envelopes", () => {
     ).toThrow(/size/);
     expect(() =>
       parseRpcEnvelope(
-        { ...envelope, payload: new Array<null>(50).fill(null) },
+        { ...envelope, payload: Array.from({ length: 50 }, () => null) },
         parseNormalizedValue,
         { maxItems: 20 },
       ),
