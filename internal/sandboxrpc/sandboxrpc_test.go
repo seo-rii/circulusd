@@ -19,6 +19,67 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func TestClientReadyAuthenticatesOneSessionConcurrently(t *testing.T) {
+	t.Parallel()
+
+	server, client, _ := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	const callers = 64
+	results := make(chan error, callers)
+	var start sync.WaitGroup
+	start.Add(callers)
+	for range callers {
+		go func() {
+			start.Done()
+			start.Wait()
+			results <- client.Ready(context.Background())
+		}()
+	}
+	for range callers {
+		if err := <-results; err != nil {
+			t.Fatalf("Ready() error = %v", err)
+		}
+	}
+	server.handler.handshakeMu.Lock()
+	nonceUsed := server.handler.nonceUsed
+	sessionEstablished := !bytes.Equal(server.handler.session[:], make([]byte, len(server.handler.session)))
+	server.handler.handshakeMu.Unlock()
+	if !nonceUsed || !sessionEstablished {
+		t.Fatal("Ready() did not establish exactly one authenticated server session")
+	}
+}
+
+func TestClientReadyRejectsInvalidLifecycleWithoutBurningPreCancelledNonce(t *testing.T) {
+	t.Parallel()
+
+	var nilClient *Client
+	if err := nilClient.Ready(context.Background()); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("nil Ready() error = %v", err)
+	}
+
+	server, client, _ := startTestTransport(t)
+	defer server.Close()
+	if err := client.Ready(nil); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("nil-context Ready() error = %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.Ready(cancelled); !errors.Is(err, context.Canceled) && connect.CodeOf(err) != connect.CodeCanceled {
+		t.Fatalf("cancelled Ready() error = %v", err)
+	}
+	if err := client.Ready(context.Background()); err != nil {
+		t.Fatalf("Ready() after pre-cancellation error = %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := client.Ready(context.Background()); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("Ready() after Close error = %v", err)
+	}
+}
+
 func TestPrivateTransportProcessLifecycleAndConcurrentIdempotency(t *testing.T) {
 	t.Parallel()
 
@@ -360,7 +421,15 @@ func TestRequestDigestAndIdempotencyConflictFailClosed(t *testing.T) {
 
 func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	t.Helper()
-	root := t.TempDir()
+	root, err := os.MkdirTemp("", "circulusd-srpc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("RemoveAll(%q) error = %v", root, err)
+		}
+	})
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}

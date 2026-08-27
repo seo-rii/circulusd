@@ -112,6 +112,24 @@ func (client *Client) Close() error {
 	return nil
 }
 
+// Ready establishes and authenticates the client's single-use sandbox session.
+func (client *Client) Ready(ctx context.Context) error {
+	if client == nil {
+		return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is nil"))
+	}
+	if ctx == nil {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("request context is nil"))
+	}
+	if err := ctx.Err(); err != nil {
+		return contextConnectError(err)
+	}
+	if client.closed.Load() {
+		return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+	}
+	_, err := client.ensureHandshake(ctx)
+	return err
+}
+
 func (client *Client) Spawn(ctx context.Context, message *v1.SpawnProcessRequest) (*v1.SpawnProcessResponse, error) {
 	prepared, requestID, err := prepareRequest(ctx, message)
 	if err != nil {
@@ -292,6 +310,10 @@ func (client *Client) ensureHandshake(ctx context.Context) (string, error) {
 			return "", connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
 		}
 		client.handshakeMu.Lock()
+		if client.closed.Load() {
+			client.handshakeMu.Unlock()
+			return "", connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+		}
 		if client.handshakeSession != "" {
 			session := client.handshakeSession
 			client.handshakeMu.Unlock()
