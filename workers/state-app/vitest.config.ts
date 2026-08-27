@@ -20,6 +20,7 @@ export default defineConfig({
       "test/workspace*.test.ts",
       "test/control*.test.ts",
       "test/host*.test.ts",
+      "test/phase0b*.test.ts",
     ],
   },
 });
