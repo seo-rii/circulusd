@@ -129,6 +129,9 @@ func TestCandidateAndProductionRequireCompleteSignedArtifacts(t *testing.T) {
 		{name: "unsigned artifact", mutate: func(manifest *Manifest) {
 			manifest.Components[0].Artifacts[0].Signature = nil
 		}},
+		{name: "missing artifact size", mutate: func(manifest *Manifest) {
+			manifest.Components[0].Artifacts[0].SizeBytes = nil
+		}},
 		{name: "protocol range reversed", mutate: func(manifest *Manifest) {
 			manifest.ProtocolCompatibility[0].Minimum = ProtocolVersion{Major: 2}
 		}},
@@ -191,6 +194,7 @@ func completeRelease(status string) Manifest {
 	}
 	components := make([]Component, 0, len(requiredProductionComponents))
 	for _, name := range requiredProductionComponents {
+		size := uint64(12)
 		components = append(components, Component{
 			Name:          name,
 			Version:       "0.3.0",
@@ -202,6 +206,7 @@ func completeRelease(status string) Manifest {
 				Architecture: "any",
 				Name:         name + ".tar.zst",
 				SHA256:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				SizeBytes:    &size,
 				Signature:    &signature,
 			}},
 		})

@@ -219,6 +219,10 @@ func (manifest Manifest) Validate() error {
 			if artifact.SizeBytes != nil && *artifact.SizeBytes > maxJSONInteger {
 				return fmt.Errorf("component %q artifact %q size exceeds the JSON safe-integer range", component.Name, artifact.Name)
 			}
+			if manifest.Release.Status != "development" &&
+				(artifact.SizeBytes == nil || *artifact.SizeBytes == 0) {
+				return fmt.Errorf("component %q artifact %q requires a positive signed size", component.Name, artifact.Name)
+			}
 			artifactKey := artifact.Architecture + "\x00" + artifact.Name
 			if _, exists := artifacts[artifactKey]; exists {
 				return fmt.Errorf("component %q artifact %q for %q is duplicated", component.Name, artifact.Name, artifact.Architecture)
