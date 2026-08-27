@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/config"
 	"github.com/hancomac/circulusd/internal/conformance"
+	"github.com/hancomac/circulusd/internal/controlrpc"
 	"github.com/hancomac/circulusd/internal/doctor"
 	"github.com/hancomac/circulusd/internal/release"
 )
@@ -372,6 +374,193 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 	}
 	if invalid := invalidProbe.Run(t.Context()); invalid.Status != conformance.Fail {
 		t.Fatalf("invalid root result = %+v", invalid)
+	}
+}
+
+func TestCapabilitiesCommandQueriesPlatformdAndEmitsStableJSON(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "platformd.sock")
+	server, err := controlrpc.ListenServer(controlrpc.ServerConfig{
+		SocketPath:  socketPath,
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+		Capabilities: []*v1.CapabilityStatus{
+			{
+				Name:         "state.celld",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE,
+				UnavailableReason: &v1.PublicError{
+					Code:      v1.ErrorCode_ERROR_CODE_UNAVAILABLE,
+					Reason:    "NOT_WIRED",
+					Message:   "state adapter is not wired",
+					Retryable: true,
+					Metadata:  map[string]string{"source": "platformd"},
+				},
+			},
+			{
+				Name:         "control.protocol",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+				Attributes:   map[string]string{"transport": "uds"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverContext, stopServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve(serverContext) }()
+	t.Cleanup(func() {
+		stopServer()
+		_ = server.Close()
+		select {
+		case serveErr := <-serverDone:
+			if serveErr != nil {
+				t.Errorf("Server.Serve() error = %v", serveErr)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("control server did not stop")
+		}
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	dependencies := defaultDependencies()
+	dependencies.stdout = &stdout
+	dependencies.stderr = &stderr
+	exitCode := execute(context.Background(), []string{
+		"capabilities",
+		"--socket", socketPath,
+		"--timeout", "2s",
+	}, dependencies)
+	if exitCode != 0 {
+		t.Fatalf("execute() = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	var document capabilitiesOutput
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatalf("capabilities JSON: %v; output=%q", err, stdout.String())
+	}
+	if document.APIVersion != "v1alpha" || document.Protocol.Major != 1 || document.Protocol.Minor != 0 ||
+		document.Protocol.DescriptorDigest != "sha256:ff942ae0643b6fa2a8b8ccee97e1593e0d4b56cd414ee771ad0b731ff5854f63" ||
+		document.ServerSequence != "1" {
+		t.Fatalf("capabilities envelope = %+v", document)
+	}
+	if len(document.Capabilities) != 2 || document.Capabilities[0].Name != "control.protocol" ||
+		document.Capabilities[0].Availability != "available" || document.Capabilities[0].UnavailableReason != nil ||
+		document.Capabilities[0].Attributes["transport"] != "uds" {
+		t.Fatalf("available capability = %+v", document.Capabilities)
+	}
+	unavailable := document.Capabilities[1]
+	if unavailable.Name != "state.celld" || unavailable.Availability != "unavailable" ||
+		unavailable.UnavailableReason == nil || unavailable.UnavailableReason.Code != "unavailable" ||
+		unavailable.UnavailableReason.Reason != "NOT_WIRED" || !unavailable.UnavailableReason.Retryable ||
+		unavailable.UnavailableReason.Metadata["source"] != "platformd" {
+		t.Fatalf("unavailable capability = %+v", unavailable)
+	}
+	if strings.Contains(stdout.String(), "requestId") || strings.Contains(stdout.String(), "request_id") {
+		t.Fatalf("capabilities output leaked internal request identity: %q", stdout.String())
+	}
+}
+
+func TestCapabilitiesCommandRejectsInvalidInputBeforeDialing(t *testing.T) {
+	called := false
+	dependencies := commandDependencies{
+		stdout: &bytes.Buffer{},
+		stderr: &bytes.Buffer{},
+		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+			called = true
+			return nil, errors.New("must not dial")
+		},
+	}
+	invalidArguments := [][]string{
+		{"capabilities", "--socket", "relative.sock"},
+		{"capabilities", "--timeout", "0s"},
+		{"capabilities", "--timeout", "10m"},
+		{"capabilities", "unexpected"},
+		{"capabilities", "--unknown"},
+	}
+	for index, arguments := range invalidArguments {
+		if exitCode := execute(context.Background(), arguments, dependencies); exitCode != 2 {
+			t.Fatalf("execute(invalidArguments[%d]) = %d, want 2", index, exitCode)
+		}
+	}
+	if called {
+		t.Fatal("invalid capabilities command dialed platformd")
+	}
+}
+
+func TestCapabilitiesCommandFailsClosedOnContradictoryOrDuplicateStatus(t *testing.T) {
+	tests := []struct {
+		name         string
+		capabilities []*v1.CapabilityStatus
+	}{
+		{
+			name: "available with failure reason",
+			capabilities: []*v1.CapabilityStatus{{
+				Name:              "control.protocol",
+				Availability:      v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+				UnavailableReason: &v1.PublicError{Code: v1.ErrorCode_ERROR_CODE_UNAVAILABLE, Reason: "BAD", Message: "bad"},
+			}},
+		},
+		{
+			name: "unavailable without reason",
+			capabilities: []*v1.CapabilityStatus{{
+				Name:         "state.celld",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE,
+			}},
+		},
+		{
+			name: "duplicate name",
+			capabilities: []*v1.CapabilityStatus{
+				{Name: "state.celld", Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE},
+				{Name: "state.celld", Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE},
+			},
+		},
+		{
+			name:         "unspecified availability",
+			capabilities: []*v1.CapabilityStatus{{Name: "state.celld"}},
+		},
+		{
+			name: "invalid capability name",
+			capabilities: []*v1.CapabilityStatus{{
+				Name:         "state celld",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
+				stdout: &stdout,
+				stderr: &stderr,
+				getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+					return &v1.GetCapabilitiesResponse{
+						Meta:             &v1.RpcResponseMeta{ServerSequence: 1},
+						ProtocolVersion:  &v1.ProtocolVersion{Major: 1},
+						DescriptorDigest: &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: make([]byte, 32)},
+						Capabilities:     test.capabilities,
+					}, nil
+				},
+			})
+			if exitCode != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "invalid capability response") {
+				t.Fatalf("execute()=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestCapabilitiesCommandReportsOnlyStructuredTransportCode(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
+		stdout: &stdout,
+		stderr: &stderr,
+		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+			return nil, errors.New("credential=must-not-leak")
+		},
+	})
+	if exitCode != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "code=unknown") ||
+		strings.Contains(stderr.String(), "credential") {
+		t.Fatalf("execute()=%d stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
 	}
 }
 

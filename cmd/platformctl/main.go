@@ -14,12 +14,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"connectrpc.com/connect"
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/config"
 	"github.com/hancomac/circulusd/internal/conformance"
+	"github.com/hancomac/circulusd/internal/controlrpc"
 	"github.com/hancomac/circulusd/internal/doctor"
 	"github.com/hancomac/circulusd/internal/release"
 )
@@ -28,8 +35,11 @@ const (
 	defaultConfigurationPath = "/etc/pi-platform/config.yaml"
 	defaultReleasePath       = "/usr/lib/pi-platform/release-manifest.json"
 	defaultReleaseRootsPath  = "/etc/pi-platform/release-trust-roots.json"
+	defaultPlatformdSocket   = "/run/pi-platform/platformd.sock"
 	minimumDoctorFreeBytes   = 5 << 30
 	minimumDoctorFreeInodes  = 100_000
+	defaultControlTimeout    = 30 * time.Second
+	maximumControlTimeout    = 5 * time.Minute
 )
 
 type configurationSnapshot struct {
@@ -47,6 +57,36 @@ type commandDependencies struct {
 	additionalProbes  []doctor.Probe
 	runID             func() (string, error)
 	hostID            func() (string, error)
+	getCapabilities   func(context.Context, string) (*v1.GetCapabilitiesResponse, error)
+}
+
+type capabilitiesOutput struct {
+	APIVersion     string             `json:"apiVersion"`
+	Protocol       protocolOutput     `json:"protocol"`
+	ServerSequence string             `json:"serverSequence"`
+	Capabilities   []capabilityOutput `json:"capabilities"`
+}
+
+type protocolOutput struct {
+	Major            uint64 `json:"major"`
+	Minor            uint64 `json:"minor"`
+	DescriptorDigest string `json:"descriptorDigest"`
+}
+
+type capabilityOutput struct {
+	Name              string                 `json:"name"`
+	Availability      string                 `json:"availability"`
+	UnavailableReason *capabilityErrorOutput `json:"unavailableReason,omitempty"`
+	Attributes        map[string]string      `json:"attributes,omitempty"`
+}
+
+type capabilityErrorOutput struct {
+	Code         string            `json:"code"`
+	Reason       string            `json:"reason"`
+	Message      string            `json:"message"`
+	Retryable    bool              `json:"retryable"`
+	RetryAfterMS string            `json:"retryAfterMs,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
 func main() {
@@ -56,9 +96,153 @@ func main() {
 }
 
 func execute(ctx context.Context, arguments []string, dependencies commandDependencies) int {
-	if len(arguments) == 0 || arguments[0] != "doctor" {
+	if len(arguments) == 0 {
 		if dependencies.stderr != nil {
-			fmt.Fprintln(dependencies.stderr, "usage: platformctl doctor [options]")
+			fmt.Fprintln(dependencies.stderr, "usage: platformctl <doctor|capabilities> [options]")
+		}
+		return 2
+	}
+	if arguments[0] == "capabilities" {
+		flags := flag.NewFlagSet("platformctl capabilities", flag.ContinueOnError)
+		flags.SetOutput(dependencies.stderr)
+		socketPath := flags.String("socket", defaultPlatformdSocket, "canonical absolute platformd control socket path")
+		timeout := flags.Duration("timeout", defaultControlTimeout, "control request timeout")
+		if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
+			return 2
+		}
+		if !filepath.IsAbs(*socketPath) || filepath.Clean(*socketPath) != *socketPath ||
+			*socketPath == string(filepath.Separator) || *timeout <= 0 || *timeout > maximumControlTimeout {
+			if dependencies.stderr != nil {
+				fmt.Fprintln(dependencies.stderr, "platformctl: socket must be canonical and absolute and timeout must be within (0, 5m]")
+			}
+			return 2
+		}
+		if ctx == nil || dependencies.stdout == nil || dependencies.stderr == nil || dependencies.getCapabilities == nil {
+			return 1
+		}
+		requestContext, cancel := context.WithTimeout(ctx, *timeout)
+		response, err := dependencies.getCapabilities(requestContext, *socketPath)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(dependencies.stderr, "platformctl: query capabilities failed (code=%s)\n", connect.CodeOf(err))
+			return 1
+		}
+		if response == nil || response.GetMeta() == nil || response.GetMeta().GetServerSequence() == 0 ||
+			response.GetProtocolVersion().GetMajor() != 1 || response.GetProtocolVersion().GetMinor() != 0 ||
+			response.GetDescriptorDigest().GetAlgorithm() != v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256 ||
+			len(response.GetDescriptorDigest().GetValue()) != sha256.Size {
+			fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+			return 1
+		}
+		document := capabilitiesOutput{
+			APIVersion: "v1alpha",
+			Protocol: protocolOutput{
+				Major:            response.GetProtocolVersion().GetMajor(),
+				Minor:            response.GetProtocolVersion().GetMinor(),
+				DescriptorDigest: "sha256:" + hex.EncodeToString(response.GetDescriptorDigest().GetValue()),
+			},
+			ServerSequence: strconv.FormatUint(response.GetMeta().GetServerSequence(), 10),
+			Capabilities:   make([]capabilityOutput, 0, len(response.GetCapabilities())),
+		}
+		seenNames := make(map[string]struct{}, len(response.GetCapabilities()))
+		for _, capability := range response.GetCapabilities() {
+			if capability == nil {
+				fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+				return 1
+			}
+			validName := capability.GetName() != "" && len(capability.GetName()) <= 256
+			for _, character := range capability.GetName() {
+				if (character < 'a' || character > 'z') && (character < '0' || character > '9') &&
+					character != '.' && character != '_' && character != ':' && character != '/' && character != '-' {
+					validName = false
+				}
+			}
+			if !validName {
+				fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+				return 1
+			}
+			if _, duplicate := seenNames[capability.GetName()]; duplicate {
+				fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+				return 1
+			}
+			seenNames[capability.GetName()] = struct{}{}
+			item := capabilityOutput{Name: capability.GetName()}
+			switch capability.GetAvailability() {
+			case v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE:
+				if capability.GetUnavailableReason() != nil {
+					fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+					return 1
+				}
+				item.Availability = "available"
+			case v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE,
+				v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_DEGRADED,
+				v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_FORBIDDEN:
+				reason := capability.GetUnavailableReason()
+				if reason == nil || reason.GetCode() == v1.ErrorCode_ERROR_CODE_UNSPECIFIED ||
+					reason.GetReason() == "" || reason.GetReason() != strings.TrimSpace(reason.GetReason()) ||
+					reason.GetMessage() == "" || !utf8.ValidString(reason.GetReason()) || !utf8.ValidString(reason.GetMessage()) ||
+					len(reason.GetReason()) > 256 || len(reason.GetMessage()) > 1_024 ||
+					strings.IndexFunc(reason.GetReason(), unicode.IsControl) >= 0 || strings.IndexFunc(reason.GetMessage(), unicode.IsControl) >= 0 ||
+					len(reason.GetMetadata()) > 32 {
+					fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+					return 1
+				}
+				item.Availability = strings.ToLower(strings.TrimPrefix(capability.GetAvailability().String(), "CAPABILITY_AVAILABILITY_"))
+				item.UnavailableReason = &capabilityErrorOutput{
+					Code:      strings.ToLower(strings.TrimPrefix(reason.GetCode().String(), "ERROR_CODE_")),
+					Reason:    reason.GetReason(),
+					Message:   reason.GetMessage(),
+					Retryable: reason.GetRetryable(),
+				}
+				if reason.GetRetryAfterMs() != 0 {
+					item.UnavailableReason.RetryAfterMS = strconv.FormatUint(reason.GetRetryAfterMs(), 10)
+				}
+				if len(reason.GetMetadata()) != 0 {
+					item.UnavailableReason.Metadata = make(map[string]string, len(reason.GetMetadata()))
+					for key, value := range reason.GetMetadata() {
+						if key == "" || !utf8.ValidString(key) || !utf8.ValidString(value) || len(key) > 256 || len(value) > 1_024 ||
+							strings.IndexFunc(key, unicode.IsControl) >= 0 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+							fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+							return 1
+						}
+						item.UnavailableReason.Metadata[key] = value
+					}
+				}
+			default:
+				fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+				return 1
+			}
+			if len(capability.GetAttributes()) > 32 {
+				fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+				return 1
+			}
+			if len(capability.GetAttributes()) != 0 {
+				item.Attributes = make(map[string]string, len(capability.GetAttributes()))
+				for key, value := range capability.GetAttributes() {
+					if key == "" || !utf8.ValidString(key) || !utf8.ValidString(value) || len(key) > 256 || len(value) > 1_024 ||
+						strings.IndexFunc(key, unicode.IsControl) >= 0 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+						fmt.Fprintln(dependencies.stderr, "platformctl: invalid capability response")
+						return 1
+					}
+					item.Attributes[key] = value
+				}
+			}
+			document.Capabilities = append(document.Capabilities, item)
+		}
+		sort.Slice(document.Capabilities, func(left, right int) bool {
+			return document.Capabilities[left].Name < document.Capabilities[right].Name
+		})
+		encoder := json.NewEncoder(dependencies.stdout)
+		encoder.SetEscapeHTML(true)
+		if err := encoder.Encode(document); err != nil {
+			fmt.Fprintln(dependencies.stderr, "platformctl: write capability report")
+			return 1
+		}
+		return 0
+	}
+	if arguments[0] != "doctor" {
+		if dependencies.stderr != nil {
+			fmt.Fprintln(dependencies.stderr, "usage: platformctl <doctor|capabilities> [options]")
 		}
 		return 2
 	}
@@ -285,6 +469,24 @@ func defaultDependencies() commandDependencies {
 			}
 			digest := sha256.Sum256([]byte(machineID))
 			return "host-" + hex.EncodeToString(digest[:]), nil
+		},
+		getCapabilities: func(ctx context.Context, socketPath string) (*v1.GetCapabilitiesResponse, error) {
+			client, err := controlrpc.NewClient(controlrpc.ClientConfig{
+				SocketPath: socketPath,
+				Peer:       v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL,
+			})
+			if err != nil {
+				return nil, err
+			}
+			response, callErr := client.GetCapabilities(ctx)
+			closeErr := client.Close()
+			if callErr != nil {
+				return nil, callErr
+			}
+			if closeErr != nil {
+				return nil, closeErr
+			}
+			return response, nil
 		},
 	}
 }
