@@ -16,7 +16,7 @@ import (
 )
 
 func TestPlatformdServesHonestCapabilitiesAndRemovesItsSocket(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "platformd.sock")
+	socketPath := platformdSocketPath(t)
 	var stderr bytes.Buffer
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
@@ -121,7 +121,7 @@ func TestPlatformdRejectsInvalidCLIWithoutReplacingExistingPaths(t *testing.T) {
 		})
 	}
 
-	existingPath := filepath.Join(t.TempDir(), "platformd.sock")
+	existingPath := platformdSocketPath(t)
 	if err := os.WriteFile(existingPath, []byte("preserve"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestPlatformdUsesExplicitUIDAllowlist(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("requires a non-root caller so UID 0 is disallowed by SO_PEERCRED")
 	}
-	socketPath := filepath.Join(t.TempDir(), "platformd.sock")
+	socketPath := platformdSocketPath(t)
 	var stderr bytes.Buffer
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
@@ -183,12 +183,26 @@ func TestPlatformdUsesExplicitUIDAllowlist(t *testing.T) {
 	}
 }
 
+func platformdSocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "cpd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove temporary socket directory: %v", err)
+		}
+	})
+	return filepath.Join(directory, "platformd.sock")
+}
+
 func waitForSocket(t *testing.T, socketPath string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		info, err := os.Lstat(socketPath)
-		if err == nil && info.Mode()&os.ModeSocket != 0 {
+		if err == nil && info.Mode()&os.ModeSocket != 0 && info.Mode().Perm() == 0o600 {
 			return
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {

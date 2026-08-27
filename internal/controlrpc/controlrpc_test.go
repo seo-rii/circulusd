@@ -227,7 +227,7 @@ func TestClientRejectsInsecureOrNonSocketEndpoint(t *testing.T) {
 }
 
 func TestServerAndClientUseDistinctSocketDirectoryOwnershipPolicies(t *testing.T) {
-	parent := t.TempDir()
+	parent := filepath.Dir(testSocketPath(t))
 	path := filepath.Join(parent, "control.sock")
 	owner := uint32(os.Getuid())
 	if err := validateServerSocketPath(path); err != nil {
@@ -889,7 +889,16 @@ func handshakeRequest(t *testing.T, peer v1.ProtocolPeer) *v1.HandshakeRequest {
 
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "control.sock")
+	directory, err := os.MkdirTemp("/tmp", "cr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove temporary socket directory: %v", err)
+		}
+	})
+	return filepath.Join(directory, "control.sock")
 }
 
 func assertDescriptorDigest(t *testing.T, digest *v1.Digest) {
