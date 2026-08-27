@@ -1101,6 +1101,21 @@ export class LowLevelPiAgentEngine {
         "beforeToolCall cannot change a tool request into a model request",
       );
     }
+    const replayPolicyStrength = {
+      safe: 0,
+      "idempotency-key": 1,
+      confirm: 2,
+      never: 3,
+    } as const;
+    if (replayPolicyStrength[patched.replayPolicy] < replayPolicyStrength[head.replayPolicy]) {
+      throw new BoundaryFault(
+        "EXTENSION_OUTPUT_INVALID",
+        "beforeToolCall cannot weaken the tool replay policy",
+      );
+    }
+    // The downstream Broker remains responsible for authorizing the final
+    // transformed operation and payload. This local clamp only preserves the
+    // runtime's minimum replay-safety requirement.
     this.#throwIfAborted(signal);
     const request = await this.#intent(patched);
     return {
