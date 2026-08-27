@@ -945,12 +945,12 @@ func newTestProvider(
 			return build(request)
 		},
 		start: func(context.Context, LaunchPlan) (sandboxInstance, error) {
-			fixture.startCount.Add(1)
-			fixture.started <- struct{}{}
 			instance := newFakeInstance(fixture)
 			fixture.mu.Lock()
 			fixture.instances = append(fixture.instances, instance)
 			fixture.mu.Unlock()
+			fixture.startCount.Add(1)
+			fixture.started <- struct{}{}
 			return instance, nil
 		},
 		resolve: RequestResolverFunc(func(ctx context.Context, spec executor.SandboxSpec) (ResolvedLaunch, error) {
