@@ -1,0 +1,618 @@
+import {
+  runAgentLoop,
+  runAgentLoopContinue,
+  type AgentLoopConfig,
+  type AgentMessage,
+  type StreamFn,
+} from "@earendil-works/pi-agent-core";
+import {
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessage,
+  type Context as PiContext,
+  type Message,
+  type Model,
+  type UserMessage,
+} from "@earendil-works/pi-ai";
+import {
+  normalizeProtocolValue,
+  type NormalizedValue,
+} from "@circulusd/protocol-types";
+
+import { PiRuntimeError } from "./errors.ts";
+import {
+  boundedProtocolValue,
+  boundedSafeInteger,
+  exactRecord,
+} from "./validation.ts";
+import type {
+  AgentCoreFactory,
+  AgentCoreTransition,
+  EffectSettlementOutcome,
+} from "./types.ts";
+
+export const PI_AGENT_CORE_PACKAGE_VERSION = "0.84.3" as const;
+export const PI_AGENT_CORE_STATE_VERSION = 1 as const;
+
+const maximumAdapterValueBytes = 4 << 20;
+
+export interface PiAgentCoreModelConfiguration {
+  readonly id: string;
+  readonly api: string;
+  readonly provider: string;
+  readonly reasoning: boolean;
+  readonly input: readonly ("text" | "image")[];
+  readonly contextWindow: number;
+  readonly maxTokens: number;
+}
+
+export interface PiAgentCoreAdapterConfiguration {
+  readonly systemPrompt: string;
+  readonly model: PiAgentCoreModelConfiguration;
+}
+
+interface PiAgentCoreState {
+  readonly [key: string]: NormalizedValue;
+  readonly version: typeof PI_AGENT_CORE_STATE_VERSION;
+  readonly phase: "ready" | "waiting_model" | "complete" | "failed";
+  readonly messages: NormalizedValue[];
+}
+
+export function createPiAgentCoreInitialState(): NormalizedValue {
+  return {
+    version: PI_AGENT_CORE_STATE_VERSION,
+    phase: "ready",
+    messages: [],
+  };
+}
+
+export function createPiAgentCoreFactory(
+  configuration: PiAgentCoreAdapterConfiguration,
+): AgentCoreFactory {
+  const normalizedConfiguration = boundedProtocolValue(
+    configuration,
+    maximumAdapterValueBytes,
+    "piAgentCore.configuration",
+    "INVALID_CONFIGURATION",
+  );
+  const configurationRecord = exactRecord(
+    normalizedConfiguration,
+    ["systemPrompt", "model"],
+    [],
+    "piAgentCore.configuration",
+    "INVALID_CONFIGURATION",
+  );
+  if (typeof configurationRecord.systemPrompt !== "string") {
+    throw new PiRuntimeError(
+      "INVALID_CONFIGURATION",
+      "piAgentCore.configuration.systemPrompt must be a string",
+    );
+  }
+  const modelRecord = exactRecord(
+    configurationRecord.model,
+    ["id", "api", "provider", "reasoning", "input", "contextWindow", "maxTokens"],
+    [],
+    "piAgentCore.configuration.model",
+    "INVALID_CONFIGURATION",
+  );
+  for (const field of ["id", "api", "provider"] as const) {
+    if (
+      typeof modelRecord[field] !== "string" ||
+      modelRecord[field].length === 0 ||
+      modelRecord[field].length > 256
+    ) {
+      throw new PiRuntimeError(
+        "INVALID_CONFIGURATION",
+        `piAgentCore.configuration.model.${field} must be a bounded non-empty string`,
+      );
+    }
+  }
+  if (typeof modelRecord.reasoning !== "boolean") {
+    throw new PiRuntimeError(
+      "INVALID_CONFIGURATION",
+      "piAgentCore.configuration.model.reasoning must be a boolean",
+    );
+  }
+  if (
+    !Array.isArray(modelRecord.input) ||
+    modelRecord.input.length === 0 ||
+    modelRecord.input.length > 2 ||
+    modelRecord.input.some((value) => value !== "text" && value !== "image") ||
+    new Set(modelRecord.input).size !== modelRecord.input.length
+  ) {
+    throw new PiRuntimeError(
+      "INVALID_CONFIGURATION",
+      "piAgentCore.configuration.model.input must contain unique supported input modes",
+    );
+  }
+  const contextWindow = boundedSafeInteger(
+    modelRecord.contextWindow,
+    1,
+    "piAgentCore.configuration.model.contextWindow",
+    "INVALID_CONFIGURATION",
+  );
+  const maxTokens = boundedSafeInteger(
+    modelRecord.maxTokens,
+    1,
+    "piAgentCore.configuration.model.maxTokens",
+    "INVALID_CONFIGURATION",
+  );
+  if (maxTokens > contextWindow) {
+    throw new PiRuntimeError(
+      "INVALID_CONFIGURATION",
+      "piAgentCore.configuration.model.maxTokens exceeds its context window",
+    );
+  }
+
+  const systemPrompt = configurationRecord.systemPrompt;
+  const modelConfiguration = Object.freeze({
+    id: modelRecord.id as string,
+    api: modelRecord.api as string,
+    provider: modelRecord.provider as string,
+    reasoning: modelRecord.reasoning,
+    input: [...(modelRecord.input as ("text" | "image")[])],
+    contextWindow,
+    maxTokens,
+  });
+  const piModel: Model<Api> = Object.freeze({
+    id: modelConfiguration.id,
+    name: modelConfiguration.id,
+    api: modelConfiguration.api,
+    provider: modelConfiguration.provider,
+    baseUrl: "",
+    reasoning: modelConfiguration.reasoning,
+    input: [...modelConfiguration.input],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: modelConfiguration.contextWindow,
+    maxTokens: modelConfiguration.maxTokens,
+  });
+  const loopConfiguration: AgentLoopConfig = {
+    model: piModel,
+    convertToLlm(messages) {
+      return messages as Message[];
+    },
+    shouldStopAfterTurn() {
+      return true;
+    },
+    toolExecution: "sequential",
+  };
+
+  return () => ({
+    async advance(context): Promise<AgentCoreTransition> {
+      const stateRecord = exactRecord(
+        context.state,
+        ["version", "phase", "messages"],
+        [],
+        "piAgentCore.state",
+        "CORE_OUTPUT_INVALID",
+      );
+      if (stateRecord.version !== PI_AGENT_CORE_STATE_VERSION) {
+        throw new Error("Pi Agent Core state version is unsupported");
+      }
+      if (
+        stateRecord.phase !== "ready" &&
+        stateRecord.phase !== "waiting_model" &&
+        stateRecord.phase !== "complete" &&
+        stateRecord.phase !== "failed"
+      ) {
+        throw new Error("Pi Agent Core state phase is unsupported");
+      }
+      if (!Array.isArray(stateRecord.messages)) {
+        throw new Error("Pi Agent Core state messages must be an array");
+      }
+      const state: PiAgentCoreState = {
+        version: PI_AGENT_CORE_STATE_VERSION,
+        phase: stateRecord.phase,
+        messages: stateRecord.messages.map((message) => normalizeProtocolValue(message)),
+      };
+
+      if (context.input.kind === "turn_start") {
+        if (state.phase !== "ready" || state.messages.length !== 0) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_STATE_MISMATCH",
+              message: "Pi turn start requires a fresh adapter state",
+              retryable: false,
+            },
+          };
+        }
+        const inputRecord = exactRecord(
+          context.input.input,
+          ["prompt", "timestamp"],
+          [],
+          "piAgentCore.turnInput",
+          "CORE_OUTPUT_INVALID",
+        );
+        if (typeof inputRecord.prompt !== "string") {
+          throw new Error("Pi turn prompt must be a string");
+        }
+        const timestamp = boundedSafeInteger(
+          inputRecord.timestamp,
+          0,
+          "piAgentCore.turnInput.timestamp",
+          "CORE_OUTPUT_INVALID",
+        );
+        const prompt: UserMessage = {
+          role: "user",
+          content: inputRecord.prompt,
+          timestamp,
+        };
+        let capturedContext: PiContext | undefined;
+        let modelCalls = 0;
+        let modelMismatch = false;
+        const captureModelBoundary: StreamFn = (model, piContext) => {
+          modelCalls += 1;
+          if (
+            model.id !== piModel.id ||
+            model.api !== piModel.api ||
+            model.provider !== piModel.provider
+          ) {
+            modelMismatch = true;
+          }
+          capturedContext = structuredClone(piContext);
+          const stream = createAssistantMessageEventStream();
+          const aborted: AssistantMessage = {
+            role: "assistant",
+            content: [],
+            api: piModel.api,
+            provider: piModel.provider,
+            model: piModel.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "aborted",
+            errorMessage: "model request captured by the bounded adapter",
+            timestamp,
+          };
+          stream.push({ type: "error", reason: "aborted", error: aborted });
+          return stream;
+        };
+        await runAgentLoop(
+          [prompt],
+          { systemPrompt, messages: [], tools: [] },
+          loopConfiguration,
+          async () => undefined,
+          context.signal,
+          captureModelBoundary,
+        );
+        if (capturedContext === undefined || modelCalls !== 1) {
+          throw new Error("Pi did not produce exactly one bounded model request");
+        }
+        if (modelMismatch) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_REQUEST_MISMATCH",
+              message: "Pi invoked a model outside the immutable runtime configuration",
+              retryable: false,
+            },
+          };
+        }
+        const normalizedContext = boundedProtocolValue(
+          capturedContext,
+          maximumAdapterValueBytes,
+          "piAgentCore.modelContext",
+          "CORE_OUTPUT_INVALID",
+        ) as { readonly messages: NormalizedValue[] } & NormalizedValue;
+        return {
+          kind: "model_request",
+          state: {
+            version: PI_AGENT_CORE_STATE_VERSION,
+            phase: "waiting_model",
+            messages: structuredClone(normalizedContext.messages),
+          },
+          request: {
+            service: "model",
+            operation: "complete",
+            replayPolicy: "never",
+            payload: {
+              protocol: "pi-agent-core",
+              version: 1,
+              packageVersion: PI_AGENT_CORE_PACKAGE_VERSION,
+              model: modelConfiguration,
+              context: normalizedContext,
+            },
+          },
+        };
+      }
+
+      if (context.input.kind === "effect_settlement") {
+        if (
+          state.phase !== "waiting_model" ||
+          context.input.request.service !== "model" ||
+          context.input.request.operation !== "complete"
+        ) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_STATE_MISMATCH",
+              message: "Pi model settlement does not match the adapter state",
+              retryable: false,
+            },
+          };
+        }
+        if (context.input.settlement.kind !== "success") {
+          const settlement: EffectSettlementOutcome = context.input.settlement;
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_SETTLEMENT_FAILED",
+              message: settlement.kind === "error" ? settlement.message : settlement.reason,
+              retryable: false,
+            },
+          };
+        }
+        const settlementRecord = exactRecord(
+          context.input.settlement.result,
+          ["version", "message"],
+          [],
+          "piAgentCore.modelSettlement",
+          "CORE_OUTPUT_INVALID",
+        );
+        if (settlementRecord.version !== 1) {
+          throw new Error("Pi model settlement version is unsupported");
+        }
+        const messageRecord = exactRecord(
+          settlementRecord.message,
+          ["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"],
+          ["responseModel", "responseId", "errorMessage", "rawStopReason", "endTurn"],
+          "piAgentCore.modelSettlement.message",
+          "CORE_OUTPUT_INVALID",
+        );
+        if (
+          messageRecord.role !== "assistant" ||
+          typeof messageRecord.api !== "string" ||
+          typeof messageRecord.provider !== "string" ||
+          typeof messageRecord.model !== "string" ||
+          !Array.isArray(messageRecord.content)
+        ) {
+          throw new Error("Pi model settlement assistant message is invalid");
+        }
+        const metadataIsValid = [
+          messageRecord.responseModel,
+          messageRecord.responseId,
+          messageRecord.errorMessage,
+          messageRecord.rawStopReason,
+        ].every((value) => value === undefined || typeof value === "string") &&
+          (messageRecord.endTurn === undefined || typeof messageRecord.endTurn === "boolean");
+        if (!metadataIsValid) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_RESPONSE_INVALID",
+              message: "Pi model response metadata is invalid",
+              retryable: false,
+            },
+          };
+        }
+        boundedSafeInteger(
+          messageRecord.timestamp,
+          0,
+          "piAgentCore.modelSettlement.message.timestamp",
+          "CORE_OUTPUT_INVALID",
+        );
+        const usageRecord = exactRecord(
+          messageRecord.usage,
+          ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"],
+          ["cacheWrite1h", "reasoning"],
+          "piAgentCore.modelSettlement.message.usage",
+          "CORE_OUTPUT_INVALID",
+        );
+        const costRecord = exactRecord(
+          usageRecord.cost,
+          ["input", "output", "cacheRead", "cacheWrite", "total"],
+          [],
+          "piAgentCore.modelSettlement.message.usage.cost",
+          "CORE_OUTPUT_INVALID",
+        );
+        const usageIsValid = [
+          usageRecord.input,
+          usageRecord.output,
+          usageRecord.cacheRead,
+          usageRecord.cacheWrite,
+          usageRecord.totalTokens,
+          usageRecord.cacheWrite1h,
+          usageRecord.reasoning,
+        ].every((value) => value === undefined ||
+          (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) &&
+          [
+            costRecord.input,
+            costRecord.output,
+            costRecord.cacheRead,
+            costRecord.cacheWrite,
+            costRecord.total,
+          ].every((value) =>
+            typeof value === "number" && Number.isFinite(value) && value >= 0
+          );
+        if (!usageIsValid) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_RESPONSE_INVALID",
+              message: "Pi model response usage is invalid",
+              retryable: false,
+            },
+          };
+        }
+        if (
+          messageRecord.api !== modelConfiguration.api ||
+          messageRecord.provider !== modelConfiguration.provider ||
+          messageRecord.model !== modelConfiguration.id
+        ) {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_RESPONSE_MISMATCH",
+              message: "Pi model response does not match the durable request",
+              retryable: false,
+            },
+          };
+        }
+        const stopReason = messageRecord.stopReason;
+        if (stopReason === "aborted" || stopReason === "error") {
+          const message = typeof messageRecord.errorMessage === "string"
+            ? messageRecord.errorMessage
+            : `Pi model ${stopReason}`;
+          return {
+            kind: "turn_error",
+            state: {
+              version: PI_AGENT_CORE_STATE_VERSION,
+              phase: "failed",
+              messages: [...state.messages, normalizeProtocolValue(messageRecord)],
+            },
+            error: {
+              code: stopReason === "aborted" ? "PI_MODEL_ABORTED" : "PI_MODEL_ERROR",
+              message,
+              retryable: false,
+            },
+          };
+        }
+        if (stopReason !== "stop" && stopReason !== "length" && stopReason !== "toolUse") {
+          return {
+            kind: "turn_error",
+            state: { ...state, phase: "failed" },
+            error: {
+              code: "PI_MODEL_RESPONSE_UNSUPPORTED",
+              message: "Pi model response stop reason is unsupported",
+              retryable: false,
+            },
+          };
+        }
+        const containsToolCall = messageRecord.content.some((block) => {
+          return block !== null &&
+            typeof block === "object" &&
+            !Array.isArray(block) &&
+            (block as { readonly type?: unknown }).type === "toolCall";
+        });
+        if (containsToolCall || stopReason === "toolUse") {
+          return {
+            kind: "turn_error",
+            state: {
+              version: PI_AGENT_CORE_STATE_VERSION,
+              phase: "failed",
+              messages: [...state.messages, normalizeProtocolValue(messageRecord)],
+            },
+            error: {
+              code: "PI_TOOL_CALL_UNSUPPORTED",
+              message: "Pi tool calls are disabled until the durable tool adapter is available",
+              retryable: false,
+            },
+          };
+        }
+        for (const [index, block] of messageRecord.content.entries()) {
+          const contentRecord = exactRecord(
+            block,
+            ["type"],
+            ["text", "textSignature", "thinking", "thinkingSignature", "redacted"],
+            `piAgentCore.modelSettlement.message.content[${index}]`,
+            "CORE_OUTPUT_INVALID",
+          );
+          if (contentRecord.type === "text") {
+            const textRecord = exactRecord(
+              block,
+              ["type", "text"],
+              ["textSignature"],
+              `piAgentCore.modelSettlement.message.content[${index}]`,
+              "CORE_OUTPUT_INVALID",
+            );
+            if (
+              typeof textRecord.text !== "string" ||
+              (textRecord.textSignature !== undefined &&
+                typeof textRecord.textSignature !== "string")
+            ) {
+              throw new Error("Pi text content is invalid");
+            }
+            continue;
+          }
+          if (contentRecord.type === "thinking" && modelConfiguration.reasoning) {
+            const thinkingRecord = exactRecord(
+              block,
+              ["type", "thinking"],
+              ["thinkingSignature", "redacted"],
+              `piAgentCore.modelSettlement.message.content[${index}]`,
+              "CORE_OUTPUT_INVALID",
+            );
+            if (
+              typeof thinkingRecord.thinking !== "string" ||
+              (thinkingRecord.thinkingSignature !== undefined &&
+                typeof thinkingRecord.thinkingSignature !== "string") ||
+              (thinkingRecord.redacted !== undefined &&
+                typeof thinkingRecord.redacted !== "boolean")
+            ) {
+              throw new Error("Pi thinking content is invalid");
+            }
+            continue;
+          }
+          throw new Error("Pi model-only settlement contains unsupported content");
+        }
+        const assistant = normalizeProtocolValue(messageRecord) as unknown as AssistantMessage;
+        let modelCalls = 0;
+        const settledModelStream: StreamFn = () => {
+          modelCalls += 1;
+          const stream = createAssistantMessageEventStream();
+          stream.push({
+            type: "done",
+            reason: stopReason,
+            message: structuredClone(assistant),
+          });
+          return stream;
+        };
+        const messages = await runAgentLoopContinue(
+          {
+            systemPrompt,
+            messages: state.messages.map((message) => structuredClone(message)) as unknown as Message[],
+            tools: [],
+          },
+          loopConfiguration,
+          async () => undefined,
+          context.signal,
+          settledModelStream,
+        );
+        if (modelCalls !== 1 || messages.length !== 1 || messages[0]?.role !== "assistant") {
+          throw new Error("Pi model settlement did not complete exactly one bounded turn");
+        }
+        const completedMessage = boundedProtocolValue(
+          messages[0] as AgentMessage,
+          maximumAdapterValueBytes,
+          "piAgentCore.completedMessage",
+          "CORE_OUTPUT_INVALID",
+        );
+        return {
+          kind: "turn_complete",
+          state: {
+            version: PI_AGENT_CORE_STATE_VERSION,
+            phase: "complete",
+            messages: [...state.messages, completedMessage],
+          },
+          result: {
+            version: 1,
+            message: structuredClone(completedMessage),
+          },
+        };
+      }
+
+      return {
+        kind: "turn_error",
+        state: { ...state, phase: "failed" },
+        error: {
+          code: "PI_STATE_MISMATCH",
+          message: "Pi adapter received an unsupported continuation",
+          retryable: false,
+        },
+      };
+    },
+  });
+}

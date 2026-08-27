@@ -13,6 +13,8 @@
     "test:unit": "vitest run"
   },
   "dependencies": {
-    "@circulusd/protocol-types": "workspace:*"
+    "@circulusd/protocol-types": "workspace:*",
+    "@earendil-works/pi-agent-core": "0.84.3",
+    "@earendil-works/pi-ai": "0.84.3"
   }
 }

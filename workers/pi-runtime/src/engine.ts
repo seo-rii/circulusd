@@ -105,12 +105,12 @@ class SystemEngineClock implements EngineClock {
     return performance.now();
   }
 
-  setTimeout(callback: () => void, delayMs: number): number {
+  setTimeout(callback: () => void, delayMs: number): unknown {
     return globalThis.setTimeout(callback, delayMs);
   }
 
   clearTimeout(handle: unknown): void {
-    if (typeof handle === "number") globalThis.clearTimeout(handle);
+    globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>);
   }
 }
 
