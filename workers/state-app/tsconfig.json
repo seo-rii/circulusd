@@ -1,10 +1,18 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "lib": ["ES2024", "WebWorker"],
+    "skipLibCheck": true,
     "paths": {
       "@circulusd/protocol-types": ["../../packages/protocol-types/src/index.ts"]
     },
     "rootDir": "../.."
   },
-  "include": ["src/session/**/*.ts", "src/workspace/**/*.ts", "src/control/**/*.ts"]
+  "include": [
+    "src/session/**/*.ts",
+    "src/workspace/**/*.ts",
+    "src/control/**/*.ts",
+    "src/host/**/*.ts",
+    "worker-configuration.d.ts"
+  ]
 }

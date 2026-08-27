@@ -23,7 +23,7 @@ export const EXTENSION_VALUE_MAX_BYTES = 512 * 1_024;
 export const EXTENSION_STATE_MAX_BYTES = 2 * 1_024 * 1_024;
 export const GENERATION_STATE_MAX_BYTES = 2 * 1_024 * 1_024;
 export const AUDIT_EVENT_MAX_BYTES = 64 * 1_024;
-export const AUDIT_STATE_MAX_BYTES = 16 * 1_024 * 1_024;
+export const AUDIT_STATE_MAX_BYTES = 3 * 1_024 * 1_024;
 
 const textEncoder = new TextEncoder();
 

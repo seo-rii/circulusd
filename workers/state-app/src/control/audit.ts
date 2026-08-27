@@ -27,6 +27,7 @@ import {
   type AuditEntry,
   type AuditEventInput,
   type ControlAuthoritySnapshot,
+  type ControlCommandReceipt,
   type CreateAuditStateInput,
 } from "./types.ts";
 
@@ -232,6 +233,116 @@ async function auditEntryHash(
   }
 }
 
+export interface AuditAppendHead {
+  readonly tenantId: string;
+  readonly sequence: number;
+  readonly headHash: Digest;
+  readonly previousTimestamp: number | null;
+}
+
+export interface PreparedAuditAppendCommand {
+  readonly commandId: string;
+  readonly expectedSequence: number;
+  readonly event: AuditEventInput;
+  readonly commandDigest: Digest;
+}
+
+export type AppliedAuditAppend =
+  | {
+      readonly replayed: true;
+      readonly outcome: AuditCommandOutcome;
+      readonly commandDigest: Digest;
+    }
+  | {
+      readonly replayed: false;
+      readonly entry: AuditEntry;
+      readonly receipt: ControlCommandReceipt<AuditCommandOutcome>;
+      readonly outcome: AuditCommandOutcome;
+      readonly commandDigest: Digest;
+    };
+
+export async function validateAuditEntryReceipt(
+  tenantId: string,
+  expectedSequence: number,
+  expectedPreviousHash: Digest,
+  previousTimestamp: number | null,
+  entry: AuditEntry,
+  receipt: ControlCommandReceipt<AuditCommandOutcome>,
+): Promise<void> {
+  validatedExactFields(
+    entry,
+    ["sequence", "previousHash", "hash", "event"],
+    [],
+    `audit entry ${expectedSequence}`,
+    "FAILED_PRECONDITION",
+  );
+  if (entry.sequence !== expectedSequence) {
+    controlError("FAILED_PRECONDITION", "audit entry sequence is not contiguous");
+  }
+  validatedDigest(entry.previousHash, `audit entry ${expectedSequence}.previousHash`);
+  validatedDigest(entry.hash, `audit entry ${expectedSequence}.hash`);
+  if (entry.previousHash !== expectedPreviousHash) {
+    controlError("FAILED_PRECONDITION", "audit previousHash chain is broken");
+  }
+  const event = validatedAuditEvent(
+    entry.event,
+    `audit entry ${expectedSequence}.event`,
+    null,
+  );
+  if (previousTimestamp !== null && event.timestamp < previousTimestamp) {
+    controlError("FAILED_PRECONDITION", "audit timestamps must not decrease");
+  }
+
+  validatedExactFields(
+    receipt,
+    ["commandId", "commandDigest", "committedSequence", "outcome"],
+    [],
+    `audit receipt ${expectedSequence}`,
+    "FAILED_PRECONDITION",
+  );
+  const commandId = validatedIdentifier(
+    receipt.commandId,
+    `audit receipt ${expectedSequence}.commandId`,
+  );
+  const commandDigest = validatedDigest(
+    receipt.commandDigest,
+    `audit receipt ${expectedSequence}.commandDigest`,
+  );
+  if (receipt.committedSequence !== expectedSequence) {
+    controlError("FAILED_PRECONDITION", "audit receipt sequence is not contiguous");
+  }
+  const outcome = validatedExactFields(
+    receipt.outcome,
+    ["kind", "sequence", "hash"],
+    [],
+    `audit receipt ${expectedSequence}.outcome`,
+    "FAILED_PRECONDITION",
+  );
+  if (
+    outcome.kind !== "audit_event_appended" ||
+    outcome.sequence !== expectedSequence ||
+    outcome.hash !== entry.hash
+  ) {
+    controlError("FAILED_PRECONDITION", "audit receipt disagrees with its entry");
+  }
+  validatedDigest(outcome.hash, `audit receipt ${expectedSequence}.outcome.hash`);
+
+  const expectedHash = await auditEntryHash(
+    tenantId,
+    expectedSequence,
+    expectedPreviousHash,
+    commandId,
+    commandDigest,
+    event,
+  );
+  if (entry.hash !== expectedHash) {
+    controlError(
+      "FAILED_PRECONDITION",
+      `audit entry ${expectedSequence} hash is invalid`,
+    );
+  }
+}
+
 function assertAuditStateShape(state: AuditAggregateState): void {
   validatedExactFields(
     state,
@@ -347,6 +458,7 @@ export function createAuditState(input: CreateAuditStateInput): AuditAggregateSt
 export async function validateAuditState(state: AuditAggregateState): Promise<void> {
   assertAuditStateShape(state);
   let expectedPreviousHash = AUDIT_GENESIS_HASH;
+  let previousTimestamp: number | null = null;
   for (const [index, entry] of state.entries.entries()) {
     const receipt = state.commandReceipts[index];
     if (receipt === undefined) {
@@ -355,22 +467,41 @@ export async function validateAuditState(state: AuditAggregateState): Promise<vo
         `audit entry ${entry.sequence} has no authoritative command receipt`,
       );
     }
-    const expectedHash = await auditEntryHash(
+    await validateAuditEntryReceipt(
       state.tenantId,
-      entry.sequence,
+      index + 1,
       expectedPreviousHash,
-      receipt.commandId,
-      receipt.commandDigest,
-      entry.event,
+      previousTimestamp,
+      entry,
+      receipt,
     );
-    if (entry.hash !== expectedHash) {
-      controlError("FAILED_PRECONDITION", `audit entry ${entry.sequence} hash is invalid`);
-    }
-    expectedPreviousHash = expectedHash;
+    expectedPreviousHash = entry.hash;
+    previousTimestamp = entry.event.timestamp;
   }
   if (state.headHash !== expectedPreviousHash) {
     controlError("FAILED_PRECONDITION", "audit head hash is invalid");
   }
+}
+
+export function validateAuditReadRequest(
+  tenantId: string,
+  afterSequenceInput: number,
+  limitInput: number,
+  authority: ControlAuthoritySnapshot,
+  now: number,
+): { readonly afterSequence: number; readonly limit: number } {
+  validatedAuthority(
+    authority,
+    { tenantId, subjectKind: "tenant", subjectId: tenantId },
+    now,
+    "audit.read",
+  );
+  const afterSequence = validatedInteger(afterSequenceInput, "afterSequence", 0);
+  const limit = validatedInteger(limitInput, "limit", 1);
+  if (limit > 1_000) {
+    controlError("INVALID_ARGUMENT", "audit read limit cannot exceed 1000");
+  }
+  return { afterSequence, limit };
 }
 
 export async function readAuditEntries(
@@ -381,27 +512,22 @@ export async function readAuditEntries(
   now: number,
 ): Promise<AuditEntry[]> {
   await validateAuditState(state);
-  validatedAuthority(
+  const { afterSequence, limit } = validateAuditReadRequest(
+    state.tenantId,
+    afterSequenceInput,
+    limitInput,
     authority,
-    { tenantId: state.tenantId, subjectKind: "tenant", subjectId: state.tenantId },
     now,
-    "audit.read",
   );
-  const afterSequence = validatedInteger(afterSequenceInput, "afterSequence", 0);
-  const limit = validatedInteger(limitInput, "limit", 1);
-  if (limit > 1_000) {
-    controlError("INVALID_ARGUMENT", "audit read limit cannot exceed 1000");
-  }
   return structuredClone(
     state.entries.filter((entry) => entry.sequence > afterSequence).slice(0, limit),
   );
 }
 
-export async function applyAuditCommand(
-  state: AuditAggregateState,
+export async function prepareAuditAppendCommand(
+  tenantId: string,
   command: AuditCommand,
-): Promise<ApplyAuditCommandResult> {
-  await validateAuditState(state);
+): Promise<PreparedAuditAppendCommand> {
   const commandRecord = validatedDataRecord(command, "command");
   if (commandRecord.kind !== "append_audit_event") {
     controlError("INVALID_ARGUMENT", "unknown Audit command kind");
@@ -421,7 +547,7 @@ export async function applyAuditCommand(
   const now = validatedInteger(command.now, "command.now", 0);
   const authority = validatedAuthority(
     command.authority,
-    { tenantId: state.tenantId, subjectKind: "tenant", subjectId: state.tenantId },
+    { tenantId, subjectKind: "tenant", subjectId: tenantId },
     now,
     "audit.append",
   );
@@ -431,67 +557,117 @@ export async function applyAuditCommand(
   }
   const commandDigest = await semanticCommandDigest(
     "circulusd.state-app.audit-command",
-    { tenantId: state.tenantId, kind: command.kind, commandId, expectedSequence, event },
+    { tenantId, kind: command.kind, commandId, expectedSequence, event },
   );
-  const receipt = state.commandReceipts.find(
-    (candidate) => candidate.commandId === commandId,
-  );
-  if (receipt !== undefined) {
-    if (receipt.commandDigest !== commandDigest) {
+  return { commandId, expectedSequence, event, commandDigest };
+}
+
+export async function applyPreparedAuditAppend(
+  head: AuditAppendHead,
+  command: PreparedAuditAppendCommand,
+  existingReceipt: ControlCommandReceipt<AuditCommandOutcome> | undefined,
+): Promise<AppliedAuditAppend> {
+  if (existingReceipt !== undefined) {
+    if (
+      existingReceipt.commandId !== command.commandId ||
+      existingReceipt.commandDigest !== command.commandDigest
+    ) {
       controlError(
         "IDEMPOTENCY_CONFLICT",
-        `commandId ${commandId} was reused with a different semantic digest`,
+        `commandId ${command.commandId} was reused with a different semantic digest`,
       );
     }
     return {
-      state,
-      outcome: structuredClone(receipt.outcome),
-      commandDigest,
+      outcome: structuredClone(existingReceipt.outcome),
+      commandDigest: command.commandDigest,
       replayed: true,
     };
   }
-  if (expectedSequence !== state.sequence) {
+  if (command.expectedSequence !== head.sequence) {
     controlError(
       "CONFLICT",
-      `expected sequence ${expectedSequence}, current is ${state.sequence}`,
+      `expected sequence ${command.expectedSequence}, current is ${head.sequence}`,
     );
   }
-  const previousTimestamp = state.entries.at(-1)?.event.timestamp;
-  if (previousTimestamp !== undefined && event.timestamp < previousTimestamp) {
+  if (
+    head.previousTimestamp !== null &&
+    command.event.timestamp < head.previousTimestamp
+  ) {
     controlError("FAILED_PRECONDITION", "audit event timestamp cannot move backwards");
   }
 
-  const sequence = state.sequence + 1;
+  const sequence = head.sequence + 1;
   const hash = await auditEntryHash(
-    state.tenantId,
+    head.tenantId,
     sequence,
-    state.headHash,
-    commandId,
-    commandDigest,
-    event,
+    head.headHash,
+    command.commandId,
+    command.commandDigest,
+    command.event,
   );
   const entry: AuditEntry = {
     sequence,
-    previousHash: state.headHash,
+    previousHash: head.headHash,
     hash,
-    event,
+    event: command.event,
   };
   const outcome: AuditCommandOutcome = {
     kind: "audit_event_appended",
     sequence,
     hash,
   };
-  const next = structuredClone(state);
-  next.sequence = sequence;
-  next.headHash = hash;
-  next.entries.push(entry);
-  next.commandReceipts.push({
-    commandId,
-    commandDigest,
-    committedSequence: sequence,
+  return {
+    entry,
+    receipt: {
+      commandId: command.commandId,
+      commandDigest: command.commandDigest,
+      committedSequence: sequence,
+      outcome,
+    },
     outcome,
-  });
+    commandDigest: command.commandDigest,
+    replayed: false,
+  };
+}
+
+export async function applyAuditCommand(
+  state: AuditAggregateState,
+  command: AuditCommand,
+): Promise<ApplyAuditCommandResult> {
+  await validateAuditState(state);
+  const prepared = await prepareAuditAppendCommand(state.tenantId, command);
+  const receipt = state.commandReceipts.find(
+    (candidate) => candidate.commandId === prepared.commandId,
+  );
+  const applied = await applyPreparedAuditAppend(
+    {
+      tenantId: state.tenantId,
+      sequence: state.sequence,
+      headHash: state.headHash,
+      previousTimestamp: state.entries.at(-1)?.event.timestamp ?? null,
+    },
+    prepared,
+    receipt,
+  );
+  if (applied.replayed) {
+    return {
+      state,
+      outcome: applied.outcome,
+      commandDigest: applied.commandDigest,
+      replayed: true,
+    };
+  }
+  const next = structuredClone(state);
+  next.sequence = applied.entry.sequence;
+  next.headHash = applied.entry.hash;
+  next.entries.push(applied.entry);
+  next.commandReceipts.push(applied.receipt);
   assertEncodedSize(next, "next state", AUDIT_STATE_MAX_BYTES, "RESOURCE_EXHAUSTED");
   await validateAuditState(next);
-  return { state: next, outcome: structuredClone(outcome), commandDigest, replayed: false };
+  return {
+    state: next,
+    outcome: structuredClone(applied.outcome),
+    commandDigest: applied.commandDigest,
+    replayed: false,
+  };
 }

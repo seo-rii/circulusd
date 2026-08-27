@@ -10,6 +10,7 @@ import {
   type AuditEventInput,
   type ControlAuthoritySnapshot,
 } from "../src/control/index.ts";
+import { AUDIT_STATE_MAX_BYTES } from "../src/control/validation.ts";
 
 function authority(
   overrides: Partial<ControlAuthoritySnapshot> = {},
@@ -61,6 +62,10 @@ function state(): AuditAggregateState {
 }
 
 describe("Audit aggregate", () => {
+  it("leaves host routing headroom inside the 4 MiB isolate-safe record cap", () => {
+    expect(AUDIT_STATE_MAX_BYTES).toBe(3 * 1_048_576);
+  });
+
   it("paginates reads only after tenant-level audit ACL validation", async () => {
     const committed = await applyAuditCommand(state(), {
       kind: "append_audit_event",

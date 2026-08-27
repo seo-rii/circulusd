@@ -7,9 +7,19 @@ export default defineConfig({
         "../../packages/protocol-types/src/index.ts",
         import.meta.url,
       ).pathname,
+      "cloudflare:workers": new URL(
+        "test/cloudflare-workers.ts",
+        import.meta.url,
+      ).pathname,
     },
   },
   test: {
-    include: ["test/session*.test.ts", "test/workspace*.test.ts", "test/control*.test.ts"],
+    testTimeout: 20_000,
+    include: [
+      "test/session*.test.ts",
+      "test/workspace*.test.ts",
+      "test/control*.test.ts",
+      "test/host*.test.ts",
+    ],
   },
 });

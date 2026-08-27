@@ -19,7 +19,9 @@ export const SESSION_EFFECT_REQUEST_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_EFFECT_REQUEST_DIGEST_DOMAIN = "circulusd.session.effect-request" as const;
 export const SESSION_VALUE_MAX_ENCODED_BYTES = 1_048_576 as const;
 export const SESSION_COMMAND_MAX_ENCODED_BYTES = 8 * 1_048_576;
-export const SESSION_STATE_MAX_ENCODED_BYTES = 32 * 1_048_576;
+// The host record adds routing and manifest metadata around this value. Three
+// MiB leaves headroom below the host's 4 MiB record/isolate-memory boundary.
+export const SESSION_STATE_MAX_ENCODED_BYTES = 3 * 1_048_576;
 
 export type SessionStatus =
   | "created"

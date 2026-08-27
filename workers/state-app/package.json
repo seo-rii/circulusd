@@ -7,10 +7,14 @@
   "exports": {
     "./session": "./src/session/index.ts",
     "./workspace": "./src/workspace/index.ts",
-    "./control": "./src/control/index.ts"
+    "./control": "./src/control/index.ts",
+    "./host": "./src/host/index.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",
+    "check:worker-types": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --check",
+    "generate:rpc-digests": "node scripts/generate-rpc-digests.mjs",
+    "types:worker": "wrangler types worker-configuration.d.ts --config wrangler.jsonc",
     "test": "vitest run",
     "test:unit": "vitest run"
   },
