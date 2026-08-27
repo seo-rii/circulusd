@@ -9,7 +9,7 @@ import type {
   NormalizedValue,
 } from "@circulusd/protocol-types";
 
-export const SESSION_STATE_SCHEMA_VERSION = 1 as const;
+export const SESSION_STATE_SCHEMA_VERSION = 2 as const;
 export const SESSION_COMMAND_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_DOMAIN = "circulusd.session.agent-checkpoint" as const;
@@ -22,6 +22,7 @@ export const SESSION_COMMAND_MAX_ENCODED_BYTES = 8 * 1_048_576;
 // The host record adds routing and manifest metadata around this value. Three
 // MiB leaves headroom below the host's 4 MiB record/isolate-memory boundary.
 export const SESSION_STATE_MAX_ENCODED_BYTES = 3 * 1_048_576;
+export const SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS = 256 as const;
 
 export type SessionStatus =
   | "created"
@@ -166,6 +167,42 @@ export interface CommandReceipt {
   outcome: SessionCommandOutcome;
 }
 
+export interface PublicTurnAdmission {
+  readonly authorizationGeneration: number;
+  readonly idempotencyKeyDigest: Digest;
+  readonly requestDigest: Digest;
+}
+
+export interface TurnAdmissionReceipt {
+  idempotencyKeyDigest: Digest;
+  requestDigest: Digest;
+  inputDigest: Digest;
+  turnId: string;
+  turnSequence: number;
+  activated: boolean;
+  publicEventSequence: number;
+}
+
+export interface SessionPublicEvent {
+  sequence: number;
+  type: "turn.accepted";
+  turnId: string;
+  turnSequence: number;
+  status: "active" | "queued";
+}
+
+export interface SessionPublicEventSnapshot {
+  readonly sessionId: string;
+  readonly activeTurnId: string | null;
+  readonly turnStatus: ActiveTurn["status"] | null;
+  readonly lastEventSequence: number;
+}
+
+export interface SessionPublicEventReplay {
+  readonly snapshot: SessionPublicEventSnapshot;
+  readonly events: readonly SessionPublicEvent[];
+}
+
 export interface SessionAggregateState extends SessionRuntimeConfiguration {
   schemaVersion: typeof SESSION_STATE_SCHEMA_VERSION;
   sessionId: string;
@@ -176,6 +213,7 @@ export interface SessionAggregateState extends SessionRuntimeConfiguration {
   runtimePointer: RuntimePointer;
   status: SessionStatus;
   eventSequence: number;
+  publicEventSequence: number;
   nextTurnSequence: number;
   activeTurn: ActiveTurn | null;
   queuedTurns: QueuedTurn[];
@@ -188,6 +226,8 @@ export interface SessionAggregateState extends SessionRuntimeConfiguration {
   authorizationGeneration: number;
   emergencyOverlayDigest: Digest;
   commandReceipts: CommandReceipt[];
+  publicEvents: SessionPublicEvent[];
+  turnAdmissionReceipts: TurnAdmissionReceipt[];
 }
 
 interface SessionCommandBase {
@@ -215,6 +255,7 @@ export interface EnqueueTurnCommand extends SessionCommandBase {
   readonly genesisCheckpoint: AgentCheckpoint;
   readonly turnLeaseGeneration: number;
   readonly leaseExpiresAt: number;
+  readonly publicAdmission?: PublicTurnAdmission;
 }
 
 export interface CommitEngineStepCommand extends ActiveTurnCommandBase {

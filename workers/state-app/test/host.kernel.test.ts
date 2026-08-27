@@ -6,6 +6,7 @@ import {
   PROTOCOL_MINOR,
   PROTOCOL_NAME,
   digestBytes,
+  digestStructuredValue,
   encodeCanonicalCbor,
   type Digest,
 } from "@circulusd/protocol-types";
@@ -28,6 +29,7 @@ import {
 } from "../src/host/index.ts";
 import type { AggregateAdapter } from "../src/host/contracts.ts";
 import { TransactionalAggregateKernel } from "../src/host/kernel.ts";
+import { ChunkedAggregateStorage } from "../src/host/storage.ts";
 import {
   HOST_RPC_CONTRACTS,
   type HostRpcOperation,
@@ -44,9 +46,12 @@ import type {
   UserCommand,
 } from "../src/control/index.ts";
 import {
+  applySessionCommand,
+  createSessionState,
   turnInputDigest,
   type CreateSessionStateInput,
   type SessionCommand,
+  type SessionPublicEventReplay,
 } from "../src/session/index.ts";
 import type {
   CreateWorkspaceStateInput,
@@ -233,6 +238,7 @@ function routedCellContext(
   return {
     state: { id: currentId, storage } as never,
     environment: { [bindingName]: namespace },
+    route: { currentId, namespace },
   };
 }
 
@@ -392,15 +398,29 @@ function sessionInitialization(): CreateSessionStateInput {
   };
 }
 
-async function enqueueSessionCommand(): Promise<SessionCommand> {
-  const input = { message: "hello" };
-  const payloadBytes = new TextEncoder().encode("genesis:turn-1");
+async function enqueueSessionCommand(
+  overrides: {
+    readonly commandId?: string;
+    readonly expectedEventSequence?: number;
+    readonly transactionTime?: number;
+    readonly turnId?: string;
+    readonly message?: string;
+    readonly idempotencyKeyDigest?: Digest;
+    readonly requestDigest?: Digest;
+    readonly authorizationGeneration?: number;
+    readonly turnLeaseGeneration?: number;
+    readonly leaseExpiresAt?: number;
+  } = {},
+): Promise<SessionCommand> {
+  const turnId = overrides.turnId ?? "turn-1";
+  const input = { message: overrides.message ?? "hello" };
+  const payloadBytes = new TextEncoder().encode(`genesis:${turnId}`);
   return {
     kind: "enqueue_turn",
-    commandId: "enqueue-1",
-    expectedEventSequence: 0,
-    transactionTime: 100,
-    turnId: "turn-1",
+    commandId: overrides.commandId ?? "enqueue-1",
+    expectedEventSequence: overrides.expectedEventSequence ?? 0,
+    transactionTime: overrides.transactionTime ?? 100,
+    turnId,
     input,
     inputDigest: await turnInputDigest(input),
     genesisCheckpoint: {
@@ -410,16 +430,46 @@ async function enqueueSessionCommand(): Promise<SessionCommand> {
       checkpointSchemaVersion: 1,
       runtimeRevisionDigest: digest("1"),
       sessionId: "session-1",
-      turnId: "turn-1",
+      turnId,
       checkpointSequence: 0,
       predecessorDigest: null,
       payloadEncoding: "opaque-v1",
       payloadBytes,
       payloadDigest: await digestBytes(payloadBytes),
     },
-    turnLeaseGeneration: 10,
-    leaseExpiresAt: 1_000,
+    turnLeaseGeneration: overrides.turnLeaseGeneration ?? 10,
+    leaseExpiresAt: overrides.leaseExpiresAt ?? 1_000,
+    publicAdmission: {
+      authorizationGeneration: overrides.authorizationGeneration ?? 6,
+      idempotencyKeyDigest: overrides.idempotencyKeyDigest ?? digest("a"),
+      requestDigest: overrides.requestDigest ?? digest("b"),
+    },
   };
+}
+
+function sessionCell(storage: FakeTransactionalStorage): SessionCell {
+  const route = routedCellContext(
+    storage,
+    "SESSION_CELL",
+    sessionCellName("tenant-1", "session-1"),
+  );
+  return new SessionCell(route.state, route.environment);
+}
+
+function readSessionPublicEvents(
+  cell: SessionCell,
+  payload: {
+    readonly authority: ControlAuthoritySnapshot;
+    readonly now: number;
+    readonly afterSequence: number;
+    readonly limit: number;
+  },
+): Promise<SessionPublicEventReplay> {
+  return hostRpcResult(
+    "session.read-events",
+    payload,
+    (request) => cell.readSessionEvents(request),
+  );
 }
 
 function workspaceInitialization(): CreateWorkspaceStateInput {
@@ -1165,6 +1215,97 @@ describe("named aggregate cells", () => {
     expect("load" in cell || "save" in cell || "patch" in cell).toBe(false);
   });
 
+  it("migrates a persisted schema-v1 Session before replay, read, and execution", async () => {
+    const storage = new FakeTransactionalStorage();
+    const initialization = sessionInitialization();
+    const logicalName = sessionCellName("tenant-1", "session-1");
+    const route = routedCellContext(storage, "SESSION_CELL", logicalName);
+    const legacyCommand = structuredClone(
+      await enqueueSessionCommand(),
+    ) as SessionCommand & { publicAdmission?: unknown };
+    delete legacyCommand.publicAdmission;
+    const committedLegacyState = (
+      await applySessionCommand(createSessionState(initialization), legacyCommand)
+    ).state;
+    const legacyState = structuredClone(
+      committedLegacyState,
+    ) as unknown as Record<string, unknown>;
+    legacyState.schemaVersion = 1;
+    delete legacyState.publicEventSequence;
+    delete legacyState.publicEvents;
+    delete legacyState.turnAdmissionReceipts;
+    const initializationDigest = await digestStructuredValue(
+      "circulusd.state-app.session-initialization",
+      1,
+      initialization,
+    );
+    const legacyRecords = new ChunkedAggregateStorage<Record<string, unknown>>(
+      "session",
+      () => undefined,
+      route.route,
+    );
+    await storage.transaction(async (transaction) => {
+      await legacyRecords.write(
+        transaction,
+        legacyRecords.buildInitialRecord(
+          initializationDigest,
+          legacyState,
+          logicalName,
+        ),
+      );
+    });
+    const legacyRevision = storage.revision;
+
+    const cell = new SessionCell(route.state, route.environment);
+    await expect(hostRpcResult(
+      "session.initialize",
+      initialization,
+      (request) => cell.initializeSession(request),
+    )).resolves.toEqual({ version: 1, replayed: true });
+    expect(storage.revision).toBe(legacyRevision + 1);
+
+    await expect(hostRpcResult(
+      "session.read",
+      { authority: sessionAuthority(), now: 200 },
+      (request) => cell.readSession(request),
+    )).resolves.toMatchObject({
+      schemaVersion: 2,
+      eventSequence: 1,
+      activeTurn: { turnId: "turn-1" },
+      publicEventSequence: 0,
+      publicEvents: [],
+      turnAdmissionReceipts: [],
+    });
+    const migratedRevision = storage.revision;
+    await expect(readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    })).resolves.toMatchObject({
+      snapshot: { lastEventSequence: 0 },
+      events: [],
+    });
+    expect(storage.revision).toBe(migratedRevision);
+
+    await expect(hostRpcResult(
+      "session.execute",
+      legacyCommand,
+      (request) => cell.executeSessionCommand(request),
+    )).resolves.toMatchObject({ version: 1, replayed: true });
+    await expect(hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand({
+        commandId: "enqueue-after-v1-migration",
+        expectedEventSequence: 1,
+        turnId: "turn-after-v1-migration",
+        idempotencyKeyDigest: digest("c"),
+        requestDigest: digest("d"),
+      }),
+      (request) => cell.executeSessionCommand(request),
+    )).resolves.toMatchObject({ version: 2, replayed: false });
+  });
+
   it("fails closed when a Session read authority is forged, expired, or stale", async () => {
     const storage = new FakeTransactionalStorage();
     const route = routedCellContext(
@@ -1197,6 +1338,290 @@ describe("named aggregate cells", () => {
         code: expect.stringMatching(/^(?:PERMISSION_DENIED|STALE_GENERATION)$/),
       });
     }
+  });
+
+  it("commits active and queued public admissions with a bounded gap-free cursor", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+
+    const first = await hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => cell.executeSessionCommand(request),
+    );
+    expect(first.outcome).toMatchObject({
+      kind: "turn_enqueued",
+      turnId: "turn-1",
+      activated: true,
+    });
+
+    await hostRpcResult(
+      "session.execute",
+      {
+        kind: "rotate_generations",
+        commandId: "rotate-between-public-turns",
+        expectedEventSequence: 1,
+        nextPlacementGeneration: 4,
+        nextSandboxGeneration: 5,
+        nextAuthorizationGeneration: 7,
+        nextEmergencyOverlayDigest: digest("3"),
+      },
+      (request) => cell.executeSessionCommand(request),
+    );
+    const second = await hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand({
+        commandId: "enqueue-2",
+        expectedEventSequence: 2,
+        transactionTime: 110,
+        turnId: "turn-2",
+        idempotencyKeyDigest: digest("c"),
+        requestDigest: digest("d"),
+        authorizationGeneration: 7,
+        turnLeaseGeneration: 11,
+      }),
+      (request) => cell.executeSessionCommand(request),
+    );
+    expect(second.outcome).toMatchObject({
+      kind: "turn_enqueued",
+      turnId: "turn-2",
+      activated: false,
+    });
+
+    const authority = sessionAuthority({
+      authorizationGeneration: 7,
+      currentAuthorizationGeneration: 7,
+    });
+    const firstPage = await readSessionPublicEvents(cell, {
+      authority,
+      now: 200,
+      afterSequence: 0,
+      limit: 1,
+    });
+    expect(firstPage).toEqual({
+      snapshot: {
+        sessionId: "session-1",
+        activeTurnId: "turn-1",
+        turnStatus: "active",
+        lastEventSequence: 2,
+      },
+      events: [
+        {
+          sequence: 1,
+          type: "turn.accepted",
+          turnId: "turn-1",
+          turnSequence: 0,
+          status: "active",
+        },
+      ],
+    });
+    await expect(readSessionPublicEvents(cell, {
+      authority,
+      now: 200,
+      afterSequence: 1,
+      limit: 1,
+    })).resolves.toMatchObject({
+      events: [
+        {
+          sequence: 2,
+          turnId: "turn-2",
+          turnSequence: 1,
+          status: "queued",
+        },
+      ],
+    });
+    await expect(readSessionPublicEvents(cell, {
+      authority,
+      now: 200,
+      afterSequence: 0,
+      limit: 257,
+    })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
+  it("checks current authorization before public admission receipt replay and event reads", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    const admitted = await enqueueSessionCommand();
+    await hostRpcResult(
+      "session.execute",
+      admitted,
+      (request) => cell.executeSessionCommand(request),
+    );
+    await hostRpcResult(
+      "session.execute",
+      {
+        kind: "rotate_generations",
+        commandId: "rotate-public-authorization",
+        expectedEventSequence: 1,
+        nextPlacementGeneration: 4,
+        nextSandboxGeneration: 5,
+        nextAuthorizationGeneration: 7,
+        nextEmergencyOverlayDigest: digest("3"),
+      },
+      (request) => cell.executeSessionCommand(request),
+    );
+
+    await expect(hostRpcResult(
+      "session.execute",
+      admitted,
+      (request) => cell.executeSessionCommand(request),
+    )).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    await expect(readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    })).rejects.toMatchObject({ code: "STALE_GENERATION" });
+
+    const reauthorized = await enqueueSessionCommand({
+      commandId: "enqueue-after-reauthorization",
+      expectedEventSequence: 2,
+      turnId: "turn-replayed-proposal",
+      authorizationGeneration: 7,
+    });
+    const replayed = await hostRpcResult(
+      "session.execute",
+      reauthorized,
+      (request) => cell.executeSessionCommand(request),
+    );
+    expect(replayed).toMatchObject({
+      version: 2,
+      replayed: true,
+      outcome: { kind: "turn_enqueued", turnId: "turn-1", activated: true },
+    });
+    await expect(readSessionPublicEvents(cell, {
+      authority: sessionAuthority({
+        authorizationGeneration: 7,
+        currentAuthorizationGeneration: 7,
+      }),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    })).resolves.toMatchObject({
+      snapshot: { lastEventSequence: 1 },
+      events: [{ sequence: 1, turnId: "turn-1" }],
+    });
+  });
+
+  it("converges concurrent semantic duplicates on one public turn and event", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    const first = await enqueueSessionCommand({
+      commandId: "enqueue-concurrent-a",
+      turnId: "turn-concurrent-a",
+    });
+    const duplicate = await enqueueSessionCommand({
+      commandId: "enqueue-concurrent-b",
+      turnId: "turn-concurrent-b",
+    });
+
+    const results = await Promise.all([
+      hostRpcResult(
+        "session.execute",
+        first,
+        (request) => cell.executeSessionCommand(request),
+      ),
+      hostRpcResult(
+        "session.execute",
+        duplicate,
+        (request) => cell.executeSessionCommand(request),
+      ),
+    ]);
+    expect(results.map((result) => result.replayed).sort()).toEqual([false, true]);
+    expect(results[0]?.outcome).toEqual(results[1]?.outcome);
+
+    const replay = await readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    });
+    expect(replay.events).toHaveLength(1);
+    const firstOutcome = results.at(0)?.outcome;
+    expect(firstOutcome?.kind).toBe("turn_enqueued");
+    expect(replay.events[0]?.turnId).toBe(
+      firstOutcome?.kind === "turn_enqueued" ? firstOutcome.turnId : null,
+    );
+    expect(replay.snapshot.lastEventSequence).toBe(1);
+  });
+
+  it("lets one concurrent idempotency conflict win without a partial public event", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    const contenders = await Promise.allSettled([
+      hostRpcResult(
+        "session.execute",
+        await enqueueSessionCommand({
+          commandId: "enqueue-conflict-a",
+          turnId: "turn-conflict-a",
+          message: "request-a",
+          requestDigest: digest("b"),
+        }),
+        (request) => cell.executeSessionCommand(request),
+      ),
+      hostRpcResult(
+        "session.execute",
+        await enqueueSessionCommand({
+          commandId: "enqueue-conflict-b",
+          turnId: "turn-conflict-b",
+          message: "request-b",
+          requestDigest: digest("b"),
+        }),
+        (request) => cell.executeSessionCommand(request),
+      ),
+    ]);
+    expect(contenders.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(contenders.find((result) => result.status === "rejected")).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "IDEMPOTENCY_CONFLICT" }),
+    });
+
+    const winner = contenders.find((result) => result.status === "fulfilled");
+    const winnerTurnId =
+      winner?.status === "fulfilled" && winner.value.outcome.kind === "turn_enqueued"
+        ? winner.value.outcome.turnId
+        : null;
+    expect(winnerTurnId).not.toBeNull();
+    await expect(hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand({
+        commandId: "enqueue-conflict-request-digest",
+        expectedEventSequence: 1,
+        turnId: "turn-conflict-request-digest",
+        message: winnerTurnId === "turn-conflict-a" ? "request-a" : "request-b",
+        requestDigest: digest("c"),
+      }),
+      (request) => cell.executeSessionCommand(request),
+    )).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+
+    const replay = await readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    });
+    expect(replay.snapshot.lastEventSequence).toBe(1);
+    expect(replay.events).toHaveLength(1);
   });
 
   it("routes Workspace commands and only exposes its authorized invocation lookup", async () => {

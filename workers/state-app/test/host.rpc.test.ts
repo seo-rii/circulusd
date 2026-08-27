@@ -25,41 +25,43 @@ const MEBIBYTE = 1_048_576;
 
 const GOLDEN_SCHEMA_DIGESTS = {
   "session.initialize":
-    "sha256:a2fd77db7b504367728147f55b355f5a06e7b3b6e307d425ce2d6d25686eb278",
+    "sha256:1518697b46cb9c9c72ae37ce45c437ff641f6d1c691afd993528314d1aa6149c",
   "session.execute":
-    "sha256:ad9ad65775d83fb71e02aab52d85a39e7f4136b60948e0db622d233c9d6bf43d",
+    "sha256:0e9967c75472e5273c4bcd6e9fbea8ab37ecd3b553f8a5942abca76284697c69",
   "session.read":
-    "sha256:bb04fed746e9c50db4baec42f2a0903d9e3bf955f2a5770af549c45383a37e99",
+    "sha256:daf11265b5dfc5f8b71f83481c1b8019ffccb8176ec77b8e51b4292f4471770d",
+  "session.read-events":
+    "sha256:4a358aa50ce30d2a13598feed78585424b8940b9080f5081f3a084ad0d6576e8",
   "workspace.initialize":
-    "sha256:bb6d5f476ffabca1d8aa6450b65cc0eef7ed6adf3e221d0bbe30c0f4127bcba0",
+    "sha256:e054dfe6338c668d3d78ce2628b752564d9352be4a40751a04b3657295bb477b",
   "workspace.execute":
-    "sha256:2773aacece38c522e80d42d58862ae6d26cb672fc2772dbb46bc5f2ee63ab563",
+    "sha256:15ecf7638b1ea35048533ba626b1fb6f5cf7a2febb2b55c4a354a661d8981286",
   "workspace.lookup-invocation":
-    "sha256:ef1645220af92c4f983b41a57dd24b8aa98d5ea2021f6295f1b71d6fc3c278f3",
+    "sha256:b5148a164c346f3e09ed1824a12b5b5ccfd497475942337b40af32c39ab439cf",
   "user.initialize":
-    "sha256:484ebdc370de058a8ae22cc6fedbe0978b8fa90b099797fdb3336b2e0ecf04fb",
+    "sha256:d5672b65f02842e76952970dff9e8481eddd20bcabad326360a88397973c0553",
   "user.execute":
-    "sha256:9b3793672672de8f076fe9c5415d6befcc48bbecb9c06976f053221ba320f6ed",
+    "sha256:97752f66559f85f07db156f17156b957f4aa89f296e91b1a767ae6df154184cc",
   "user.read":
-    "sha256:1419c18f5765374edaf27206c9908416affe3f1628c3872e24c5807e32cf6e4c",
+    "sha256:a9db29fd72bab14db6576884fe5c4fde54afc5f4c89a3f70976c372c02bee048",
   "extension-state.initialize":
-    "sha256:ab3ede0be07cdd96f3f3d299adb79b168f9f7f0adc19b362829067fa32e79f6e",
+    "sha256:f8a68787c1969fa73d58d88a105df7f8779e8da69c973f6883bd88a104e6e084",
   "extension-state.execute":
-    "sha256:5d7e9cff751305fc4469641b15d6335030e2a08b5cf71112776021fc7447673e",
+    "sha256:6948ac088965ab7922a837d69156f97fb45ff24b35b27023e6e3d124e5074c50",
   "extension-state.read":
-    "sha256:2bdb526ce79f83e9f2a8bbfdb7fa1cce4bb29d0f8c76d5f568ecc4847c564a3a",
+    "sha256:caec4d6952983a993be2a942303b09847537b04d9608a58d66cb009bad77e0c7",
   "capability-generation.initialize":
-    "sha256:34775514d28693a14d50bd83f9baef1c26f852c532d7322ba2acd9cfe3cfef87",
+    "sha256:47fb52e1aa89766ef5f42c6156ae9fa31282e337e5008763926242554fe7b850",
   "capability-generation.execute":
-    "sha256:30d1ca470b41611d50598ff40582186c96b7cf28a49b37ccfe777f4365501d2e",
+    "sha256:5e7189d32508fafeeec35f81f69189131860116218ab93135740dd26584cb4bb",
   "capability-generation.assert-current":
-    "sha256:ca055c45f41c8bb604b07ac0e2afa91e9c94f6ca8daff73b55131e3e5d2168c1",
+    "sha256:f433d8b7901c1f4e7d0e169560dd9d378fe0d161eb77df5aa7913ab20cb453b5",
   "audit.initialize":
-    "sha256:77a1688ce217dd1843486e0cc8e8fda617176040b9affa24922345de8d9b7498",
+    "sha256:07b5b0766b2c3048eb5b7dfd4d4878e29de90aa466bdc4d73ea7b14e1ecb1f3e",
   "audit.execute":
-    "sha256:166e61b727b94117903fb3506d3c1806bcf28e5ccc8731b3d8dfdb2083a1d257",
+    "sha256:8fda42f94c7517733f1d391a1608ac26d028b8ce7a31119d202f67a9f553aa90",
   "audit.read":
-    "sha256:1584fcf232fdb8c21fed20478791f8199015b39805c3f7e53ffccc801ef3a9e1",
+    "sha256:742f82e7358f49fefd17e9074314cef860a42630d332b6bdc326d6c355117d31",
 } as const satisfies Record<HostRpcOperation, `sha256:${string}`>;
 
 function requestEnvelope(
@@ -107,8 +109,8 @@ describe("state host RPC contracts", () => {
     }
   });
 
-  it("pins 18 separated operation schemas and explicit request/response limits", () => {
-    expect(HOST_RPC_OPERATIONS).toHaveLength(18);
+  it("pins 19 separated operation schemas and explicit request/response limits", () => {
+    expect(HOST_RPC_OPERATIONS).toHaveLength(19);
     expect(HOST_RPC_CONTRACTS).toEqual(
       expect.objectContaining(
         Object.fromEntries(
@@ -125,7 +127,7 @@ describe("state host RPC contracts", () => {
     expect(
       new Set(HOST_RPC_OPERATIONS.map((operation) =>
         HOST_RPC_CONTRACTS[operation].schemaDigest)),
-    ).toHaveLength(18);
+    ).toHaveLength(19);
 
     for (const operation of HOST_RPC_OPERATIONS) {
       const contract = HOST_RPC_CONTRACTS[operation];
@@ -154,6 +156,9 @@ describe("state host RPC contracts", () => {
     expect(HOST_RPC_CONTRACTS["session.read"].responseMaxEncodedBytes).toBeGreaterThan(
       3 * MEBIBYTE,
     );
+    expect(
+      HOST_RPC_CONTRACTS["session.read-events"].responseMaxEncodedBytes,
+    ).toBeLessThanOrEqual(2 * MEBIBYTE);
     expect(HOST_RPC_CONTRACTS["user.read"].responseMaxEncodedBytes).toBeGreaterThan(
       2 * MEBIBYTE,
     );

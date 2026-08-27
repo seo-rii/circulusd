@@ -8,6 +8,7 @@ import {
 
 import {
   HostContractError,
+  type AggregateMigrationResult,
   type CellRoutePort,
   type TransactionPort,
 } from "./contracts.ts";
@@ -84,16 +85,24 @@ function exactRecord(value: unknown, expectedKeys: readonly string[], label: str
 export class ChunkedAggregateStorage<State> {
   readonly #aggregateKind: string;
   readonly #validateState: (state: State) => void | Promise<void>;
+  readonly #migrateState:
+    | ((state: unknown) =>
+        AggregateMigrationResult<State> | Promise<AggregateMigrationResult<State>>)
+    | undefined;
   readonly #route: CellRoutePort | undefined;
 
   constructor(
     aggregateKind: string,
     validateState: (state: State) => void | Promise<void>,
     route?: CellRoutePort,
+    migrateState?: (
+      state: unknown,
+    ) => AggregateMigrationResult<State> | Promise<AggregateMigrationResult<State>>,
   ) {
     this.#aggregateKind = aggregateKind;
     this.#validateState = validateState;
     this.#route = route;
+    this.#migrateState = migrateState;
   }
 
   buildInitialRecord(
@@ -304,16 +313,42 @@ export class ChunkedAggregateStorage<State> {
     ) {
       throw new HostContractError("CORRUPT_STATE", "stored aggregate metadata is invalid");
     }
-    const record = recordCandidate as unknown as StateRecord<State>;
-    this.#assertStoredRoute(record);
+    const storedRecord = recordCandidate as unknown as StateRecord<unknown>;
+    this.#assertStoredRoute(storedRecord as StateRecord<State>);
+    let record: StateRecord<State>;
+    let migrated = false;
     try {
+      let state = storedRecord.state as State;
+      if (this.#migrateState !== undefined) {
+        const migration = await this.#migrateState(storedRecord.state);
+        if (
+          typeof migration !== "object" ||
+          migration === null ||
+          Array.isArray(migration) ||
+          typeof migration.migrated !== "boolean" ||
+          !Object.prototype.hasOwnProperty.call(migration, "state") ||
+          Reflect.ownKeys(migration).length !== 2
+        ) {
+          throw new TypeError("aggregate migration returned an invalid result");
+        }
+        state = migration.state;
+        migrated = migration.migrated;
+      }
+      record = {
+        ...storedRecord,
+        state,
+      } as StateRecord<State>;
       await this.#validateState(record.state);
     } catch (error) {
       throw new HostContractError("CORRUPT_STATE", "stored aggregate state is invalid", {
         cause: error,
       });
     }
-    return { record, manifest };
+    if (!migrated) {
+      return { record, manifest };
+    }
+    const migratedManifest = await this.#writeRecord(transaction, record, manifest);
+    return { record, manifest: migratedManifest };
   }
 
   async write(
@@ -321,6 +356,14 @@ export class ChunkedAggregateStorage<State> {
     record: StateRecord<State>,
     previousManifest?: StateManifest,
   ): Promise<void> {
+    await this.#writeRecord(transaction, record, previousManifest);
+  }
+
+  async #writeRecord(
+    transaction: TransactionPort,
+    record: StateRecord<State>,
+    previousManifest?: StateManifest,
+  ): Promise<StateManifest> {
     exactRecord(
       record,
       [
@@ -402,6 +445,7 @@ export class ChunkedAggregateStorage<State> {
         await transaction.delete(chunkKey(previousManifest.generationDigest, index));
       }
     }
+    return manifest;
   }
 
   #validRouteMetadata(cellName: unknown, physicalCellId: unknown): boolean {

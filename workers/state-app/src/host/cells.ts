@@ -5,11 +5,14 @@ import { parseNormalizedValue, type Digest } from "@circulusd/protocol-types";
 import {
   applySessionCommand,
   createSessionState,
+  migrateSessionState,
+  replaySessionPublicEvents,
   validateSessionState,
   type CreateSessionStateInput,
   type SessionAggregateState,
   type SessionCommand,
   type SessionCommandOutcome,
+  type SessionPublicEventReplay,
 } from "../session/index.ts";
 import {
   applyWorkspaceCommand,
@@ -90,6 +93,7 @@ const sessionAdapter: AggregateAdapter<
   cellName: (initialization) =>
     sessionCellName(initialization.tenantId, initialization.sessionId),
   create: createSessionState,
+  migrate: migrateSessionState,
   validate: validateSessionState,
   apply: applySessionCommand,
   version: (state) => state.eventSequence,
@@ -258,6 +262,30 @@ interface AuthorizedControlQuery {
   readonly now: number;
 }
 
+interface SessionEventsQuery extends AuthorizedControlQuery {
+  readonly afterSequence: number;
+  readonly limit: number;
+}
+
+function assertAuthorizedSessionRead(
+  state: SessionAggregateState,
+  query: AuthorizedControlQuery,
+): void {
+  const authority = validatedAuthority(
+    query.authority,
+    {
+      tenantId: state.tenantId,
+      subjectKind: "session",
+      subjectId: state.sessionId,
+    },
+    query.now,
+    "session.read",
+  );
+  if (authority.currentAuthorizationGeneration !== state.authorizationGeneration) {
+    controlError("STALE_GENERATION", "session read authority is stale");
+  }
+}
+
 interface CapabilityGenerationQuery extends AuthorizedControlQuery {
   readonly candidateGeneration: number;
 }
@@ -318,26 +346,32 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
       (input) => this.kernel.query(
         input,
         (state, query) => {
-          const authority = validatedAuthority(
-            query.authority,
-            {
-              tenantId: state.tenantId,
-              subjectKind: "session",
-              subjectId: state.sessionId,
-            },
-            query.now,
-            "session.read",
-          );
-          if (
-            authority.currentAuthorizationGeneration !==
-            state.authorizationGeneration
-          ) {
-            controlError(
-              "STALE_GENERATION",
-              "session read authority is stale",
-            );
-          }
+          assertAuthorizedSessionRead(state, query);
           return state;
+        },
+      ),
+    );
+  }
+
+  readSessionEvents(
+    request: unknown,
+  ): Promise<HostRpcResponse<SessionPublicEventReplay>> {
+    return invokeHostRpc(
+      "session.read-events",
+      request,
+      (payload) => exactQueryPayload<SessionEventsQuery>(
+        payload,
+        ["authority", "now", "afterSequence", "limit"],
+      ),
+      (input) => this.kernel.query(
+        input,
+        (state, query) => {
+          assertAuthorizedSessionRead(state, query);
+          return replaySessionPublicEvents(
+            state,
+            query.afterSequence,
+            query.limit,
+          );
         },
       ),
     );

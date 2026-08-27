@@ -87,7 +87,12 @@ export class TransactionalAggregateKernel<State, Initialization, Command, Outcom
   ) {
     this.storage = transactionalStorage(state);
     this.adapter = adapter;
-    this.records = new ChunkedAggregateStorage(adapter.kind, adapter.validate, route);
+    this.records = new ChunkedAggregateStorage(
+      adapter.kind,
+      adapter.validate,
+      route,
+      adapter.migrate,
+    );
   }
 
   async initialize(initialization: Initialization): Promise<InitializationResult> {

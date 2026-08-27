@@ -10,6 +10,7 @@ import {
   parseEngineStepResult,
   validateAgentCheckpoint,
   type AgentCheckpoint,
+  type Digest,
   type EffectIntent,
   type EngineKind,
   type NormalizedValue,
@@ -23,6 +24,7 @@ import {
   SESSION_COMMAND_SCHEMA_VERSION,
   SESSION_EFFECT_REQUEST_DIGEST_DOMAIN,
   SESSION_EFFECT_REQUEST_DIGEST_SCHEMA_VERSION,
+  SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS,
   SESSION_STATE_SCHEMA_VERSION,
   SESSION_STATE_MAX_ENCODED_BYTES,
   SESSION_TURN_INPUT_DIGEST_DOMAIN,
@@ -35,10 +37,47 @@ import {
   type SessionCommand,
   type SessionCommandOutcome,
   type SessionEffect,
+  type SessionPublicEventReplay,
+  type TurnAdmissionReceipt,
 } from "./types.ts";
 import type { SessionAggregateErrorCode } from "./errors.ts";
 
 const textEncoder = new TextEncoder();
+
+const LEGACY_SESSION_STATE_FIELDS = [
+  "schemaVersion",
+  "sessionId",
+  "tenantId",
+  "userId",
+  "workspaceId",
+  "runtimeRevisionDigest",
+  "runtimePointer",
+  "policySnapshotDigest",
+  "emergencyOverlayDigest",
+  "engineKind",
+  "adapterAbiVersion",
+  "checkpointSchemaVersion",
+  "status",
+  "eventSequence",
+  "nextTurnSequence",
+  "activeTurn",
+  "queuedTurns",
+  "terminalTurns",
+  "knownTurnIds",
+  "latestSettledTurn",
+  "effects",
+  "placementGeneration",
+  "sandboxGeneration",
+  "authorizationGeneration",
+  "commandReceipts",
+] as const;
+
+const SESSION_STATE_FIELDS = [
+  ...LEGACY_SESSION_STATE_FIELDS,
+  "publicEventSequence",
+  "publicEvents",
+  "turnAdmissionReceipts",
+] as const;
 
 function validatedExactFields(
   value: unknown,
@@ -710,6 +749,7 @@ export function createSessionState(input: CreateSessionStateInput): SessionAggre
     ),
     status: "ready",
     eventSequence: 0,
+    publicEventSequence: 0,
     nextTurnSequence: 0,
     activeTurn: null,
     queuedTurns: [],
@@ -729,9 +769,45 @@ export function createSessionState(input: CreateSessionStateInput): SessionAggre
       0,
     ),
     commandReceipts: [],
+    publicEvents: [],
+    turnAdmissionReceipts: [],
   };
   assertSessionInvariants(state);
   return state;
+}
+
+export function migrateSessionState(state: unknown): {
+  readonly state: SessionAggregateState;
+  readonly migrated: boolean;
+} {
+  if (
+    typeof state !== "object" ||
+    state === null ||
+    Array.isArray(state) ||
+    (state as { readonly schemaVersion?: unknown }).schemaVersion !== 1
+  ) {
+    return {
+      state: state as SessionAggregateState,
+      migrated: false,
+    };
+  }
+  const legacy = validatedExactFields(
+    state,
+    LEGACY_SESSION_STATE_FIELDS,
+    [],
+    "legacy session state",
+    "FAILED_PRECONDITION",
+  );
+  return {
+    state: {
+      ...structuredClone(legacy),
+      schemaVersion: SESSION_STATE_SCHEMA_VERSION,
+      publicEventSequence: 0,
+      publicEvents: [],
+      turnAdmissionReceipts: [],
+    } as unknown as SessionAggregateState,
+    migrated: true,
+  };
 }
 
 export function assertSessionInvariants(state: SessionAggregateState): void {
@@ -744,33 +820,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   );
   validatedExactFields(
     state,
-    [
-      "schemaVersion",
-      "sessionId",
-      "tenantId",
-      "userId",
-      "workspaceId",
-      "runtimeRevisionDigest",
-      "runtimePointer",
-      "policySnapshotDigest",
-      "emergencyOverlayDigest",
-      "engineKind",
-      "adapterAbiVersion",
-      "checkpointSchemaVersion",
-      "status",
-      "eventSequence",
-      "nextTurnSequence",
-      "activeTurn",
-      "queuedTurns",
-      "terminalTurns",
-      "knownTurnIds",
-      "latestSettledTurn",
-      "effects",
-      "placementGeneration",
-      "sandboxGeneration",
-      "authorizationGeneration",
-      "commandReceipts",
-    ],
+    SESSION_STATE_FIELDS,
     [],
     "session state",
     "FAILED_PRECONDITION",
@@ -780,7 +830,9 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     !Array.isArray(state.terminalTurns) ||
     !Array.isArray(state.knownTurnIds) ||
     !Array.isArray(state.effects) ||
-    !Array.isArray(state.commandReceipts)
+    !Array.isArray(state.commandReceipts) ||
+    !Array.isArray(state.publicEvents) ||
+    !Array.isArray(state.turnAdmissionReceipts)
   ) {
     sessionError("FAILED_PRECONDITION", "session state collections must be arrays");
   }
@@ -848,6 +900,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   validatedInteger(state.adapterAbiVersion, "state.adapterAbiVersion", 1);
   validatedInteger(state.checkpointSchemaVersion, "state.checkpointSchemaVersion", 1);
   validatedInteger(state.eventSequence, "state.eventSequence", 0);
+  validatedInteger(state.publicEventSequence, "state.publicEventSequence", 0);
   validatedInteger(state.nextTurnSequence, "state.nextTurnSequence", 0);
   validatedInteger(state.placementGeneration, "state.placementGeneration", 0);
   validatedInteger(state.sandboxGeneration, "state.sandboxGeneration", 0);
@@ -1382,6 +1435,108 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
   }
 
+  if (
+    state.publicEvents.length !== state.publicEventSequence ||
+    state.turnAdmissionReceipts.length !== state.publicEventSequence
+  ) {
+    sessionError(
+      "FAILED_PRECONDITION",
+      "publicEventSequence does not match the public event journal and admission receipts",
+    );
+  }
+  const inputDigestByTurnId = new Map<string, string>();
+  for (const turn of state.terminalTurns) {
+    inputDigestByTurnId.set(turn.turnId, turn.inputDigest);
+  }
+  for (const turn of state.queuedTurns) {
+    inputDigestByTurnId.set(turn.turnId, turn.inputDigest);
+  }
+  if (state.activeTurn !== null) {
+    inputDigestByTurnId.set(state.activeTurn.turnId, state.activeTurn.inputDigest);
+  }
+  const publicTurnIds = new Set<string>();
+  const idempotencyKeyDigests = new Set<string>();
+  for (let index = 0; index < state.publicEventSequence; index += 1) {
+    const event = state.publicEvents[index];
+    const receipt = state.turnAdmissionReceipts[index];
+    if (event === undefined || receipt === undefined) {
+      sessionError("FAILED_PRECONDITION", "public event journal has a gap");
+    }
+    validatedExactFields(
+      event,
+      ["sequence", "type", "turnId", "turnSequence", "status"],
+      [],
+      `state.publicEvents[${index}]`,
+      "FAILED_PRECONDITION",
+    );
+    validatedInteger(event.sequence, `state.publicEvents[${index}].sequence`, 1);
+    if (event.sequence !== index + 1 || event.type !== "turn.accepted") {
+      sessionError("FAILED_PRECONDITION", "public events are not gap-free turn.accepted events");
+    }
+    validatedIdentifier(event.turnId, `state.publicEvents[${index}].turnId`);
+    validatedInteger(event.turnSequence, `state.publicEvents[${index}].turnSequence`, 0);
+    if (
+      state.knownTurnIds[event.turnSequence] !== event.turnId ||
+      (event.status !== "active" && event.status !== "queued") ||
+      publicTurnIds.has(event.turnId)
+    ) {
+      sessionError("FAILED_PRECONDITION", "public turn.accepted event is inconsistent");
+    }
+    publicTurnIds.add(event.turnId);
+
+    validatedExactFields(
+      receipt,
+      [
+        "idempotencyKeyDigest",
+        "requestDigest",
+        "inputDigest",
+        "turnId",
+        "turnSequence",
+        "activated",
+        "publicEventSequence",
+      ],
+      [],
+      `state.turnAdmissionReceipts[${index}]`,
+      "FAILED_PRECONDITION",
+    );
+    const idempotencyKeyDigest = parseDigest(
+      receipt.idempotencyKeyDigest,
+      `state.turnAdmissionReceipts[${index}].idempotencyKeyDigest`,
+    );
+    parseDigest(
+      receipt.requestDigest,
+      `state.turnAdmissionReceipts[${index}].requestDigest`,
+    );
+    parseDigest(receipt.inputDigest, `state.turnAdmissionReceipts[${index}].inputDigest`);
+    validatedIdentifier(receipt.turnId, `state.turnAdmissionReceipts[${index}].turnId`);
+    validatedInteger(
+      receipt.turnSequence,
+      `state.turnAdmissionReceipts[${index}].turnSequence`,
+      0,
+    );
+    validatedInteger(
+      receipt.publicEventSequence,
+      `state.turnAdmissionReceipts[${index}].publicEventSequence`,
+      1,
+    );
+    if (typeof receipt.activated !== "boolean") {
+      sessionError("FAILED_PRECONDITION", "admission receipt activated must be a boolean");
+    }
+    if (idempotencyKeyDigests.has(idempotencyKeyDigest)) {
+      sessionError("FAILED_PRECONDITION", "duplicate public idempotency key receipt");
+    }
+    idempotencyKeyDigests.add(idempotencyKeyDigest);
+    if (
+      receipt.publicEventSequence !== event.sequence ||
+      receipt.turnId !== event.turnId ||
+      receipt.turnSequence !== event.turnSequence ||
+      receipt.activated !== (event.status === "active") ||
+      inputDigestByTurnId.get(receipt.turnId) !== receipt.inputDigest
+    ) {
+      sessionError("FAILED_PRECONDITION", "public admission receipt is inconsistent");
+    }
+  }
+
   const commandIds = new Set<string>();
   if (state.commandReceipts.length !== state.eventSequence) {
     sessionError("FAILED_PRECONDITION", "eventSequence does not match command receipt count");
@@ -1554,6 +1709,36 @@ export async function validateSessionState(state: SessionAggregateState): Promis
   }
 }
 
+export function replaySessionPublicEvents(
+  state: SessionAggregateState,
+  afterSequenceInput: unknown,
+  limitInput: unknown,
+): SessionPublicEventReplay {
+  assertSessionInvariants(state);
+  const afterSequence = validatedInteger(afterSequenceInput, "afterSequence", 0);
+  const limit = validatedInteger(limitInput, "limit", 1);
+  if (afterSequence > state.publicEventSequence) {
+    sessionError("INVALID_ARGUMENT", "afterSequence is ahead of the public event cursor");
+  }
+  if (limit > SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS) {
+    sessionError(
+      "INVALID_ARGUMENT",
+      `limit must not exceed ${SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS}`,
+    );
+  }
+  return {
+    snapshot: {
+      sessionId: state.sessionId,
+      activeTurnId: state.activeTurn?.turnId ?? null,
+      turnStatus: state.activeTurn?.status ?? null,
+      lastEventSequence: state.publicEventSequence,
+    },
+    events: structuredClone(
+      state.publicEvents.slice(afterSequence, afterSequence + limit),
+    ),
+  };
+}
+
 export async function applySessionCommand(
   state: SessionAggregateState,
   command: SessionCommand,
@@ -1578,6 +1763,7 @@ export async function applySessionCommand(
         "turnLeaseGeneration",
         "leaseExpiresAt",
       ];
+      optionalCommandFields = ["publicAdmission"];
       break;
     case "commit_engine_step":
       commandFields = [
@@ -1769,6 +1955,81 @@ export async function applySessionCommand(
     throw error;
   }
 
+  let validatedPublicAdmission:
+    | {
+        readonly idempotencyKeyDigest: Digest;
+        readonly requestDigest: Digest;
+        readonly input: NormalizedValue;
+        readonly inputDigest: Digest;
+      }
+    | undefined;
+  if (command.kind === "enqueue_turn" && command.publicAdmission !== undefined) {
+    const admission = validatedExactFields(
+      command.publicAdmission,
+      ["authorizationGeneration", "idempotencyKeyDigest", "requestDigest"],
+      [],
+      "publicAdmission",
+      "INVALID_ARGUMENT",
+    );
+    const authorizationGeneration = validatedInteger(
+      admission.authorizationGeneration,
+      "publicAdmission.authorizationGeneration",
+      0,
+    );
+    if (authorizationGeneration !== state.authorizationGeneration) {
+      sessionError("STALE_GENERATION", "public turn admission authority is stale");
+    }
+    const input = validatedNormalizedValue(
+      command.input,
+      "input",
+      SESSION_VALUE_MAX_ENCODED_BYTES,
+      false,
+      "INVALID_ARGUMENT",
+    );
+    const inputDigest = parseDigest(command.inputDigest, "inputDigest");
+    if ((await turnInputDigest(input)) !== inputDigest) {
+      sessionError("DIGEST_MISMATCH", "inputDigest does not bind the normalized turn input");
+    }
+    validatedPublicAdmission = {
+      idempotencyKeyDigest: parseDigest(
+        admission.idempotencyKeyDigest,
+        "publicAdmission.idempotencyKeyDigest",
+      ),
+      requestDigest: parseDigest(
+        admission.requestDigest,
+        "publicAdmission.requestDigest",
+      ),
+      input,
+      inputDigest,
+    };
+    const idempotencyKeyDigest = validatedPublicAdmission.idempotencyKeyDigest;
+    const admissionReceipt = state.turnAdmissionReceipts.find(
+      (receipt) => receipt.idempotencyKeyDigest === idempotencyKeyDigest,
+    );
+    if (admissionReceipt !== undefined) {
+      if (
+        admissionReceipt.requestDigest !== validatedPublicAdmission.requestDigest ||
+        admissionReceipt.inputDigest !== validatedPublicAdmission.inputDigest
+      ) {
+        sessionError(
+          "IDEMPOTENCY_CONFLICT",
+          "public idempotency key was reused with a different semantic request",
+        );
+      }
+      return {
+        state,
+        outcome: {
+          kind: "turn_enqueued",
+          turnId: admissionReceipt.turnId,
+          turnSequence: admissionReceipt.turnSequence,
+          activated: admissionReceipt.activated,
+        },
+        commandDigest,
+        replayed: true,
+      };
+    }
+  }
+
   const existingReceipt = state.commandReceipts.find(
     (receipt) => receipt.commandId === command.commandId,
   );
@@ -1933,15 +2194,21 @@ export async function applySessionCommand(
         "transactionTime",
         0,
       );
-      const input = validatedNormalizedValue(
+      const input = validatedPublicAdmission?.input ?? validatedNormalizedValue(
         command.input,
         "input",
         SESSION_VALUE_MAX_ENCODED_BYTES,
         false,
         "INVALID_ARGUMENT",
       );
-      const inputDigest = parseDigest(command.inputDigest, "inputDigest");
-      if ((await turnInputDigest(input)) !== inputDigest) {
+      const inputDigest = validatedPublicAdmission?.inputDigest ?? parseDigest(
+        command.inputDigest,
+        "inputDigest",
+      );
+      if (
+        validatedPublicAdmission === undefined &&
+        (await turnInputDigest(input)) !== inputDigest
+      ) {
         sessionError("DIGEST_MISMATCH", "inputDigest does not bind the normalized turn input");
       }
       const turnLeaseGeneration = validatedInteger(
@@ -2000,6 +2267,26 @@ export async function applySessionCommand(
         turnSequence: queuedTurn.sequence,
         activated,
       };
+      if (validatedPublicAdmission !== undefined) {
+        next.publicEventSequence += 1;
+        next.publicEvents.push({
+          sequence: next.publicEventSequence,
+          type: "turn.accepted",
+          turnId,
+          turnSequence: queuedTurn.sequence,
+          status: activated ? "active" : "queued",
+        });
+        const admissionReceipt: TurnAdmissionReceipt = {
+          idempotencyKeyDigest: validatedPublicAdmission.idempotencyKeyDigest,
+          requestDigest: validatedPublicAdmission.requestDigest,
+          inputDigest,
+          turnId,
+          turnSequence: queuedTurn.sequence,
+          activated,
+          publicEventSequence: next.publicEventSequence,
+        };
+        next.turnAdmissionReceipts.push(admissionReceipt);
+      }
       break;
     }
 

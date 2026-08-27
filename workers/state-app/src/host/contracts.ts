@@ -63,10 +63,18 @@ export interface AggregateApplyResult<State, Outcome> {
   readonly replayed: boolean;
 }
 
+export interface AggregateMigrationResult<State> {
+  readonly state: State;
+  readonly migrated: boolean;
+}
+
 export interface AggregateAdapter<State, Initialization, Command, Outcome> {
   readonly kind: string;
   cellName?(initialization: Initialization): string;
   create(initialization: Initialization): State;
+  migrate?(
+    state: unknown,
+  ): AggregateMigrationResult<State> | Promise<AggregateMigrationResult<State>>;
   validate(state: State): void | Promise<void>;
   apply(state: State, command: Command): Promise<AggregateApplyResult<State, Outcome>>;
   version(state: State): number;
