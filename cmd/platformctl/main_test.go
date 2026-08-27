@@ -252,6 +252,7 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 			"protocGenConnectGo": "1.19.1",
 		},
 	}
+	artifactSize := uint64(1)
 	for _, componentName := range []string{
 		"platformd", "agentd", "executord", "sandboxd", "workerd", "celld",
 	} {
@@ -266,6 +267,7 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 				Architecture: "any",
 				Name:         componentName + ".tar.zst",
 				SHA256:       strings.Repeat("1", 64),
+				SizeBytes:    &artifactSize,
 			}},
 		}
 		digest, err := release.ArtifactSigningDigest(
@@ -378,7 +380,16 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 }
 
 func TestCapabilitiesCommandQueriesPlatformdAndEmitsStableJSON(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "platformd.sock")
+	socketDirectory, err := os.MkdirTemp("/tmp", "cpc-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(socketDirectory); err != nil {
+			t.Errorf("RemoveAll(%q) error = %v", socketDirectory, err)
+		}
+	})
+	socketPath := filepath.Join(socketDirectory, "platformd.sock")
 	server, err := controlrpc.ListenServer(controlrpc.ServerConfig{
 		SocketPath:  socketPath,
 		AllowedUIDs: []uint32{uint32(os.Getuid())},
