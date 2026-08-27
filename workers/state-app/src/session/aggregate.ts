@@ -170,6 +170,7 @@ function checkpointMatchesSession(
   state: SessionAggregateState,
   checkpoint: AgentCheckpoint,
   turnId: string,
+  requireActiveRuntime = true,
 ): void {
   if (checkpoint.sessionId !== state.sessionId) {
     sessionError("FAILED_PRECONDITION", "checkpoint sessionId does not match the session");
@@ -177,7 +178,10 @@ function checkpointMatchesSession(
   if (checkpoint.turnId !== turnId) {
     sessionError("FAILED_PRECONDITION", "checkpoint turnId does not match the active turn");
   }
-  if (checkpoint.runtimeRevisionDigest !== state.runtimeRevisionDigest) {
+  if (
+    requireActiveRuntime &&
+    checkpoint.runtimeRevisionDigest !== state.runtimeRevisionDigest
+  ) {
     sessionError(
       "FAILED_PRECONDITION",
       "checkpoint runtimeRevisionDigest does not match the active runtime",
@@ -503,6 +507,117 @@ function assertSessionCommandOutcome(
       parseDigest(outcome.emergencyOverlayDigest, `${field}.emergencyOverlayDigest`);
       break;
     }
+    case "runtime_revision_staged": {
+      const outcome = validatedExactFields(
+        value,
+        ["kind", "activeRevision", "candidateRevision", "switchGeneration"],
+        [],
+        field,
+        errorCode,
+      );
+      const activeRevision = parseDigest(
+        outcome.activeRevision,
+        `${field}.activeRevision`,
+      );
+      const candidateRevision = parseDigest(
+        outcome.candidateRevision,
+        `${field}.candidateRevision`,
+      );
+      if (candidateRevision === activeRevision) {
+        sessionError(errorCode, `${field} aliases active and candidate revisions`);
+      }
+      validatedInteger(outcome.switchGeneration, `${field}.switchGeneration`, 1);
+      break;
+    }
+    case "runtime_candidate_discarded": {
+      const outcome = validatedExactFields(
+        value,
+        [
+          "kind",
+          "activeRevision",
+          "candidateRevision",
+          "switchGeneration",
+          "failureReceiptDigest",
+        ],
+        [],
+        field,
+        errorCode,
+      );
+      const activeRevision = parseDigest(
+        outcome.activeRevision,
+        `${field}.activeRevision`,
+      );
+      const candidateRevision = parseDigest(
+        outcome.candidateRevision,
+        `${field}.candidateRevision`,
+      );
+      if (candidateRevision === activeRevision) {
+        sessionError(errorCode, `${field} aliases active and candidate revisions`);
+      }
+      validatedInteger(outcome.switchGeneration, `${field}.switchGeneration`, 1);
+      parseDigest(outcome.failureReceiptDigest, `${field}.failureReceiptDigest`);
+      break;
+    }
+    case "runtime_revision_activated": {
+      const outcome = validatedExactFields(
+        value,
+        [
+          "kind",
+          "activeRevision",
+          "previousRevision",
+          "switchGeneration",
+          "healthReceiptDigest",
+          "migrationReceiptDigest",
+        ],
+        [],
+        field,
+        errorCode,
+      );
+      const activeRevision = parseDigest(
+        outcome.activeRevision,
+        `${field}.activeRevision`,
+      );
+      const previousRevision = parseDigest(
+        outcome.previousRevision,
+        `${field}.previousRevision`,
+      );
+      if (previousRevision === activeRevision) {
+        sessionError(errorCode, `${field} aliases active and previous revisions`);
+      }
+      validatedInteger(outcome.switchGeneration, `${field}.switchGeneration`, 2);
+      parseDigest(outcome.healthReceiptDigest, `${field}.healthReceiptDigest`);
+      parseDigest(outcome.migrationReceiptDigest, `${field}.migrationReceiptDigest`);
+      break;
+    }
+    case "runtime_revision_rolled_back": {
+      const outcome = validatedExactFields(
+        value,
+        [
+          "kind",
+          "activeRevision",
+          "previousRevision",
+          "switchGeneration",
+          "failureReceiptDigest",
+        ],
+        [],
+        field,
+        errorCode,
+      );
+      const activeRevision = parseDigest(
+        outcome.activeRevision,
+        `${field}.activeRevision`,
+      );
+      const previousRevision = parseDigest(
+        outcome.previousRevision,
+        `${field}.previousRevision`,
+      );
+      if (previousRevision === activeRevision) {
+        sessionError(errorCode, `${field} aliases active and previous revisions`);
+      }
+      validatedInteger(outcome.switchGeneration, `${field}.switchGeneration`, 2);
+      parseDigest(outcome.failureReceiptDigest, `${field}.failureReceiptDigest`);
+      break;
+    }
     default:
       sessionError(errorCode, `${field} has an unknown outcome kind`);
   }
@@ -564,13 +679,23 @@ export function createSessionState(input: CreateSessionStateInput): SessionAggre
     "initialization",
     "INVALID_ARGUMENT",
   );
+  const runtimeRevisionDigest = parseDigest(
+    input.runtimeRevisionDigest,
+    "runtimeRevisionDigest",
+  );
   const state: SessionAggregateState = {
     schemaVersion: SESSION_STATE_SCHEMA_VERSION,
     sessionId: validatedIdentifier(input.sessionId, "sessionId"),
     tenantId: validatedIdentifier(input.tenantId, "tenantId"),
     userId: validatedIdentifier(input.userId, "userId"),
     workspaceId: validatedIdentifier(input.workspaceId, "workspaceId"),
-    runtimeRevisionDigest: parseDigest(input.runtimeRevisionDigest, "runtimeRevisionDigest"),
+    runtimeRevisionDigest,
+    runtimePointer: {
+      activeRevision: runtimeRevisionDigest,
+      candidateRevision: null,
+      previousRevision: null,
+      switchGeneration: 1,
+    },
     policySnapshotDigest: parseDigest(input.policySnapshotDigest, "policySnapshotDigest"),
     emergencyOverlayDigest: parseDigest(
       input.emergencyOverlayDigest,
@@ -626,6 +751,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       "userId",
       "workspaceId",
       "runtimeRevisionDigest",
+      "runtimePointer",
       "policySnapshotDigest",
       "emergencyOverlayDigest",
       "engineKind",
@@ -665,7 +791,57 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   validatedIdentifier(state.tenantId, "state.tenantId");
   validatedIdentifier(state.userId, "state.userId");
   validatedIdentifier(state.workspaceId, "state.workspaceId");
-  parseDigest(state.runtimeRevisionDigest, "state.runtimeRevisionDigest");
+  const runtimeRevisionDigest = parseDigest(
+    state.runtimeRevisionDigest,
+    "state.runtimeRevisionDigest",
+  );
+  const runtimePointer = validatedExactFields(
+    state.runtimePointer,
+    [
+      "activeRevision",
+      "candidateRevision",
+      "previousRevision",
+      "switchGeneration",
+    ],
+    [],
+    "state.runtimePointer",
+    "FAILED_PRECONDITION",
+  );
+  const activeRevision = parseDigest(
+    runtimePointer.activeRevision,
+    "state.runtimePointer.activeRevision",
+  );
+  const candidateRevision =
+    runtimePointer.candidateRevision === null
+      ? null
+      : parseDigest(
+          runtimePointer.candidateRevision,
+          "state.runtimePointer.candidateRevision",
+        );
+  const previousRevision =
+    runtimePointer.previousRevision === null
+      ? null
+      : parseDigest(
+          runtimePointer.previousRevision,
+          "state.runtimePointer.previousRevision",
+        );
+  validatedInteger(
+    runtimePointer.switchGeneration,
+    "state.runtimePointer.switchGeneration",
+    1,
+  );
+  if (activeRevision !== runtimeRevisionDigest) {
+    sessionError(
+      "FAILED_PRECONDITION",
+      "runtimePointer.activeRevision does not match runtimeRevisionDigest",
+    );
+  }
+  const pointerRevisions = [activeRevision, candidateRevision, previousRevision].filter(
+    (revision): revision is typeof activeRevision => revision !== null,
+  );
+  if (new Set(pointerRevisions).size !== pointerRevisions.length) {
+    sessionError("FAILED_PRECONDITION", "runtime pointer revisions must not alias");
+  }
   parseDigest(state.policySnapshotDigest, "state.policySnapshotDigest");
   parseDigest(state.emergencyOverlayDigest, "state.emergencyOverlayDigest");
   validatedEngineKind(state.engineKind, "state.engineKind");
@@ -743,7 +919,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     );
     parseDigest(turn.inputDigest, `terminal turn ${turn.turnId} inputDigest`);
     const finalCheckpoint = parseAgentCheckpoint(turn.finalCheckpoint);
-    checkpointMatchesSession(state, finalCheckpoint, turn.turnId);
+    checkpointMatchesSession(state, finalCheckpoint, turn.turnId, false);
     validatedInteger(turn.turnLeaseGeneration, "terminal turn lease generation", 1);
     validatedInteger(turn.leaseExpiresAt, "terminal turn lease expiry", 1);
     if (typeof turn.abortRequested !== "boolean") {
@@ -1234,6 +1410,112 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       "FAILED_PRECONDITION",
     );
   }
+
+  let receiptActiveRevision: typeof activeRevision | null = null;
+  let receiptCandidateRevision: typeof activeRevision | null = null;
+  let receiptPreviousRevision: typeof activeRevision | null = null;
+  let receiptSwitchGeneration = 1;
+  const activatedRuntimeRevisions = new Set<typeof activeRevision>();
+  for (const receipt of state.commandReceipts) {
+    const receiptOutcome = receipt.outcome;
+    switch (receiptOutcome.kind) {
+      case "runtime_revision_staged":
+        receiptActiveRevision ??= receiptOutcome.activeRevision;
+        if (
+          receiptOutcome.activeRevision !== receiptActiveRevision ||
+          receiptOutcome.switchGeneration !== receiptSwitchGeneration ||
+          receiptCandidateRevision !== null ||
+          receiptOutcome.candidateRevision === receiptActiveRevision ||
+          receiptOutcome.candidateRevision === receiptPreviousRevision
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "runtime revision staging receipt does not follow pointer history",
+          );
+        }
+        activatedRuntimeRevisions.add(receiptActiveRevision);
+        receiptCandidateRevision = receiptOutcome.candidateRevision;
+        break;
+      case "runtime_candidate_discarded":
+        if (
+          receiptActiveRevision === null ||
+          receiptOutcome.activeRevision !== receiptActiveRevision ||
+          receiptOutcome.candidateRevision !== receiptCandidateRevision ||
+          receiptOutcome.switchGeneration !== receiptSwitchGeneration
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "runtime candidate discard receipt does not follow pointer history",
+          );
+        }
+        receiptCandidateRevision = null;
+        break;
+      case "runtime_revision_activated": {
+        if (
+          receiptActiveRevision === null ||
+          receiptOutcome.previousRevision !== receiptActiveRevision ||
+          receiptOutcome.activeRevision !== receiptCandidateRevision ||
+          receiptOutcome.switchGeneration !== receiptSwitchGeneration + 1
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "runtime revision activation receipt does not follow pointer history",
+          );
+        }
+        const priorActiveRevision: typeof activeRevision = receiptActiveRevision;
+        receiptActiveRevision = receiptOutcome.activeRevision;
+        receiptCandidateRevision = null;
+        receiptPreviousRevision = priorActiveRevision;
+        receiptSwitchGeneration += 1;
+        activatedRuntimeRevisions.add(receiptActiveRevision);
+        break;
+      }
+      case "runtime_revision_rolled_back": {
+        if (
+          receiptActiveRevision === null ||
+          receiptCandidateRevision !== null ||
+          receiptPreviousRevision === null ||
+          receiptOutcome.activeRevision !== receiptPreviousRevision ||
+          receiptOutcome.previousRevision !== receiptActiveRevision ||
+          receiptOutcome.switchGeneration !== receiptSwitchGeneration + 1
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "runtime revision rollback receipt does not follow pointer history",
+          );
+        }
+        const priorActiveRevision: typeof activeRevision = receiptActiveRevision;
+        receiptActiveRevision = receiptPreviousRevision;
+        receiptPreviousRevision = priorActiveRevision;
+        receiptSwitchGeneration += 1;
+        activatedRuntimeRevisions.add(receiptActiveRevision);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  receiptActiveRevision ??= activeRevision;
+  activatedRuntimeRevisions.add(receiptActiveRevision);
+  if (
+    receiptActiveRevision !== activeRevision ||
+    receiptCandidateRevision !== candidateRevision ||
+    receiptPreviousRevision !== previousRevision ||
+    receiptSwitchGeneration !== state.runtimePointer.switchGeneration
+  ) {
+    sessionError(
+      "FAILED_PRECONDITION",
+      "runtime pointer does not match its durable command receipt history",
+    );
+  }
+  for (const turn of state.terminalTurns) {
+    if (!activatedRuntimeRevisions.has(turn.finalCheckpoint.runtimeRevisionDigest)) {
+      sessionError(
+        "FAILED_PRECONDITION",
+        `terminal turn ${turn.turnId} names a runtime revision that was never active`,
+      );
+    }
+  }
 }
 
 export async function validateSessionState(state: SessionAggregateState): Promise<void> {
@@ -1415,6 +1697,46 @@ export async function applySessionCommand(
         "nextEmergencyOverlayDigest",
       ];
       break;
+    case "stage_runtime_revision":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "candidateRevision",
+      ];
+      break;
+    case "discard_runtime_candidate":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "expectedCandidateRevision",
+        "failureReceiptDigest",
+      ];
+      break;
+    case "activate_runtime_revision":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "expectedActiveRevision",
+        "expectedCandidateRevision",
+        "expectedSwitchGeneration",
+        "healthReceiptDigest",
+        "migrationReceiptDigest",
+      ];
+      break;
+    case "rollback_runtime_revision":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "expectedActiveRevision",
+        "expectedPreviousRevision",
+        "expectedSwitchGeneration",
+        "failureReceiptDigest",
+      ];
+      break;
     default:
       sessionError("INVALID_ARGUMENT", "unknown session command kind");
   }
@@ -1590,6 +1912,12 @@ export async function applySessionCommand(
 
   switch (command.kind) {
     case "enqueue_turn": {
+      if (next.runtimePointer.candidateRevision !== null) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "new turn admission is frozen while a runtime revision candidate is staged",
+        );
+      }
       if (next.activeTurn?.status === "needs_confirmation") {
         sessionError(
           "NEEDS_CONFIRMATION",
@@ -2478,6 +2806,171 @@ export async function applySessionCommand(
         turnId: active.turnId,
         turnLeaseGeneration: nextTurnLeaseGeneration,
         leaseExpiresAt: nextLeaseExpiresAt,
+      };
+      break;
+    }
+
+    case "stage_runtime_revision": {
+      const candidateRevision = parseDigest(
+        command.candidateRevision,
+        "candidateRevision",
+      );
+      if (next.runtimePointer.candidateRevision !== null) {
+        sessionError("CONFLICT", "a runtime revision candidate is already staged");
+      }
+      if (
+        candidateRevision === next.runtimePointer.activeRevision ||
+        candidateRevision === next.runtimePointer.previousRevision
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "a runtime revision candidate must not alias an existing pointer",
+        );
+      }
+      next.runtimePointer.candidateRevision = candidateRevision;
+      outcome = {
+        kind: "runtime_revision_staged",
+        activeRevision: next.runtimePointer.activeRevision,
+        candidateRevision,
+        switchGeneration: next.runtimePointer.switchGeneration,
+      };
+      break;
+    }
+
+    case "discard_runtime_candidate": {
+      const expectedCandidateRevision = parseDigest(
+        command.expectedCandidateRevision,
+        "expectedCandidateRevision",
+      );
+      const failureReceiptDigest = parseDigest(
+        command.failureReceiptDigest,
+        "failureReceiptDigest",
+      );
+      if (next.runtimePointer.candidateRevision !== expectedCandidateRevision) {
+        sessionError("CONFLICT", "runtime revision candidate CAS failed");
+      }
+      next.runtimePointer.candidateRevision = null;
+      outcome = {
+        kind: "runtime_candidate_discarded",
+        activeRevision: next.runtimePointer.activeRevision,
+        candidateRevision: expectedCandidateRevision,
+        switchGeneration: next.runtimePointer.switchGeneration,
+        failureReceiptDigest,
+      };
+      break;
+    }
+
+    case "activate_runtime_revision": {
+      const expectedActiveRevision = parseDigest(
+        command.expectedActiveRevision,
+        "expectedActiveRevision",
+      );
+      const expectedCandidateRevision = parseDigest(
+        command.expectedCandidateRevision,
+        "expectedCandidateRevision",
+      );
+      const expectedSwitchGeneration = validatedInteger(
+        command.expectedSwitchGeneration,
+        "expectedSwitchGeneration",
+        1,
+      );
+      const healthReceiptDigest = parseDigest(
+        command.healthReceiptDigest,
+        "healthReceiptDigest",
+      );
+      const migrationReceiptDigest = parseDigest(
+        command.migrationReceiptDigest,
+        "migrationReceiptDigest",
+      );
+      if (
+        next.runtimePointer.activeRevision !== expectedActiveRevision ||
+        next.runtimePointer.candidateRevision !== expectedCandidateRevision ||
+        next.runtimePointer.switchGeneration !== expectedSwitchGeneration
+      ) {
+        sessionError("CONFLICT", "runtime revision activation CAS failed");
+      }
+      if (next.activeTurn !== null || next.queuedTurns.length !== 0) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "runtime revision activation requires all admitted turns to drain",
+        );
+      }
+      if (next.runtimePointer.switchGeneration === Number.MAX_SAFE_INTEGER) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "runtime revision switchGeneration cannot be incremented safely",
+        );
+      }
+      const previousRevision = next.runtimePointer.activeRevision;
+      next.runtimePointer.activeRevision = expectedCandidateRevision;
+      next.runtimePointer.candidateRevision = null;
+      next.runtimePointer.previousRevision = previousRevision;
+      next.runtimePointer.switchGeneration += 1;
+      next.runtimeRevisionDigest = expectedCandidateRevision;
+      outcome = {
+        kind: "runtime_revision_activated",
+        activeRevision: expectedCandidateRevision,
+        previousRevision,
+        switchGeneration: next.runtimePointer.switchGeneration,
+        healthReceiptDigest,
+        migrationReceiptDigest,
+      };
+      break;
+    }
+
+    case "rollback_runtime_revision": {
+      const expectedActiveRevision = parseDigest(
+        command.expectedActiveRevision,
+        "expectedActiveRevision",
+      );
+      const expectedPreviousRevision = parseDigest(
+        command.expectedPreviousRevision,
+        "expectedPreviousRevision",
+      );
+      const expectedSwitchGeneration = validatedInteger(
+        command.expectedSwitchGeneration,
+        "expectedSwitchGeneration",
+        1,
+      );
+      const failureReceiptDigest = parseDigest(
+        command.failureReceiptDigest,
+        "failureReceiptDigest",
+      );
+      if (
+        next.runtimePointer.activeRevision !== expectedActiveRevision ||
+        next.runtimePointer.previousRevision !== expectedPreviousRevision ||
+        next.runtimePointer.switchGeneration !== expectedSwitchGeneration
+      ) {
+        sessionError("CONFLICT", "runtime revision rollback CAS failed");
+      }
+      if (next.runtimePointer.candidateRevision !== null) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "a staged runtime revision candidate must be discarded before rollback",
+        );
+      }
+      if (next.activeTurn !== null || next.queuedTurns.length !== 0) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "runtime revision rollback requires all admitted turns to drain",
+        );
+      }
+      if (next.runtimePointer.switchGeneration === Number.MAX_SAFE_INTEGER) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "runtime revision switchGeneration cannot be incremented safely",
+        );
+      }
+      next.runtimePointer.activeRevision = expectedPreviousRevision;
+      next.runtimePointer.previousRevision = expectedActiveRevision;
+      next.runtimePointer.switchGeneration += 1;
+      next.runtimeRevisionDigest = expectedPreviousRevision;
+      outcome = {
+        kind: "runtime_revision_rolled_back",
+        activeRevision: expectedPreviousRevision,
+        previousRevision: expectedActiveRevision,
+        switchGeneration: next.runtimePointer.switchGeneration,
+        failureReceiptDigest,
       };
       break;
     }

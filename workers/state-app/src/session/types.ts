@@ -60,6 +60,13 @@ export interface SessionRuntimeConfiguration {
   readonly checkpointSchemaVersion: number;
 }
 
+export interface RuntimePointer {
+  activeRevision: Digest;
+  candidateRevision: Digest | null;
+  previousRevision: Digest | null;
+  switchGeneration: number;
+}
+
 export interface CreateSessionStateInput extends SessionRuntimeConfiguration {
   readonly sessionId: string;
   readonly tenantId: string;
@@ -165,6 +172,8 @@ export interface SessionAggregateState extends SessionRuntimeConfiguration {
   tenantId: string;
   userId: string;
   workspaceId: string;
+  runtimeRevisionDigest: Digest;
+  runtimePointer: RuntimePointer;
   status: SessionStatus;
   eventSequence: number;
   nextTurnSequence: number;
@@ -290,6 +299,34 @@ export interface RotateGenerationsCommand extends SessionCommandBase {
   readonly nextEmergencyOverlayDigest: Digest;
 }
 
+export interface StageRuntimeRevisionCommand extends SessionCommandBase {
+  readonly kind: "stage_runtime_revision";
+  readonly candidateRevision: Digest;
+}
+
+export interface DiscardRuntimeCandidateCommand extends SessionCommandBase {
+  readonly kind: "discard_runtime_candidate";
+  readonly expectedCandidateRevision: Digest;
+  readonly failureReceiptDigest: Digest;
+}
+
+export interface ActivateRuntimeRevisionCommand extends SessionCommandBase {
+  readonly kind: "activate_runtime_revision";
+  readonly expectedActiveRevision: Digest;
+  readonly expectedCandidateRevision: Digest;
+  readonly expectedSwitchGeneration: number;
+  readonly healthReceiptDigest: Digest;
+  readonly migrationReceiptDigest: Digest;
+}
+
+export interface RollbackRuntimeRevisionCommand extends SessionCommandBase {
+  readonly kind: "rollback_runtime_revision";
+  readonly expectedActiveRevision: Digest;
+  readonly expectedPreviousRevision: Digest;
+  readonly expectedSwitchGeneration: number;
+  readonly failureReceiptDigest: Digest;
+}
+
 export type SessionCommand =
   | EnqueueTurnCommand
   | CommitEngineStepCommand
@@ -301,7 +338,11 @@ export type SessionCommand =
   | RequestAbortCommand
   | FinalizeAbortCommand
   | RotateTurnLeaseCommand
-  | RotateGenerationsCommand;
+  | RotateGenerationsCommand
+  | StageRuntimeRevisionCommand
+  | DiscardRuntimeCandidateCommand
+  | ActivateRuntimeRevisionCommand
+  | RollbackRuntimeRevisionCommand;
 
 export type SessionCommandOutcome =
   | {
@@ -367,6 +408,34 @@ export type SessionCommandOutcome =
       readonly sandboxGeneration: number;
       readonly authorizationGeneration: number;
       readonly emergencyOverlayDigest: Digest;
+    }
+  | {
+      readonly kind: "runtime_revision_staged";
+      readonly activeRevision: Digest;
+      readonly candidateRevision: Digest;
+      readonly switchGeneration: number;
+    }
+  | {
+      readonly kind: "runtime_candidate_discarded";
+      readonly activeRevision: Digest;
+      readonly candidateRevision: Digest;
+      readonly switchGeneration: number;
+      readonly failureReceiptDigest: Digest;
+    }
+  | {
+      readonly kind: "runtime_revision_activated";
+      readonly activeRevision: Digest;
+      readonly previousRevision: Digest;
+      readonly switchGeneration: number;
+      readonly healthReceiptDigest: Digest;
+      readonly migrationReceiptDigest: Digest;
+    }
+  | {
+      readonly kind: "runtime_revision_rolled_back";
+      readonly activeRevision: Digest;
+      readonly previousRevision: Digest;
+      readonly switchGeneration: number;
+      readonly failureReceiptDigest: Digest;
     };
 
 export interface ApplySessionCommandResult {
