@@ -21,6 +21,15 @@ importers:
         specifier: 4.126.0
         version: 4.126.0
 
+  packages/extension-manifest:
+    dependencies:
+      '@circulusd/protocol-types':
+        specifier: workspace:*
+        version: link:../protocol-types
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+
   packages/protocol-types: {}
 
   workers/pi-runtime:

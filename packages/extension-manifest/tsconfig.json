@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2024", "ESNext.Disposable", "WebWorker"],
+    "paths": {
+      "@circulusd/protocol-types": ["../protocol-types/src/index.ts"]
+    },
+    "rootDir": "../.."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

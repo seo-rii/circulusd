@@ -1,0 +1,19 @@
+{
+  "name": "@circulusd/extension-manifest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:unit": "vitest run"
+  },
+  "dependencies": {
+    "@circulusd/protocol-types": "workspace:*",
+    "typescript": "7.0.2"
+  }
+}
