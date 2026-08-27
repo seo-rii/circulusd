@@ -9,7 +9,7 @@ import type {
   NormalizedValue,
 } from "@circulusd/protocol-types";
 
-export const SESSION_STATE_SCHEMA_VERSION = 2 as const;
+export const SESSION_STATE_SCHEMA_VERSION = 3 as const;
 export const SESSION_COMMAND_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_DOMAIN = "circulusd.session.agent-checkpoint" as const;
@@ -183,13 +183,58 @@ export interface TurnAdmissionReceipt {
   publicEventSequence: number;
 }
 
-export interface SessionPublicEvent {
+interface SessionPublicEventBase {
   sequence: number;
-  type: "turn.accepted";
   turnId: string;
   turnSequence: number;
+}
+
+export interface SessionPublicTurnAcceptedEvent extends SessionPublicEventBase {
+  type: "turn.accepted";
   status: "active" | "queued";
 }
+
+interface SessionPublicEffectEventBase extends SessionPublicEventBase {
+  effectId: string;
+  invocationId: string;
+  service: SessionEffect["service"];
+  operation: string;
+}
+
+export interface SessionPublicEffectPreparedEvent
+  extends SessionPublicEffectEventBase {
+  type: "model.effect.prepared" | "tool.effect.prepared";
+}
+
+export interface SessionPublicToolExternallyCommittedEvent
+  extends SessionPublicEffectEventBase {
+  type: "tool.externally_committed";
+  externalCommitId: string;
+  resultRef: string;
+}
+
+export interface SessionPublicEffectSettledEvent
+  extends SessionPublicEffectEventBase {
+  type: "model.settled" | "tool.settled";
+  settlementKind: EffectSettlement["kind"];
+}
+
+export interface SessionPublicNeedsConfirmationEvent
+  extends SessionPublicEffectEventBase {
+  type: "turn.needs_confirmation";
+}
+
+export interface SessionPublicTerminalEvent extends SessionPublicEventBase {
+  type: "turn.completed" | "turn.failed" | "turn.aborted";
+}
+
+export type SessionPublicEvent =
+  | SessionPublicTurnAcceptedEvent
+  | SessionPublicEffectPreparedEvent
+  | SessionPublicToolExternallyCommittedEvent
+  | SessionPublicEffectSettledEvent
+  | SessionPublicNeedsConfirmationEvent
+  | SessionPublicTerminalEvent;
 
 export interface SessionPublicEventSnapshot {
   readonly sessionId: string;

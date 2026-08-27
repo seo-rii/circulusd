@@ -1215,7 +1215,7 @@ describe("named aggregate cells", () => {
     expect("load" in cell || "save" in cell || "patch" in cell).toBe(false);
   });
 
-  it("migrates a persisted schema-v1 Session before replay, read, and execution", async () => {
+  it("migrates a persisted schema-v1 Session to the current journal schema before use", async () => {
     const storage = new FakeTransactionalStorage();
     const initialization = sessionInitialization();
     const logicalName = sessionCellName("tenant-1", "session-1");
@@ -1269,7 +1269,7 @@ describe("named aggregate cells", () => {
       { authority: sessionAuthority(), now: 200 },
       (request) => cell.readSession(request),
     )).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       eventSequence: 1,
       activeTurn: { turnId: "turn-1" },
       publicEventSequence: 0,
@@ -1441,6 +1441,96 @@ describe("named aggregate cells", () => {
       afterSequence: 0,
       limit: 257,
     })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+  });
+
+  it("atomically journals a fenced terminal transition and replays its receipt without duplicates", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    await hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => cell.executeSessionCommand(request),
+    );
+    const committedRevision = storage.revision;
+    const abortCommand = {
+      kind: "request_abort" as const,
+      commandId: "abort-public-turn",
+      expectedEventSequence: 1,
+      turnId: "turn-1",
+      fence: {
+        turnLeaseGeneration: 10,
+        placementGeneration: 4,
+        sandboxGeneration: 5,
+        authorizationGeneration: 6,
+      },
+      transactionTime: 200,
+      reason: "user requested abort",
+    };
+
+    await expect(hostRpcResult(
+      "session.execute",
+      {
+        ...abortCommand,
+        commandId: "abort-with-stale-placement",
+        fence: { ...abortCommand.fence, placementGeneration: 3 },
+      },
+      (request) => cell.executeSessionCommand(request),
+    )).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    expect(storage.revision).toBe(committedRevision);
+    await expect(readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 0,
+      limit: 16,
+    })).resolves.toMatchObject({
+      snapshot: { lastEventSequence: 1 },
+      events: [{ sequence: 1, type: "turn.accepted" }],
+    });
+
+    const committed = await hostRpcResult(
+      "session.execute",
+      abortCommand,
+      (request) => cell.executeSessionCommand(request),
+    );
+    expect(committed).toMatchObject({ version: 2, replayed: false });
+    expect(storage.revision).toBe(committedRevision + 1);
+    await expect(hostRpcResult(
+      "session.read",
+      { authority: sessionAuthority(), now: 200 },
+      (request) => cell.readSession(request),
+    )).resolves.toMatchObject({
+      eventSequence: 2,
+      publicEventSequence: 2,
+      activeTurn: null,
+      terminalTurns: [{ turnId: "turn-1", status: "aborted" }],
+      publicEvents: [
+        { sequence: 1, type: "turn.accepted", turnId: "turn-1" },
+        { sequence: 2, type: "turn.aborted", turnId: "turn-1" },
+      ],
+    });
+
+    const terminalRevision = storage.revision;
+    const replayed = await hostRpcResult(
+      "session.execute",
+      abortCommand,
+      (request) => cell.executeSessionCommand(request),
+    );
+    expect(replayed).toMatchObject({ version: 2, replayed: true });
+    expect(storage.revision).toBe(terminalRevision);
+    await expect(readSessionPublicEvents(cell, {
+      authority: sessionAuthority(),
+      now: 200,
+      afterSequence: 1,
+      limit: 1,
+    })).resolves.toMatchObject({
+      snapshot: { lastEventSequence: 2 },
+      events: [{ sequence: 2, type: "turn.aborted", turnId: "turn-1" }],
+    });
   });
 
   it("checks current authorization before public admission receipt replay and event reads", async () => {

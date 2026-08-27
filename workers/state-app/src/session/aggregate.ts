@@ -37,6 +37,7 @@ import {
   type SessionCommand,
   type SessionCommandOutcome,
   type SessionEffect,
+  type SessionPublicEvent,
   type SessionPublicEventReplay,
   type TurnAdmissionReceipt,
 } from "./types.ts";
@@ -44,7 +45,10 @@ import type { SessionAggregateErrorCode } from "./errors.ts";
 
 const textEncoder = new TextEncoder();
 
-const LEGACY_SESSION_STATE_FIELDS = [
+type SessionPublicEventInput<Event = SessionPublicEvent> =
+  Event extends SessionPublicEvent ? Omit<Event, "sequence"> : never;
+
+const LEGACY_SESSION_STATE_V1_FIELDS = [
   "schemaVersion",
   "sessionId",
   "tenantId",
@@ -72,12 +76,14 @@ const LEGACY_SESSION_STATE_FIELDS = [
   "commandReceipts",
 ] as const;
 
-const SESSION_STATE_FIELDS = [
-  ...LEGACY_SESSION_STATE_FIELDS,
+const LEGACY_SESSION_STATE_V2_FIELDS = [
+  ...LEGACY_SESSION_STATE_V1_FIELDS,
   "publicEventSequence",
   "publicEvents",
   "turnAdmissionReceipts",
 ] as const;
+
+const SESSION_STATE_FIELDS = LEGACY_SESSION_STATE_V2_FIELDS;
 
 function validatedExactFields(
   value: unknown,
@@ -780,11 +786,31 @@ export function migrateSessionState(state: unknown): {
   readonly state: SessionAggregateState;
   readonly migrated: boolean;
 } {
+  const schemaVersion =
+    typeof state === "object" && state !== null && !Array.isArray(state)
+      ? (state as { readonly schemaVersion?: unknown }).schemaVersion
+      : undefined;
+  if (schemaVersion === 2) {
+    const legacy = validatedExactFields(
+      state,
+      LEGACY_SESSION_STATE_V2_FIELDS,
+      [],
+      "legacy schema-v2 session state",
+      "FAILED_PRECONDITION",
+    );
+    return {
+      state: {
+        ...structuredClone(legacy),
+        schemaVersion: SESSION_STATE_SCHEMA_VERSION,
+      } as unknown as SessionAggregateState,
+      migrated: true,
+    };
+  }
   if (
     typeof state !== "object" ||
     state === null ||
     Array.isArray(state) ||
-    (state as { readonly schemaVersion?: unknown }).schemaVersion !== 1
+    schemaVersion !== 1
   ) {
     return {
       state: state as SessionAggregateState,
@@ -793,9 +819,9 @@ export function migrateSessionState(state: unknown): {
   }
   const legacy = validatedExactFields(
     state,
-    LEGACY_SESSION_STATE_FIELDS,
+    LEGACY_SESSION_STATE_V1_FIELDS,
     [],
-    "legacy session state",
+    "legacy schema-v1 session state",
     "FAILED_PRECONDITION",
   );
   return {
@@ -1199,6 +1225,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   }
 
   const effectIds = new Set<string>();
+  const effectsById = new Map<string, SessionEffect>();
   const invocationIds = new Set<string>();
   const unconsumedEffects: SessionEffect[] = [];
   for (const [index, effect] of state.effects.entries()) {
@@ -1233,6 +1260,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "effect or invocation identity was reused");
     }
     effectIds.add(effect.effectId);
+    effectsById.set(effect.effectId, effect);
     invocationIds.add(effect.invocationId);
     if (
       effect.phase !== "prepared" &&
@@ -1435,18 +1463,17 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
   }
 
-  if (
-    state.publicEvents.length !== state.publicEventSequence ||
-    state.turnAdmissionReceipts.length !== state.publicEventSequence
-  ) {
+  if (state.publicEvents.length !== state.publicEventSequence) {
     sessionError(
       "FAILED_PRECONDITION",
-      "publicEventSequence does not match the public event journal and admission receipts",
+      "publicEventSequence does not match the public event journal",
     );
   }
   const inputDigestByTurnId = new Map<string, string>();
+  const terminalTurnById = new Map<string, (typeof state.terminalTurns)[number]>();
   for (const turn of state.terminalTurns) {
     inputDigestByTurnId.set(turn.turnId, turn.inputDigest);
+    terminalTurnById.set(turn.turnId, turn);
   }
   for (const turn of state.queuedTurns) {
     inputDigestByTurnId.set(turn.turnId, turn.inputDigest);
@@ -1455,35 +1482,187 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     inputDigestByTurnId.set(state.activeTurn.turnId, state.activeTurn.inputDigest);
   }
   const publicTurnIds = new Set<string>();
-  const idempotencyKeyDigests = new Set<string>();
+  const preparedEffectIds = new Set<string>();
+  const externallyCommittedEffectIds = new Set<string>();
+  const settledEffectIds = new Set<string>();
+  const terminalEventTurnIds = new Set<string>();
+  const turnsWithEarlierEvents = new Set<string>();
   for (let index = 0; index < state.publicEventSequence; index += 1) {
     const event = state.publicEvents[index];
-    const receipt = state.turnAdmissionReceipts[index];
-    if (event === undefined || receipt === undefined) {
+    if (event === undefined) {
       sessionError("FAILED_PRECONDITION", "public event journal has a gap");
     }
-    validatedExactFields(
-      event,
-      ["sequence", "type", "turnId", "turnSequence", "status"],
-      [],
-      `state.publicEvents[${index}]`,
-      "FAILED_PRECONDITION",
-    );
-    validatedInteger(event.sequence, `state.publicEvents[${index}].sequence`, 1);
-    if (event.sequence !== index + 1 || event.type !== "turn.accepted") {
-      sessionError("FAILED_PRECONDITION", "public events are not gap-free turn.accepted events");
+    const eventField = `state.publicEvents[${index}]`;
+    validatedInteger(event.sequence, `${eventField}.sequence`, 1);
+    if (event.sequence !== index + 1) {
+      sessionError("FAILED_PRECONDITION", "public event journal is not gap-free");
     }
-    validatedIdentifier(event.turnId, `state.publicEvents[${index}].turnId`);
-    validatedInteger(event.turnSequence, `state.publicEvents[${index}].turnSequence`, 0);
+    validatedIdentifier(event.turnId, `${eventField}.turnId`);
+    validatedInteger(event.turnSequence, `${eventField}.turnSequence`, 0);
     if (
       state.knownTurnIds[event.turnSequence] !== event.turnId ||
-      (event.status !== "active" && event.status !== "queued") ||
-      publicTurnIds.has(event.turnId)
+      terminalEventTurnIds.has(event.turnId)
     ) {
-      sessionError("FAILED_PRECONDITION", "public turn.accepted event is inconsistent");
+      sessionError("FAILED_PRECONDITION", "public event turn identity or order is inconsistent");
     }
-    publicTurnIds.add(event.turnId);
+    switch (event.type) {
+      case "turn.accepted":
+        validatedExactFields(
+          event,
+          ["sequence", "type", "turnId", "turnSequence", "status"],
+          [],
+          eventField,
+          "FAILED_PRECONDITION",
+        );
+        if (
+          (event.status !== "active" && event.status !== "queued") ||
+          publicTurnIds.has(event.turnId) ||
+          turnsWithEarlierEvents.has(event.turnId)
+        ) {
+          sessionError("FAILED_PRECONDITION", "public turn.accepted event is inconsistent");
+        }
+        publicTurnIds.add(event.turnId);
+        break;
+      case "model.effect.prepared":
+      case "tool.effect.prepared":
+      case "tool.externally_committed":
+      case "model.settled":
+      case "tool.settled":
+      case "turn.needs_confirmation": {
+        if (!publicTurnIds.has(event.turnId)) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "public effect event precedes its turn.accepted event",
+          );
+        }
+        const fields = [
+          "sequence",
+          "type",
+          "turnId",
+          "turnSequence",
+          "effectId",
+          "invocationId",
+          "service",
+          "operation",
+        ];
+        if (event.type === "tool.externally_committed") {
+          fields.push("externalCommitId", "resultRef");
+        } else if (event.type === "model.settled" || event.type === "tool.settled") {
+          fields.push("settlementKind");
+        }
+        validatedExactFields(event, fields, [], eventField, "FAILED_PRECONDITION");
+        validatedIdentifier(event.effectId, `${eventField}.effectId`);
+        validatedIdentifier(event.invocationId, `${eventField}.invocationId`);
+        validatedIdentifier(event.operation, `${eventField}.operation`);
+        const effect = effectsById.get(event.effectId);
+        if (
+          effect === undefined ||
+          effect.turnId !== event.turnId ||
+          effect.invocationId !== event.invocationId ||
+          effect.service !== event.service ||
+          effect.operation !== event.operation
+        ) {
+          sessionError("FAILED_PRECONDITION", "public effect event is inconsistent");
+        }
+        const isModelEvent =
+          event.type === "model.effect.prepared" || event.type === "model.settled";
+        if (
+          event.type !== "turn.needs_confirmation" &&
+          isModelEvent !== (effect.service === "model")
+        ) {
+          sessionError("FAILED_PRECONDITION", "public effect event uses the wrong event family");
+        }
+        if (event.type === "model.effect.prepared" || event.type === "tool.effect.prepared") {
+          if (
+            preparedEffectIds.has(effect.effectId) ||
+            externallyCommittedEffectIds.has(effect.effectId) ||
+            settledEffectIds.has(effect.effectId)
+          ) {
+            sessionError("FAILED_PRECONDITION", "public effect preparation is duplicated or late");
+          }
+          preparedEffectIds.add(effect.effectId);
+        } else if (event.type === "tool.externally_committed") {
+          validatedIdentifier(event.externalCommitId, `${eventField}.externalCommitId`);
+          validatedIdentifier(event.resultRef, `${eventField}.resultRef`);
+          if (
+            effect.service === "model" ||
+            effect.externalCommitId !== event.externalCommitId ||
+            effect.resultRef !== event.resultRef ||
+            externallyCommittedEffectIds.has(effect.effectId) ||
+            settledEffectIds.has(effect.effectId)
+          ) {
+            sessionError("FAILED_PRECONDITION", "public external commit event is inconsistent");
+          }
+          externallyCommittedEffectIds.add(effect.effectId);
+        } else if (event.type === "model.settled" || event.type === "tool.settled") {
+          if (
+            event.settlementKind !== "success" &&
+            event.settlementKind !== "error" &&
+            event.settlementKind !== "interrupted_unknown" &&
+            event.settlementKind !== "abandoned"
+          ) {
+            sessionError("FAILED_PRECONDITION", "public settlement kind is unknown");
+          }
+          if (
+            effect.settlement?.kind !== event.settlementKind ||
+            settledEffectIds.has(effect.effectId)
+          ) {
+            sessionError("FAILED_PRECONDITION", "public settlement event is inconsistent");
+          }
+          settledEffectIds.add(effect.effectId);
+        } else if (
+          effect.replayPolicy !== "confirm" ||
+          externallyCommittedEffectIds.has(effect.effectId) ||
+          settledEffectIds.has(effect.effectId)
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "public confirmation event is inconsistent",
+          );
+        }
+        break;
+      }
+      case "turn.completed":
+      case "turn.failed":
+      case "turn.aborted": {
+        if (!publicTurnIds.has(event.turnId)) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "public terminal event precedes its turn.accepted event",
+          );
+        }
+        validatedExactFields(
+          event,
+          ["sequence", "type", "turnId", "turnSequence"],
+          [],
+          eventField,
+          "FAILED_PRECONDITION",
+        );
+        const terminalTurn = terminalTurnById.get(event.turnId);
+        const expectedType =
+          terminalTurn?.status === "completed"
+            ? "turn.completed"
+            : terminalTurn?.status === "failed"
+              ? "turn.failed"
+              : terminalTurn?.status === "aborted"
+                ? "turn.aborted"
+                : null;
+        if (event.type !== expectedType || terminalEventTurnIds.has(event.turnId)) {
+          sessionError("FAILED_PRECONDITION", "public terminal event is inconsistent");
+        }
+        terminalEventTurnIds.add(event.turnId);
+        break;
+      }
+      default:
+        sessionError("FAILED_PRECONDITION", "public event type is unknown");
+    }
+    turnsWithEarlierEvents.add(event.turnId);
+  }
 
+  const idempotencyKeyDigests = new Set<string>();
+  const admissionEventSequences = new Set<number>();
+  let previousAdmissionEventSequence = 0;
+  for (const [index, receipt] of state.turnAdmissionReceipts.entries()) {
     validatedExactFields(
       receipt,
       [
@@ -1526,8 +1705,12 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "duplicate public idempotency key receipt");
     }
     idempotencyKeyDigests.add(idempotencyKeyDigest);
+    const event = state.publicEvents[receipt.publicEventSequence - 1];
     if (
-      receipt.publicEventSequence !== event.sequence ||
+      event === undefined ||
+      event.type !== "turn.accepted" ||
+      receipt.publicEventSequence <= previousAdmissionEventSequence ||
+      admissionEventSequences.has(receipt.publicEventSequence) ||
       receipt.turnId !== event.turnId ||
       receipt.turnSequence !== event.turnSequence ||
       receipt.activated !== (event.status === "active") ||
@@ -1535,6 +1718,17 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     ) {
       sessionError("FAILED_PRECONDITION", "public admission receipt is inconsistent");
     }
+    previousAdmissionEventSequence = receipt.publicEventSequence;
+    admissionEventSequences.add(receipt.publicEventSequence);
+  }
+  if (
+    admissionEventSequences.size !== publicTurnIds.size ||
+    state.publicEvents.some(
+      (event) =>
+        event.type === "turn.accepted" && !admissionEventSequences.has(event.sequence),
+    )
+  ) {
+    sessionError("FAILED_PRECONDITION", "public turn.accepted event lacks its admission receipt");
   }
 
   const commandIds = new Set<string>();
@@ -2170,6 +2364,13 @@ export async function applySessionCommand(
   const next = structuredClone(state);
   let outcome: SessionCommandOutcome;
   let turnPromotionTime: number | null = null;
+  const appendPublicEvent = (event: SessionPublicEventInput): void => {
+    if (next.publicEventSequence === Number.MAX_SAFE_INTEGER) {
+      sessionError("FAILED_PRECONDITION", "public event sequence cannot be incremented safely");
+    }
+    next.publicEventSequence += 1;
+    next.publicEvents.push({ sequence: next.publicEventSequence, ...event });
+  };
 
   switch (command.kind) {
     case "enqueue_turn": {
@@ -2268,9 +2469,7 @@ export async function applySessionCommand(
         activated,
       };
       if (validatedPublicAdmission !== undefined) {
-        next.publicEventSequence += 1;
-        next.publicEvents.push({
-          sequence: next.publicEventSequence,
+        appendPublicEvent({
           type: "turn.accepted",
           turnId,
           turnSequence: queuedTurn.sequence,
@@ -3347,6 +3546,112 @@ export async function applySessionCommand(
       next.status = "running";
       break;
     }
+  }
+
+  const publiclyAdmittedTurnIds = new Set(
+    next.turnAdmissionReceipts.map((receipt) => receipt.turnId),
+  );
+  for (const effect of next.effects.slice(state.effects.length)) {
+    if (!publiclyAdmittedTurnIds.has(effect.turnId)) {
+      continue;
+    }
+    const turnSequence = next.knownTurnIds.indexOf(effect.turnId);
+    if (turnSequence < 0) {
+      sessionError("FAILED_PRECONDITION", "prepared effect turn is not known");
+    }
+    appendPublicEvent({
+      type: effect.service === "model" ? "model.effect.prepared" : "tool.effect.prepared",
+      turnId: effect.turnId,
+      turnSequence,
+      effectId: effect.effectId,
+      invocationId: effect.invocationId,
+      service: effect.service,
+      operation: effect.operation,
+    });
+  }
+  const previousEffectsById = new Map(
+    state.effects.map((effect) => [effect.effectId, effect] as const),
+  );
+  for (const effect of next.effects) {
+    if (!publiclyAdmittedTurnIds.has(effect.turnId)) {
+      continue;
+    }
+    const previousEffect = previousEffectsById.get(effect.effectId);
+    if (previousEffect === undefined || previousEffect.phase === effect.phase) {
+      continue;
+    }
+    const turnSequence = next.knownTurnIds.indexOf(effect.turnId);
+    if (turnSequence < 0) {
+      sessionError("FAILED_PRECONDITION", "transitioned effect turn is not known");
+    }
+    if (effect.phase === "externally_committed" && effect.service !== "model") {
+      if (effect.externalCommitId === null || effect.resultRef === null) {
+        sessionError("FAILED_PRECONDITION", "external commit transition lacks proof");
+      }
+      appendPublicEvent({
+        type: "tool.externally_committed",
+        turnId: effect.turnId,
+        turnSequence,
+        effectId: effect.effectId,
+        invocationId: effect.invocationId,
+        service: effect.service,
+        operation: effect.operation,
+        externalCommitId: effect.externalCommitId,
+        resultRef: effect.resultRef,
+      });
+    } else if (effect.phase === "settled") {
+      if (effect.settlement === null) {
+        sessionError("FAILED_PRECONDITION", "settled effect transition lacks settlement");
+      }
+      appendPublicEvent({
+        type: effect.service === "model" ? "model.settled" : "tool.settled",
+        turnId: effect.turnId,
+        turnSequence,
+        effectId: effect.effectId,
+        invocationId: effect.invocationId,
+        service: effect.service,
+        operation: effect.operation,
+        settlementKind: effect.settlement.kind,
+      });
+    }
+  }
+  if (
+    next.activeTurn?.status === "needs_confirmation" &&
+    publiclyAdmittedTurnIds.has(next.activeTurn.turnId) &&
+    (state.activeTurn?.turnId !== next.activeTurn.turnId ||
+      state.activeTurn.status !== "needs_confirmation")
+  ) {
+    const effect =
+      next.activeTurn.activeEffectId === null
+        ? undefined
+        : effectById(next, next.activeTurn.activeEffectId);
+    if (effect === undefined) {
+      sessionError("FAILED_PRECONDITION", "confirmation transition lacks an active effect");
+    }
+    appendPublicEvent({
+      type: "turn.needs_confirmation",
+      turnId: next.activeTurn.turnId,
+      turnSequence: next.activeTurn.sequence,
+      effectId: effect.effectId,
+      invocationId: effect.invocationId,
+      service: effect.service,
+      operation: effect.operation,
+    });
+  }
+  for (const turn of next.terminalTurns.slice(state.terminalTurns.length)) {
+    if (!publiclyAdmittedTurnIds.has(turn.turnId)) {
+      continue;
+    }
+    appendPublicEvent({
+      type:
+        turn.status === "completed"
+          ? "turn.completed"
+          : turn.status === "failed"
+            ? "turn.failed"
+            : "turn.aborted",
+      turnId: turn.turnId,
+      turnSequence: turn.sequence,
+    });
   }
 
   assertSessionCommandOutcome(outcome, "command outcome", "FAILED_PRECONDITION");
