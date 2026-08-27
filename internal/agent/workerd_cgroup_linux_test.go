@@ -730,6 +730,155 @@ func TestWorkerdCgroupControllerAndLeasesDoNotLeakFileDescriptors(t *testing.T) 
 	}
 }
 
+func TestWorkerdCgroupControllerCloseWaitsForTerminalLeaseFDClosure(t *testing.T) {
+	backend := newFakeWorkerdCgroupBackend()
+	controller, err := newWorkerdCgroupControllerWithBackend(validWorkerdCgroupConfig(), backend)
+	if err != nil {
+		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
+	}
+	lease, err := controller.prepare(context.Background(), "close-waits-for-leaf-fd", 1)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	closeRelease := make(chan struct{})
+	backend.closeEntered = make(chan int, 2)
+	backend.closeGates[lease.fd] = closeRelease
+	destroyResult := make(chan error, 1)
+	go func() { destroyResult <- lease.destroy(context.Background()) }()
+	if fd := <-backend.closeEntered; fd != lease.fd {
+		t.Fatalf("first close fd = %d, want lease fd %d", fd, lease.fd)
+	}
+	controllerCloseResult := make(chan error, 1)
+	go func() { controllerCloseResult <- controller.close() }()
+	select {
+	case closeErr := <-controllerCloseResult:
+		t.Fatalf("controller.close() returned before leaf fd closure: %v", closeErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(closeRelease)
+	if err := <-destroyResult; err != nil {
+		t.Fatalf("destroy() error = %v", err)
+	}
+	if err := <-controllerCloseResult; err != nil {
+		t.Fatalf("controller.close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupLeaseLeafCloseFailureIsTerminalAndReplayable(t *testing.T) {
+	backend := newFakeWorkerdCgroupBackend()
+	controller, err := newWorkerdCgroupControllerWithBackend(validWorkerdCgroupConfig(), backend)
+	if err != nil {
+		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
+	}
+	lease, err := controller.prepare(context.Background(), "terminal-leaf-close", 1)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	leaseFD := lease.fd
+	backend.closeFailures[leaseFD] = 1
+	firstErr := lease.destroy(context.Background())
+	if !errors.Is(firstErr, errWorkerdCgroupContract) {
+		t.Fatalf("destroy(close failure) error = %v, want cgroup contract error", firstErr)
+	}
+	if !lease.destroyedState() {
+		t.Fatal("destroyedState() = false after terminal leaf close failure")
+	}
+	if replayErr := lease.destroy(context.Background()); !errors.Is(replayErr, errWorkerdCgroupContract) {
+		t.Fatalf("destroy(replay) error = %v, want cached cgroup contract error", replayErr)
+	}
+	if calls := backend.closeCalls[leaseFD]; calls != 1 {
+		t.Fatalf("leaf close calls = %d, want 1", calls)
+	}
+	if descriptors := backend.openFileDescriptors(); descriptors != 1 {
+		t.Fatalf("descriptors after terminal leaf close = %d, want root only", descriptors)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("controller.close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupControllerPoisonWriterWaitsForActiveBorrow(t *testing.T) {
+	backend := newFakeWorkerdCgroupBackend()
+	controller, err := newWorkerdCgroupControllerWithBackend(validWorkerdCgroupConfig(), backend)
+	if err != nil {
+		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
+	}
+	borrowedLease, err := controller.prepare(context.Background(), "active-borrow", 1)
+	if err != nil {
+		t.Fatalf("prepare(active borrow) error = %v", err)
+	}
+	poisonedLease, err := controller.prepare(context.Background(), "poison-writer", 1)
+	if err != nil {
+		t.Fatalf("prepare(poison writer) error = %v", err)
+	}
+	queuedLease, err := controller.prepare(context.Background(), "queued-after-writer", 1)
+	if err != nil {
+		t.Fatalf("prepare(queued reader) error = %v", err)
+	}
+	borrowEntered := make(chan struct{})
+	borrowRelease := make(chan struct{})
+	borrowResult := make(chan error, 1)
+	go func() {
+		borrowResult <- borrowedLease.withDirectoryFD(func(int) error {
+			close(borrowEntered)
+			<-borrowRelease
+			return nil
+		})
+	}()
+	<-borrowEntered
+	backend.replaceChild(poisonedLease.name)
+	destroyResult := make(chan error, 1)
+	go func() { destroyResult <- poisonedLease.destroy(context.Background()) }()
+	writerDeadline := time.Now().Add(time.Second)
+	for controller.authority.TryRLock() {
+		controller.authority.RUnlock()
+		if time.Now().After(writerDeadline) {
+			t.Fatal("poison writer did not queue behind active borrow")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	queuedCallbackEntered := make(chan struct{}, 1)
+	queuedBorrowResult := make(chan error, 1)
+	go func() {
+		queuedBorrowResult <- queuedLease.withDirectoryFD(func(int) error {
+			queuedCallbackEntered <- struct{}{}
+			return nil
+		})
+	}()
+	select {
+	case destroyErr := <-destroyResult:
+		t.Fatalf("poison writer completed during active borrow: %v", destroyErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case <-queuedCallbackEntered:
+		t.Fatal("new borrow bypassed queued poison writer")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(borrowRelease)
+	if err := <-borrowResult; err != nil {
+		t.Fatalf("active borrow error = %v", err)
+	}
+	if err := <-destroyResult; !errors.Is(err, errWorkerdCgroupPoisoned) {
+		t.Fatalf("poisoning destroy error = %v, want poisoned", err)
+	}
+	if err := <-queuedBorrowResult; !errors.Is(err, errWorkerdCgroupLeaseUnavailable) {
+		t.Fatalf("queued borrow error = %v, want unavailable after poison", err)
+	}
+	if err := borrowedLease.withDirectoryFD(func(int) error { return nil }); !errors.Is(err, errWorkerdCgroupLeaseUnavailable) {
+		t.Fatalf("borrow after poison error = %v, want unavailable", err)
+	}
+	if err := borrowedLease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy(active borrow lease) error = %v", err)
+	}
+	if err := queuedLease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy(queued reader lease) error = %v", err)
+	}
+	if err := controller.close(); !errors.Is(err, errWorkerdCgroupPoisoned) {
+		t.Fatalf("close() error = %v, want poisoned", err)
+	}
+}
+
 func TestWorkerdCgroupAvailabilityIsNotRunWithoutMutatingHost(t *testing.T) {
 	rootPath := fmt.Sprintf("/sys/fs/cgroup/circulusd-workerd-controller-not-installed-%d", os.Getpid())
 	if _, err := os.Stat(rootPath); !errors.Is(err, os.ErrNotExist) {
@@ -814,6 +963,14 @@ type fakeWorkerdCgroupBackend struct {
 	mkdirGate         <-chan struct{}
 	killEntered       chan struct{}
 	killGate          <-chan struct{}
+	killHook          func()
+	killEnteredByFD   map[int]chan struct{}
+	killGatesByFD     map[int]<-chan struct{}
+	killHooksByFD     map[int]func()
+	closeEntered      chan int
+	closeGates        map[int]<-chan struct{}
+	closeFailures     map[int]int
+	closeCalls        map[int]int
 }
 
 func newFakeWorkerdCgroupBackend() *fakeWorkerdCgroupBackend {
@@ -843,6 +1000,12 @@ func newFakeWorkerdCgroupBackend() *fakeWorkerdCgroupBackend {
 		nextInode:       100,
 		corruptReadback: map[string]string{},
 		writeFailures:   map[string]int{},
+		killEnteredByFD: map[int]chan struct{}{},
+		killGatesByFD:   map[int]<-chan struct{}{},
+		killHooksByFD:   map[int]func(){},
+		closeGates:      map[int]<-chan struct{}{},
+		closeFailures:   map[int]int{},
+		closeCalls:      map[int]int{},
 	}
 }
 
@@ -931,6 +1094,16 @@ func (backend *fakeWorkerdCgroupBackend) writeControl(fd int, name string, value
 		backend.killCalls++
 		entered := backend.killEntered
 		gate := backend.killGate
+		hook := backend.killHook
+		if specific := backend.killEnteredByFD[fd]; specific != nil {
+			entered = specific
+		}
+		if specific := backend.killGatesByFD[fd]; specific != nil {
+			gate = specific
+		}
+		if specific := backend.killHooksByFD[fd]; specific != nil {
+			hook = specific
+		}
 		backend.mu.Unlock()
 		if entered != nil {
 			select {
@@ -940,6 +1113,9 @@ func (backend *fakeWorkerdCgroupBackend) writeControl(fd int, name string, value
 		}
 		if gate != nil {
 			<-gate
+		}
+		if hook != nil {
+			hook()
 		}
 		return nil
 	}
@@ -1012,9 +1188,27 @@ func (backend *fakeWorkerdCgroupBackend) removeChild(_ int, name string) error {
 
 func (backend *fakeWorkerdCgroupBackend) closeFD(fd int) error {
 	backend.mu.Lock()
-	defer backend.mu.Unlock()
+	entered := backend.closeEntered
+	gate := backend.closeGates[fd]
+	backend.mu.Unlock()
+	if entered != nil {
+		entered <- fd
+	}
+	if gate != nil {
+		<-gate
+	}
+	backend.mu.Lock()
+	backend.closeCalls[fd]++
 	delete(backend.openFDs, fd)
 	delete(backend.groupsByFD, fd)
+	fail := backend.closeFailures[fd] > 0
+	if fail {
+		backend.closeFailures[fd]--
+	}
+	backend.mu.Unlock()
+	if fail {
+		return unix.EIO
+	}
 	return nil
 }
 

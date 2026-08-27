@@ -65,6 +65,20 @@ type WorkerdLauncherConfig struct {
 	OutputLimitBytes int
 	HistoryCapacity  int
 	ReadinessProbe   WorkerdReadinessProbe
+	Cgroup           *WorkerdCgroupConfig
+}
+
+// WorkerdCgroupConfig defines the delegated cgroup v2 boundary consumed by a
+// production launcher. The root must already exist with the ownership,
+// permissions, and enabled controllers enforced by the controller contract.
+type WorkerdCgroupConfig struct {
+	RootPath       string
+	MaximumShards  int
+	DrainTimeout   time.Duration
+	MemoryMaxBytes uint64
+	SwapMaxBytes   uint64
+	CPUCores       uint64
+	PIDsMax        uint64
 }
 
 // WorkerdEnsureRequest is the immutable identity of one shard generation.
@@ -109,7 +123,9 @@ type WorkerdLauncherEvidence struct {
 	ChildFDAllowlist         bool
 	BoundedOutput            bool
 	ReadinessGated           bool
+	AtomicCgroupPlacement    bool
 	CgroupLimits             bool
+	CgroupTermination        bool
 	CPUAccounting            bool
 	RSSAccounting            bool
 	KillReconstruction       bool
@@ -130,6 +146,7 @@ type workerdLaunchCommand struct {
 	Arguments           []string
 	Environment         []string
 	ExtraFiles          []*os.File
+	CgroupFD            int
 	Stdout              io.Writer
 	Stderr              io.Writer
 	ShardID             string
@@ -179,6 +196,10 @@ type workerdCloseOperation struct {
 	err  error
 }
 
+type workerdCgroupAllocation struct {
+	key workerdLaunchKey
+}
+
 type workerdInstance struct {
 	key      workerdLaunchKey
 	identity workerdLaunchIdentity
@@ -186,6 +207,7 @@ type workerdInstance struct {
 	stdout   *boundedWorkerdWriter
 	stderr   *boundedWorkerdWriter
 	exitDone chan struct{}
+	cgroup   *workerdCgroupLease
 
 	mu                  sync.Mutex
 	exited              bool
@@ -213,7 +235,9 @@ type WorkerdProcessLauncher struct {
 	historyCapacity    int
 	readinessProbe     WorkerdReadinessProbe
 	starter            workerdProcessStarter
+	cgroups            *workerdCgroupController
 	pending            map[workerdLaunchKey]*workerdPendingLaunch
+	allocations        map[*workerdCgroupLease]workerdCgroupAllocation
 	current            map[string]*workerdInstance
 	latestGenerations  map[string]uint64
 	retiredGenerations map[string]uint64
@@ -221,6 +245,8 @@ type WorkerdProcessLauncher struct {
 	instances          map[*workerdInstance]struct{}
 	closed             bool
 	closeOperation     *workerdCloseOperation
+	cgroupsClosed      bool
+	terminalCloseErr   error
 }
 
 // WorkerdShardHandle is returned only after the configured readiness probe
@@ -241,7 +267,22 @@ type boundedWorkerdWriter struct {
 
 // NewWorkerdProcessLauncher constructs the production Linux launcher.
 func NewWorkerdProcessLauncher(config WorkerdLauncherConfig) (*WorkerdProcessLauncher, error) {
-	return newWorkerdProcessLauncher(config, osWorkerdProcessStarter{})
+	if config.Cgroup == nil {
+		return nil, ErrInvalidWorkerdLauncherConfig
+	}
+	cgroups, err := newWorkerdCgroupController(workerdCgroupConfig{
+		RootPath:       config.Cgroup.RootPath,
+		MaximumShards:  config.Cgroup.MaximumShards,
+		DrainTimeout:   config.Cgroup.DrainTimeout,
+		MemoryMaxBytes: config.Cgroup.MemoryMaxBytes,
+		SwapMaxBytes:   config.Cgroup.SwapMaxBytes,
+		CPUCores:       config.Cgroup.CPUCores,
+		PIDsMax:        config.Cgroup.PIDsMax,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return newWorkerdProcessLauncherWithCgroup(config, osWorkerdProcessStarter{}, unix.MemfdCreate, cgroups)
 }
 
 func newWorkerdProcessLauncher(config WorkerdLauncherConfig, starter workerdProcessStarter) (*WorkerdProcessLauncher, error) {
@@ -249,6 +290,21 @@ func newWorkerdProcessLauncher(config WorkerdLauncherConfig, starter workerdProc
 }
 
 func newWorkerdProcessLauncherWithMemfd(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator) (*WorkerdProcessLauncher, error) {
+	return newWorkerdProcessLauncherWithResources(config, starter, createMemfd, nil)
+}
+
+func newWorkerdProcessLauncherWithCgroup(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController) (*WorkerdProcessLauncher, error) {
+	if cgroups == nil {
+		return nil, ErrInvalidWorkerdLauncherConfig
+	}
+	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, createMemfd, cgroups)
+	if err != nil {
+		return nil, errors.Join(err, cgroups.close())
+	}
+	return launcher, nil
+}
+
+func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController) (*WorkerdProcessLauncher, error) {
 	if starter == nil || config.ReadinessProbe == nil || config.ReadinessTimeout <= 0 ||
 		config.ReadinessTimeout > maximumWorkerdReadinessTimeout ||
 		config.StopGracePeriod <= 0 || config.StopGracePeriod > maximumWorkerdStopGracePeriod ||
@@ -376,7 +432,9 @@ func newWorkerdProcessLauncherWithMemfd(config WorkerdLauncherConfig, starter wo
 		historyCapacity:    config.HistoryCapacity,
 		readinessProbe:     config.ReadinessProbe,
 		starter:            starter,
+		cgroups:            cgroups,
 		pending:            make(map[workerdLaunchKey]*workerdPendingLaunch),
+		allocations:        make(map[*workerdCgroupLease]workerdCgroupAllocation),
 		current:            make(map[string]*workerdInstance),
 		latestGenerations:  make(map[string]uint64),
 		retiredGenerations: make(map[string]uint64),
@@ -479,9 +537,14 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 				launcher.mu.Unlock()
 				return nil, ErrWorkerdLaunchConflict
 			}
-			handle := &WorkerdShardHandle{launcher: launcher, instance: current}
-			launcher.mu.Unlock()
-			return handle, nil
+			current.mu.Lock()
+			unavailable := current.exited || current.groupGone || current.stop != nil || current.handleStopRequested
+			current.mu.Unlock()
+			if !unavailable {
+				handle := &WorkerdShardHandle{launcher: launcher, instance: current}
+				launcher.mu.Unlock()
+				return handle, nil
+			}
 		}
 		var earlierPending *workerdPendingLaunch
 		for pendingKey, candidate := range launcher.pending {
@@ -599,6 +662,70 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		}
 		launcher.mu.Unlock()
 	}()
+	var cgroupLease *workerdCgroupLease
+	keepCgroupAllocation := false
+	if launcher.cgroups != nil {
+		type residualCgroupAllocation struct {
+			lease *workerdCgroupLease
+			key   workerdLaunchKey
+		}
+		launcher.mu.Lock()
+		residuals := make([]residualCgroupAllocation, 0)
+		for lease, allocation := range launcher.allocations {
+			if allocation.key.shardID == pending.key.shardID {
+				residuals = append(residuals, residualCgroupAllocation{lease: lease, key: allocation.key})
+			}
+		}
+		launcher.mu.Unlock()
+		sort.Slice(residuals, func(first, second int) bool {
+			if residuals[first].key.generation != residuals[second].key.generation {
+				return residuals[first].key.generation < residuals[second].key.generation
+			}
+			return residuals[first].lease.name < residuals[second].lease.name
+		})
+		for _, residual := range residuals {
+			cleanupErr := residual.lease.destroy(context.Background())
+			if residual.lease.destroyedState() {
+				launcher.forgetWorkerdCgroupAllocation(residual.lease)
+				launcher.rememberWorkerdTerminalCloseError(cleanupErr)
+			}
+			if cleanupErr != nil {
+				resultErr = fmt.Errorf("clean residual workerd cgroup for shard %q generation %d: %w", residual.key.shardID, residual.key.generation, cleanupErr)
+				return
+			}
+		}
+		lease, prepareErr := launcher.cgroups.prepare(pending.ctx, pending.key.shardID, pending.key.generation)
+		cgroupLease = lease
+		if cgroupLease != nil {
+			launcher.mu.Lock()
+			_, alreadyRegistered := launcher.allocations[cgroupLease]
+			if !alreadyRegistered {
+				launcher.allocations[cgroupLease] = workerdCgroupAllocation{key: pending.key}
+			}
+			launcher.mu.Unlock()
+			defer func() {
+				if keepCgroupAllocation {
+					return
+				}
+				cleanupErr := cgroupLease.destroy(context.Background())
+				if cgroupLease.destroyedState() {
+					launcher.forgetWorkerdCgroupAllocation(cgroupLease)
+					launcher.rememberWorkerdTerminalCloseError(cleanupErr)
+				}
+				if cleanupErr != nil {
+					resultErr = errors.Join(resultErr, cleanupErr)
+				}
+			}()
+		}
+		if prepareErr != nil {
+			resultErr = prepareErr
+			return
+		}
+		if cgroupLease == nil {
+			resultErr = fmt.Errorf("%w: cgroup prepare returned no lease", errWorkerdCgroupContract)
+			return
+		}
+	}
 
 	if err := pending.ctx.Err(); err != nil {
 		resultErr = fmt.Errorf("%w: shard %q generation %d was abandoned before start", ErrWorkerdNotReady, pending.key.shardID, pending.key.generation)
@@ -607,42 +734,64 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	stdout := &boundedWorkerdWriter{limit: launcher.outputLimitBytes}
 	stderr := &boundedWorkerdWriter{limit: launcher.outputLimitBytes}
 	arguments := slices.Clone(pending.arguments)
-	process, err := launcher.starter.Start(workerdLaunchCommand{
+	command := workerdLaunchCommand{
 		Executable:          launcher.executableProcPath,
 		Arguments:           arguments,
 		Environment:         slices.Clone(launcher.environment),
 		ExtraFiles:          make([]*os.File, 0),
+		CgroupFD:            -1,
 		Stdout:              stdout,
 		Stderr:              stderr,
 		ShardID:             pending.key.shardID,
 		PlacementGeneration: pending.key.generation,
-	})
+	}
+	var process workerdStartedProcess
+	var startErr error
+	if cgroupLease == nil {
+		process, startErr = launcher.starter.Start(command)
+	} else {
+		startErr = cgroupLease.withDirectoryFD(func(fd int) error {
+			command.CgroupFD = fd
+			var err error
+			process, err = launcher.starter.Start(command)
+			return err
+		})
+	}
 	pending.arguments = nil
-	if err != nil {
-		resultErr = fmt.Errorf("%w: shard %q generation %d: %v", ErrWorkerdLaunchFailed, pending.key.shardID, pending.key.generation, err)
+	if startErr != nil {
+		resultErr = fmt.Errorf("%w: shard %q generation %d: %w", ErrWorkerdLaunchFailed, pending.key.shardID, pending.key.generation, startErr)
 		return
 	}
 	instance := &workerdInstance{
 		key: pending.key, identity: pending.identity, process: process,
-		stdout: stdout, stderr: stderr, exitDone: make(chan struct{}),
+		stdout: stdout, stderr: stderr, exitDone: make(chan struct{}), cgroup: cgroupLease,
 	}
 	launcher.mu.Lock()
+	if cgroupLease != nil {
+		allocation, registered := launcher.allocations[cgroupLease]
+		if !registered || allocation.key != pending.key {
+			launcher.mu.Unlock()
+			resultErr = fmt.Errorf("%w: cgroup allocation ownership was lost before process publication", errWorkerdCgroupContract)
+			return
+		}
+		delete(launcher.allocations, cgroupLease)
+		keepCgroupAllocation = true
+	}
 	launcher.instances[instance] = struct{}{}
 	launcher.mu.Unlock()
 	go func() {
 		exitErr := process.Wait()
+		launcher.mu.Lock()
 		instance.mu.Lock()
 		instance.exited = true
 		instance.exitErr = exitErr
 		close(instance.exitDone)
-		instance.mu.Unlock()
-
-		launcher.mu.Lock()
 		if launcher.current[instance.key.shardID] == instance {
 			if launcher.retiredGenerations[instance.key.shardID] < instance.key.generation {
 				launcher.retiredGenerations[instance.key.shardID] = instance.key.generation
 			}
 		}
+		instance.mu.Unlock()
 		launcher.mu.Unlock()
 		stop := launcher.beginWorkerdStop(instance, true)
 		_ = launcher.waitWorkerdStop(context.Background(), stop)
@@ -780,12 +929,27 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	launcher.mu.Unlock()
 }
 
+func (launcher *WorkerdProcessLauncher) forgetWorkerdCgroupAllocation(lease *workerdCgroupLease) {
+	launcher.mu.Lock()
+	delete(launcher.allocations, lease)
+	launcher.mu.Unlock()
+}
+
+func (launcher *WorkerdProcessLauncher) rememberWorkerdTerminalCloseError(err error) {
+	if err == nil {
+		return
+	}
+	launcher.mu.Lock()
+	launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, err)
+	launcher.mu.Unlock()
+}
+
 func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstance, forceKill bool) *workerdStopOperation {
 	instance.mu.Lock()
 	if instance.stop != nil {
 		select {
 		case <-instance.stop.done:
-			if instance.stop.err == nil {
+			if instance.stop.err == nil || (instance.cgroup != nil && instance.cgroup.destroyedState()) {
 				stop := instance.stop
 				instance.mu.Unlock()
 				return stop
@@ -800,6 +964,26 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 	instance.stop = stop
 	instance.mu.Unlock()
 	go func() {
+		if instance.cgroup != nil {
+			cleanupErr := instance.cgroup.destroy(context.Background())
+			if instance.cgroup.destroyedState() {
+				launcher.mu.Lock()
+				instance.mu.Lock()
+				instance.groupGone = true
+				delete(launcher.instances, instance)
+				if launcher.current[instance.key.shardID] == instance {
+					delete(launcher.current, instance.key.shardID)
+				}
+				if cleanupErr != nil {
+					launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, cleanupErr)
+				}
+				instance.mu.Unlock()
+				launcher.mu.Unlock()
+			}
+			stop.err = cleanupErr
+			close(stop.done)
+			return
+		}
 		var roundErr error
 		groupGone := false
 		alive, groupErr := instance.process.GroupAlive()
@@ -860,14 +1044,14 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 			}
 		}
 		if groupGone {
+			launcher.mu.Lock()
 			instance.mu.Lock()
 			instance.groupGone = true
-			instance.mu.Unlock()
-			launcher.mu.Lock()
 			delete(launcher.instances, instance)
 			if launcher.current[instance.key.shardID] == instance {
 				delete(launcher.current, instance.key.shardID)
 			}
+			instance.mu.Unlock()
 			launcher.mu.Unlock()
 			stop.err = nil
 		} else {
@@ -905,7 +1089,9 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 	if operation != nil {
 		select {
 		case <-operation.done:
-			startRound = operation.err != nil && len(launcher.instances) != 0
+			retryableOwnership := len(launcher.instances) != 0 || len(launcher.allocations) != 0 ||
+				(launcher.cgroups != nil && !launcher.cgroupsClosed)
+			startRound = operation.err != nil && retryableOwnership
 		default:
 		}
 	}
@@ -946,15 +1132,66 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 				}
 				return instances[first].process.PID() < instances[second].process.PID()
 			})
-			var closeErr error
+			var roundErr error
 			stops := make([]*workerdStopOperation, len(instances))
 			for index, instance := range instances {
 				stops[index] = launcher.beginWorkerdStop(instance, false)
 			}
 			for _, stop := range stops {
 				if stopErr := launcher.waitWorkerdStop(context.Background(), stop); stopErr != nil {
-					closeErr = errors.Join(closeErr, stopErr)
+					roundErr = errors.Join(roundErr, stopErr)
 				}
+			}
+
+			type residualCgroupAllocation struct {
+				lease *workerdCgroupLease
+				key   workerdLaunchKey
+			}
+			launcher.mu.Lock()
+			residuals := make([]residualCgroupAllocation, 0, len(launcher.allocations))
+			for lease, allocation := range launcher.allocations {
+				residuals = append(residuals, residualCgroupAllocation{lease: lease, key: allocation.key})
+			}
+			launcher.mu.Unlock()
+			sort.Slice(residuals, func(first, second int) bool {
+				if residuals[first].key.shardID != residuals[second].key.shardID {
+					return residuals[first].key.shardID < residuals[second].key.shardID
+				}
+				if residuals[first].key.generation != residuals[second].key.generation {
+					return residuals[first].key.generation < residuals[second].key.generation
+				}
+				return residuals[first].lease.name < residuals[second].lease.name
+			})
+			for _, residual := range residuals {
+				cleanupErr := residual.lease.destroy(context.Background())
+				if residual.lease.destroyedState() {
+					launcher.forgetWorkerdCgroupAllocation(residual.lease)
+					launcher.rememberWorkerdTerminalCloseError(cleanupErr)
+				}
+				if cleanupErr != nil {
+					roundErr = errors.Join(roundErr, fmt.Errorf("clean residual workerd cgroup for shard %q generation %d: %w", residual.key.shardID, residual.key.generation, cleanupErr))
+				}
+			}
+
+			launcher.mu.Lock()
+			ownershipRemains := len(launcher.instances) != 0 || len(launcher.allocations) != 0
+			cgroups := launcher.cgroups
+			cgroupsClosed := launcher.cgroupsClosed
+			launcher.mu.Unlock()
+			if cgroups != nil && !cgroupsClosed && !ownershipRemains {
+				cgroupErr := cgroups.close()
+				if errors.Is(cgroupErr, errWorkerdCgroupBusy) {
+					roundErr = errors.Join(roundErr, cgroupErr)
+				} else {
+					launcher.mu.Lock()
+					launcher.cgroupsClosed = true
+					if cgroupErr != nil {
+						launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, cgroupErr)
+					}
+					launcher.mu.Unlock()
+				}
+			} else if cgroups != nil && !cgroupsClosed && ownershipRemains && roundErr == nil {
+				roundErr = errWorkerdCgroupBusy
 			}
 
 			launcher.mu.Lock()
@@ -963,10 +1200,20 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 			launcher.mu.Unlock()
 			if executable != nil {
 				if executableErr := executable.Close(); executableErr != nil {
-					closeErr = errors.Join(closeErr, fmt.Errorf("close verified workerd executable: %w", executableErr))
+					launcher.mu.Lock()
+					launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, fmt.Errorf("close verified workerd executable: %w", executableErr))
+					launcher.mu.Unlock()
 				}
 			}
-			operation.err = closeErr
+			launcher.mu.Lock()
+			terminalErr := launcher.terminalCloseErr
+			cleanupComplete := len(launcher.instances) == 0 && len(launcher.allocations) == 0 &&
+				(launcher.cgroups == nil || launcher.cgroupsClosed)
+			launcher.mu.Unlock()
+			if cleanupComplete {
+				roundErr = nil
+			}
+			operation.err = errors.Join(roundErr, terminalErr)
 			close(operation.done)
 		}()
 	} else {
@@ -993,8 +1240,12 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	launcher.mu.Lock()
 	instance.mu.Lock()
 	if instance.groupGone {
+		stop := instance.stop
 		instance.mu.Unlock()
 		launcher.mu.Unlock()
+		if stop != nil {
+			return launcher.waitWorkerdStop(ctx, stop)
+		}
 		return nil
 	}
 	if instance.replacementRetired {
@@ -1008,8 +1259,8 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 		}
 		instance.handleStopRequested = true
 		instance.mu.Unlock()
-		stop := launcher.beginWorkerdStop(instance, false)
 		launcher.mu.Unlock()
+		stop := launcher.beginWorkerdStop(instance, false)
 		return launcher.waitWorkerdStop(ctx, stop)
 	}
 	_, tracked := launcher.instances[instance]
@@ -1020,8 +1271,8 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	}
 	instance.handleStopRequested = true
 	instance.mu.Unlock()
-	stop := launcher.beginWorkerdStop(instance, false)
 	launcher.mu.Unlock()
+	stop := launcher.beginWorkerdStop(instance, false)
 	return launcher.waitWorkerdStop(ctx, stop)
 }
 
@@ -1078,6 +1329,22 @@ func (launcher *WorkerdProcessLauncher) Evidence() WorkerdLauncherEvidence {
 	if launcher == nil {
 		return WorkerdLauncherEvidence{}
 	}
+	integratedCgroup := launcher.cgroups != nil
+	missingCapabilities := make([]string, 0, 7)
+	if integratedCgroup {
+		missingCapabilities = append(missingCapabilities, "workerd-cgroup-authority-isolation")
+	} else {
+		missingCapabilities = append(missingCapabilities,
+			"agentd-cgroup-limits",
+			"agentd-cgroup-termination",
+		)
+	}
+	missingCapabilities = append(missingCapabilities,
+		"agentd-cpu-accounting",
+		"agentd-rss-accounting",
+		"workerd-child-fd-allowlist",
+		"workerd-kill-reconstruction",
+	)
 	return WorkerdLauncherEvidence{
 		ExecutableDigest:         launcher.executableDigest,
 		VerifiedOpenExecutable:   true,
@@ -1087,19 +1354,14 @@ func (launcher *WorkerdProcessLauncher) Evidence() WorkerdLauncherEvidence {
 		ChildFDAllowlist:         false,
 		BoundedOutput:            true,
 		ReadinessGated:           true,
-		CgroupLimits:             false,
+		AtomicCgroupPlacement:    integratedCgroup,
+		CgroupLimits:             integratedCgroup,
+		CgroupTermination:        integratedCgroup,
 		CPUAccounting:            false,
 		RSSAccounting:            false,
 		KillReconstruction:       false,
 		AdmissionReady:           false,
-		MissingCapabilities: []string{
-			"agentd-cgroup-limits",
-			"agentd-cgroup-termination",
-			"agentd-cpu-accounting",
-			"agentd-rss-accounting",
-			"workerd-child-fd-allowlist",
-			"workerd-kill-reconstruction",
-		},
+		MissingCapabilities:      missingCapabilities,
 	}
 }
 
@@ -1120,9 +1382,11 @@ func (writer *boundedWorkerdWriter) Write(content []byte) (int, error) {
 	return written, nil
 }
 
-type osWorkerdProcessStarter struct{}
+type osWorkerdProcessStarter struct {
+	start func(*exec.Cmd) error
+}
 
-func (osWorkerdProcessStarter) Start(command workerdLaunchCommand) (workerdStartedProcess, error) {
+func (starter osWorkerdProcessStarter) Start(command workerdLaunchCommand) (workerdStartedProcess, error) {
 	process := exec.Command(command.Executable, command.Arguments...)
 	process.Env = make([]string, len(command.Environment))
 	copy(process.Env, command.Environment)
@@ -1131,8 +1395,19 @@ func (osWorkerdProcessStarter) Start(command workerdLaunchCommand) (workerdStart
 	process.Stdout = command.Stdout
 	process.Stderr = command.Stderr
 	process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := process.Start(); err != nil {
+	if command.CgroupFD >= 0 {
+		process.SysProcAttr.UseCgroupFD = true
+		process.SysProcAttr.CgroupFD = command.CgroupFD
+	}
+	start := starter.start
+	if start == nil {
+		start = func(command *exec.Cmd) error { return command.Start() }
+	}
+	if err := start(process); err != nil {
 		return nil, err
+	}
+	if process.Process == nil {
+		return nil, errors.New("workerd process starter returned without a process")
 	}
 	return &osWorkerdStartedProcess{process: process, pid: process.Process.Pid}, nil
 }

@@ -115,7 +115,8 @@ type workerdCgroupBackend interface {
 }
 
 type workerdCgroupController struct {
-	mu sync.Mutex
+	authority sync.RWMutex
+	mu        sync.Mutex
 
 	config   workerdCgroupConfig
 	backend  workerdCgroupBackend
@@ -253,7 +254,7 @@ func probeWorkerdCgroupAvailability(config workerdCgroupConfig) workerdCgroupAva
 	if err := controller.close(); err != nil {
 		return workerdCgroupAvailability{Status: "FAILED", Reason: "delegated cgroup root descriptor could not be closed", Evidence: evidence}
 	}
-	return workerdCgroupAvailability{Status: "REFERENCE_ONLY", Available: true, Reason: "real process attachment gate is not implemented", Evidence: evidence}
+	return workerdCgroupAvailability{Status: "REFERENCE_ONLY", Available: true, Reason: "mechanical attachment is implemented but production cgroup authority isolation is not", Evidence: evidence}
 }
 
 func (controller *workerdCgroupController) prepare(ctx context.Context, shardID string, generation uint64) (resultLease *workerdCgroupLease, resultErr error) {
@@ -288,10 +289,12 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 	}
 	fd, identity, err := controller.backend.openChild(controller.rootFD, name)
 	if err != nil {
+		controller.authority.Lock()
 		controller.mu.Lock()
 		controller.reserved--
 		controller.poisoned = true
 		controller.mu.Unlock()
+		controller.authority.Unlock()
 		return nil, errors.Join(classifyWorkerdCgroupError("open shard cgroup", err), errWorkerdCgroupPoisoned)
 	}
 	lease := &workerdCgroupLease{controller: controller, name: name, fd: fd, identity: identity}
@@ -300,6 +303,8 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 		if !rollbackRequired || resultErr == nil {
 			return
 		}
+		controller.authority.Lock()
+		defer controller.authority.Unlock()
 		controller.mu.Lock()
 		currentIdentity, exists, identityErr := controller.backend.identityAt(controller.rootFD, name)
 		if identityErr != nil {
@@ -438,9 +443,15 @@ func (lease *workerdCgroupLease) withDirectoryFD(use func(int) error) error {
 	lease.mu.Lock()
 	defer lease.mu.Unlock()
 	controller := lease.controller
+	if !lease.attachable || lease.destroyed || lease.destroyOperation != nil {
+		return errWorkerdCgroupLeaseUnavailable
+	}
+	controller.authority.RLock()
+	defer controller.authority.RUnlock()
 	controller.mu.Lock()
-	defer controller.mu.Unlock()
-	if !lease.attachable || lease.destroyed || lease.destroyOperation != nil || controller.poisoned {
+	unavailable := controller.poisoned || controller.closed
+	controller.mu.Unlock()
+	if unavailable {
 		return errWorkerdCgroupLeaseUnavailable
 	}
 	return use(lease.fd)
@@ -478,6 +489,7 @@ func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
 	go func() {
 		controller := lease.controller
 		var cleanupErr error
+		ownershipReleased := false
 		if !cleanupOnly {
 			if err := controller.backend.writeControl(lease.fd, "cgroup.kill", "1"); err != nil {
 				cleanupErr = classifyWorkerdCgroupError("kill shard cgroup", err)
@@ -534,36 +546,45 @@ func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
 			cancel()
 		}
 		if cleanupErr == nil {
+			controller.authority.Lock()
 			controller.mu.Lock()
 			identity, exists, err := controller.backend.identityAt(controller.rootFD, lease.name)
 			if err != nil {
 				controller.mu.Unlock()
+				controller.authority.Unlock()
 				cleanupErr = classifyWorkerdCgroupError("verify shard cgroup identity", err)
 			} else if !exists || identity != lease.identity {
 				controller.reserved--
 				controller.poisoned = true
+				ownershipReleased = true
 				controller.mu.Unlock()
 				closeErr := controller.backend.closeFD(lease.fd)
+				controller.authority.Unlock()
 				cleanupErr = errors.Join(errWorkerdCgroupPathReplaced, errWorkerdCgroupPoisoned)
 				if closeErr != nil {
 					cleanupErr = errors.Join(cleanupErr, classifyWorkerdCgroupError("close poisoned shard cgroup", closeErr))
 				}
 			} else if err := controller.backend.removeChild(controller.rootFD, lease.name); err != nil {
 				controller.mu.Unlock()
+				controller.authority.Unlock()
 				cleanupErr = classifyWorkerdCgroupError("remove shard cgroup", err)
 			} else {
 				controller.reserved--
+				ownershipReleased = true
 				controller.mu.Unlock()
-				_ = controller.backend.closeFD(lease.fd)
+				if closeErr := controller.backend.closeFD(lease.fd); closeErr != nil {
+					cleanupErr = classifyWorkerdCgroupError("close removed shard cgroup", closeErr)
+				}
+				controller.authority.Unlock()
 			}
 		}
 		lease.mu.Lock()
 		operation.err = cleanupErr
 		operation.finished = true
-		if cleanupErr == nil || errors.Is(cleanupErr, errWorkerdCgroupPoisoned) {
+		if cleanupErr == nil || ownershipReleased {
 			lease.destroyed = true
 			lease.fd = -1
-			if errors.Is(cleanupErr, errWorkerdCgroupPoisoned) {
+			if cleanupErr != nil {
 				lease.terminalErr = cleanupErr
 			}
 		}
@@ -578,10 +599,22 @@ func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
 	}
 }
 
+func (lease *workerdCgroupLease) destroyedState() bool {
+	if lease == nil {
+		return false
+	}
+	lease.mu.Lock()
+	destroyed := lease.destroyed
+	lease.mu.Unlock()
+	return destroyed
+}
+
 func (controller *workerdCgroupController) close() error {
 	if controller == nil {
 		return nil
 	}
+	controller.authority.Lock()
+	defer controller.authority.Unlock()
 	controller.mu.Lock()
 	if controller.closed {
 		err := controller.closeErr

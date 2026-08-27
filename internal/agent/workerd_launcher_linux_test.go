@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -20,6 +21,46 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestOSWorkerdProcessStarterUsesCloneIntoCgroupWithoutExtraFile(t *testing.T) {
+	var startedCommand *exec.Cmd
+	starter := osWorkerdProcessStarter{start: func(command *exec.Cmd) error {
+		startedCommand = command
+		command.Process = &os.Process{Pid: 20_010}
+		return nil
+	}}
+	process, err := starter.Start(workerdLaunchCommand{
+		Executable: "/sealed/workerd", CgroupFD: 47, ExtraFiles: make([]*os.File, 0),
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if process.PID() != 20_010 {
+		t.Fatalf("PID() = %d, want 20010", process.PID())
+	}
+	var attributes *syscall.SysProcAttr
+	if startedCommand != nil {
+		attributes = startedCommand.SysProcAttr
+	}
+	if attributes == nil || !attributes.UseCgroupFD || attributes.CgroupFD != 47 {
+		t.Fatalf("SysProcAttr = %#v, want UseCgroupFD with fd 47", attributes)
+	}
+	if len(startedCommand.ExtraFiles) != 0 {
+		t.Fatalf("ExtraFiles = %d, want cgroup fd excluded", len(startedCommand.ExtraFiles))
+	}
+}
+
+func TestNewWorkerdProcessLauncherFailsClosedWithoutCgroupBoundary(t *testing.T) {
+	config, _ := newWorkerdLauncherFixture(t, &recordingWorkerdStarter{}, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, err := NewWorkerdProcessLauncher(config)
+	if launcher != nil {
+		_ = launcher.Close(context.Background())
+	}
+	if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
+		t.Fatalf("NewWorkerdProcessLauncher(without cgroup) = %#v, %v, want nil, invalid config", launcher, err)
+	}
+}
 
 func TestNewWorkerdProcessLauncherRejectsUnpinnedOrUnsafeExecutable(t *testing.T) {
 	t.Parallel()
@@ -74,7 +115,7 @@ func TestNewWorkerdProcessLauncherRejectsUnpinnedOrUnsafeExecutable(t *testing.T
 			t.Parallel()
 			config, _ := newWorkerdLauncherFixture(t, &recordingWorkerdStarter{}, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
 			test.mutate(t, &config)
-			launcher, err := NewWorkerdProcessLauncher(config)
+			launcher, err := newWorkerdProcessLauncher(config, osWorkerdProcessStarter{})
 			if launcher != nil || !errors.Is(err, test.wantErr) {
 				t.Fatalf("NewWorkerdProcessLauncher() = %#v, %v, want nil, %v", launcher, err, test.wantErr)
 			}
@@ -192,7 +233,7 @@ func TestNewWorkerdProcessLauncherRejectsUnboundedConfiguration(t *testing.T) {
 			t.Parallel()
 			config, _ := newWorkerdLauncherFixture(t, &recordingWorkerdStarter{}, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
 			test.mutate(&config)
-			launcher, err := NewWorkerdProcessLauncher(config)
+			launcher, err := newWorkerdProcessLauncher(config, osWorkerdProcessStarter{})
 			if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
 				t.Fatalf("NewWorkerdProcessLauncher() = %#v, %v, want nil, invalid config", launcher, err)
 			}
@@ -207,7 +248,7 @@ func TestNewWorkerdProcessLauncherAcceptsClosedProductionBounds(t *testing.T) {
 	config.StopGracePeriod = 30 * time.Second
 	config.OutputLimitBytes = 1 << 20
 	config.Environment = map[string]string{"HOME": strings.Repeat("x", 64<<10)}
-	launcher, err := NewWorkerdProcessLauncher(config)
+	launcher, err := newWorkerdProcessLauncher(config, osWorkerdProcessStarter{})
 	if err != nil {
 		t.Fatalf("NewWorkerdProcessLauncher(maximum bounds) error = %v", err)
 	}
@@ -470,7 +511,7 @@ func TestNewWorkerdProcessLauncherRejectsOversizedExecutableBeforeHashing(t *tes
 		t.Fatal(err)
 	}
 	config.ExecutablePath = oversizedPath
-	launcher, err := NewWorkerdProcessLauncher(config)
+	launcher, err := newWorkerdProcessLauncher(config, osWorkerdProcessStarter{})
 	if launcher != nil || !errors.Is(err, ErrUnsafeWorkerdExecutable) {
 		t.Fatalf("NewWorkerdProcessLauncher(oversized) = %#v, %v, want nil, unsafe executable", launcher, err)
 	}
@@ -1052,7 +1093,8 @@ func TestWorkerdProcessLauncherEvidenceFailsClosedWithoutResourceAuthority(t *te
 		!evidence.BoundedOutput || !evidence.ReadinessGated {
 		t.Fatalf("implemented launcher evidence = %#v", evidence)
 	}
-	if evidence.CgroupLimits || evidence.CPUAccounting || evidence.RSSAccounting || evidence.KillReconstruction || evidence.AdmissionReady {
+	if evidence.AtomicCgroupPlacement || evidence.CgroupLimits || evidence.CgroupTermination || evidence.CPUAccounting ||
+		evidence.RSSAccounting || evidence.KillReconstruction || evidence.AdmissionReady {
 		t.Fatalf("resource authority must fail closed: %#v", evidence)
 	}
 	wantMissing := []string{
@@ -1342,7 +1384,7 @@ func TestWorkerdProcessLauncherProductionStarterRunsOpenedTestBinary(t *testing.
 			}
 		}
 	})
-	launcher, err := NewWorkerdProcessLauncher(WorkerdLauncherConfig{
+	launcher, err := newWorkerdProcessLauncher(WorkerdLauncherConfig{
 		ExecutablePath:   executablePath,
 		ExecutableDigest: fmt.Sprintf("sha256:%x", hash.Sum(nil)),
 		ReadinessTimeout: 2 * time.Second,
@@ -1350,7 +1392,7 @@ func TestWorkerdProcessLauncherProductionStarterRunsOpenedTestBinary(t *testing.
 		OutputLimitBytes: 4096,
 		HistoryCapacity:  128,
 		ReadinessProbe:   probe,
-	})
+	}, osWorkerdProcessStarter{})
 	if err != nil {
 		t.Fatalf("NewWorkerdProcessLauncher() error = %v", err)
 	}
@@ -1592,6 +1634,7 @@ type recordedWorkerdCommand struct {
 	Arguments           []string
 	Environment         []string
 	ExtraFiles          []*os.File
+	CgroupFD            int
 	ShardID             string
 	PlacementGeneration uint64
 	executableContent   []byte
@@ -1602,6 +1645,7 @@ type recordingWorkerdStarter struct {
 	commands      []recordedWorkerdCommand
 	processes     []*fakeWorkerdProcess
 	startErr      error
+	startErrors   []error
 	stdoutPayload string
 	stderrPayload string
 }
@@ -1611,7 +1655,8 @@ func (starter *recordingWorkerdStarter) Start(command workerdLaunchCommand) (wor
 	recorded := recordedWorkerdCommand{
 		Executable: command.Executable, Arguments: slices.Clone(command.Arguments),
 		Environment: slices.Clone(command.Environment), ExtraFiles: slices.Clone(command.ExtraFiles),
-		ShardID: command.ShardID, PlacementGeneration: command.PlacementGeneration,
+		CgroupFD: command.CgroupFD,
+		ShardID:  command.ShardID, PlacementGeneration: command.PlacementGeneration,
 		executableContent: content,
 	}
 	starter.mu.Lock()
@@ -1622,6 +1667,9 @@ func (starter *recordingWorkerdStarter) Start(command workerdLaunchCommand) (wor
 		process = starter.processes[index]
 	}
 	startErr := starter.startErr
+	if index < len(starter.startErrors) {
+		startErr = starter.startErrors[index]
+	}
 	stdoutPayload, stderrPayload := starter.stdoutPayload, starter.stderrPayload
 	starter.mu.Unlock()
 	if readErr != nil {
