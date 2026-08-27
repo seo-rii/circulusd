@@ -12,7 +12,6 @@ import (
 	"path"
 	"reflect"
 	"strconv"
-	"time"
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/identity"
@@ -24,6 +23,7 @@ type RequestAuthenticator interface {
 
 type HTTPConfig struct {
 	Service          *Service
+	SessionEvents    *SessionEventService
 	Authenticator    RequestAuthenticator
 	MaximumBodyBytes int64
 	NewRequestID     func() (string, error)
@@ -31,6 +31,7 @@ type HTTPConfig struct {
 
 type HTTPHandler struct {
 	service          *Service
+	sessionEvents    *SessionEventService
 	authenticator    RequestAuthenticator
 	maximumBodyBytes int64
 	newRequestID     func() (string, error)
@@ -54,7 +55,8 @@ func NewHTTPHandler(config HTTPConfig) (*HTTPHandler, error) {
 		newRequestID = newSecureRequestID
 	}
 	handler := &HTTPHandler{
-		service: config.Service, authenticator: config.Authenticator,
+		service: config.Service, sessionEvents: config.SessionEvents,
+		authenticator:    config.Authenticator,
 		maximumBodyBytes: config.MaximumBodyBytes, newRequestID: newRequestID,
 		mux: http.NewServeMux(),
 	}
@@ -370,35 +372,41 @@ func (handler *HTTPHandler) replayEvents(response http.ResponseWriter, request *
 		)
 		return
 	}
+	if handler.sessionEvents == nil {
+		writeHTTPError(
+			response, http.StatusServiceUnavailable, "unavailable", "STREAMING_UNAVAILABLE",
+			"authoritative event replay is unavailable", true,
+		)
+		return
+	}
+	accepts := request.Header.Values("Accept")
+	if len(accepts) != 1 || accepts[0] != "text/event-stream" {
+		writeHTTPError(
+			response, http.StatusNotAcceptable, "invalid_argument", "SSE_ACCEPT_REQUIRED",
+			"the request Accept header must be text/event-stream", false,
+		)
+		return
+	}
 	afterSequence := uint64(0)
 	cursors := request.Header.Values("Last-Event-ID")
-	if len(cursors) > 1 {
+	validCursor := len(cursors) <= 1
+	if len(cursors) == 1 {
+		cursor := cursors[0]
+		validCursor = cursor != "" && !(len(cursor) > 1 && cursor[0] == '0')
+		for index := 0; index < len(cursor) && validCursor; index++ {
+			validCursor = cursor[index] >= '0' && cursor[index] <= '9'
+		}
+		if validCursor {
+			afterSequence, err = strconv.ParseUint(cursor, 10, 64)
+			validCursor = err == nil && afterSequence <= maximumSharedInteger
+		}
+	}
+	if !validCursor {
 		writeHTTPError(
 			response, http.StatusBadRequest, "invalid_argument", "INVALID_CURSOR",
 			"the event cursor is invalid", false,
 		)
 		return
-	}
-	if len(cursors) == 1 && cursors[0] != "" {
-		cursor := cursors[0]
-		afterSequence, err = strconv.ParseUint(cursor, 10, 64)
-		if err != nil {
-			writeHTTPError(
-				response, http.StatusBadRequest, "invalid_argument", "INVALID_CURSOR",
-				"the event cursor is invalid", false,
-			)
-			return
-		}
-	}
-	stream, err := handler.service.OpenEventStream(request.Context(), ReplayEventsRequest{
-		Principal: principal, SessionID: request.PathValue("sessionId"), AfterSequence: afterSequence,
-	})
-	if err != nil {
-		writeServiceError(response, err)
-		return
-	}
-	if stream.Subscription != nil {
-		defer stream.Subscription.Close()
 	}
 	flusher, canFlush := response.(http.Flusher)
 	if !canFlush {
@@ -408,78 +416,38 @@ func (handler *HTTPHandler) replayEvents(response http.ResponseWriter, request *
 		)
 		return
 	}
-	replay := stream.Replay
+	page, err := handler.sessionEvents.ReadSessionEventPage(request.Context(), ReadSessionEventPageRequest{
+		Principal: principal, SessionID: request.PathValue("sessionId"),
+		AfterSequence: afterSequence,
+	})
+	if err != nil {
+		writeServiceError(response, err)
+		return
+	}
+	snapshotPayload, err := json.Marshal(page.Snapshot)
+	if err != nil {
+		writeServiceError(response, ErrRepositoryFailure)
+		return
+	}
+	var framed bytes.Buffer
+	framed.WriteString("retry: 1000\n\n")
+	fmt.Fprintf(&framed, "event: session.snapshot\ndata: %s\n\n", snapshotPayload)
+	for _, event := range page.Events {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			writeServiceError(response, ErrRepositoryFailure)
+			return
+		}
+		fmt.Fprintf(&framed, "id: %d\nevent: %s\ndata: %s\n\n", event.Sequence, event.Type, payload)
+	}
 	response.Header().Set("Content-Type", "text/event-stream")
 	response.Header().Set("Cache-Control", "no-cache, no-store")
 	response.Header().Set("X-Accel-Buffering", "no")
 	response.WriteHeader(http.StatusOK)
-	snapshotPayload, err := json.Marshal(struct {
-		SessionID           string     `json:"sessionId"`
-		ActiveTurnID        string     `json:"activeTurnId,omitempty"`
-		TurnStatus          TurnStatus `json:"turnStatus,omitempty"`
-		LastDurableSequence uint64     `json:"lastDurableSequence"`
-	}{
-		SessionID: replay.Snapshot.SessionID, ActiveTurnID: replay.Snapshot.ActiveTurnID,
-		TurnStatus:          replay.Snapshot.TurnStatus,
-		LastDurableSequence: replay.Snapshot.LastDurableSequence,
-	})
-	if err != nil {
-		return
-	}
-	if _, err := fmt.Fprintf(response, "event: session.snapshot\ndata: %s\n\n", snapshotPayload); err != nil {
+	if _, err := response.Write(framed.Bytes()); err != nil {
 		return
 	}
 	flusher.Flush()
-	for _, event := range replay.Events {
-		payload, err := json.Marshal(struct {
-			TurnID  string `json:"turnId"`
-			Payload string `json:"payload"`
-		}{TurnID: event.TurnID, Payload: event.Payload})
-		if err != nil {
-			return
-		}
-		if _, err := fmt.Fprintf(response, "id: %d\nevent: %s\ndata: %s\n\n", event.Sequence, event.Type, payload); err != nil {
-			return
-		}
-		flusher.Flush()
-	}
-	if !stream.CaughtUp {
-		return
-	}
-	keepalive := time.NewTicker(15 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-request.Context().Done():
-			return
-		case event, open := <-stream.Subscription.Events():
-			if !open {
-				return
-			}
-			payload, err := json.Marshal(struct {
-				TurnID  string `json:"turnId"`
-				Payload string `json:"payload"`
-			}{TurnID: event.TurnID, Payload: event.Payload})
-			if err != nil {
-				return
-			}
-			if event.Durable {
-				if _, err := fmt.Fprintf(
-					response, "id: %d\nevent: %s\ndata: %s\n\n", event.Sequence, event.Type, payload,
-				); err != nil {
-					return
-				}
-			} else if _, err := fmt.Fprintf(response, "event: %s\ndata: %s\n\n", event.Type, payload); err != nil {
-				return
-			}
-			flusher.Flush()
-		case <-keepalive.C:
-			if _, err := io.WriteString(response, ": keepalive\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
-	}
 }
 
 func (handler *HTTPHandler) authenticate(request *http.Request) (Principal, error) {

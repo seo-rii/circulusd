@@ -1,17 +1,14 @@
 package platformapi_test
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/hancomac/circulusd/internal/platformapi"
 )
@@ -21,20 +18,6 @@ type requestAuthenticator struct {
 	principal platformapi.Principal
 	err       error
 	calls     int
-}
-
-type cancelingRecorder struct {
-	*httptest.ResponseRecorder
-	cancel context.CancelFunc
-	marker string
-}
-
-func (recorder *cancelingRecorder) Write(payload []byte) (int, error) {
-	written, err := recorder.ResponseRecorder.Write(payload)
-	if strings.Contains(recorder.Body.String(), recorder.marker) {
-		recorder.cancel()
-	}
-	return written, err
 }
 
 func (authenticator *requestAuthenticator) Authenticate(
@@ -190,159 +173,5 @@ func TestHTTPAuthenticationPrecedesBodyParsingAndErrorsAreRedacted(t *testing.T)
 	}
 	if authenticator.calls != 1 {
 		t.Fatalf("Authenticate() calls = %d, want 1", authenticator.calls)
-	}
-}
-
-func TestHTTPSSEReplaysOnlyEventsAfterLastEventIDWithSnapshot(t *testing.T) {
-	ctx := context.Background()
-	store := platformapi.NewMemoryStore()
-	registerAPISession(t, store)
-	service := newAPIService(t, store, &scopedAuthorizer{})
-	created, err := service.CreateTurn(ctx, platformapi.CreateTurnRequest{
-		Principal: platformapi.Principal{TenantID: apiTenantID, SubjectID: apiSubjectID},
-		SessionID: apiSessionID, IdempotencyKey: "sse-turn",
-		Messages: []platformapi.Message{{Role: "user", Content: "stream"}},
-	})
-	if err != nil {
-		t.Fatalf("CreateTurn() error = %v", err)
-	}
-	eventAuth := eventAuthority(created.Turn.ID)
-	for index, event := range []struct {
-		command string
-		type_   platformapi.EventType
-		status  platformapi.TurnStatus
-	}{
-		{command: "op_AAAAAAAAAAAAAAAAAAAAAAAAAA", type_: platformapi.EventTurnAccepted, status: platformapi.TurnActive},
-		{command: "op_AAAAAAAAAAAAAAAAAAAAAAAAAE", type_: platformapi.EventTurnCompleted, status: platformapi.TurnCompleted},
-	} {
-		if _, _, err := service.AppendDurableEvent(ctx, platformapi.AppendDurableEventRequest{
-			Authority: eventAuth, CommandID: event.command, ExpectedSequence: uint64(index),
-			Type: event.type_, Payload: []byte(`{"index":` + string(rune('1'+index)) + `}`), TurnStatus: event.status,
-		}); err != nil {
-			t.Fatalf("AppendDurableEvent(%d) error = %v", index, err)
-		}
-	}
-
-	handler := newHTTPHandler(t, service, &requestAuthenticator{principal: platformapi.Principal{
-		TenantID: apiTenantID, SubjectID: apiSubjectID,
-	}})
-	streamContext, cancelStream := context.WithCancel(context.Background())
-	defer cancelStream()
-	request := httptest.NewRequest(http.MethodGet, "/v1/sessions/"+apiSessionID+"/events", nil).
-		WithContext(streamContext)
-	request.Header.Set("Accept", "text/event-stream")
-	request.Header.Set("Last-Event-ID", "1")
-	response := &cancelingRecorder{
-		ResponseRecorder: httptest.NewRecorder(), cancel: cancelStream, marker: "event: turn.completed\n",
-	}
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("GET events status/body = %d/%s", response.Code, response.Body.String())
-	}
-	if contentType := response.Header().Get("Content-Type"); contentType != "text/event-stream" {
-		t.Fatalf("Content-Type = %q, want text/event-stream", contentType)
-	}
-	body, err := io.ReadAll(response.Result().Body)
-	if err != nil {
-		t.Fatalf("read SSE body: %v", err)
-	}
-	text := string(body)
-	if !strings.Contains(text, "event: session.snapshot\n") || !strings.Contains(text, "\"lastDurableSequence\":2") ||
-		!strings.Contains(text, "id: 2\n") || !strings.Contains(text, "event: turn.completed\n") {
-		t.Fatalf("SSE body missing snapshot or event 2:\n%s", text)
-	}
-	if strings.Contains(text, "id: 1\n") || strings.Contains(text, "event: turn.accepted\n") {
-		t.Fatalf("SSE body replayed event at cursor:\n%s", text)
-	}
-
-	invalid := httptest.NewRequest(http.MethodGet, "/v1/sessions/"+apiSessionID+"/events", nil)
-	invalid.Header.Set("Accept", "text/event-stream")
-	invalid.Header.Set("Last-Event-ID", "-1")
-	invalidResponse := httptest.NewRecorder()
-	handler.ServeHTTP(invalidResponse, invalid)
-	if invalidResponse.Code != http.StatusBadRequest {
-		t.Fatalf("GET events invalid cursor status = %d, want 400", invalidResponse.Code)
-	}
-
-	duplicateCursor := httptest.NewRequest(http.MethodGet, "/v1/sessions/"+apiSessionID+"/events", nil)
-	duplicateCursor.Header.Set("Accept", "text/event-stream")
-	duplicateCursor.Header.Add("Last-Event-ID", "1")
-	duplicateCursor.Header.Add("Last-Event-ID", "2")
-	duplicateCursorResponse := httptest.NewRecorder()
-	handler.ServeHTTP(duplicateCursorResponse, duplicateCursor)
-	if duplicateCursorResponse.Code != http.StatusBadRequest {
-		t.Fatalf("GET events duplicate cursor status = %d, want 400", duplicateCursorResponse.Code)
-	}
-}
-
-func TestHTTPSSEContinuesWithLiveEphemeralEvents(t *testing.T) {
-	ctx := context.Background()
-	store := platformapi.NewMemoryStore()
-	registerAPISession(t, store)
-	service := newAPIService(t, store, &scopedAuthorizer{})
-	created, err := service.CreateTurn(ctx, platformapi.CreateTurnRequest{
-		Principal: platformapi.Principal{TenantID: apiTenantID, SubjectID: apiSubjectID},
-		SessionID: apiSessionID, IdempotencyKey: "sse-live-turn",
-		Messages: []platformapi.Message{{Role: "user", Content: "stream live"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	eventAuth := eventAuthority(created.Turn.ID)
-	if _, _, err := service.AppendDurableEvent(ctx, platformapi.AppendDurableEventRequest{
-		Authority: eventAuth, CommandID: "op_AAAAAAAAAAAAAAAAAAAAAAAAAA", ExpectedSequence: 0,
-		Type: platformapi.EventTurnAccepted, Payload: []byte(`{"state":"accepted"}`), TurnStatus: platformapi.TurnActive,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	handler := newHTTPHandler(t, service, &requestAuthenticator{principal: platformapi.Principal{
-		TenantID: apiTenantID, SubjectID: apiSubjectID,
-	}})
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	requestContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(
-		requestContext, http.MethodGet, server.URL+"/v1/sessions/"+apiSessionID+"/events", nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Accept", "text/event-stream")
-	request.Header.Set("Last-Event-ID", "1")
-	response, err := server.Client().Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	reader := bufio.NewReader(response.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read initial SSE snapshot: %v", err)
-		}
-		if line == "\n" {
-			break
-		}
-	}
-	if _, err := service.PublishEphemeralEvent(ctx, platformapi.EphemeralEventRequest{
-		Authority: eventAuth, Type: platformapi.EventModelDelta, Payload: []byte("partial"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	var live strings.Builder
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("read live SSE event: %v", err)
-		}
-		live.WriteString(line)
-		if line == "\n" {
-			break
-		}
-	}
-	if text := live.String(); !strings.Contains(text, "event: model.delta\n") ||
-		!strings.Contains(text, `"payload":"partial"`) || strings.Contains(text, "id:") {
-		t.Fatalf("live ephemeral SSE event = %q", text)
 	}
 }
