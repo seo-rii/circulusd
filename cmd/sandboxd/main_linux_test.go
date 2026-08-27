@@ -33,9 +33,12 @@ func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 		readNonce: func() ([]byte, error) {
 			return append([]byte(nil), nonce...), nil
 		},
-		loadCommands: func(path string) (map[string]string, error) {
+		loadCommands: func(path string, ownerUID uint32) (map[string]string, error) {
 			if path != "/etc/circulusd/commands.json" {
 				t.Fatalf("command manifest path = %q", path)
+			}
+			if ownerUID != 65534 {
+				t.Fatalf("command manifest owner UID = %d", ownerUID)
 			}
 			return map[string]string{"echo": "/usr/bin/echo"}, nil
 		},
@@ -58,6 +61,7 @@ func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
 		"--protocol-version", "1",
+		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
 	}, dependencies)
 	if exitCode != 0 {
@@ -98,6 +102,7 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
 		"--protocol-version", "1",
+		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
 	}
 	withoutFlag := func(name string) []string {
@@ -129,6 +134,10 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 		{name: "zero generation", arguments: replaceFlag("--generation", "0")},
 		{name: "noncanonical generation", arguments: replaceFlag("--generation", "07")},
 		{name: "unsupported protocol", arguments: replaceFlag("--protocol-version", "2")},
+		{name: "missing command manifest owner", arguments: withoutFlag("--command-manifest-owner-uid")},
+		{name: "zero command manifest owner", arguments: replaceFlag("--command-manifest-owner-uid", "0")},
+		{name: "noncanonical command manifest owner", arguments: replaceFlag("--command-manifest-owner-uid", "065534")},
+		{name: "command manifest owner sentinel", arguments: replaceFlag("--command-manifest-owner-uid", "4294967295")},
 		{name: "no allowed client", arguments: withoutFlag("--allow-client-uid")},
 		{name: "noncanonical UID", arguments: replaceFlag("--allow-client-uid", "065534")},
 		{name: "relative socket", arguments: replaceFlag("--control-socket", "control.sock")},
@@ -146,7 +155,7 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 					read = true
 					return nil, errors.New("must not be called")
 				},
-				loadCommands: func(string) (map[string]string, error) {
+				loadCommands: func(string, uint32) (map[string]string, error) {
 					t.Fatal("invalid arguments reached command manifest loading")
 					return nil, nil
 				},
@@ -166,6 +175,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
 		"--protocol-version", "1",
+		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
 	}
 	t.Run("pre-canceled context", func(t *testing.T) {
@@ -175,7 +185,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 		read := false
 		exitCode := execute(ctx, arguments, daemonDependencies{
 			stderr: io.Discard,
-			loadCommands: func(string) (map[string]string, error) {
+			loadCommands: func(string, uint32) (map[string]string, error) {
 				t.Fatal("pre-canceled daemon loaded the command manifest")
 				return nil, nil
 			},
@@ -197,7 +207,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 		t.Parallel()
 		exitCode := execute(context.Background(), arguments, daemonDependencies{
 			stderr: io.Discard,
-			loadCommands: func(string) (map[string]string, error) {
+			loadCommands: func(string, uint32) (map[string]string, error) {
 				return map[string]string{"echo": "/usr/bin/echo"}, nil
 			},
 			readNonce: func() ([]byte, error) { return nil, errors.New("read failed") },
@@ -213,7 +223,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 		var passedNonce []byte
 		exitCode := execute(context.Background(), arguments, daemonDependencies{
 			stderr: io.Discard,
-			loadCommands: func(string) (map[string]string, error) {
+			loadCommands: func(string, uint32) (map[string]string, error) {
 				return map[string]string{"echo": "/usr/bin/echo"}, nil
 			},
 			readNonce:     func() ([]byte, error) { return nonce, nil },
@@ -241,11 +251,12 @@ func TestExecuteFailsClosedOnIncompleteDependencyAdapters(t *testing.T) {
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
 		"--protocol-version", "1",
+		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
 	}
 	base := daemonDependencies{
 		stderr: io.Discard,
-		loadCommands: func(string) (map[string]string, error) {
+		loadCommands: func(string, uint32) (map[string]string, error) {
 			return map[string]string{"echo": "/usr/bin/echo"}, nil
 		},
 		readNonce: func() ([]byte, error) {

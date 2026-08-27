@@ -43,7 +43,7 @@ type daemonServer interface {
 type daemonDependencies struct {
 	stderr        io.Writer
 	readNonce     func() ([]byte, error)
-	loadCommands  func(string) (map[string]string, error)
+	loadCommands  func(string, uint32) (map[string]string, error)
 	newSupervisor func(sandboxd.Config) (*sandboxd.Supervisor, error)
 	listen        func(sandboxrpc.ServerConfig) (daemonServer, error)
 	runner        sandboxd.Runner
@@ -119,12 +119,14 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	flags.SetOutput(flagOutput)
 	socketPath := singleStringValue{name: "control socket", value: defaultControlSocketPath}
 	manifestPath := singleStringValue{name: "command manifest", value: defaultCommandManifest}
+	manifestOwnerUID := singleStringValue{name: "command manifest owner UID"}
 	sandboxID := singleStringValue{name: "sandbox ID"}
 	generationValue := singleStringValue{name: "generation"}
 	protocolVersion := singleStringValue{name: "protocol version"}
 	var allowedClientUIDs uidValues
 	flags.Var(&socketPath, "control-socket", "canonical absolute private control socket path")
 	flags.Var(&manifestPath, "command-manifest", "canonical absolute sealed command manifest path")
+	flags.Var(&manifestOwnerUID, "command-manifest-owner-uid", "expected owner UID of the sealed command manifest")
 	flags.Var(&sandboxID, "sandbox-id", "launch-time sandbox identity")
 	flags.Var(&generationValue, "generation", "positive launch-time sandbox generation")
 	flags.Var(&protocolVersion, "protocol-version", "sandbox protocol major version")
@@ -134,8 +136,11 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	}
 	parsedSandboxID, sandboxIDError := identity.Parse(identity.Sandbox, sandboxID.value)
 	generation, generationError := strconv.ParseUint(generationValue.value, 10, 64)
+	parsedManifestOwnerUID, manifestOwnerError := strconv.ParseUint(manifestOwnerUID.value, 10, 32)
 	if sandboxIDError != nil || generationError != nil || generation == 0 ||
 		generation > maximumSharedGeneration || strconv.FormatUint(generation, 10) != generationValue.value ||
+		manifestOwnerError != nil || parsedManifestOwnerUID == 0 || parsedManifestOwnerUID == uint64(^uint32(0)) ||
+		strconv.FormatUint(parsedManifestOwnerUID, 10) != manifestOwnerUID.value || !manifestOwnerUID.set ||
 		protocolVersion.value != supportedProtocolVersion || !protocolVersion.set ||
 		len(allowedClientUIDs.values) == 0 || socketPath.value == "" || len(socketPath.value) > 107 ||
 		!filepath.IsAbs(socketPath.value) || filepath.Clean(socketPath.value) != socketPath.value ||
@@ -157,7 +162,7 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		return 1
 	}
 
-	commands, err := dependencies.loadCommands(manifestPath.value)
+	commands, err := dependencies.loadCommands(manifestPath.value, uint32(parsedManifestOwnerUID))
 	if err != nil {
 		fmt.Fprintf(dependencies.stderr, "sandboxd: load command manifest: %v\n", err)
 		return 1

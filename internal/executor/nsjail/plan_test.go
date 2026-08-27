@@ -86,6 +86,8 @@ func TestPlannerBuildsExplicitFailClosedProductionPlan(t *testing.T) {
 		"arg: \"7\"",
 		"arg: \"--protocol-version\"",
 		"arg: \"1\"",
+		"arg: \"--command-manifest-owner-uid\"",
+		"arg: \"65534\"",
 		"arg: \"--allow-client-uid\"",
 		"arg: \"65534\"",
 	}
@@ -216,6 +218,8 @@ func TestPlannerRejectsUntrustedPathsDowngradesAndUnboundedResources(t *testing.
 		{name: "zero protocol", mutate: func(config *Config) { config.ProtocolVersion = 0 }},
 		{name: "zero sandboxd client uid", mutate: func(config *Config) { config.SandboxdClientUID = 0 }},
 		{name: "sandboxd client uid sentinel", mutate: func(config *Config) { config.SandboxdClientUID = math.MaxUint32 }},
+		{name: "zero command manifest owner uid", mutate: func(config *Config) { config.CommandManifestOwnerUID = 0 }},
+		{name: "command manifest owner uid sentinel", mutate: func(config *Config) { config.CommandManifestOwnerUID = math.MaxUint32 }},
 	}
 	for _, test := range configTests {
 		t.Run(test.name, func(t *testing.T) {
@@ -311,13 +315,14 @@ func TestPlannerBuildIsDeterministicAndConcurrentSafe(t *testing.T) {
 
 func validConfig() Config {
 	return Config{
-		BinaryPath:        "/usr/lib/circulusd/nsjail",
-		EnvironmentRoot:   "/var/lib/circulusd/environments",
-		SandboxRoot:       "/run/circulusd/sandboxes",
-		CgroupRoot:        "/sys/fs/cgroup/circulusd",
-		SandboxdPath:      "/usr/lib/circulusd/sandboxd",
-		ProtocolVersion:   1,
-		SandboxdClientUID: 65534,
+		BinaryPath:              "/usr/lib/circulusd/nsjail",
+		EnvironmentRoot:         "/var/lib/circulusd/environments",
+		SandboxRoot:             "/run/circulusd/sandboxes",
+		CgroupRoot:              "/sys/fs/cgroup/circulusd",
+		SandboxdPath:            "/usr/lib/circulusd/sandboxd",
+		ProtocolVersion:         1,
+		SandboxdClientUID:       65534,
+		CommandManifestOwnerUID: 65534,
 	}
 }
 

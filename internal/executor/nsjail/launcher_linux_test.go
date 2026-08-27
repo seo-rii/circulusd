@@ -827,7 +827,8 @@ func newLauncherFixture(t *testing.T) launcherFixture {
 	planner, err := NewPlanner(Config{
 		BinaryPath: binaryPath, EnvironmentRoot: environmentRoot, SandboxRoot: sandboxRoot,
 		CgroupRoot: cgroupRoot, SandboxdPath: "/usr/lib/circulusd/sandboxd", ProtocolVersion: 1,
-		SandboxdClientUID: 65534,
+		SandboxdClientUID:       65534,
+		CommandManifestOwnerUID: 65534,
 	})
 	if err != nil {
 		t.Fatalf("NewPlanner() error = %v", err)

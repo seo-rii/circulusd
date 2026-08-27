@@ -26,7 +26,7 @@ var ErrInvalidCommandManifest = errors.New("sandboxd: invalid command manifest")
 // LoadCommandManifest reads the immutable environment allowlist used to
 // resolve logical command names. The manifest itself is trusted packaging
 // input, but it is still parsed fail-closed before becoming launch authority.
-func LoadCommandManifest(path string) (map[string]string, error) {
+func LoadCommandManifest(path string, expectedOwnerUID uint32) (map[string]string, error) {
 	if path == "" || len(path) > 4096 || !utf8.ValidString(path) ||
 		strings.IndexByte(path, 0) >= 0 || !filepath.IsAbs(path) ||
 		filepath.Clean(path) != path || path == string(filepath.Separator) {
@@ -48,7 +48,7 @@ func LoadCommandManifest(path string) (map[string]string, error) {
 		return nil, fmt.Errorf("%w: inspect: %v", ErrInvalidCommandManifest, err)
 	}
 	if before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 ||
-		before.Uid != uint32(os.Geteuid()) || before.Mode&0o022 != 0 ||
+		before.Uid != expectedOwnerUID || before.Mode&0o022 != 0 ||
 		before.Size <= 0 || before.Size > maximumCommandManifestBytes {
 		return nil, fmt.Errorf("%w: file type, owner, mode, link count, or size is unsafe", ErrInvalidCommandManifest)
 	}

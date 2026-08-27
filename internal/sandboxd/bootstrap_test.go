@@ -20,7 +20,7 @@ func TestLoadCommandManifestReturnsCanonicalAllowlist(t *testing.T) {
     {"name": "python3", "path": "/usr/bin/python3"}
   ]
 }`)
-	commands, err := LoadCommandManifest(path)
+	commands, err := LoadCommandManifest(path, uint32(os.Geteuid()))
 	if err != nil {
 		t.Fatalf("LoadCommandManifest() error = %v", err)
 	}
@@ -29,7 +29,7 @@ func TestLoadCommandManifestReturnsCanonicalAllowlist(t *testing.T) {
 	}
 
 	commands["echo"] = "/tmp/changed"
-	again, err := LoadCommandManifest(path)
+	again, err := LoadCommandManifest(path, uint32(os.Geteuid()))
 	if err != nil {
 		t.Fatalf("second LoadCommandManifest() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestLoadCommandManifestRejectsAmbiguousOrUnsafeDocuments(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := LoadCommandManifest(writeCommandManifest(t, test.document))
+			_, err := LoadCommandManifest(writeCommandManifest(t, test.document), uint32(os.Geteuid()))
 			if !errors.Is(err, ErrInvalidCommandManifest) {
 				t.Fatalf("LoadCommandManifest() error = %v, want ErrInvalidCommandManifest", err)
 			}
@@ -82,7 +82,7 @@ func TestLoadCommandManifestRejectsUnsafeFilesystemObjects(t *testing.T) {
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := LoadCommandManifest(link); !errors.Is(err, ErrInvalidCommandManifest) {
+		if _, err := LoadCommandManifest(link, uint32(os.Geteuid())); !errors.Is(err, ErrInvalidCommandManifest) {
 			t.Fatalf("LoadCommandManifest(symlink) error = %v", err)
 		}
 	})
@@ -93,14 +93,14 @@ func TestLoadCommandManifestRejectsUnsafeFilesystemObjects(t *testing.T) {
 		if err := os.Chmod(path, 0o660); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := LoadCommandManifest(path); !errors.Is(err, ErrInvalidCommandManifest) {
+		if _, err := LoadCommandManifest(path, uint32(os.Geteuid())); !errors.Is(err, ErrInvalidCommandManifest) {
 			t.Fatalf("LoadCommandManifest(writable) error = %v", err)
 		}
 	})
 	t.Run("directory", func(t *testing.T) {
 		t.Parallel()
 
-		if _, err := LoadCommandManifest(t.TempDir()); !errors.Is(err, ErrInvalidCommandManifest) {
+		if _, err := LoadCommandManifest(t.TempDir(), uint32(os.Geteuid())); !errors.Is(err, ErrInvalidCommandManifest) {
 			t.Fatalf("LoadCommandManifest(directory) error = %v", err)
 		}
 	})
@@ -119,7 +119,7 @@ func TestLoadCommandManifestIsSafeForConcurrentReaders(t *testing.T) {
 		go func() {
 			ready.Done()
 			<-start
-			commands, err := LoadCommandManifest(path)
+			commands, err := LoadCommandManifest(path, uint32(os.Geteuid()))
 			if err == nil && commands["echo"] != "/bin/echo" {
 				err = errors.New("unexpected concurrent allowlist")
 			}
@@ -132,6 +132,16 @@ func TestLoadCommandManifestIsSafeForConcurrentReaders(t *testing.T) {
 		if err := <-errorsSeen; err != nil {
 			t.Fatalf("concurrent LoadCommandManifest() error = %v", err)
 		}
+	}
+}
+
+func TestLoadCommandManifestRejectsUnexpectedOwner(t *testing.T) {
+	t.Parallel()
+
+	path := writeCommandManifest(t, `{"schemaVersion":1,"commands":[{"name":"echo","path":"/bin/echo"}]}`)
+	unexpectedOwner := uint32(os.Geteuid()) ^ 1
+	if _, err := LoadCommandManifest(path, unexpectedOwner); !errors.Is(err, ErrInvalidCommandManifest) {
+		t.Fatalf("LoadCommandManifest(unexpected owner %d) error = %v", unexpectedOwner, err)
 	}
 }
 
