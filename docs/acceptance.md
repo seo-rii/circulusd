@@ -13,7 +13,7 @@ Only `PASS` satisfies a required release profile. Development fakes and unit lau
 |---|---|---|---|
 | §53.1 | Session/Pi/extension isolation | stock workerd, two sessions, eviction and stale generation suite | NOT_RUN |
 | §53.2 | Single durable state machine | Session aggregate model/property tests and multi-tool serialization | NOT_RUN |
-| §53.3 | Worker Loader | pinned workerd Loader ABI, outbound denial, cgroup and identity suite | UNAVAILABLE: workerd is not installed on this host |
+| §53.3 | Worker Loader | pinned workerd Loader ABI, outbound denial, cgroup and identity suite | NOT_RUN: pinned stock workerd passed content-addressed replacement, Dynamic Worker, extension-order, isolate-separation and outbound-denial probes; real Pi engine, shard recycle/cgroup and stable broker binding remain NOT_RUN |
 | §53.4 | TurnAuthority/capability | generation, expiry, renewal and forged-scope suite | NOT_RUN |
 | §53.5 | Effect recovery | kill-before/after full durable boundary matrix | NOT_RUN |
 | §53.6 | Runtime Revision | candidate, migration, CAS activation and rollback suite | NOT_RUN |
@@ -32,7 +32,7 @@ Only `PASS` satisfies a required release profile. Development fakes and unit lau
 
 ## External qualification notes
 
-- Pi Agent Core `0.84.3` and workerd `v1.20260825.1` require a bounded-step feasibility gate before Phase 0A passes.
+- Pi Agent Core `0.84.3` and workerd `v1.20260825.1` remain short of the complete bounded-step Phase 0A gate. The digest-pinned stock workerd binary passed the currently configured non-mock Loader/isolate/outbound probes on this host, while the real Pi engine, shard recycle/cgroup pressure and stable broker RPC probes remain explicitly `NOT_RUN`.
 - celld `v0.3.0` is pinned but remains alpha; its durability and ownership contract is a separate hard gate.
 - SeaweedFS `4.44` is provisional. No self-hosted offline object store is currently qualified by celld, and MinIO Community Edition does not satisfy the required conditional-write contract.
 - Release pins and known missing artifacts are recorded in `deploy/airgap/release-manifest.json`.
