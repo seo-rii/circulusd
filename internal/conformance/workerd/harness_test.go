@@ -194,13 +194,22 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			t.Fatalf("probe %q calls = %d, want 1", probe.entrypoint, seen[probe.entrypoint])
 		}
 	}
+	resourceResults := make(map[string]conformance.Result)
 	for _, result := range report.Results {
 		wantStatus := conformance.Pass
 		wantReason := ""
 		switch result.Component {
+		case "workerd.cpu-limit":
+			resourceResults[result.Component] = result
+			wantStatus = conformance.NotRun
+			wantReason = "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured"
 		case "workerd.outbound-denial":
 			wantStatus = conformance.Fail
 			wantReason = "stock workerd probe returned a non-zero exit status"
+		case "workerd.rss-cold-start":
+			resourceResults[result.Component] = result
+			wantStatus = conformance.NotRun
+			wantReason = "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured"
 		case "workerd.shard-recycle":
 			wantStatus = conformance.NotRun
 			wantReason = "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"
@@ -215,6 +224,15 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			result.Evidence.Version != config.ExpectedVersion ||
 			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock {
 			t.Fatalf("result %q evidence = %+v", result.Component, result.Evidence)
+		}
+	}
+	for component, reason := range map[string]string{
+		"workerd.cpu-limit":      "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.rss-cold-start": "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
+	} {
+		result, found := resourceResults[component]
+		if !found || result.Status != conformance.NotRun || result.Reason != reason {
+			t.Fatalf("resource result %q = %+v, found=%t", component, result, found)
 		}
 	}
 }
@@ -242,6 +260,8 @@ func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
 		t.Fatalf("shardRecycle component = %q, want no runnable substitute for the agentd cgroup gate", got)
 	}
 	wantNotRun := map[string]string{
+		"workerd.cpu-limit":             "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.rss-cold-start":        "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
 		"workerd.shard-recycle":         "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
 		"workerd.stable-broker-binding": "stable broker RPC probe is not configured",
 	}
@@ -564,7 +584,7 @@ func TestStockWorkerdFixture(t *testing.T) {
 	report := harness.Run(t.Context())
 	for _, result := range report.Results {
 		switch result.Component {
-		case "workerd.shard-recycle", "workerd.stable-broker-binding":
+		case "workerd.cpu-limit", "workerd.rss-cold-start", "workerd.shard-recycle", "workerd.stable-broker-binding":
 			if result.Status != conformance.NotRun {
 				t.Fatalf("external-boundary result = %+v, want NOT_RUN", result)
 			}
