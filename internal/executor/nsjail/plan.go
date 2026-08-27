@@ -42,6 +42,9 @@ type Config struct {
 	CgroupRoot      string
 	SandboxdPath    string
 	ProtocolVersion uint32
+	// SandboxdClientUID is the trusted executord peer UID as observed from
+	// sandboxd's user namespace (normally the host kernel overflow UID).
+	SandboxdClientUID uint32
 }
 
 // NetworkMode is deliberately narrow for the first production slice. A
@@ -190,6 +193,9 @@ func NewPlanner(config Config) (*Planner, error) {
 	if config.ProtocolVersion == 0 {
 		return nil, fmt.Errorf("%w: sandbox protocol version must be positive", ErrInvalidConfig)
 	}
+	if config.SandboxdClientUID == 0 || config.SandboxdClientUID == ^uint32(0) {
+		return nil, fmt.Errorf("%w: sandboxd client UID must be an explicit unprivileged UID", ErrInvalidConfig)
+	}
 	roots := []string{config.EnvironmentRoot, config.SandboxRoot, config.CgroupRoot}
 	for left := range roots {
 		for right := left + 1; right < len(roots); right++ {
@@ -335,7 +341,8 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = configuration.WriteString("  arg: \"--control-socket\"\n  arg: \"/run/circulusd/control/control.sock\"\n")
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--sandbox-id\"\n  arg: %s\n", strconv.Quote(request.SandboxID.String()))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--generation\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(request.Generation, 10)))
-	_, _ = fmt.Fprintf(&configuration, "  arg: \"--protocol-version\"\n  arg: %s\n}\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.ProtocolVersion), 10)))
+	_, _ = fmt.Fprintf(&configuration, "  arg: \"--protocol-version\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.ProtocolVersion), 10)))
+	_, _ = fmt.Fprintf(&configuration, "  arg: \"--allow-client-uid\"\n  arg: %s\n}\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.SandboxdClientUID), 10)))
 
 	plan := LaunchPlan{
 		executable:           planner.config.BinaryPath,
