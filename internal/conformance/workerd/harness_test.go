@@ -166,6 +166,14 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			arguments[5] != filepath.Join(directory, "phase0.capnp") {
 			t.Fatalf("probe arguments = %q", arguments)
 		}
+		broker, readBrokerErr := os.ReadFile(filepath.Join(directory, "fake-broker.mjs"))
+		if readBrokerErr != nil {
+			t.Fatalf("ReadFile(materialized fake broker) error = %v", readBrokerErr)
+		}
+		if !bytes.Contains(broker, []byte("export const model")) ||
+			!bytes.Contains(broker, []byte("export const mcp")) {
+			t.Fatal("materialized fake broker does not expose stable model and MCP services")
+		}
 		entrypoint := strings.TrimPrefix(arguments[6], "phase0:")
 		mutex.Lock()
 		seen[entrypoint]++
@@ -198,6 +206,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 	for _, result := range report.Results {
 		wantStatus := conformance.Pass
 		wantReason := ""
+		wantMock := false
 		switch result.Component {
 		case "workerd.cpu-limit":
 			resourceResults[result.Component] = result
@@ -214,15 +223,14 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			wantStatus = conformance.NotRun
 			wantReason = "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"
 		case "workerd.stable-broker-binding":
-			wantStatus = conformance.NotRun
-			wantReason = "stable broker RPC probe is not configured"
+			wantMock = true
 		}
 		if result.Status != wantStatus || result.Reason != wantReason {
 			t.Fatalf("result %q = %+v, want status=%s reason=%q", result.Component, result, wantStatus, wantReason)
 		}
 		if result.Evidence.BinaryDigest != config.ExpectedBinaryDigest ||
 			result.Evidence.Version != config.ExpectedVersion ||
-			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock {
+			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock != wantMock {
 			t.Fatalf("result %q evidence = %+v", result.Component, result.Evidence)
 		}
 	}
@@ -259,14 +267,142 @@ func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
 	if got := componentsByEntrypoint["shardRecycle"]; got != "" {
 		t.Fatalf("shardRecycle component = %q, want no runnable substitute for the agentd cgroup gate", got)
 	}
+	if got := componentsByEntrypoint["stableBrokerBinding"]; got != "workerd.stable-broker-binding" {
+		t.Fatalf("stableBrokerBinding component = %q, want real workerd binding probe", got)
+	}
 	wantNotRun := map[string]string{
-		"workerd.cpu-limit":             "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
-		"workerd.rss-cold-start":        "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
-		"workerd.shard-recycle":         "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
-		"workerd.stable-broker-binding": "stable broker RPC probe is not configured",
+		"workerd.cpu-limit":      "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.rss-cold-start": "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
+		"workerd.shard-recycle":  "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
 	}
 	if !reflect.DeepEqual(notRunReasons, wantNotRun) {
 		t.Fatalf("NOT_RUN checks = %#v, want %#v", notRunReasons, wantNotRun)
+	}
+}
+
+func TestStableBrokerFixtureUsesRealBindingsAndConcurrentIdentities(t *testing.T) {
+	t.Parallel()
+
+	broker, err := fixtureFiles.ReadFile("fixture/fake-broker.mjs")
+	if err != nil {
+		t.Errorf("ReadFile(fake broker) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte("export const model"),
+		[]byte("export const mcp"),
+		[]byte("requestDigest"),
+		[]byte("initialModelIdentities"),
+		[]byte("rendezvous-pending"),
+	} {
+		if !bytes.Contains(broker, required) {
+			t.Errorf("fake broker does not contain %q", required)
+		}
+	}
+
+	configuration, err := fixtureFiles.ReadFile("fixture/phase0.capnp.tmpl")
+	if err != nil {
+		t.Fatalf("ReadFile(configuration) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte(`(name = "fake-broker.mjs", esModule = embed "fake-broker.mjs")`),
+		[]byte(`(name = "MODEL", service = (name = "fake-broker", entrypoint = "model"))`),
+		[]byte(`(name = "MCP", service = (name = "fake-broker", entrypoint = "mcp"))`),
+	} {
+		if !bytes.Contains(configuration, required) {
+			t.Errorf("workerd configuration does not contain %q", required)
+		}
+	}
+
+	host, err := fixtureFiles.ReadFile("fixture/session-host.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(session host) error = %v", err)
+	}
+	worker, err := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(worker bundle) error = %v", err)
+	}
+	workerDigest := fmt.Sprintf("stable-broker/sha256-%x/", sha256.Sum256(worker))
+	for _, required := range [][]byte{
+		[]byte("MODEL: env.MODEL"),
+		[]byte("MCP: env.MCP"),
+		[]byte(workerDigest + "identity-a"),
+		[]byte(workerDigest + "identity-b"),
+		[]byte("Promise.all(["),
+		[]byte("missing-model"),
+		[]byte("missing-mcp"),
+		[]byte("Math.max(leftResult.initialModelAttempts, rightResult.initialModelAttempts) >= 2"),
+		[]byte(`"model", "external-tool", "model", "turn_complete"`),
+	} {
+		if !bytes.Contains(host, required) {
+			t.Errorf("session host does not contain stable broker contract %q", required)
+		}
+	}
+
+	entry, err := os.ReadFile("fixture/pi-worker.entry.ts")
+	if err != nil {
+		t.Fatalf("ReadFile(worker entry) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte(`path === "/stable-broker-turn"`),
+		[]byte("env.MODEL.fetch"),
+		[]byte("env.MCP.fetch"),
+		[]byte("requestDigest"),
+		[]byte("initialModelAttempts"),
+	} {
+		if !bytes.Contains(entry, required) {
+			t.Errorf("Pi worker does not contain stable broker dispatch %q", required)
+		}
+	}
+}
+
+func TestEnvironmentDigestBindsTheFakeBrokerFixture(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	harness, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	hash := sha256.New()
+	for _, value := range []string{
+		config.CompatibilityDate,
+		strings.Join(config.CompatibilityFlags, "\x00"),
+		"fixture/phase0.capnp.tmpl",
+		"fixture/session-host.mjs",
+		"fixture/pi-worker.mjs",
+		"fixture/fake-broker.mjs",
+	} {
+		_, _ = hash.Write([]byte(fmt.Sprintf("%d:", len(value))))
+		_, _ = hash.Write([]byte(value))
+	}
+	for _, candidate := range requiredProbes {
+		for _, value := range []string{
+			"probe",
+			candidate.component,
+			candidate.entrypoint,
+			candidate.notRunReason,
+			fmt.Sprintf("%t", candidate.mock),
+		} {
+			_, _ = hash.Write([]byte(fmt.Sprintf("%d:", len(value))))
+			_, _ = hash.Write([]byte(value))
+		}
+	}
+	for _, path := range []string{
+		"fixture/phase0.capnp.tmpl",
+		"fixture/session-host.mjs",
+		"fixture/pi-worker.mjs",
+		"fixture/fake-broker.mjs",
+	} {
+		contents, readErr := fixtureFiles.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("ReadFile(%q) error = %v", path, readErr)
+		}
+		_, _ = hash.Write([]byte(fmt.Sprintf("%d:", len(contents))))
+		_, _ = hash.Write(contents)
+	}
+	want := fmt.Sprintf("sha256:%x", hash.Sum(nil))
+	if harness.environmentDigest != want {
+		t.Fatalf("environment digest = %q, want fake-broker-bound %q", harness.environmentDigest, want)
 	}
 }
 
@@ -584,7 +720,7 @@ func TestStockWorkerdFixture(t *testing.T) {
 	report := harness.Run(t.Context())
 	for _, result := range report.Results {
 		switch result.Component {
-		case "workerd.cpu-limit", "workerd.rss-cold-start", "workerd.shard-recycle", "workerd.stable-broker-binding":
+		case "workerd.cpu-limit", "workerd.rss-cold-start", "workerd.shard-recycle":
 			if result.Status != conformance.NotRun {
 				t.Fatalf("external-boundary result = %+v, want NOT_RUN", result)
 			}
@@ -592,6 +728,10 @@ func TestStockWorkerdFixture(t *testing.T) {
 			if result.Status != conformance.Pass {
 				t.Fatalf("stock workerd result = %+v", result)
 			}
+		}
+		wantMock := result.Component == "workerd.stable-broker-binding"
+		if result.Evidence.Mock != wantMock {
+			t.Fatalf("stock workerd result %q mock evidence = %t, want %t", result.Component, result.Evidence.Mock, wantMock)
 		}
 	}
 }

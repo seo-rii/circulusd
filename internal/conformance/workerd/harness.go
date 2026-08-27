@@ -1,7 +1,7 @@
 // Package workerd runs release-pinned Phase 0A probes against stock workerd.
 // A PASS means the digest-pinned process executed that exact probe. Checks that
-// need stable broker RPC or agentd-managed cgroups remain
-// explicit NOT_RUN results until an external fixture supplies those boundaries.
+// need agentd-managed cgroups remain explicit NOT_RUN results. The embedded
+// stable broker is deterministic test infrastructure and is marked mock.
 package workerd
 
 import (
@@ -35,7 +35,7 @@ var (
 	compatibilityDatePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 	compatibilityFlagPattern = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 
-	//go:embed fixture/phase0.capnp.tmpl fixture/session-host.mjs fixture/pi-worker.mjs
+	//go:embed fixture/phase0.capnp.tmpl fixture/session-host.mjs fixture/pi-worker.mjs fixture/fake-broker.mjs
 	fixtureFiles embed.FS
 )
 
@@ -76,7 +76,7 @@ var requiredProbes = []probe{
 	{component: "workerd.outbound-denial", entrypoint: "outboundDenial"},
 	{component: "workerd.rss-cold-start", notRunReason: "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured"},
 	{component: "workerd.shard-recycle", notRunReason: "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"},
-	{component: "workerd.stable-broker-binding", notRunReason: "stable broker RPC probe is not configured"},
+	{component: "workerd.stable-broker-binding", entrypoint: "stableBrokerBinding", mock: true},
 }
 
 type commandOutput struct {
@@ -146,6 +146,7 @@ func New(config Config) (*Harness, error) {
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
 		"fixture/pi-worker.mjs",
+		"fixture/fake-broker.mjs",
 	} {
 		_, _ = hash.Write([]byte(fmt.Sprintf("%d:", len(value))))
 		_, _ = hash.Write([]byte(value))
@@ -166,6 +167,7 @@ func New(config Config) (*Harness, error) {
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
 		"fixture/pi-worker.mjs",
+		"fixture/fake-broker.mjs",
 	} {
 		contents, err := fixtureFiles.ReadFile(path)
 		if err != nil {
@@ -314,6 +316,7 @@ func (harness *Harness) Run(ctx context.Context) conformance.Report {
 			template, templateErr := fixtureFiles.ReadFile("fixture/phase0.capnp.tmpl")
 			host, hostErr := fixtureFiles.ReadFile("fixture/session-host.mjs")
 			worker, workerErr := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
+			broker, brokerErr := fixtureFiles.ReadFile("fixture/fake-broker.mjs")
 			flags := make([]string, len(harness.config.CompatibilityFlags))
 			for index, flag := range harness.config.CompatibilityFlags {
 				flags[index] = `"` + flag + `"`
@@ -322,12 +325,13 @@ func (harness *Harness) Run(ctx context.Context) conformance.Report {
 			configuration = strings.ReplaceAll(configuration, "@COMPATIBILITY_FLAGS@", strings.Join(flags, ", "))
 			hostSource := strings.ReplaceAll(string(host), "@COMPATIBILITY_DATE@", harness.config.CompatibilityDate)
 			hostSource = strings.ReplaceAll(hostSource, "@COMPATIBILITY_FLAGS@", strings.Join(flags, ", "))
-			writeErrors := []error{templateErr, hostErr, workerErr}
+			writeErrors := []error{templateErr, hostErr, workerErr, brokerErr}
 			if templateErr == nil {
 				writeErrors = append(writeErrors,
 					os.WriteFile(filepath.Join(directory, "phase0.capnp"), []byte(configuration), 0o600),
 					os.WriteFile(filepath.Join(directory, "session-host.mjs"), []byte(hostSource), 0o600),
 					os.WriteFile(filepath.Join(directory, "pi-worker.mjs"), worker, 0o600),
+					os.WriteFile(filepath.Join(directory, "fake-broker.mjs"), broker, 0o600),
 				)
 			}
 			for _, writeErr := range writeErrors {

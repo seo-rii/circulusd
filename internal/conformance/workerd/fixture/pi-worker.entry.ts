@@ -5,8 +5,25 @@ import {
   createPiAgentCoreInitialState,
   type ExtensionRegistration,
 } from "../../../../workers/pi-runtime/src/index.ts";
+import type { NormalizedValue } from "../../../../packages/protocol-types/src/index.ts";
 
 let counter = 0;
+
+interface FetcherBinding {
+  fetch(input: Request | string, init?: RequestInit): Promise<Response>;
+}
+
+interface WorkerEnvironment {
+  readonly MARKER: string;
+  readonly MODEL?: FetcherBinding;
+  readonly MCP?: FetcherBinding;
+}
+
+interface BrokerEnvelope {
+  readonly requestDigest: string;
+  readonly stage: string;
+  readonly settlement?: NormalizedValue;
+}
 
 async function denied(operation: () => Promise<unknown>): Promise<boolean> {
   try {
@@ -190,8 +207,184 @@ async function runAgentTurn(): Promise<{
   };
 }
 
+async function runStableBrokerTurn(env: WorkerEnvironment): Promise<{
+  readonly identity: string;
+  readonly completed: boolean;
+  readonly trace: readonly string[];
+  readonly brokerTrace: readonly string[];
+  readonly initialModelAttempts: number;
+}> {
+  if (
+    env.MODEL === undefined ||
+    typeof env.MODEL.fetch !== "function" ||
+    env.MCP === undefined ||
+    typeof env.MCP.fetch !== "function"
+  ) {
+    throw new Error("stable broker bindings are missing");
+  }
+  if (env.MARKER !== "identity-a" && env.MARKER !== "identity-b") {
+    throw new Error("stable broker identity is invalid");
+  }
+  const identity = env.MARKER;
+  const model = {
+    id: "phase0-stable-broker-model",
+    api: "circulusd-model-gateway",
+    provider: "circulusd",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 4_096,
+    maxTokens: 512,
+  } as const;
+  const coreFactory = createPiAgentCoreFactory({
+    systemPrompt: "Use the stable Phase 0A mock broker bindings.",
+    model,
+    tools: [{
+      name: "echo",
+      description: "Echo one identity",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string", enum: [identity] } },
+        required: ["text"],
+        additionalProperties: false,
+      },
+      replayPolicy: "safe",
+    }],
+  });
+  const engineIdentity = {
+    sessionId: `session_phase0_${identity.replace("-", "_")}`,
+    runtimeRevisionDigest: `sha256:${"b".repeat(64)}` as const,
+    adapterAbiVersion: 2,
+    checkpointSchemaVersion: 2,
+  };
+  const engines = Array.from(
+    { length: 4 },
+    () => new LowLevelPiAgentEngine(engineIdentity, coreFactory),
+  );
+  const timestampBase = identity === "identity-a" ? 1_700_000_001_000 : 1_700_000_002_000;
+  const genesis = await engines[0]!.createGenesisCheckpoint({
+    turnId: `turn_phase0_${identity.replace("-", "_")}`,
+    input: { prompt: identity, timestamp: timestampBase - 1 },
+    initialCoreState: createPiAgentCoreInitialState(),
+  });
+  const firstModel = await engines[0]!.step({
+    authority: createOpaqueTurnAuthority(new Uint8Array([4, 5, 6])),
+    checkpoint: genesis,
+  });
+  if (firstModel.kind !== "effect_request" || firstModel.request.service !== "model") {
+    throw new Error("stable broker turn did not emit its first model request");
+  }
+  let firstModelResponse: Response | undefined;
+  let firstModelEnvelope: BrokerEnvelope | undefined;
+  let initialModelAttempts = 0;
+  while (initialModelAttempts < 8) {
+    initialModelAttempts += 1;
+    const response = await env.MODEL.fetch("https://model.phase0.invalid/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ identity, request: firstModel.request }),
+    });
+    const envelope = await response.json() as BrokerEnvelope;
+    if (response.status === 202) {
+      if (
+        envelope.requestDigest !== firstModel.request.requestDigest ||
+        envelope.stage !== "rendezvous-pending" ||
+        envelope.settlement !== undefined
+      ) {
+        throw new Error("stable model binding returned an invalid rendezvous response");
+      }
+      continue;
+    }
+    firstModelResponse = response;
+    firstModelEnvelope = envelope;
+    break;
+  }
+  if (
+    firstModelResponse === undefined ||
+    firstModelEnvelope === undefined ||
+    !firstModelResponse.ok ||
+    firstModelEnvelope.requestDigest !== firstModel.request.requestDigest ||
+    firstModelEnvelope.stage !== "model-tool" ||
+    firstModelEnvelope.settlement === null ||
+    typeof firstModelEnvelope.settlement !== "object"
+  ) {
+    throw new Error("stable model binding returned an uncorrelated first settlement");
+  }
+  const tool = await engines[1]!.step({
+    authority: createOpaqueTurnAuthority(new Uint8Array([4, 5, 6])),
+    checkpoint: firstModel.checkpoint,
+    settlement: {
+      requestDigest: firstModel.request.requestDigest,
+      outcome: { kind: "success", result: firstModelEnvelope.settlement },
+    },
+  });
+  if (tool.kind !== "effect_request" || tool.request.service !== "external-tool") {
+    throw new Error("stable broker turn did not emit its MCP tool request");
+  }
+  const toolResponse = await env.MCP.fetch("https://mcp.phase0.invalid/call", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ identity, request: tool.request }),
+  });
+  const toolEnvelope = await toolResponse.json() as BrokerEnvelope;
+  if (
+    !toolResponse.ok ||
+    toolEnvelope.requestDigest !== tool.request.requestDigest ||
+    toolEnvelope.stage !== "mcp-echo" ||
+    toolEnvelope.settlement === null ||
+    typeof toolEnvelope.settlement !== "object"
+  ) {
+    throw new Error("stable MCP binding returned an uncorrelated tool settlement");
+  }
+  const secondModel = await engines[2]!.step({
+    authority: createOpaqueTurnAuthority(new Uint8Array([4, 5, 6])),
+    checkpoint: tool.checkpoint,
+    settlement: {
+      requestDigest: tool.request.requestDigest,
+      outcome: { kind: "success", result: toolEnvelope.settlement },
+    },
+  });
+  if (secondModel.kind !== "effect_request" || secondModel.request.service !== "model") {
+    throw new Error("stable broker turn did not emit its continuation model request");
+  }
+  const secondModelResponse = await env.MODEL.fetch("https://model.phase0.invalid/complete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ identity, request: secondModel.request }),
+  });
+  const secondModelEnvelope = await secondModelResponse.json() as BrokerEnvelope;
+  if (
+    !secondModelResponse.ok ||
+    secondModelEnvelope.requestDigest !== secondModel.request.requestDigest ||
+    secondModelEnvelope.stage !== "model-complete" ||
+    secondModelEnvelope.settlement === null ||
+    typeof secondModelEnvelope.settlement !== "object"
+  ) {
+    throw new Error("stable model binding returned an uncorrelated final settlement");
+  }
+  const completed = await engines[3]!.step({
+    authority: createOpaqueTurnAuthority(new Uint8Array([4, 5, 6])),
+    checkpoint: secondModel.checkpoint,
+    settlement: {
+      requestDigest: secondModel.request.requestDigest,
+      outcome: { kind: "success", result: secondModelEnvelope.settlement },
+    },
+  });
+  return {
+    identity,
+    completed: completed.kind === "turn_complete",
+    initialModelAttempts,
+    trace: [
+      firstModel.request.service,
+      tool.request.service,
+      secondModel.request.service,
+      completed.kind,
+    ],
+    brokerTrace: [firstModelEnvelope.stage, toolEnvelope.stage, secondModelEnvelope.stage],
+  };
+}
+
 export default {
-  async fetch(request: Request, env: { readonly MARKER: string }): Promise<Response> {
+  async fetch(request: Request, env: WorkerEnvironment): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/identity") {
       return Response.json({ marker: env.MARKER });
@@ -202,6 +395,17 @@ export default {
     }
     if (path === "/agent-turn") {
       return Response.json(await runAgentTurn());
+    }
+    if (path === "/stable-broker-turn") {
+      if (
+        env.MODEL === undefined ||
+        typeof env.MODEL.fetch !== "function" ||
+        env.MCP === undefined ||
+        typeof env.MCP.fetch !== "function"
+      ) {
+        return Response.json({ code: "missing_binding" }, { status: 503 });
+      }
+      return Response.json(await runStableBrokerTurn(env));
     }
     if (path === "/outbound") {
       const fetchDenied = await denied(() =>

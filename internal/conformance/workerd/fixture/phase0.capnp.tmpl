@@ -12,7 +12,20 @@ const phase0 :Workerd.Config = (
           (name = "pi-worker-source", text = embed "pi-worker.mjs")
         ],
         bindings = [
-          (name = "LOADER", workerLoader = (id = "circulusd-phase0"))
+          (name = "LOADER", workerLoader = (id = "circulusd-phase0")),
+          (name = "MODEL", service = (name = "fake-broker", entrypoint = "model")),
+          (name = "MCP", service = (name = "fake-broker", entrypoint = "mcp"))
+        ],
+        globalOutbound = "deny"
+      )
+    ),
+    (
+      name = "fake-broker",
+      worker = (
+        compatibilityDate = "@COMPATIBILITY_DATE@",
+        compatibilityFlags = [@COMPATIBILITY_FLAGS@],
+        modules = [
+          (name = "fake-broker.mjs", esModule = embed "fake-broker.mjs")
         ],
         globalOutbound = "deny"
       )

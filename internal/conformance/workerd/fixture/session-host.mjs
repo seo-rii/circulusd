@@ -4,14 +4,14 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function definition(marker, limits = { cpuMs: 1000, subRequests: 0 }) {
+function definition(marker, limits = { cpuMs: 1000, subRequests: 0 }, bindings = {}) {
   return {
     compatibilityDate: "@COMPATIBILITY_DATE@",
     compatibilityFlags: [@COMPATIBILITY_FLAGS@],
     limits,
     mainModule: "pi-worker.js",
     modules: { "pi-worker.js": { js: workerSource } },
-    env: { MARKER: marker },
+    env: { MARKER: marker, ...bindings },
     globalOutbound: null,
   };
 }
@@ -88,6 +88,55 @@ export const extensionOrder = {
       "a:afterModelResponse", "b:afterModelResponse", "a:afterTurn", "b:afterTurn",
     ];
     assert(JSON.stringify(result.hooks) === JSON.stringify(expected), "extension hook order changed");
+  },
+};
+
+export const stableBrokerBinding = {
+  async test(_controller, env) {
+    const left = env.LOADER.get("stable-broker/sha256-14246996606065f4947a6d0126df91361e3263db6953e169b57867d1d7efa4dc/identity-a", () =>
+      definition("identity-a", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
+    );
+    const right = env.LOADER.get("stable-broker/sha256-14246996606065f4947a6d0126df91361e3263db6953e169b57867d1d7efa4dc/identity-b", () =>
+      definition("identity-b", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
+    );
+    const [leftResult, rightResult] = await Promise.all([
+      invoke(left, "/stable-broker-turn"),
+      invoke(right, "/stable-broker-turn"),
+    ]);
+    const expectedTrace = ["model", "external-tool", "model", "turn_complete"];
+    const expectedBrokerTrace = ["model-tool", "mcp-echo", "model-complete"];
+    assert(
+      Math.max(leftResult.initialModelAttempts, rightResult.initialModelAttempts) >= 2,
+      "stable broker rendezvous did not defer its first identity",
+    );
+    for (const [identity, result] of [
+      ["identity-a", leftResult],
+      ["identity-b", rightResult],
+    ]) {
+      assert(result.identity === identity, `stable broker crossed identity ${identity}`);
+      assert(result.completed === true, `stable broker did not complete ${identity}`);
+      assert(JSON.stringify(result.trace) === JSON.stringify(expectedTrace), `stable broker trace changed for ${identity}`);
+      assert(JSON.stringify(result.brokerTrace) === JSON.stringify(expectedBrokerTrace), `stable broker settlement trace changed for ${identity}`);
+    }
+
+    const missingModel = env.LOADER.get("stable-broker/missing-model", () =>
+      definition("identity-a", undefined, { MCP: env.MCP })
+    );
+    const missingMcp = env.LOADER.get("stable-broker/missing-mcp", () =>
+      definition("identity-b", undefined, { MODEL: env.MODEL })
+    );
+    const [missingModelResponse, missingMcpResponse] = await Promise.all([
+      missingModel.getEntrypoint().fetch("https://phase0.invalid/stable-broker-turn"),
+      missingMcp.getEntrypoint().fetch("https://phase0.invalid/stable-broker-turn"),
+    ]);
+    assert(missingModelResponse.status === 503, "stable broker route accepted a missing MODEL binding");
+    assert(missingMcpResponse.status === 503, "stable broker route accepted a missing MCP binding");
+    const [missingModelBody, missingMcpBody] = await Promise.all([
+      missingModelResponse.json(),
+      missingMcpResponse.json(),
+    ]);
+    assert(missingModelBody.code === "missing_binding", "missing MODEL failure was not explicit");
+    assert(missingMcpBody.code === "missing_binding", "missing MCP failure was not explicit");
   },
 };
 
