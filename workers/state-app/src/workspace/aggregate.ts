@@ -1397,6 +1397,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
   }
 
   const historyInvocations = new Set<string>();
+  const leaseHistoryByInvocation = new Map<string, WorkspaceLeaseHistoryRecord>();
   for (const history of state.leaseHistory) {
     validatedExactKeys(
       history,
@@ -1446,6 +1447,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     ) {
       workspaceError("FAILED_PRECONDITION", "lease history status is invalid");
     }
+    leaseHistoryByInvocation.set(history.invocationId, history);
   }
   if (state.nextLeaseGeneration <= maximumLeaseGeneration) {
     workspaceError("FAILED_PRECONDITION", "next lease generation is not monotonic");
@@ -1454,9 +1456,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     workspaceError("FAILED_PRECONDITION", "next lease enqueue sequence is not monotonic");
   }
   if (state.activeWriteLease !== null) {
-    const activeHistory = state.leaseHistory.find(
-      (history) => history.invocationId === state.activeWriteLease?.invocationId,
-    );
+    const activeHistory = leaseHistoryByInvocation.get(state.activeWriteLease.invocationId);
     if (
       activeHistory === undefined ||
       activeHistory.status !== "active" ||
@@ -1471,9 +1471,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     }
   }
   for (const queued of state.writeQueue) {
-    const history = state.leaseHistory.find(
-      (record) => record.invocationId === queued.authority.invocationId,
-    );
+    const history = leaseHistoryByInvocation.get(queued.authority.invocationId);
     if (
       history === undefined ||
       history.status !== (queued.canceled ? "canceled" : "queued") ||
@@ -1529,7 +1527,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       workspaceError("FAILED_PRECONDITION", "lease conflict invocation changed request digest");
     }
     conflictDigests.set(invocationId, requestDigest);
-    const history = state.leaseHistory.find((record) => record.invocationId === invocationId);
+    const history = leaseHistoryByInvocation.get(invocationId);
     if (history !== undefined && history.requestDigest !== requestDigest) {
       workspaceError("FAILED_PRECONDITION", "lease conflict disagrees with lease history");
     }
@@ -1718,6 +1716,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
 
   const invocationIds = new Set<string>();
   const commitIds = new Set<string>();
+  const invocationLedgerByRevision = new Map<number, WorkspaceInvocationRecord>();
   for (const record of state.invocationLedger) {
     validatedExactKeys(
       record,
@@ -1748,14 +1747,18 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     commitIds.add(record.result.workspaceCommitId);
     if (
       state.activeWriteLease?.invocationId === record.invocationId ||
-      state.writeQueue.some((entry) => entry.authority.invocationId === record.invocationId)
+      queuedInvocations.has(record.invocationId)
     ) {
       workspaceError("FAILED_PRECONDITION", "a committed invocation still has writer authority");
     }
     parseDigest(record.requestDigest, "invocation ledger requestDigest");
     validatedIdentifier(record.invocationId, "invocation ledger invocationId");
     validatedIdentifier(record.result.workspaceCommitId, "invocation ledger workspaceCommitId");
-    validatedInteger(record.result.revision, "invocation ledger revision", 1);
+    const resultRevision = validatedInteger(
+      record.result.revision,
+      "invocation ledger revision",
+      1,
+    );
     parseDigest(record.result.rootDigest, "invocation ledger rootDigest");
     validatedInteger(record.baseRevision, "invocation ledger baseRevision", 0);
     validatedIdentifier(
@@ -1781,7 +1784,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     ) {
       workspaceError("FAILED_PRECONDITION", "invocation ledger authority is inconsistent");
     }
-    const revision = state.revisions[record.result.revision];
+    const revision = state.revisions[resultRevision];
     if (
       record.status !== "committed" ||
       revision === undefined ||
@@ -1829,9 +1832,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     ) {
       workspaceError("FAILED_PRECONDITION", "invocation protection proof is inconsistent");
     }
-    const committedHistory = state.leaseHistory.find(
-      (history) => history.invocationId === record.invocationId,
-    );
+    const committedHistory = leaseHistoryByInvocation.get(record.invocationId);
     if (
       committedHistory === undefined ||
       committedHistory.status !== "committed" ||
@@ -1842,11 +1843,10 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     ) {
       workspaceError("FAILED_PRECONDITION", "committed lease history is inconsistent");
     }
+    invocationLedgerByRevision.set(resultRevision, record);
   }
   for (const revision of state.revisions.slice(1)) {
-    const record = state.invocationLedger.find(
-      (candidate) => candidate.result.revision === revision.revision,
-    );
+    const record = invocationLedgerByRevision.get(revision.revision);
     if (
       record === undefined ||
       record.invocationId !== revision.invocationId ||
@@ -1864,7 +1864,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
   for (const history of state.leaseHistory) {
     if (
       history.status === "committed" &&
-      !state.invocationLedger.some((record) => record.invocationId === history.invocationId)
+      !invocationIds.has(history.invocationId)
     ) {
       workspaceError("FAILED_PRECONDITION", "committed lease history lacks a ledger record");
     }

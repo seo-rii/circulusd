@@ -686,4 +686,119 @@ describe("workspace adversarial contracts", () => {
       } as never),
     ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
   });
+
+  it("keeps cross-collection invariant comparisons linear as history grows", async () => {
+    let current = createWorkspaceState({
+      workspaceId: "workspace-linear-invariants",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+
+    for (let index = 1; index <= 12; index += 1) {
+      const invocationId = `committed-${index}`;
+      const acquired = await acquiredLease(current, invocationId, index * 10);
+      const leaseFence = fence(acquired.lease);
+      const ticketId = `ticket-${invocationId}`;
+      const nextRootDigest = digest(index.toString(16));
+      const prepared = await applyWorkspaceCommand(acquired.state, {
+        kind: "prepare_materialization",
+        expectedEventSequence: acquired.state.eventSequence,
+        now: index * 10 + 1,
+        ticketId,
+        accessMode: "read_write",
+        requestedRevision: current.revision,
+        authority: authority(invocationId, { workspaceId: current.workspaceId }),
+        sandboxId: `sandbox-${invocationId}`,
+        backend: "nsjail",
+        projectionGeneration: 1,
+        leaseFence,
+        ticketTtlMs: 50,
+      });
+      const committed = await applyWorkspaceCommand(prepared.state, {
+        kind: "commit_workspace",
+        expectedEventSequence: prepared.state.eventSequence,
+        now: index * 10 + 2,
+        materializationTicketId: ticketId,
+        leaseFence,
+        baseRevision: current.revision,
+        workspaceCommitId: `workspace-commit-${index}`,
+        postExecutionRootDigest: nextRootDigest,
+        referencedObjectDigests: [nextRootDigest],
+        protectionProofs: [
+          protectionProof(`protect-${index}`, nextRootDigest),
+        ],
+        authority: authority(invocationId, {
+          purpose: "settlement",
+          workspaceId: current.workspaceId,
+        }),
+      });
+      current = committed.state;
+    }
+
+    const owner = await acquiredLease(current, "active-owner", 300);
+    current = owner.state;
+    for (let index = 1; index <= 16; index += 1) {
+      const queued = await acquire(current, `queued-${index}`, 300 + index);
+      expect(queued.outcome.kind).toBe("write_lease_queued");
+      current = queued.state;
+    }
+
+    let relationalComparisons = 0;
+    const instrumentedArrayPrototype = Object.create(Array.prototype) as unknown[];
+    Object.defineProperties(instrumentedArrayPrototype, {
+      find: {
+        configurable: true,
+        value: function (
+          this: unknown[],
+          predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+          thisArgument?: unknown,
+        ): unknown {
+          for (let index = 0; index < this.length; index += 1) {
+            if (!(index in this)) {
+              continue;
+            }
+            relationalComparisons += 1;
+            const value = this[index];
+            if (predicate.call(thisArgument, value, index, this)) {
+              return value;
+            }
+          }
+          return undefined;
+        },
+      },
+      some: {
+        configurable: true,
+        value: function (
+          this: unknown[],
+          predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+          thisArgument?: unknown,
+        ): boolean {
+          for (let index = 0; index < this.length; index += 1) {
+            if (!(index in this)) {
+              continue;
+            }
+            relationalComparisons += 1;
+            if (predicate.call(thisArgument, this[index], index, this)) {
+              return true;
+            }
+          }
+          return false;
+        },
+      },
+    });
+    const historyPrototype = Object.getPrototypeOf(current.leaseHistory);
+    const ledgerPrototype = Object.getPrototypeOf(current.invocationLedger);
+    Object.setPrototypeOf(current.leaseHistory, instrumentedArrayPrototype);
+    Object.setPrototypeOf(current.invocationLedger, instrumentedArrayPrototype);
+    try {
+      expect(() => assertWorkspaceInvariants(current)).not.toThrow();
+    } finally {
+      Object.setPrototypeOf(current.leaseHistory, historyPrototype);
+      Object.setPrototypeOf(current.invocationLedger, ledgerPrototype);
+    }
+
+    expect(relationalComparisons).toBeLessThanOrEqual(
+      4 * (current.leaseHistory.length + current.invocationLedger.length),
+    );
+  });
 });
