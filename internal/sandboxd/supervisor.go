@@ -152,6 +152,21 @@ func NewSupervisor(config Config) (*Supervisor, error) {
 	}, nil
 }
 
+// LaunchAuthority returns the supervisor's current launch identity. Callers
+// use it only to bind a private transport to the exact supervisor instance;
+// command payloads cannot replace this authority.
+func (supervisor *Supervisor) LaunchAuthority() LaunchAuthority {
+	if supervisor == nil {
+		return LaunchAuthority{}
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	return LaunchAuthority{
+		SandboxID:  supervisor.sandboxID,
+		Generation: supervisor.generation,
+	}
+}
+
 // Spawn starts or idempotently returns a process for the request/process ID
 // pair. Concurrent duplicates share one runner start.
 func (supervisor *Supervisor) Spawn(

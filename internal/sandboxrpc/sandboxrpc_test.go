@@ -1,0 +1,473 @@
+//go:build linux
+
+package sandboxrpc
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
+	"github.com/hancomac/circulusd/internal/sandboxd"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestPrivateTransportProcessLifecycleAndConcurrentIdempotency(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	request := validSpawnRequest("spawn-once", "invocation-00001")
+	const callers = 16
+	responses := make(chan *v1.SpawnProcessResponse, callers)
+	errorsSeen := make(chan error, callers)
+	var start sync.WaitGroup
+	start.Add(callers)
+	for range callers {
+		go func() {
+			start.Done()
+			start.Wait()
+			response, err := client.Spawn(context.Background(), request)
+			if err != nil {
+				errorsSeen <- err
+				return
+			}
+			responses <- response
+		}()
+	}
+
+	var handle *v1.ProcessHandle
+	for range callers {
+		select {
+		case err := <-errorsSeen:
+			t.Fatalf("concurrent Spawn() error = %v", err)
+		case response := <-responses:
+			if handle == nil {
+				handle = response.GetProcess()
+			}
+			if !proto.Equal(handle, response.GetProcess()) {
+				t.Fatalf("concurrent Spawn() handle differs: %v vs %v", handle, response.GetProcess())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent Spawn()")
+		}
+	}
+	if got := runner.StartCount(); got != 1 {
+		t.Fatalf("runner starts = %d, want 1", got)
+	}
+	process := nextFakeProcess(t, runner)
+	resolved := process.Spec()
+	if resolved.ExecutablePath != "/bin/echo" || resolved.WorkingDirectory != testWorkspaceRoot(t, server) {
+		t.Fatalf("trusted RunSpec = %#v", resolved)
+	}
+
+	write := &v1.WriteStdinRequest{
+		Meta:          idempotentMeta("stdin-0000000001"),
+		Process:       proto.Clone(handle).(*v1.ProcessHandle),
+		ChunkSequence: 1,
+		Data:          []byte("hello"),
+	}
+	firstWrite, err := client.WriteStdin(context.Background(), write)
+	if err != nil {
+		t.Fatalf("WriteStdin() error = %v", err)
+	}
+	secondWrite, err := client.WriteStdin(context.Background(), write)
+	if err != nil {
+		t.Fatalf("retry WriteStdin() error = %v", err)
+	}
+	if firstWrite.GetAcceptedSequence() != 1 || secondWrite.GetAcceptedSequence() != 1 ||
+		!bytes.Equal(process.StdinBytes(), []byte("hello")) {
+		t.Fatalf("idempotent stdin responses = (%v, %v), bytes = %q", firstWrite, secondWrite, process.StdinBytes())
+	}
+
+	closed, err := client.CloseStdin(context.Background(), &v1.CloseStdinRequest{
+		Meta:    idempotentMeta("close-stdin-0001"),
+		Process: proto.Clone(handle).(*v1.ProcessHandle),
+	})
+	if err != nil || !closed.GetClosed() {
+		t.Fatalf("CloseStdin() = (%v, %v)", closed, err)
+	}
+	process.Complete(sandboxd.RunResult{ExitCode: 0})
+	waited, err := client.Wait(context.Background(), &v1.WaitProcessRequest{
+		Meta:    idempotentMeta("wait-process-001"),
+		Process: proto.Clone(handle).(*v1.ProcessHandle),
+	})
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if waited.GetState() != v1.ProcessLifecycleState_PROCESS_LIFECYCLE_STATE_EXITED || waited.GetResult().GetExitCode() != 0 {
+		t.Fatalf("Wait() = %v", waited)
+	}
+
+	secondSpawn, err := client.Spawn(context.Background(), validSpawnRequest("spawn-cancel", "invocation-00002"))
+	if err != nil {
+		t.Fatalf("second Spawn() error = %v", err)
+	}
+	secondProcess := nextFakeProcess(t, runner)
+	signaled, err := client.Signal(context.Background(), &v1.SignalProcessRequest{
+		Meta:    idempotentMeta("signal-process01"),
+		Process: secondSpawn.GetProcess(),
+		Signal:  v1.ProcessSignal_PROCESS_SIGNAL_INTERRUPT,
+	})
+	if err != nil || !signaled.GetDelivered() {
+		t.Fatalf("Signal() = (%v, %v)", signaled, err)
+	}
+	cancelled, err := client.Cancel(context.Background(), &v1.CancelProcessRequest{
+		Meta:    idempotentMeta("cancel-process01"),
+		Process: secondSpawn.GetProcess(),
+		Reason:  "caller cancelled",
+	})
+	if err != nil || !cancelled.GetProcessGroupTerminationStarted() {
+		t.Fatalf("Cancel() = (%v, %v)", cancelled, err)
+	}
+	if got := secondProcess.Signals(); len(got) != 2 || got[0] != sandboxd.SignalInterrupt || got[1] != sandboxd.SignalCancel {
+		t.Fatalf("process-group signals = %v", got)
+	}
+}
+
+func TestPrivateTransportFailsClosedAtWireBoundary(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	invalidCases := []struct {
+		name   string
+		mutate func(*v1.SpawnProcessRequest)
+	}{
+		{name: "host executable path", mutate: func(request *v1.SpawnProcessRequest) { request.Executable = "/bin/sh" }},
+		{name: "host working path", mutate: func(request *v1.SpawnProcessRequest) { request.WorkingDirectory = "/tmp" }},
+		{name: "raw secret handle", mutate: func(request *v1.SpawnProcessRequest) {
+			request.EnvironmentHandles = []*v1.SecretHandle{{Value: []byte("secret")}}
+		}},
+		{name: "stale generation", mutate: func(request *v1.SpawnProcessRequest) { request.Sandbox.Generation++ }},
+		{name: "unknown protocol field", mutate: func(request *v1.SpawnProcessRequest) {
+			request.ProtoReflect().SetUnknown([]byte{0xf8, 0x07, 0x01})
+		}},
+	}
+	for index, test := range invalidCases {
+		t.Run(test.name, func(t *testing.T) {
+			request := validSpawnRequest("invalid-spawn-"+string(rune('a'+index)), "invalid-invoc-01")
+			test.mutate(request)
+			_, err := client.Spawn(context.Background(), request)
+			if got := connect.CodeOf(err); got != connect.CodeInvalidArgument && got != connect.CodeFailedPrecondition {
+				t.Fatalf("Spawn() code = %v error = %v", got, err)
+			}
+		})
+	}
+	if runner.StartCount() != 0 {
+		t.Fatalf("invalid requests started %d processes", runner.StartCount())
+	}
+
+	request := validSpawnRequest("valid-spawn-0001", "valid-invocat-01")
+	if _, err := client.Spawn(context.Background(), request); err != nil {
+		t.Fatalf("valid Spawn() error = %v", err)
+	}
+	process := nextFakeProcess(t, runner)
+	process.Complete(sandboxd.RunResult{ExitCode: 0})
+
+	// The launch capability nonce is consumed by the first client's handshake.
+	second, err := NewClient(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
+	})
+	if err != nil {
+		t.Fatalf("NewClient(second) error = %v", err)
+	}
+	defer second.Close()
+	_, err = second.Wait(context.Background(), &v1.WaitProcessRequest{
+		Meta:    idempotentMeta("second-client-001"),
+		Process: &v1.ProcessHandle{},
+	})
+	if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+		t.Fatalf("second one-time handshake code = %v error = %v", got, err)
+	}
+}
+
+func TestServerRequiresPrivateSocketDirectory(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
+		Authority:         sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 7},
+		WorkspaceRoot:     root,
+		Commands:          map[string]string{"echo": "/bin/echo"},
+		Runner:            sandboxd.NewFakeRunner(),
+		ReplayLimitBytes:  1 << 20,
+		ReplayLimitEvents: 128,
+		SubscriberBuffer:  16,
+		ReadChunkBytes:    4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ListenServer(ServerConfig{
+		SocketPath:        filepath.Join(root, "control.sock"),
+		AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
+		Supervisor:        supervisor,
+	})
+	if err == nil {
+		t.Fatal("ListenServer() succeeded with a non-private socket directory")
+	}
+}
+
+func TestServerRejectsSupervisorLaunchAuthorityMismatch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		authority sandboxd.LaunchAuthority
+	}{
+		{
+			name:      "sandbox identity",
+			authority: sandboxd.LaunchAuthority{SandboxID: "sandbox-other", Generation: 7},
+		},
+		{
+			name:      "sandbox generation",
+			authority: sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 8},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			if err := os.Chmod(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
+				Authority:         test.authority,
+				WorkspaceRoot:     root,
+				Commands:          map[string]string{"echo": "/bin/echo"},
+				Runner:            sandboxd.NewFakeRunner(),
+				ReplayLimitBytes:  1 << 20,
+				ReplayLimitEvents: 128,
+				SubscriberBuffer:  16,
+				ReadChunkBytes:    4096,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := ListenServer(ServerConfig{
+				SocketPath:        filepath.Join(root, "control.sock"),
+				AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
+				SandboxID:         []byte("sandbox-alpha"),
+				SandboxGeneration: 7,
+				OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
+				Supervisor:        supervisor,
+			})
+			if server != nil {
+				_ = server.Close()
+			}
+			if err == nil {
+				t.Fatal("ListenServer() accepted a supervisor with different launch authority")
+			}
+		})
+	}
+}
+
+func TestHandshakeRequiresFixedFrameWithoutConsumingNonce(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	oversized := connect.NewRequest(&v1.HandshakeRequest{
+		Peer:              v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD,
+		MinimumVersion:    protocolVersion(),
+		MaximumVersion:    protocolVersion(),
+		MaximumFrameSize:  maximumMessageBytes + 1,
+		DescriptorDigest:  descriptorDigest(),
+		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
+		SandboxId:         &v1.OpaqueId{Value: []byte("sandbox-alpha")},
+		SandboxGeneration: 7,
+	})
+	_, err := client.control.Handshake(context.Background(), oversized)
+	if got := connect.CodeOf(err); got != connect.CodeFailedPrecondition {
+		t.Fatalf("oversized handshake code = %v error = %v", got, err)
+	}
+
+	response, err := client.Spawn(context.Background(), validSpawnRequest("fixed-frame-spawn", "fixed-frame-inv"))
+	if err != nil {
+		t.Fatalf("Spawn() after rejected negotiation error = %v", err)
+	}
+	if response.GetProcess() == nil {
+		t.Fatal("Spawn() returned no process")
+	}
+	process := nextFakeProcess(t, runner)
+	process.Complete(sandboxd.RunResult{ExitCode: 0})
+}
+
+func TestRequestDigestAndIdempotencyConflictFailClosed(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	session, err := client.ensureHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("ensureHandshake() error = %v", err)
+	}
+	prepared, _, err := prepareRequest(context.Background(), validSpawnRequest("tampered-digest", "tampered-invocat"))
+	if err != nil {
+		t.Fatalf("prepareRequest() error = %v", err)
+	}
+	tampered := prepared.(*v1.SpawnProcessRequest)
+	tampered.Meta.RequestDigest.Value[0] ^= 0xff
+	raw := connect.NewRequest(tampered)
+	raw.Header().Set(sessionHeader, session)
+	if _, err := client.process.Spawn(context.Background(), raw); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("tampered request digest error = %v", err)
+	}
+	if runner.StartCount() != 0 {
+		t.Fatalf("tampered request started %d processes", runner.StartCount())
+	}
+
+	request := validSpawnRequest("conflicting-key", "conflict-invocat")
+	if _, err := client.Spawn(context.Background(), request); err != nil {
+		t.Fatalf("first Spawn() error = %v", err)
+	}
+	process := nextFakeProcess(t, runner)
+	changed := proto.Clone(request).(*v1.SpawnProcessRequest)
+	changed.Arguments = []string{"changed"}
+	if _, err := client.Spawn(context.Background(), changed); connect.CodeOf(err) != connect.CodeAlreadyExists {
+		t.Fatalf("conflicting idempotency key error = %v", err)
+	}
+	if runner.StartCount() != 1 {
+		t.Fatalf("conflicting retry started %d processes", runner.StartCount())
+	}
+	process.Complete(sandboxd.RunResult{ExitCode: 0})
+}
+
+func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := sandboxd.NewFakeRunner()
+	supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
+		Authority:         sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 7},
+		WorkspaceRoot:     workspace,
+		Commands:          map[string]string{"echo": "/bin/echo"},
+		Runner:            runner,
+		ReplayLimitBytes:  1 << 20,
+		ReplayLimitEvents: 128,
+		SubscriberBuffer:  16,
+		ReadChunkBytes:    4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := bytes.Repeat([]byte{0x5a}, 32)
+	server, err := ListenServer(ServerConfig{
+		SocketPath:        filepath.Join(root, "control.sock"),
+		AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      nonce,
+		Supervisor:        supervisor,
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	serveContext, cancelServe := context.WithCancel(context.Background())
+	t.Cleanup(cancelServe)
+	go func() {
+		if err := server.Serve(serveContext); err != nil {
+			t.Errorf("Serve() error = %v", err)
+		}
+	}()
+	client, err := NewClient(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      nonce,
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	return server, client, runner
+}
+
+func validSpawnRequest(idempotencyKey, invocationID string) *v1.SpawnProcessRequest {
+	digest := sha256.Sum256([]byte("authorized execution request"))
+	invocation := &v1.OpaqueId{Value: []byte(invocationID)}
+	return &v1.SpawnProcessRequest{
+		Meta:                idempotentMeta(idempotencyKey),
+		DispatchPermit:      &v1.DispatchPermit{Value: []byte("opaque-dispatch-permit")},
+		Sandbox:             &v1.SandboxHandle{SandboxId: &v1.OpaqueId{Value: []byte("sandbox-alpha")}, Generation: 7},
+		WorkspaceProtection: &v1.WorkspaceProtectionPermit{Value: []byte("opaque-workspace-permit")},
+		InvocationId:        invocation,
+		RequestDigest:       &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: digest[:]},
+		Executable:          "echo",
+		Arguments:           []string{"hello"},
+		WorkingDirectory:    "",
+		TimeoutMs:           5_000,
+		OutputLimitBytes:    1 << 20,
+		StdinMode:           v1.StdinMode_STDIN_MODE_STREAM,
+	}
+}
+
+func idempotentMeta(key string) *v1.RpcRequestMeta {
+	digest := sha256.Sum256([]byte(key))
+	return &v1.RpcRequestMeta{IdempotencyKey: append([]byte(nil), digest[:16]...)}
+}
+
+func nextFakeProcess(t *testing.T, runner *sandboxd.FakeRunner) *sandboxd.FakeProcess {
+	t.Helper()
+	select {
+	case process := <-runner.Started():
+		return process
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fake process")
+		return nil
+	}
+}
+
+func testWorkspaceRoot(t *testing.T, server *Server) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(server.SocketPath()), "workspace")
+}
+
+func TestClientRejectsNilAndCancelledCalls(t *testing.T) {
+	t.Parallel()
+
+	server, client, _ := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	if _, err := client.Spawn(context.Background(), nil); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("Spawn(nil) error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.Spawn(ctx, validSpawnRequest("cancelled-call01", "cancelled-invoc"))
+	if !errors.Is(err, context.Canceled) && connect.CodeOf(err) != connect.CodeCanceled {
+		t.Fatalf("Spawn(cancelled) error = %v", err)
+	}
+}

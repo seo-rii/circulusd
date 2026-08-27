@@ -1,0 +1,444 @@
+//go:build linux
+
+package sandboxrpc
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"connectrpc.com/connect"
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
+	v1connect "github.com/hancomac/circulusd/api/generated/circulus/v1alpha/circulusv1alphaconnect"
+	"google.golang.org/protobuf/proto"
+)
+
+type ClientConfig struct {
+	SocketPath        string
+	ServerUID         uint32
+	SandboxID         []byte
+	SandboxGeneration uint64
+	OneTimeNonce      []byte
+}
+
+// Client owns one use of a launch capability nonce. It never retries a failed
+// handshake because the server may already have consumed that capability.
+type Client struct {
+	socketPath     string
+	socketIdentity socketIdentity
+	serverUID      uint32
+	sandboxID      []byte
+	generation     uint64
+	transport      *http.Transport
+	control        v1connect.ControlServiceClient
+	process        v1connect.SandboxProcessServiceClient
+	closed         atomic.Bool
+
+	handshakeMu        sync.Mutex
+	nonce              [handshakeNonceBytes]byte
+	handshakeAttempted bool
+	handshakeInFlight  chan struct{}
+	handshakeSession   string
+	handshakeError     error
+}
+
+func NewClient(config ClientConfig) (*Client, error) {
+	if err := validateCanonicalSocketPath(config.SocketPath); err != nil {
+		return nil, err
+	}
+	identity, err := inspectSocket(config.SocketPath)
+	if err != nil {
+		return nil, err
+	}
+	if identity.uid != config.ServerUID {
+		return nil, fmt.Errorf("sandboxrpc: Unix socket owner does not match the expected server UID")
+	}
+	if err := validateClientSocketPath(config.SocketPath, config.ServerUID); err != nil {
+		return nil, err
+	}
+	if !validOpaqueID(config.SandboxID, 256) || config.SandboxGeneration == 0 {
+		return nil, fmt.Errorf("sandboxrpc: client sandbox launch identity is invalid")
+	}
+	if len(config.OneTimeNonce) != handshakeNonceBytes {
+		return nil, fmt.Errorf("sandboxrpc: client one-time nonce must be 32 bytes")
+	}
+	client := &Client{
+		socketPath:     config.SocketPath,
+		socketIdentity: identity,
+		serverUID:      config.ServerUID,
+		sandboxID:      append([]byte(nil), config.SandboxID...),
+		generation:     config.SandboxGeneration,
+	}
+	copy(client.nonce[:], config.OneTimeNonce)
+	client.transport = &http.Transport{
+		DisableCompression:  true,
+		DialContext:         client.dialContext,
+		MaxIdleConns:        2,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	httpClient := &http.Client{Transport: client.transport}
+	client.control = v1connect.NewControlServiceClient(
+		httpClient,
+		"http://sandbox.invalid",
+		connect.WithReadMaxBytes(maximumMessageBytes),
+		connect.WithSendMaxBytes(maximumMessageBytes),
+	)
+	client.process = v1connect.NewSandboxProcessServiceClient(
+		httpClient,
+		"http://sandbox.invalid",
+		connect.WithReadMaxBytes(maximumMessageBytes),
+		connect.WithSendMaxBytes(maximumMessageBytes),
+	)
+	return client, nil
+}
+
+func (client *Client) Close() error {
+	if client == nil || client.closed.Swap(true) {
+		return nil
+	}
+	client.transport.CloseIdleConnections()
+	client.handshakeMu.Lock()
+	clear(client.nonce[:])
+	client.handshakeSession = ""
+	client.handshakeMu.Unlock()
+	return nil
+}
+
+func (client *Client) Spawn(ctx context.Context, message *v1.SpawnProcessRequest) (*v1.SpawnProcessResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.SpawnProcessRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.SpawnProcessResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.Spawn(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil ||
+		response.Msg.GetProcess() == nil || !bytes.Equal(response.Msg.GetProcess().GetSandboxId().GetValue(), client.sandboxID) ||
+		response.Msg.GetProcess().GetGeneration() != client.generation ||
+		!proto.Equal(response.Msg.GetProcess().GetInvocationId(), requestMessage.GetInvocationId()) ||
+		!validOpaqueID(response.Msg.GetProcess().GetProcessId().GetValue(), 64) {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("spawn response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.SpawnProcessResponse), nil
+}
+
+func (client *Client) WriteStdin(ctx context.Context, message *v1.WriteStdinRequest) (*v1.WriteStdinResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.WriteStdinRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.WriteStdinResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.WriteStdin(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil ||
+		response.Msg.GetAcceptedSequence() != requestMessage.GetChunkSequence() ||
+		response.Msg.GetAcceptedBytes() != uint64(len(requestMessage.GetData())) {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("stdin response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.WriteStdinResponse), nil
+}
+
+func (client *Client) CloseStdin(ctx context.Context, message *v1.CloseStdinRequest) (*v1.CloseStdinResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.CloseStdinRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.CloseStdinResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.CloseStdin(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil || !response.Msg.GetClosed() {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("close-stdin response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.CloseStdinResponse), nil
+}
+
+func (client *Client) Signal(ctx context.Context, message *v1.SignalProcessRequest) (*v1.SignalProcessResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.SignalProcessRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.SignalProcessResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.Signal(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil || !response.Msg.GetDelivered() {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("signal response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.SignalProcessResponse), nil
+}
+
+func (client *Client) Cancel(ctx context.Context, message *v1.CancelProcessRequest) (*v1.CancelProcessResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.CancelProcessRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.CancelProcessResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.Cancel(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil ||
+		!response.Msg.GetProcessGroupTerminationStarted() {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("cancel response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.CancelProcessResponse), nil
+}
+
+func (client *Client) Wait(ctx context.Context, message *v1.WaitProcessRequest) (*v1.WaitProcessResponse, error) {
+	prepared, requestID, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.WaitProcessRequest)
+	response, err := callClient(client, ctx, func(session string) (*connect.Response[v1.WaitProcessResponse], error) {
+		request := connect.NewRequest(requestMessage)
+		request.Header().Set(sessionHeader, session)
+		return client.process.Wait(ctx, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil || response.Msg == nil || validateResponse(response.Msg, response.Msg.GetMeta(), requestID) != nil ||
+		(response.Msg.GetState() != v1.ProcessLifecycleState_PROCESS_LIFECYCLE_STATE_EXITED &&
+			response.Msg.GetState() != v1.ProcessLifecycleState_PROCESS_LIFECYCLE_STATE_FAILED) || response.Msg.GetResult() == nil {
+		return nil, connect.NewError(connect.CodeDataLoss, errors.New("wait response failed protocol validation"))
+	}
+	return proto.Clone(response.Msg).(*v1.WaitProcessResponse), nil
+}
+
+func (client *Client) dialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	before, err := inspectSocket(client.socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if before != client.socketIdentity || before.uid != client.serverUID {
+		return nil, fmt.Errorf("sandboxrpc: Unix socket identity changed")
+	}
+	if err := validateClientSocketPath(client.socketPath, client.serverUID); err != nil {
+		return nil, err
+	}
+	connection, err := (&net.Dialer{}).DialContext(ctx, "unix", client.socketPath)
+	if err != nil {
+		return nil, err
+	}
+	credential, err := socketPeerCredential(connection)
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	after, err := inspectSocket(client.socketPath)
+	if err != nil || after != before || credential.uid != client.serverUID {
+		_ = connection.Close()
+		return nil, fmt.Errorf("sandboxrpc: Unix socket peer identity mismatch")
+	}
+	return connection, nil
+}
+
+func callClient[T any](client *Client, ctx context.Context, invoke func(string) (*connect.Response[T], error)) (*connect.Response[T], error) {
+	if client == nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is nil"))
+	}
+	if ctx == nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request context is nil"))
+	}
+	if client.closed.Load() {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+	}
+	session, err := client.ensureHandshake(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return invoke(session)
+}
+
+func (client *Client) ensureHandshake(ctx context.Context) (string, error) {
+	for {
+		if client.closed.Load() {
+			return "", connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+		}
+		client.handshakeMu.Lock()
+		if client.handshakeSession != "" {
+			session := client.handshakeSession
+			client.handshakeMu.Unlock()
+			return session, nil
+		}
+		if client.handshakeInFlight != nil {
+			finished := client.handshakeInFlight
+			client.handshakeMu.Unlock()
+			select {
+			case <-finished:
+				continue
+			case <-ctx.Done():
+				return "", contextConnectError(ctx.Err())
+			}
+		}
+		if client.handshakeAttempted {
+			err := client.handshakeError
+			client.handshakeMu.Unlock()
+			if err == nil {
+				err = connect.NewError(connect.CodeUnauthenticated, errors.New("one-time handshake is unavailable"))
+			}
+			return "", err
+		}
+		client.handshakeAttempted = true
+		finished := make(chan struct{})
+		client.handshakeInFlight = finished
+		nonce := append([]byte(nil), client.nonce[:]...)
+		client.handshakeMu.Unlock()
+
+		session, err := client.performHandshake(ctx, nonce)
+		client.handshakeMu.Lock()
+		clear(client.nonce[:])
+		if err == nil && !client.closed.Load() {
+			client.handshakeSession = session
+		} else {
+			client.handshakeError = err
+		}
+		client.handshakeInFlight = nil
+		close(finished)
+		client.handshakeMu.Unlock()
+		if err != nil {
+			return "", err
+		}
+		if client.closed.Load() {
+			return "", connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+		}
+		return session, nil
+	}
+}
+
+func (client *Client) performHandshake(ctx context.Context, nonce []byte) (string, error) {
+	request := connect.NewRequest(&v1.HandshakeRequest{
+		Peer:              v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD,
+		MinimumVersion:    protocolVersion(),
+		MaximumVersion:    protocolVersion(),
+		FeatureBitmap:     0,
+		MaximumFrameSize:  maximumMessageBytes,
+		DescriptorDigest:  descriptorDigest(),
+		OneTimeNonce:      nonce,
+		SandboxId:         &v1.OpaqueId{Value: append([]byte(nil), client.sandboxID...)},
+		SandboxGeneration: client.generation,
+	})
+	response, err := client.control.Handshake(ctx, request)
+	if err != nil {
+		return "", err
+	}
+	if response == nil || response.Msg == nil || hasUnknownFields(response.Msg) ||
+		!isProtocolVersion(response.Msg.GetSelectedVersion()) || response.Msg.GetFeatureBitmap() != 0 ||
+		response.Msg.GetMaximumFrameSize() != maximumMessageBytes || !isDescriptorDigest(response.Msg.GetDescriptorDigest()) ||
+		response.Msg.GetStatus().GetName() != "sandbox.process" ||
+		response.Msg.GetStatus().GetAvailability() != v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE ||
+		!bytes.Equal(response.Msg.GetNonceProof(), nonceProof(nonce, client.sandboxID, client.generation)) {
+		return "", connect.NewError(connect.CodeDataLoss, errors.New("handshake response failed protocol validation"))
+	}
+	session := response.Header().Get(sessionHeader)
+	if len(session) == 0 || len(session) > 128 {
+		return "", connect.NewError(connect.CodeDataLoss, errors.New("handshake session is missing"))
+	}
+	return session, nil
+}
+
+func prepareRequest(ctx context.Context, message proto.Message) (proto.Message, []byte, error) {
+	if ctx == nil {
+		return nil, nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request context is nil"))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, contextConnectError(err)
+	}
+	if message == nil {
+		return nil, nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request is nil"))
+	}
+	cloned := proto.Clone(message)
+	if cloned == nil {
+		return nil, nil, connect.NewError(connect.CodeInternal, errors.New("cannot clone request"))
+	}
+	reflection := cloned.ProtoReflect()
+	metaField := reflection.Descriptor().Fields().ByName("meta")
+	if metaField == nil || !reflection.Has(metaField) {
+		return nil, nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request metadata is missing"))
+	}
+	meta, ok := reflection.Get(metaField).Message().Interface().(*v1.RpcRequestMeta)
+	if !ok || meta == nil || len(meta.GetIdempotencyKey()) < 16 || len(meta.GetIdempotencyKey()) > 64 {
+		return nil, nil, connect.NewError(connect.CodeInvalidArgument, errors.New("idempotency key is invalid"))
+	}
+	requestID := make([]byte, 16)
+	if _, err := rand.Read(requestID); err != nil {
+		return nil, nil, connect.NewError(connect.CodeInternal, errors.New("cannot generate request identity"))
+	}
+	now := time.Now()
+	deadline := now.Add(defaultRequestTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	maximumDeadline := now.Add(maximumRPCDeadline)
+	if deadline.After(maximumDeadline) {
+		deadline = maximumDeadline
+	}
+	if !now.Before(deadline) {
+		return nil, nil, connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+	}
+	meta.RequestId = &v1.OpaqueId{Value: append([]byte(nil), requestID...)}
+	meta.RequestDigest = nil
+	meta.DeadlineUnixMs = uint64(deadline.UnixMilli())
+	meta.IdempotencyKey = append([]byte(nil), meta.GetIdempotencyKey()...)
+	meta.ProtocolVersion = protocolVersion()
+	digest, err := requestDigest(cloned)
+	if err != nil {
+		return nil, nil, connect.NewError(connect.CodeInternal, errors.New("cannot compute request digest"))
+	}
+	meta.RequestDigest = digest
+	return cloned, requestID, nil
+}
+
+func validateResponse(message proto.Message, meta *v1.RpcResponseMeta, requestID []byte) error {
+	if hasUnknownFields(message) || meta == nil || !bytes.Equal(meta.GetRequestId().GetValue(), requestID) ||
+		meta.GetServerSequence() == 0 || !isDescriptorDigest(meta.GetDescriptorDigest()) {
+		return errors.New("response metadata is invalid")
+	}
+	return nil
+}
+
+func contextConnectError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return connect.NewError(connect.CodeCanceled, context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+	}
+	return err
+}
