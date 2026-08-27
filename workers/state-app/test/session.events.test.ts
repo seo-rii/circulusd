@@ -218,6 +218,14 @@ describe("Session public durable event journal", () => {
       turnLeaseGeneration: 10,
       leaseExpiresAt: TRANSACTION_TIME + 100_000,
     });
+    expect(replaySessionPublicEvents(admitted.state, 0, 16)).toMatchObject({
+      snapshot: {
+        activeTurnId: null,
+        turnStatus: null,
+        lastEventSequence: 0,
+      },
+      events: [],
+    });
     const prepared = await prepareEffect(
       admitted.state,
       "model",
@@ -265,6 +273,12 @@ describe("Session public durable event journal", () => {
 
   it("journals the model/tool lifecycle atomically in transition order and replays pages", async () => {
     const admitted = await admit(newSession(), "turn-lifecycle", "a");
+    expect(replaySessionPublicEvents(admitted.state, 0, 16).snapshot).toEqual({
+      sessionId: "session-events",
+      activeTurnId: "turn-lifecycle",
+      turnStatus: "active",
+      lastEventSequence: 1,
+    });
     const modelPrepared = await prepareEffect(
       admitted.state,
       "model",

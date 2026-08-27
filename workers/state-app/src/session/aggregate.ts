@@ -1920,11 +1920,18 @@ export function replaySessionPublicEvents(
       `limit must not exceed ${SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS}`,
     );
   }
+  const publicActiveTurn =
+    state.activeTurn !== null &&
+    state.turnAdmissionReceipts.some(
+      (receipt) => receipt.turnId === state.activeTurn?.turnId,
+    )
+      ? state.activeTurn
+      : null;
   return {
     snapshot: {
       sessionId: state.sessionId,
-      activeTurnId: state.activeTurn?.turnId ?? null,
-      turnStatus: state.activeTurn?.status ?? null,
+      activeTurnId: publicActiveTurn?.turnId ?? null,
+      turnStatus: publicActiveTurn?.status ?? null,
       lastEventSequence: state.publicEventSequence,
     },
     events: structuredClone(
