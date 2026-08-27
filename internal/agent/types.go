@@ -20,6 +20,7 @@ var (
 	ErrPlacementConflict  = errors.New("agent: placement generation reused with different inputs")
 	ErrPlacementNotFound  = errors.New("agent: placement not found")
 	ErrShardNotFound      = errors.New("agent: shard not found")
+	ErrManagerClosed      = errors.New("agent: manager is shut down")
 )
 
 type ProcessScope string
@@ -104,6 +105,8 @@ type ShardSpec struct {
 
 type ShardProcess interface {
 	ID() string
+	// Stop is idempotent and returns nil only after the shard can no longer
+	// execute requests. A daemon shutdown retries uncertain failures.
 	Stop(context.Context) error
 }
 
