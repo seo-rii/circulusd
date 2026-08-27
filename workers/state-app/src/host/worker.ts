@@ -7,6 +7,8 @@ export {
   WorkspaceCell,
 } from "./cells.ts";
 
-// This worker intentionally has no public HTTP API. Named Durable Object RPC
-// methods are the only host surface.
-export default {};
+import { handleStateIngress } from "./ingress.ts";
+
+export default {
+  fetch: handleStateIngress,
+};
