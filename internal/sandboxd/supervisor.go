@@ -413,10 +413,11 @@ func (supervisor *Supervisor) Spawn(
 			}
 		}
 		record.result = ProcessResult{
-			Reason:   reason,
-			ExitCode: runResult.ExitCode,
-			Signal:   signal,
-			Error:    runResult.Error,
+			Reason:     reason,
+			ExitCode:   runResult.ExitCode,
+			Signal:     signal,
+			Error:      runResult.Error,
+			FinishedAt: time.Now().UTC(),
 		}
 		record.terminal = true
 		result := record.result
@@ -768,6 +769,9 @@ func (supervisor *Supervisor) publish(record *processRecord, event ProcessEvent)
 func (supervisor *Supervisor) publishLocked(record *processRecord, event ProcessEvent) {
 	record.nextSequence++
 	event.Sequence = record.nextSequence
+	if event.OccurredAt.IsZero() {
+		event.OccurredAt = time.Now().UTC()
+	}
 	event = cloneProcessEvent(event)
 	record.replay = append(record.replay, event)
 	record.replayBytes += len(event.Data)

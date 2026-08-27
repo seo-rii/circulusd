@@ -49,6 +49,21 @@ type Client struct {
 	handshakeError     error
 }
 
+// ProcessEventStream validates one ordered, generation-bound process stream.
+// Receive and Msg are serialized; Close may safely race an in-flight Receive.
+type ProcessEventStream struct {
+	stream        *connect.ServerStreamForClient[v1.ProcessEvent]
+	process       *v1.ProcessHandle
+	nextSequence  uint64
+	receiveMu     sync.Mutex
+	current       *v1.ProcessEvent
+	validationErr error
+	terminal      bool
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	closeErr      error
+}
+
 func NewClient(config ClientConfig) (*Client, error) {
 	if err := validateCanonicalSocketPath(config.SocketPath); err != nil {
 		return nil, err
@@ -152,6 +167,132 @@ func (client *Client) Spawn(ctx context.Context, message *v1.SpawnProcessRequest
 		return nil, connect.NewError(connect.CodeDataLoss, errors.New("spawn response failed protocol validation"))
 	}
 	return proto.Clone(response.Msg).(*v1.SpawnProcessResponse), nil
+}
+
+func (client *Client) Attach(ctx context.Context, message *v1.AttachProcessRequest) (*ProcessEventStream, error) {
+	prepared, _, err := prepareRequest(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	requestMessage := prepared.(*v1.AttachProcessRequest)
+	if requestMessage.GetProcess() == nil || requestMessage.GetAfterSequence() == ^uint64(0) {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("attach request is invalid"))
+	}
+	if client == nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is nil"))
+	}
+	if client.closed.Load() {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox RPC client is closed"))
+	}
+	session, err := client.ensureHandshake(ctx)
+	if err != nil {
+		return nil, err
+	}
+	request := connect.NewRequest(requestMessage)
+	request.Header().Set(sessionHeader, session)
+	stream, err := client.process.Attach(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return &ProcessEventStream{
+		stream:       stream,
+		process:      proto.Clone(requestMessage.GetProcess()).(*v1.ProcessHandle),
+		nextSequence: requestMessage.GetAfterSequence() + 1,
+	}, nil
+}
+
+func (stream *ProcessEventStream) Receive() bool {
+	if stream == nil {
+		return false
+	}
+	stream.receiveMu.Lock()
+	defer stream.receiveMu.Unlock()
+	if stream.validationErr != nil || stream.closed.Load() {
+		return false
+	}
+	if !stream.stream.Receive() {
+		stream.validationErr = stream.stream.Err()
+		return false
+	}
+	message := stream.stream.Msg()
+	valid := message != nil && !hasUnknownFields(message) && proto.Equal(message.GetProcess(), stream.process) &&
+		message.GetSequence() == stream.nextSequence && message.GetSequence() != 0 && !stream.terminal
+	if valid {
+		switch event := message.GetEvent().(type) {
+		case *v1.ProcessEvent_Started:
+			valid = event.Started != nil && event.Started.GetStartedAtUnixMs() != 0
+		case *v1.ProcessEvent_Stdout:
+			valid = event.Stdout != nil && len(event.Stdout.GetData()) > 0 &&
+				len(event.Stdout.GetData()) <= maximumMessageBytes && !event.Stdout.GetTruncated()
+		case *v1.ProcessEvent_Stderr:
+			valid = event.Stderr != nil && len(event.Stderr.GetData()) > 0 &&
+				len(event.Stderr.GetData()) <= maximumMessageBytes && !event.Stderr.GetTruncated()
+		case *v1.ProcessEvent_Resource:
+			valid = event.Resource != nil
+		case *v1.ProcessEvent_Exit:
+			valid = event.Exit != nil && event.Exit.GetFinishedAtUnixMs() != 0
+			if valid {
+				switch event.Exit.GetTerminatingSignal() {
+				case v1.ProcessSignal_PROCESS_SIGNAL_UNSPECIFIED,
+					v1.ProcessSignal_PROCESS_SIGNAL_INTERRUPT,
+					v1.ProcessSignal_PROCESS_SIGNAL_TERMINATE,
+					v1.ProcessSignal_PROCESS_SIGNAL_KILL,
+					v1.ProcessSignal_PROCESS_SIGNAL_HANGUP:
+				default:
+					valid = false
+				}
+			}
+			stream.terminal = valid
+		case *v1.ProcessEvent_Error:
+			valid = event.Error != nil && event.Error.GetCode() != v1.ErrorCode_ERROR_CODE_UNSPECIFIED &&
+				event.Error.GetReason() != "" && event.Error.GetMessage() != ""
+		default:
+			valid = false
+		}
+	}
+	if !valid {
+		stream.validationErr = connect.NewError(connect.CodeDataLoss, errors.New("process event failed protocol validation"))
+		_ = stream.stream.Close()
+		return false
+	}
+	stream.current = proto.Clone(message).(*v1.ProcessEvent)
+	stream.nextSequence++
+	return true
+}
+
+func (stream *ProcessEventStream) Msg() *v1.ProcessEvent {
+	if stream == nil {
+		return nil
+	}
+	stream.receiveMu.Lock()
+	defer stream.receiveMu.Unlock()
+	if stream.current == nil {
+		return nil
+	}
+	return proto.Clone(stream.current).(*v1.ProcessEvent)
+}
+
+func (stream *ProcessEventStream) Err() error {
+	if stream == nil {
+		return connect.NewError(connect.CodeFailedPrecondition, errors.New("process event stream is nil"))
+	}
+	stream.receiveMu.Lock()
+	defer stream.receiveMu.Unlock()
+	if stream.validationErr != nil {
+		return stream.validationErr
+	}
+	return stream.stream.Err()
+}
+
+func (stream *ProcessEventStream) Close() error {
+	if stream == nil {
+		return nil
+	}
+	stream.closed.Store(true)
+	stream.closeOnce.Do(func() {
+		stream.closeErr = stream.stream.Close()
+	})
+	return stream.closeErr
 }
 
 func (client *Client) WriteStdin(ctx context.Context, message *v1.WriteStdinRequest) (*v1.WriteStdinResponse, error) {

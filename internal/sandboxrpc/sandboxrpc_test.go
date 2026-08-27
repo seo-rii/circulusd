@@ -195,6 +195,120 @@ func TestPrivateTransportProcessLifecycleAndConcurrentIdempotency(t *testing.T) 
 	}
 }
 
+func TestClientAttachStreamsAndReplaysOrderedProcessEvents(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	spawned, err := client.Spawn(context.Background(), validSpawnRequest("attach-spawn-001", "attach-invocat01"))
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	process := nextFakeProcess(t, runner)
+	stream, err := client.Attach(context.Background(), &v1.AttachProcessRequest{
+		Meta:    idempotentMeta("attach-stream-01"),
+		Process: proto.Clone(spawned.GetProcess()).(*v1.ProcessHandle),
+	})
+	if err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	defer stream.Close()
+
+	received := make([]*v1.ProcessEvent, 0, 4)
+	if !stream.Receive() {
+		t.Fatalf("Receive(sequence 1) = false, error = %v", stream.Err())
+	}
+	startedEvent := stream.Msg()
+	received = append(received, startedEvent)
+	if started := startedEvent.GetStarted(); startedEvent.GetSequence() != 1 ||
+		!proto.Equal(startedEvent.GetProcess(), spawned.GetProcess()) || started == nil || started.GetStartedAtUnixMs() == 0 {
+		t.Fatalf("started event = %v", startedEvent)
+	}
+	if err := process.EmitStdout([]byte("out")); err != nil {
+		t.Fatalf("EmitStdout() error = %v", err)
+	}
+	if !stream.Receive() {
+		t.Fatalf("Receive(sequence 2) = false, error = %v", stream.Err())
+	}
+	stdoutEvent := stream.Msg()
+	received = append(received, stdoutEvent)
+	if stdout := stdoutEvent.GetStdout(); stdoutEvent.GetSequence() != 2 ||
+		!proto.Equal(stdoutEvent.GetProcess(), spawned.GetProcess()) || stdout == nil ||
+		string(stdout.GetData()) != "out" || stdout.GetTruncated() {
+		t.Fatalf("stdout event = %v", stdoutEvent)
+	}
+	if err := process.EmitStderr([]byte("err")); err != nil {
+		t.Fatalf("EmitStderr() error = %v", err)
+	}
+	if !stream.Receive() {
+		t.Fatalf("Receive(sequence 3) = false, error = %v", stream.Err())
+	}
+	stderrEvent := stream.Msg()
+	received = append(received, stderrEvent)
+	if stderr := stderrEvent.GetStderr(); stderrEvent.GetSequence() != 3 ||
+		!proto.Equal(stderrEvent.GetProcess(), spawned.GetProcess()) || stderr == nil ||
+		string(stderr.GetData()) != "err" || stderr.GetTruncated() {
+		t.Fatalf("stderr event = %v", stderrEvent)
+	}
+	process.Complete(sandboxd.RunResult{ExitCode: 23})
+	if !stream.Receive() {
+		t.Fatalf("Receive(sequence 4) = false, error = %v", stream.Err())
+	}
+	exitEvent := stream.Msg()
+	received = append(received, exitEvent)
+	if exited := exitEvent.GetExit(); exitEvent.GetSequence() != 4 ||
+		!proto.Equal(exitEvent.GetProcess(), spawned.GetProcess()) || exited == nil ||
+		exited.GetExitCode() != 23 || exited.GetFinishedAtUnixMs() == 0 {
+		t.Fatalf("exit event = %v", exitEvent)
+	}
+	if stream.Receive() || stream.Err() != nil {
+		t.Fatalf("terminal Receive() = true or error = %v", stream.Err())
+	}
+	waited, err := client.Wait(context.Background(), &v1.WaitProcessRequest{
+		Meta:    idempotentMeta("attach-wait-0001"),
+		Process: proto.Clone(spawned.GetProcess()).(*v1.ProcessHandle),
+	})
+	if err != nil || !proto.Equal(waited.GetResult(), exitEvent.GetExit()) {
+		t.Fatalf("Wait() = (%v, %v), want streamed terminal result %v", waited, err, exitEvent.GetExit())
+	}
+
+	replay, err := client.Attach(context.Background(), &v1.AttachProcessRequest{
+		Meta:          idempotentMeta("attach-replay-01"),
+		Process:       proto.Clone(spawned.GetProcess()).(*v1.ProcessHandle),
+		AfterSequence: 1,
+	})
+	if err != nil {
+		t.Fatalf("Attach(replay) error = %v", err)
+	}
+	defer replay.Close()
+	for index := 1; index < len(received); index++ {
+		if !replay.Receive() {
+			t.Fatalf("replay Receive(%d) = false, error = %v", index, replay.Err())
+		}
+		if event := replay.Msg(); !proto.Equal(event, received[index]) {
+			t.Fatalf("replay event = %v, want %v", event, received[index])
+		}
+	}
+	if replay.Receive() || replay.Err() != nil {
+		t.Fatalf("terminal replay Receive() = true or error = %v", replay.Err())
+	}
+
+	invalid, err := client.Attach(context.Background(), &v1.AttachProcessRequest{
+		Meta:          idempotentMeta("attach-future-01"),
+		Process:       proto.Clone(spawned.GetProcess()).(*v1.ProcessHandle),
+		AfterSequence: 5,
+	})
+	if err != nil {
+		t.Fatalf("Attach(future cursor) construction error = %v", err)
+	}
+	defer invalid.Close()
+	if invalid.Receive() || connect.CodeOf(invalid.Err()) != connect.CodeInvalidArgument {
+		t.Fatalf("future cursor Receive() = true or error = %v", invalid.Err())
+	}
+}
+
 func TestPrivateTransportFailsClosedAtWireBoundary(t *testing.T) {
 	t.Parallel()
 

@@ -476,8 +476,8 @@ func (handler *rpcHandler) Spawn(ctx context.Context, request *connect.Request[v
 	return connect.NewResponse(response), nil
 }
 
-func (handler *rpcHandler) Attach(ctx context.Context, request *connect.Request[v1.AttachProcessRequest], _ *connect.ServerStream[v1.ProcessEvent]) error {
-	if request == nil || request.Msg == nil {
+func (handler *rpcHandler) Attach(ctx context.Context, request *connect.Request[v1.AttachProcessRequest], stream *connect.ServerStream[v1.ProcessEvent]) error {
+	if request == nil || request.Msg == nil || stream == nil {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("request is missing"))
 	}
 	requestContext, cancel, err := handler.authorize(ctx, request.Header(), request.Msg, request.Msg.GetMeta())
@@ -485,13 +485,64 @@ func (handler *rpcHandler) Attach(ctx context.Context, request *connect.Request[
 		return err
 	}
 	defer cancel()
-	if _, err := handler.process(request.Msg.GetProcess()); err != nil {
+	binding, err := handler.process(request.Msg.GetProcess())
+	if err != nil {
 		return err
 	}
-	if err := requestContext.Err(); err != nil {
+	attachment, err := handler.supervisor.Attach(requestContext, binding.handle, request.Msg.GetAfterSequence())
+	if err != nil {
 		return redactedError(err)
 	}
-	return connect.NewError(connect.CodeUnimplemented, errors.New("process streaming was not negotiated"))
+	defer attachment.Close()
+	for event := range attachment.Events {
+		wireEvent := &v1.ProcessEvent{
+			Process:  proto.Clone(binding.wire).(*v1.ProcessHandle),
+			Sequence: event.Sequence,
+		}
+		switch event.Type {
+		case sandboxd.EventStarted:
+			if event.OccurredAt.IsZero() || event.OccurredAt.UnixMilli() <= 0 {
+				return connect.NewError(connect.CodeInternal, errors.New("process start event has no timestamp"))
+			}
+			wireEvent.Event = &v1.ProcessEvent_Started{Started: &v1.ProcessStarted{
+				StartedAtUnixMs: uint64(event.OccurredAt.UnixMilli()),
+			}}
+		case sandboxd.EventStdout:
+			if len(event.Data) == 0 || len(event.Data) > maximumMessageBytes {
+				return connect.NewError(connect.CodeInternal, errors.New("process stdout event is invalid"))
+			}
+			wireEvent.Event = &v1.ProcessEvent_Stdout{Stdout: &v1.ProcessOutput{Data: append([]byte(nil), event.Data...)}}
+		case sandboxd.EventStderr:
+			if len(event.Data) == 0 || len(event.Data) > maximumMessageBytes {
+				return connect.NewError(connect.CodeInternal, errors.New("process stderr event is invalid"))
+			}
+			wireEvent.Event = &v1.ProcessEvent_Stderr{Stderr: &v1.ProcessOutput{Data: append([]byte(nil), event.Data...)}}
+		case sandboxd.EventError:
+			if event.Error == "" {
+				return connect.NewError(connect.CodeInternal, errors.New("process error event is empty"))
+			}
+			wireEvent.Event = &v1.ProcessEvent_Error{Error: &v1.PublicError{
+				Code:    v1.ErrorCode_ERROR_CODE_INTERNAL,
+				Reason:  "PROCESS_STREAM_ERROR",
+				Message: "sandbox process stream failed",
+			}}
+		case sandboxd.EventExit:
+			result, resultErr := wireProcessResult(event.Result)
+			if resultErr != nil {
+				return connect.NewError(connect.CodeInternal, resultErr)
+			}
+			wireEvent.Event = &v1.ProcessEvent_Exit{Exit: result}
+		default:
+			return connect.NewError(connect.CodeInternal, errors.New("process event type is invalid"))
+		}
+		if err := stream.Send(wireEvent); err != nil {
+			return redactedError(err)
+		}
+	}
+	if err := <-attachment.Done; err != nil {
+		return redactedError(err)
+	}
+	return nil
 }
 
 func (handler *rpcHandler) WriteStdin(ctx context.Context, request *connect.Request[v1.WriteStdinRequest]) (*connect.Response[v1.WriteStdinResponse], error) {
@@ -697,22 +748,9 @@ func (handler *rpcHandler) Wait(ctx context.Context, request *connect.Request[v1
 		if result.Reason == sandboxd.ExitReasonFailed || result.Reason == sandboxd.ExitReasonOutputLimit || result.Reason == sandboxd.ExitReasonFenced {
 			state = v1.ProcessLifecycleState_PROCESS_LIFECYCLE_STATE_FAILED
 		}
-		processResult := &v1.ProcessResult{ExitCode: int32(result.ExitCode), FinishedAtUnixMs: uint64(time.Now().UnixMilli())}
-		switch result.Reason {
-		case sandboxd.ExitReasonCanceled:
-			processResult.Cancelled = true
-		case sandboxd.ExitReasonDeadline:
-			processResult.TimedOut = true
-		case sandboxd.ExitReasonOutputLimit:
-			processResult.OutputTruncated = true
-		}
-		switch result.Signal {
-		case sandboxd.SignalInterrupt:
-			processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_INTERRUPT
-		case sandboxd.SignalTerminate:
-			processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_TERMINATE
-		case sandboxd.SignalKill:
-			processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_KILL
+		processResult, resultError := wireProcessResult(result)
+		if resultError != nil {
+			return nil, connect.NewError(connect.CodeInternal, resultError)
 		}
 		return &v1.WaitProcessResponse{State: state, Result: processResult}, nil
 	})
@@ -725,6 +763,40 @@ func (handler *rpcHandler) Wait(ctx context.Context, request *connect.Request[v1
 	}
 	response.Meta = handler.responseMeta(request.Msg.GetMeta())
 	return connect.NewResponse(response), nil
+}
+
+func wireProcessResult(result sandboxd.ProcessResult) (*v1.ProcessResult, error) {
+	if result.ExitCode < -1<<31 || result.ExitCode > 1<<31-1 || result.FinishedAt.IsZero() || result.FinishedAt.UnixMilli() <= 0 {
+		return nil, errors.New("process result is outside the wire representation")
+	}
+	processResult := &v1.ProcessResult{
+		ExitCode:         int32(result.ExitCode),
+		FinishedAtUnixMs: uint64(result.FinishedAt.UnixMilli()),
+	}
+	switch result.Reason {
+	case sandboxd.ExitReasonExited, sandboxd.ExitReasonFailed, sandboxd.ExitReasonSignaled:
+	case sandboxd.ExitReasonCanceled:
+		processResult.Cancelled = true
+	case sandboxd.ExitReasonDeadline:
+		processResult.TimedOut = true
+	case sandboxd.ExitReasonOutputLimit:
+		processResult.OutputTruncated = true
+	case sandboxd.ExitReasonFenced:
+	default:
+		return nil, errors.New("process result reason is invalid")
+	}
+	switch result.Signal {
+	case "", sandboxd.SignalCancel:
+	case sandboxd.SignalInterrupt:
+		processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_INTERRUPT
+	case sandboxd.SignalTerminate:
+		processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_TERMINATE
+	case sandboxd.SignalKill:
+		processResult.TerminatingSignal = v1.ProcessSignal_PROCESS_SIGNAL_KILL
+	default:
+		return nil, errors.New("process result signal is invalid")
+	}
+	return processResult, nil
 }
 
 func (handler *rpcHandler) authorize(ctx context.Context, header http.Header, message proto.Message, meta *v1.RpcRequestMeta) (context.Context, context.CancelFunc, error) {
@@ -881,7 +953,7 @@ func redactedError(err error) error {
 		return connect.NewError(connect.CodeCanceled, context.Canceled)
 	case errors.Is(err, context.DeadlineExceeded):
 		return connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
-	case errors.Is(err, sandboxd.ErrInvalidRequest), errors.Is(err, sandboxd.ErrInvalidSignal):
+	case errors.Is(err, sandboxd.ErrInvalidRequest), errors.Is(err, sandboxd.ErrInvalidSignal), errors.Is(err, sandboxd.ErrInvalidCursor):
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("process request is invalid"))
 	case errors.Is(err, sandboxd.ErrIDConflict):
 		return connect.NewError(connect.CodeAlreadyExists, errors.New("process request identity conflicts"))
@@ -894,6 +966,8 @@ func redactedError(err error) error {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("process state does not permit this operation"))
 	case errors.Is(err, sandboxd.ErrOutputBackpressure):
 		return connect.NewError(connect.CodeResourceExhausted, errors.New("process output backpressure limit was exceeded"))
+	case errors.Is(err, sandboxd.ErrReplayUnavailable):
+		return connect.NewError(connect.CodeOutOfRange, errors.New("requested process replay is unavailable"))
 	default:
 		return connect.NewError(connect.CodeInternal, errors.New("sandbox process operation failed"))
 	}

@@ -157,10 +157,11 @@ type RunResult struct {
 
 // ProcessResult is the stable supervisor terminal result.
 type ProcessResult struct {
-	Reason   ExitReason
-	ExitCode int
-	Signal   ProcessSignal
-	Error    string
+	Reason     ExitReason
+	ExitCode   int
+	Signal     ProcessSignal
+	Error      string
+	FinishedAt time.Time
 }
 
 // EventType identifies one ordered process stream event.
@@ -176,11 +177,12 @@ const (
 
 // ProcessEvent has a process-global, strictly increasing sequence number.
 type ProcessEvent struct {
-	Sequence uint64
-	Type     EventType
-	Data     []byte
-	Error    string
-	Result   ProcessResult
+	Sequence   uint64
+	Type       EventType
+	Data       []byte
+	Error      string
+	Result     ProcessResult
+	OccurredAt time.Time
 }
 
 // ProcessHandle is opaque and bound to one supervisor instance and launch
