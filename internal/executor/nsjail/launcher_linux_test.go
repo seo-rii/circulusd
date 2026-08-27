@@ -727,21 +727,30 @@ func TestWaitForEmptyCgroupObservesPopulatedTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer directoryFile.Close()
-	updated := make(chan struct{})
+	updated := make(chan error, 1)
 	go func() {
-		defer close(updated)
 		time.Sleep(20 * time.Millisecond)
 		if err := os.Chmod(eventsPath, 0o600); err != nil {
+			updated <- err
 			return
 		}
-		_ = os.WriteFile(eventsPath, []byte("populated 0\nfrozen 0\n"), 0o400)
+		file, err := os.OpenFile(eventsPath, os.O_WRONLY, 0)
+		if err != nil {
+			updated <- err
+			return
+		}
+		_, writeErr := file.WriteAt([]byte("0"), int64(len("populated ")))
+		updated <- errors.Join(writeErr, file.Close())
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := waitForEmptyCgroup(ctx, int(directoryFile.Fd())); err != nil {
-		t.Fatalf("waitForEmptyCgroup() error = %v", err)
+	waitErr := waitForEmptyCgroup(ctx, int(directoryFile.Fd()))
+	if updateErr := <-updated; updateErr != nil {
+		t.Fatalf("update cgroup.events: %v", updateErr)
 	}
-	<-updated
+	if waitErr != nil {
+		t.Fatalf("waitForEmptyCgroup() error = %v", waitErr)
+	}
 }
 
 type launcherFixture struct {
