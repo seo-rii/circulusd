@@ -197,13 +197,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 	for _, result := range report.Results {
 		wantStatus := conformance.Pass
 		wantReason := ""
-		wantMock := false
 		switch result.Component {
-		case "workerd.agent-adapter-smoke":
-			wantMock = true
-		case "workerd.agent-engine":
-			wantStatus = conformance.NotRun
-			wantReason = "real pinned Pi package probe is not configured"
 		case "workerd.outbound-denial":
 			wantStatus = conformance.Fail
 			wantReason = "stock workerd probe returned a non-zero exit status"
@@ -219,7 +213,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 		}
 		if result.Evidence.BinaryDigest != config.ExpectedBinaryDigest ||
 			result.Evidence.Version != config.ExpectedVersion ||
-			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock != wantMock {
+			result.Evidence.EnvironmentDigest == "" || result.Evidence.Mock {
 			t.Fatalf("result %q evidence = %+v", result.Component, result.Evidence)
 		}
 	}
@@ -238,14 +232,16 @@ func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
 		componentsByEntrypoint[candidate.entrypoint] = candidate.component
 	}
 
-	if got := componentsByEntrypoint["agentEngine"]; got != "workerd.agent-adapter-smoke" {
-		t.Fatalf("agentEngine component = %q, want adapter smoke", got)
+	if got := componentsByEntrypoint["agentEngine"]; got != "workerd.agent-engine" {
+		t.Fatalf("agentEngine component = %q, want real Pi engine", got)
+	}
+	if _, found := notRunReasons["workerd.agent-engine"]; found {
+		t.Fatal("real Pi engine is still marked NOT_RUN")
 	}
 	if got := componentsByEntrypoint["shardRecycle"]; got != "" {
 		t.Fatalf("shardRecycle component = %q, want no runnable substitute for the agentd cgroup gate", got)
 	}
 	wantNotRun := map[string]string{
-		"workerd.agent-engine":          "real pinned Pi package probe is not configured",
 		"workerd.shard-recycle":         "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
 		"workerd.stable-broker-binding": "stable broker RPC probe is not configured",
 	}
@@ -415,24 +411,107 @@ func TestNewRejectsAmbiguousOrUnboundedConfiguration(t *testing.T) {
 	}
 }
 
-func TestWorkerFixtureContainsTheLowLevelAdapterSmoke(t *testing.T) {
+func TestWorkerFixtureContainsThePinnedPiAgentCoreAdapter(t *testing.T) {
 	t.Parallel()
 
+	entry, err := os.ReadFile("fixture/pi-worker.entry.ts")
+	if err != nil {
+		t.Fatalf("ReadFile(entry) error = %v", err)
+	}
 	worker, err := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
 	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
+		t.Fatalf("ReadFile(bundle) error = %v", err)
 	}
-	for _, required := range []string{
-		"var LowLevelPiAgentEngine = class",
-		"circulusd.session.agent-checkpoint",
-		"createOpaqueTurnAuthority",
+	for _, required := range [][]byte{
+		[]byte("createPiAgentCoreFactory"),
+		[]byte("createPiAgentCoreInitialState"),
+		[]byte("adapterAbiVersion: 2"),
+		[]byte("checkpointSchemaVersion: 2"),
 	} {
-		if !bytes.Contains(worker, []byte(required)) {
-			t.Fatalf("worker fixture does not contain %q from the low-level adapter", required)
+		if !bytes.Contains(entry, required) {
+			t.Fatalf("worker entry does not contain %q from the pinned Pi adapter", required)
 		}
 	}
-	if bytes.Contains(worker, []byte("modelRequests: 1,\n        toolRequests: 1")) {
-		t.Fatal("worker fixture contains the old synthetic turn result")
+	for _, required := range [][]byte{
+		[]byte("var PI_AGENT_CORE_PACKAGE_VERSION = \"0.84.3\""),
+		[]byte("var PI_AGENT_CORE_ADAPTER_ABI_VERSION = 2"),
+		[]byte("var PI_AGENT_CORE_STATE_VERSION = 2"),
+		[]byte("Pi tool continuation did not produce one configured model request"),
+	} {
+		if !bytes.Contains(worker, required) {
+			t.Fatalf("worker bundle does not contain %q from the pinned Pi adapter", required)
+		}
+	}
+	for _, forbidden := range [][]byte{
+		[]byte("type AgentCoreFactory"),
+		[]byte("adapterAbiVersion: 1"),
+		[]byte("checkpointSchemaVersion: 1"),
+		[]byte(`from "@earendil-works/`),
+		[]byte(`from "node:`),
+		[]byte(`import("node:`),
+		[]byte("nodejs_compat"),
+	} {
+		if bytes.Contains(entry, forbidden) || bytes.Contains(worker, forbidden) {
+			t.Fatalf("worker fixture contains forbidden synthetic or unresolved dependency %q", forbidden)
+		}
+	}
+	if bytes.Count(worker, []byte("import(")) != 1 ||
+		!bytes.Contains(worker, []byte(`import("cloudflare:sockets")`)) ||
+		bytes.Contains(worker, []byte("\nimport ")) {
+		t.Fatal("worker bundle contains an unresolved import outside cloudflare:sockets")
+	}
+}
+
+func TestSessionHostRequiresTheCompletePinnedPiBoundaryTrace(t *testing.T) {
+	t.Parallel()
+
+	host, err := fixtureFiles.ReadFile("fixture/session-host.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(session host) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte("result.modelBoundaries === 2"),
+		[]byte("result.toolRequests === 1"),
+		[]byte(`"model", "external-tool", "model", "turn_complete"`),
+	} {
+		if !bytes.Contains(host, required) {
+			t.Fatalf("session host does not require actual Pi boundary evidence %q", required)
+		}
+	}
+	if bytes.Contains(host, []byte("result.modelRequests")) {
+		t.Fatal("session host still accepts the synthetic unique-model-service counter")
+	}
+}
+
+func TestColdPiReconstructionExposesEveryExtensionLifecycle(t *testing.T) {
+	t.Parallel()
+
+	entry, err := os.ReadFile("fixture/pi-worker.entry.ts")
+	if err != nil {
+		t.Fatalf("ReadFile(entry) error = %v", err)
+	}
+	for _, forbidden := range [][]byte{[]byte("seenHooks"), []byte("recordHook")} {
+		if bytes.Contains(entry, forbidden) {
+			t.Fatalf("worker entry hides repeated cold-engine lifecycle events with %q", forbidden)
+		}
+	}
+	host, err := fixtureFiles.ReadFile("fixture/session-host.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(session host) error = %v", err)
+	}
+	for hook, want := range map[string]int{
+		`"a:initialize"`:         4,
+		`"a:beforeAgentStart"`:   4,
+		`"a:beforeTurn"`:         1,
+		`"a:beforeModelRequest"`: 2,
+		`"a:afterModelResponse"`: 2,
+		`"a:beforeToolCall"`:     1,
+		`"a:afterToolCall"`:      1,
+		`"a:afterTurn"`:          1,
+	} {
+		if got := bytes.Count(host, []byte(hook)); got != want {
+			t.Fatalf("session host occurrences of %s = %d, want %d", hook, got, want)
+		}
 	}
 }
 
@@ -485,7 +564,7 @@ func TestStockWorkerdFixture(t *testing.T) {
 	report := harness.Run(t.Context())
 	for _, result := range report.Results {
 		switch result.Component {
-		case "workerd.agent-engine", "workerd.shard-recycle", "workerd.stable-broker-binding":
+		case "workerd.shard-recycle", "workerd.stable-broker-binding":
 			if result.Status != conformance.NotRun {
 				t.Fatalf("external-boundary result = %+v, want NOT_RUN", result)
 			}

@@ -65,9 +65,11 @@ export const agentEngine = {
   async test(_controller, env) {
     const worker = env.LOADER.get("agent-engine/sha256-a", () => definition("agent-engine"));
     const result = await invoke(worker, "/agent-turn");
+    const expectedTrace = ["model", "external-tool", "model", "turn_complete"];
     assert(result.completed === true, "low-level AgentEngine did not complete a model/tool turn");
-    assert(result.modelRequests === 1, "model binding was not invoked exactly once");
-    assert(result.toolRequests === 1, "tool binding was not invoked exactly once");
+    assert(result.modelBoundaries === 2, "pinned Pi adapter did not cross two model boundaries");
+    assert(result.toolRequests === 1, "pinned Pi adapter did not cross one external-tool boundary");
+    assert(JSON.stringify(result.trace) === JSON.stringify(expectedTrace), "pinned Pi adapter boundary trace changed");
   },
 };
 
@@ -78,8 +80,12 @@ export const extensionOrder = {
     const expected = [
       "a:initialize", "b:initialize", "a:beforeAgentStart", "b:beforeAgentStart",
       "a:beforeTurn", "b:beforeTurn", "a:beforeModelRequest", "b:beforeModelRequest",
+      "a:initialize", "b:initialize", "a:beforeAgentStart", "b:beforeAgentStart",
       "a:afterModelResponse", "b:afterModelResponse", "a:beforeToolCall", "b:beforeToolCall",
-      "a:afterToolCall", "b:afterToolCall", "a:afterTurn", "b:afterTurn",
+      "a:initialize", "b:initialize", "a:beforeAgentStart", "b:beforeAgentStart",
+      "a:afterToolCall", "b:afterToolCall", "a:beforeModelRequest", "b:beforeModelRequest",
+      "a:initialize", "b:initialize", "a:beforeAgentStart", "b:beforeAgentStart",
+      "a:afterModelResponse", "b:afterModelResponse", "a:afterTurn", "b:afterTurn",
     ];
     assert(JSON.stringify(result.hooks) === JSON.stringify(expected), "extension hook order changed");
   },

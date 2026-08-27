@@ -1,7 +1,8 @@
 import {
   LowLevelPiAgentEngine,
   createOpaqueTurnAuthority,
-  type AgentCoreFactory,
+  createPiAgentCoreFactory,
+  createPiAgentCoreInitialState,
   type ExtensionRegistration,
 } from "../../../../workers/pi-runtime/src/index.ts";
 
@@ -18,56 +19,41 @@ async function denied(operation: () => Promise<unknown>): Promise<boolean> {
 
 async function runAgentTurn(): Promise<{
   readonly completed: boolean;
-  readonly modelRequests: number;
+  readonly modelBoundaries: number;
   readonly toolRequests: number;
+  readonly trace: readonly string[];
   readonly hooks: readonly string[];
 }> {
   const hooks: string[] = [];
-  let modelRequests = 0;
-  let toolRequests = 0;
-  const coreFactory: AgentCoreFactory = () => ({
-    async advance(context) {
-      if (context.input.kind === "turn_start") {
-        modelRequests += 1;
-        return {
-          kind: "model_request",
-          state: { phase: "model" },
-          request: {
-            service: "model",
-            operation: "complete",
-            replayPolicy: "safe",
-            payload: { prompt: context.input.input },
-          },
-        };
-      }
-      if (context.input.kind === "effect_settlement") {
-        toolRequests += 1;
-        return {
-          kind: "tool_requests",
-          state: { phase: "tool" },
-          requests: [{
-            service: "external-tool",
-            operation: "echo",
-            replayPolicy: "safe",
-            payload: { model: context.input.settlement },
-          }],
-        };
-      }
-      if (context.input.kind === "tool_settlements") {
-        return {
-          kind: "turn_complete",
-          state: { phase: "complete" },
-          result: { tool: context.input.results[0]?.settlement ?? null },
-        };
-      }
-      throw new Error(`unexpected core input ${context.input.kind}`);
-    },
+  const model = {
+    id: "phase0-deterministic-model",
+    api: "circulusd-model-gateway",
+    provider: "circulusd",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 4_096,
+    maxTokens: 512,
+  } as const;
+  const coreFactory = createPiAgentCoreFactory({
+    systemPrompt: "You are the deterministic Phase 0A conformance agent.",
+    model,
+    tools: [{
+      name: "echo",
+      description: "Echo one text value",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+        additionalProperties: false,
+      },
+      replayPolicy: "safe",
+    }],
   });
   const identity = {
     sessionId: "session_phase0",
     runtimeRevisionDigest: `sha256:${"a".repeat(64)}` as const,
-    adapterAbiVersion: 1,
-    checkpointSchemaVersion: 1,
+    adapterAbiVersion: 2,
+    checkpointSchemaVersion: 2,
   };
   const registration = (id: string, priority: number): ExtensionRegistration => ({
     manifest: { id, priority, tools: [], patchableFields: {} },
@@ -82,39 +68,126 @@ async function runAgentTurn(): Promise<{
       async afterTurn() { hooks.push(`${id}:afterTurn`); },
     }),
   });
-  const engine = new LowLevelPiAgentEngine(identity, coreFactory);
-  engine.registerExtension(registration("b", 20));
-  engine.registerExtension(registration("a", 10));
-  const authority = () => createOpaqueTurnAuthority(new Uint8Array([1, 2, 3]));
-  const genesis = await engine.createGenesisCheckpoint({
-    turnId: "turn_phase0",
-    input: { prompt: "hello" },
-    initialCoreState: { phase: "initial" },
-  });
-  const model = await engine.step({ authority: authority(), checkpoint: genesis });
-  if (model.kind !== "effect_request" || model.request.service !== "model") {
-    throw new Error("low-level engine did not emit the model boundary");
+  const engines: LowLevelPiAgentEngine[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    const engine = new LowLevelPiAgentEngine(identity, coreFactory);
+    engine.registerExtension(registration("b", 20));
+    engine.registerExtension(registration("a", 10));
+    engines.push(engine);
   }
-  const tool = await engine.step({
+  const authority = () => createOpaqueTurnAuthority(new Uint8Array([1, 2, 3]));
+  const genesis = await engines[0]!.createGenesisCheckpoint({
+    turnId: "turn_phase0",
+    input: { prompt: "hello", timestamp: 1_700_000_000_000 },
+    initialCoreState: createPiAgentCoreInitialState(),
+  });
+  const firstModel = await engines[0]!.step({ authority: authority(), checkpoint: genesis });
+  if (
+    firstModel.kind !== "effect_request" ||
+    firstModel.request.service !== "model" ||
+    firstModel.checkpoint.adapterAbiVersion !== 2 ||
+    firstModel.checkpoint.checkpointSchemaVersion !== 2
+  ) {
+    throw new Error("pinned Pi adapter did not emit its first model boundary");
+  }
+  const tool = await engines[1]!.step({
     authority: authority(),
-    checkpoint: model.checkpoint,
+    checkpoint: firstModel.checkpoint,
     settlement: {
-      requestDigest: model.request.requestDigest,
-      outcome: { kind: "success", result: { text: "model response" } },
+      requestDigest: firstModel.request.requestDigest,
+      outcome: {
+        kind: "success",
+        result: {
+          version: 1,
+          message: {
+            role: "assistant",
+            content: [{
+              type: "toolCall",
+              id: "phase0_echo_1",
+              name: "echo",
+              arguments: { text: "hello" },
+            }],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: 1_700_000_000_001,
+          },
+        },
+      },
     },
   });
   if (tool.kind !== "effect_request" || tool.request.service === "model") {
-    throw new Error("low-level engine did not emit the tool boundary");
+    throw new Error("pinned Pi adapter did not emit the tool boundary");
   }
-  const completed = await engine.step({
+  const secondModel = await engines[2]!.step({
     authority: authority(),
     checkpoint: tool.checkpoint,
     settlement: {
       requestDigest: tool.request.requestDigest,
-      outcome: { kind: "success", result: { text: "tool response" } },
+      outcome: {
+        kind: "success",
+        result: {
+          version: 1,
+          toolCallId: "phase0_echo_1",
+          toolName: "echo",
+          content: [{ type: "text", text: "hello" }],
+          isError: false,
+          timestamp: 1_700_000_000_002,
+        },
+      },
     },
   });
-  return { completed: completed.kind === "turn_complete", modelRequests, toolRequests, hooks };
+  if (secondModel.kind !== "effect_request" || secondModel.request.service !== "model") {
+    throw new Error("pinned Pi adapter did not resume with its second model boundary");
+  }
+  const completed = await engines[3]!.step({
+    authority: authority(),
+    checkpoint: secondModel.checkpoint,
+    settlement: {
+      requestDigest: secondModel.request.requestDigest,
+      outcome: {
+        kind: "success",
+        result: {
+          version: 1,
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: {
+              input: 2,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 3,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1_700_000_000_003,
+          },
+        },
+      },
+    },
+  });
+  const trace = [firstModel.request.service, tool.request.service, secondModel.request.service,
+    completed.kind] as const;
+  return {
+    completed: completed.kind === "turn_complete",
+    modelBoundaries: trace.filter((entry) => entry === "model").length,
+    toolRequests: trace.filter((entry) => entry === "external-tool").length,
+    trace,
+    hooks,
+  };
 }
 
 export default {

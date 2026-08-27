@@ -1,6 +1,6 @@
 // Package workerd runs release-pinned Phase 0A probes against stock workerd.
 // A PASS means the digest-pinned process executed that exact probe. Checks that
-// need a real Pi package, stable broker RPC, or agentd-managed cgroups remain
+// need stable broker RPC or agentd-managed cgroups remain
 // explicit NOT_RUN results until an external fixture supplies those boundaries.
 package workerd
 
@@ -67,8 +67,7 @@ type probe struct {
 }
 
 var requiredProbes = []probe{
-	{component: "workerd.agent-adapter-smoke", entrypoint: "agentEngine", mock: true},
-	{component: "workerd.agent-engine", notRunReason: "real pinned Pi package probe is not configured"},
+	{component: "workerd.agent-engine", entrypoint: "agentEngine"},
 	{component: "workerd.content-addressed-replacement", entrypoint: "contentAddressedReplacement"},
 	{component: "workerd.dynamic-worker", entrypoint: "dynamicWorker"},
 	{component: "workerd.extension-order", entrypoint: "extensionOrder"},
@@ -361,11 +360,11 @@ func (harness *Harness) Run(ctx context.Context) conformance.Report {
 					}, directory)
 					probeContextError := probeContext.Err()
 					cancel()
-						result := conformance.Result{
-							Component: candidate.component,
-							Status:    conformance.Pass,
-							Evidence:  conformance.Evidence{Mock: candidate.mock},
-						}
+					result := conformance.Result{
+						Component: candidate.component,
+						Status:    conformance.Pass,
+						Evidence:  conformance.Evidence{Mock: candidate.mock},
+					}
 					if output.err != nil {
 						result.Status = conformance.Fail
 						if errors.Is(probeContextError, context.DeadlineExceeded) {
