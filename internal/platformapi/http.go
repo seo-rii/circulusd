@@ -9,10 +9,13 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"path"
 	"reflect"
 	"strconv"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hancomac/circulusd/internal/identity"
 )
 
 type RequestAuthenticator interface {
@@ -23,12 +26,14 @@ type HTTPConfig struct {
 	Service          *Service
 	Authenticator    RequestAuthenticator
 	MaximumBodyBytes int64
+	NewRequestID     func() (string, error)
 }
 
 type HTTPHandler struct {
 	service          *Service
 	authenticator    RequestAuthenticator
 	maximumBodyBytes int64
+	newRequestID     func() (string, error)
 	mux              *http.ServeMux
 }
 
@@ -44,39 +49,107 @@ func NewHTTPHandler(config HTTPConfig) (*HTTPHandler, error) {
 			return nil, ErrInvalidConfig
 		}
 	}
+	newRequestID := config.NewRequestID
+	if newRequestID == nil {
+		newRequestID = newSecureRequestID
+	}
 	handler := &HTTPHandler{
 		service: config.Service, authenticator: config.Authenticator,
-		maximumBodyBytes: config.MaximumBodyBytes, mux: http.NewServeMux(),
+		maximumBodyBytes: config.MaximumBodyBytes, newRequestID: newRequestID,
+		mux: http.NewServeMux(),
 	}
-	handler.mux.HandleFunc("POST /v1/sessions/{sessionId}/turns", handler.createTurn)
-	handler.mux.HandleFunc("GET /v1/sessions/{sessionId}/events", handler.replayEvents)
+	handler.mux.HandleFunc("/v1/sessions/{sessionId}/turns", handler.routeCreateTurn)
+	handler.mux.HandleFunc("/v1/sessions/{sessionId}/events", handler.routeReplayEvents)
+	handler.mux.HandleFunc("/", handler.routeNotFound)
 	return handler, nil
 }
 
 func (handler *HTTPHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("X-Content-Type-Options", "nosniff")
+	requestID, err := handler.newRequestID()
+	if err != nil || !validPublicRequestID(requestID) {
+		requestID, err = newSecureRequestID()
+		if err != nil || !validPublicRequestID(requestID) {
+			requestID = "req_FALLBACK"
+		}
+		response.Header().Set("X-Request-ID", requestID)
+		writeHTTPError(
+			response, http.StatusInternalServerError, "internal", "REQUEST_ID_GENERATION_FAILED",
+			"the request could not be initialized", true,
+		)
+		return
+	}
+	response.Header().Set("X-Request-ID", requestID)
+	if request.RequestURI == "*" ||
+		(request.URL.Path != "/" && path.Clean(request.URL.Path) != request.URL.Path) {
+		handler.routeNotFound(response, request)
+		return
+	}
 	handler.mux.ServeHTTP(response, request)
+}
+
+func (handler *HTTPHandler) routeCreateTurn(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		response.Header().Set("Allow", http.MethodPost)
+		writeHTTPError(
+			response, http.StatusMethodNotAllowed, "invalid_argument", "METHOD_NOT_ALLOWED",
+			"the request method is not allowed for this route", false,
+		)
+		return
+	}
+	handler.createTurn(response, request)
+}
+
+func (handler *HTTPHandler) routeReplayEvents(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", http.MethodGet)
+		writeHTTPError(
+			response, http.StatusMethodNotAllowed, "invalid_argument", "METHOD_NOT_ALLOWED",
+			"the request method is not allowed for this route", false,
+		)
+		return
+	}
+	handler.replayEvents(response, request)
+}
+
+func (*HTTPHandler) routeNotFound(response http.ResponseWriter, _ *http.Request) {
+	writeHTTPError(
+		response, http.StatusNotFound, "not_found", "ROUTE_NOT_FOUND",
+		"the requested route was not found", false,
+	)
 }
 
 func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *http.Request) {
 	principal, err := handler.authenticate(request)
 	if err != nil {
-		writeHTTPError(response, http.StatusUnauthorized, "unauthenticated")
+		writeHTTPError(
+			response, http.StatusUnauthorized, "unauthenticated", "AUTHENTICATION_REQUIRED",
+			"authentication is required", false,
+		)
 		return
 	}
 	contentTypes := request.Header.Values("Content-Type")
 	idempotencyKeys := request.Header.Values("Idempotency-Key")
 	if len(contentTypes) != 1 {
-		writeHTTPError(response, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		writeHTTPError(
+			response, http.StatusUnsupportedMediaType, "invalid_argument", "UNSUPPORTED_MEDIA_TYPE",
+			"the request Content-Type must be application/json", false,
+		)
 		return
 	}
 	if len(idempotencyKeys) != 1 {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_IDEMPOTENCY_KEY",
+			"exactly one idempotency key is required", false,
+		)
 		return
 	}
 	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
 	if err != nil || mediaType != "application/json" {
-		writeHTTPError(response, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		writeHTTPError(
+			response, http.StatusUnsupportedMediaType, "invalid_argument", "UNSUPPORTED_MEDIA_TYPE",
+			"the request Content-Type must be application/json", false,
+		)
 		return
 	}
 	request.Body = http.MaxBytesReader(response, request.Body, handler.maximumBodyBytes)
@@ -84,14 +157,23 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeHTTPError(response, http.StatusRequestEntityTooLarge, "request_too_large")
+			writeHTTPError(
+				response, http.StatusRequestEntityTooLarge, "resource_exhausted", "REQUEST_BODY_TOO_LARGE",
+				"the request body is too large", false,
+			)
 			return
 		}
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	if !utf8.Valid(document) {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	inString := false
@@ -164,7 +246,10 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 		}
 	}
 	if !validStrings {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	scanner := json.NewDecoder(bytes.NewReader(document))
@@ -222,11 +307,17 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 		return nil
 	}
 	if err := scanValue(0); err != nil {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	if _, err := scanner.Token(); err != io.EOF {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 
@@ -236,11 +327,17 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 		Messages []Message `json:"messages"`
 	}
 	if err := decoder.Decode(&body); err != nil {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 		return
 	}
 	result, err := handler.service.CreateTurn(request.Context(), CreateTurnRequest{
@@ -267,20 +364,29 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 func (handler *HTTPHandler) replayEvents(response http.ResponseWriter, request *http.Request) {
 	principal, err := handler.authenticate(request)
 	if err != nil {
-		writeHTTPError(response, http.StatusUnauthorized, "unauthenticated")
+		writeHTTPError(
+			response, http.StatusUnauthorized, "unauthenticated", "AUTHENTICATION_REQUIRED",
+			"authentication is required", false,
+		)
 		return
 	}
 	afterSequence := uint64(0)
 	cursors := request.Header.Values("Last-Event-ID")
 	if len(cursors) > 1 {
-		writeHTTPError(response, http.StatusBadRequest, "invalid_cursor")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_CURSOR",
+			"the event cursor is invalid", false,
+		)
 		return
 	}
 	if len(cursors) == 1 && cursors[0] != "" {
 		cursor := cursors[0]
 		afterSequence, err = strconv.ParseUint(cursor, 10, 64)
 		if err != nil {
-			writeHTTPError(response, http.StatusBadRequest, "invalid_cursor")
+			writeHTTPError(
+				response, http.StatusBadRequest, "invalid_argument", "INVALID_CURSOR",
+				"the event cursor is invalid", false,
+			)
 			return
 		}
 	}
@@ -296,7 +402,10 @@ func (handler *HTTPHandler) replayEvents(response http.ResponseWriter, request *
 	}
 	flusher, canFlush := response.(http.Flusher)
 	if !canFlush {
-		writeHTTPError(response, http.StatusInternalServerError, "streaming_unsupported")
+		writeHTTPError(
+			response, http.StatusServiceUnavailable, "unavailable", "STREAMING_UNAVAILABLE",
+			"event streaming is unavailable", true,
+		)
 		return
 	}
 	replay := stream.Replay
@@ -384,26 +493,116 @@ func (handler *HTTPHandler) authenticate(request *http.Request) (Principal, erro
 func writeServiceError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrInvalidRequest):
-		writeHTTPError(response, http.StatusBadRequest, "invalid_request")
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
+			"the request is invalid", false,
+		)
 	case errors.Is(err, ErrAccessDenied):
-		writeHTTPError(response, http.StatusForbidden, "access_denied")
+		writeHTTPError(
+			response, http.StatusForbidden, "permission_denied", "ACCESS_DENIED",
+			"permission was denied", false,
+		)
 	case errors.Is(err, ErrSessionNotFound), errors.Is(err, ErrTurnNotFound):
-		writeHTTPError(response, http.StatusNotFound, "not_found")
-	case errors.Is(err, ErrIdempotencyConflict), errors.Is(err, ErrSequenceConflict),
-		errors.Is(err, ErrInvalidCursor), errors.Is(err, ErrStaleAuthority),
-		errors.Is(err, ErrInvalidTransition):
-		writeHTTPError(response, http.StatusConflict, "conflict")
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		writeHTTPError(response, http.StatusRequestTimeout, "request_cancelled")
+		writeHTTPError(
+			response, http.StatusNotFound, "not_found", "RESOURCE_NOT_FOUND",
+			"the requested resource was not found", false,
+		)
+	case errors.Is(err, ErrIdempotencyConflict):
+		writeHTTPError(
+			response, http.StatusConflict, "idempotency_conflict", "IDEMPOTENCY_CONFLICT",
+			"the idempotency key was already used for a different request", false,
+		)
+	case errors.Is(err, ErrSequenceConflict):
+		writeHTTPError(
+			response, http.StatusConflict, "conflict", "DURABLE_SEQUENCE_CONFLICT",
+			"the durable event sequence conflicts with current state", false,
+		)
+	case errors.Is(err, ErrInvalidCursor):
+		writeHTTPError(
+			response, http.StatusBadRequest, "invalid_argument", "INVALID_CURSOR",
+			"the event cursor is invalid", false,
+		)
+	case errors.Is(err, ErrStaleAuthority):
+		writeHTTPError(
+			response, http.StatusConflict, "stale_generation", "STALE_AUTHORIZATION_GENERATION",
+			"the caller authorization generation is stale", false,
+		)
+	case errors.Is(err, ErrInvalidTransition):
+		writeHTTPError(
+			response, http.StatusPreconditionFailed, "failed_precondition", "INVALID_TURN_TRANSITION",
+			"the requested turn transition is not allowed", false,
+		)
+	case errors.Is(err, context.Canceled):
+		writeHTTPError(
+			response, http.StatusRequestTimeout, "aborted", "REQUEST_CANCELED",
+			"the request was canceled", false,
+		)
+	case errors.Is(err, context.DeadlineExceeded):
+		writeHTTPError(
+			response, http.StatusGatewayTimeout, "deadline_exceeded", "REQUEST_DEADLINE_EXCEEDED",
+			"the request deadline was exceeded", true,
+		)
 	default:
-		writeHTTPError(response, http.StatusInternalServerError, "internal_error")
+		writeHTTPError(
+			response, http.StatusInternalServerError, "internal", "INTERNAL_ERROR",
+			"an internal error occurred", false,
+		)
 	}
 }
 
-func writeHTTPError(response http.ResponseWriter, status int, code string) {
+func writeHTTPError(
+	response http.ResponseWriter,
+	status int,
+	code string,
+	reason string,
+	message string,
+	retryable bool,
+) {
+	requestID := response.Header().Get("X-Request-ID")
+	if !validPublicRequestID(requestID) {
+		generated, err := newSecureRequestID()
+		if err == nil && validPublicRequestID(generated) {
+			requestID = generated
+		} else {
+			requestID = "req_FALLBACK"
+		}
+		response.Header().Set("X-Request-ID", requestID)
+	}
 	writeJSON(response, status, struct {
-		Error string `json:"error"`
-	}{Error: code})
+		APIVersion string `json:"apiVersion"`
+		Code       string `json:"code"`
+		Reason     string `json:"reason"`
+		Message    string `json:"message"`
+		Retryable  bool   `json:"retryable"`
+		RequestID  string `json:"requestId"`
+	}{
+		APIVersion: "v1alpha", Code: code, Reason: reason, Message: message,
+		Retryable: retryable, RequestID: requestID,
+	})
+}
+
+func newSecureRequestID() (string, error) {
+	value, err := identity.New(identity.Request)
+	if err != nil {
+		return "", err
+	}
+	return value.String(), nil
+}
+
+func validPublicRequestID(value string) bool {
+	if len(value) == 0 || len(value) > 128 ||
+		!((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if !((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')) &&
+			(character < '0' || character > '9') &&
+			character != '_' && character != '.' && character != ':' && character != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {
