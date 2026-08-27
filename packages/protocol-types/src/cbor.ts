@@ -158,31 +158,52 @@ export function normalizeProtocolValue(
 export const parseNormalizedValue = normalizeProtocolValue;
 
 class ByteWriter {
-  readonly #bytes: number[] = [];
+  readonly #chunks: Uint8Array[] = [];
   readonly #maxBytes: number;
+  readonly #pendingBytes: number[] = [];
+  #length = 0;
 
   constructor(maxBytes: number) {
     this.#maxBytes = maxBytes;
   }
 
   push(byte: number): void {
-    if (this.#bytes.length >= this.#maxBytes) {
+    if (this.#length >= this.#maxBytes) {
       validationError("$", `encoded size exceeds ${this.#maxBytes} bytes`);
     }
-    this.#bytes.push(byte);
+    this.#pendingBytes.push(byte);
+    this.#length += 1;
   }
 
   pushBytes(bytes: Uint8Array): void {
-    if (this.#bytes.length + bytes.byteLength > this.#maxBytes) {
+    if (this.#length + bytes.byteLength > this.#maxBytes) {
       validationError("$", `encoded size exceeds ${this.#maxBytes} bytes`);
     }
-    for (const byte of bytes) {
-      this.#bytes.push(byte);
+    if (bytes.byteLength === 0) {
+      return;
     }
+    this.#flushPendingBytes();
+    this.#chunks.push(bytes);
+    this.#length += bytes.byteLength;
   }
 
   finish(): Uint8Array {
-    return Uint8Array.from(this.#bytes);
+    this.#flushPendingBytes();
+    const result = new Uint8Array(this.#length);
+    let offset = 0;
+    for (const chunk of this.#chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return result;
+  }
+
+  #flushPendingBytes(): void {
+    if (this.#pendingBytes.length === 0) {
+      return;
+    }
+    this.#chunks.push(Uint8Array.from(this.#pendingBytes));
+    this.#pendingBytes.length = 0;
   }
 }
 
