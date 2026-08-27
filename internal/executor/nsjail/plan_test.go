@@ -90,6 +90,7 @@ func TestPlannerBuildsExplicitFailClosedProductionPlan(t *testing.T) {
 		"disable_no_new_privs: true",
 		"user_net",
 		"iface_own",
+		"cgroup_mem_memsw_max",
 		"docker.sock",
 		"/dev/kvm",
 		"src: \"/home\"",

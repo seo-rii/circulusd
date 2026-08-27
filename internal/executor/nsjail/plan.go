@@ -243,7 +243,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = configuration.WriteString("mount_proc: true\n")
 	_, _ = fmt.Fprintf(&configuration, "seccomp_policy_file: %s\n", strconv.Quote(seccompPath))
 	_, _ = configuration.WriteString("seccomp_log: true\n")
-	_, _ = fmt.Fprintf(&configuration, "cgroup_mem_max: %d\ncgroup_mem_memsw_max: %d\ncgroup_mem_swap_max: 0\n", limits.MemoryBytes, limits.MemoryBytes)
+	_, _ = fmt.Fprintf(&configuration, "cgroup_mem_max: %d\ncgroup_mem_swap_max: 0\n", limits.MemoryBytes)
 	_, _ = fmt.Fprintf(&configuration, "cgroup_pids_max: %d\ncgroup_cpu_ms_per_sec: %d\n", limits.MaximumProcesses, limits.CPUMillisPerSecond)
 	_, _ = fmt.Fprintf(&configuration, "cgroupv2_mount: %s\nuse_cgroupv2: true\ndetect_cgroupv2: false\n", strconv.Quote(planner.config.CgroupRoot))
 	_, _ = configuration.WriteString("iface_no_lo: false\n")
