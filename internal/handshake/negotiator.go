@@ -201,6 +201,6 @@ func handshakeTranscript(request Request, response Response, serverPeer Peer) ([
 				"sandboxGeneration": request.SandboxGeneration,
 			},
 		},
-		canonical.Options{},
+		canonical.DefaultOptions(),
 	)
 }

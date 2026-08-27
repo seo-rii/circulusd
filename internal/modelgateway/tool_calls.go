@@ -24,7 +24,9 @@ type CanonicalToolArguments struct {
 // NewCanonicalToolArguments converts a provider's structured arguments into
 // the canonical protocol representation.
 func NewCanonicalToolArguments(value canonical.Value) (CanonicalToolArguments, error) {
-	encoded, err := canonical.Encode(value, canonical.Options{MaxBytes: hardMaxEventBytes})
+	options := canonical.DefaultOptions()
+	options.MaxBytes = hardMaxEventBytes
+	encoded, err := canonical.Encode(value, options)
 	if err != nil {
 		return CanonicalToolArguments{}, fmt.Errorf("%w: canonical tool arguments: %v", ErrInvalidRequest, err)
 	}

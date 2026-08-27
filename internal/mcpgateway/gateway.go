@@ -328,7 +328,10 @@ func canonicalizeCall(request CallRequest, bounds Bounds) ([]byte, Digest, error
 		}
 		return nil, Digest{}, fmt.Errorf("%w: canonical MCP input: %v", ErrInvalidRequest, err)
 	}
-	input, err := canonical.Encode(request.Input, canonical.Options{MaxDepth: bounds.MaxInputDepth, MaxBytes: int(bounds.MaxInputBytes)})
+	input, err := canonical.Encode(request.Input, canonical.Options{
+		MaxDepth: bounds.MaxInputDepth, MaxBytes: int(bounds.MaxInputBytes),
+		MaxItems: canonical.DefaultOptions().MaxItems,
+	})
 	if err != nil {
 		if errorsIsCanonicalLimit(err) {
 			return nil, Digest{}, fmt.Errorf("%w: %v", ErrInputLimit, err)
@@ -346,7 +349,7 @@ func digestCanonicalCall(serverID, toolName string, input []byte) (Digest, error
 	encoded, err := canonical.Encode(canonical.Array{
 		"circulusd.hash", int64(1), "mcp.tool.call", int64(1),
 		canonical.Map{"server": serverID, "tool": toolName, "input": canonical.Bytes(input)},
-	}, canonical.Options{})
+	}, canonical.DefaultOptions())
 	if err != nil {
 		return Digest{}, err
 	}

@@ -42,6 +42,16 @@ type Options struct {
 	MaxItems int
 }
 
+// DefaultOptions returns the package's bounded local policy. Every field in an
+// explicitly constructed Options value is an exact limit, including zero.
+func DefaultOptions() Options {
+	return Options{
+		MaxDepth: defaultMaxDepth,
+		MaxBytes: defaultMaxBytes,
+		MaxItems: defaultMaxItems,
+	}
+}
+
 type writer struct {
 	encoded  []byte
 	maxBytes int
@@ -53,22 +63,10 @@ func Encode(value Value, options Options) ([]byte, error) {
 	if options.MaxDepth < 0 || options.MaxBytes < 0 || options.MaxItems < 0 {
 		return nil, ErrInvalidOption
 	}
-	maxDepth := options.MaxDepth
-	if maxDepth == 0 {
-		maxDepth = defaultMaxDepth
-	}
-	maxBytes := options.MaxBytes
-	if maxBytes == 0 {
-		maxBytes = defaultMaxBytes
-	}
-	maxItems := options.MaxItems
-	if maxItems == 0 {
-		maxItems = defaultMaxItems
-	}
 	output := &writer{
-		encoded: make([]byte, 0, 256), maxBytes: maxBytes, maxItems: maxItems,
+		encoded: make([]byte, 0, 256), maxBytes: options.MaxBytes, maxItems: options.MaxItems,
 	}
-	if err := encode(output, value, 0, maxDepth); err != nil {
+	if err := encode(output, value, 0, options.MaxDepth); err != nil {
 		return nil, err
 	}
 	return append([]byte(nil), output.encoded...), nil
@@ -78,22 +76,10 @@ func Decode(encoded []byte, options Options) (Value, error) {
 	if options.MaxDepth < 0 || options.MaxBytes < 0 || options.MaxItems < 0 {
 		return nil, ErrInvalidOption
 	}
-	maxDepth := options.MaxDepth
-	if maxDepth == 0 {
-		maxDepth = defaultMaxDepth
+	if len(encoded) > options.MaxBytes {
+		return nil, fmt.Errorf("%w: encoded size exceeds %d bytes", ErrLimitExceeded, options.MaxBytes)
 	}
-	maxBytes := options.MaxBytes
-	if maxBytes == 0 {
-		maxBytes = defaultMaxBytes
-	}
-	maxItems := options.MaxItems
-	if maxItems == 0 {
-		maxItems = defaultMaxItems
-	}
-	if len(encoded) > maxBytes {
-		return nil, fmt.Errorf("%w: encoded size exceeds %d bytes", ErrLimitExceeded, maxBytes)
-	}
-	input := &decoder{encoded: encoded, maxDepth: maxDepth, maxItems: maxItems}
+	input := &decoder{encoded: encoded, maxDepth: options.MaxDepth, maxItems: options.MaxItems}
 	value, err := input.readValue(0)
 	if err != nil {
 		return nil, err
@@ -113,7 +99,7 @@ func StructuredDigest(domain string, schemaVersion uint64, payload Value) (strin
 	}
 	encoded, err := Encode(
 		Array{"circulusd.hash", int64(1), domain, int64(schemaVersion), payload},
-		Options{},
+		DefaultOptions(),
 	)
 	if err != nil {
 		return "", err
@@ -143,6 +129,24 @@ func NormalizeStringSet(values []string) ([]string, error) {
 }
 
 func encode(output *writer, value Value, depth int, maxDepth int) error {
+	switch numeric := value.(type) {
+	case int:
+		value = int64(numeric)
+	case int8:
+		value = int64(numeric)
+	case int16:
+		value = int64(numeric)
+	case int32:
+		value = int64(numeric)
+	case uint:
+		value = uint64(numeric)
+	case uint8:
+		value = uint64(numeric)
+	case uint16:
+		value = uint64(numeric)
+	case uint32:
+		value = uint64(numeric)
+	}
 	if depth > maxDepth {
 		return fmt.Errorf("%w: maximum depth %d", ErrLimitExceeded, maxDepth)
 	}
@@ -172,14 +176,6 @@ func encode(output *writer, value Value, depth int, maxDepth int) error {
 			return err
 		}
 		return output.appendBytes(value)
-	case int:
-		return encode(output, int64(value), depth, maxDepth)
-	case int8:
-		return encode(output, int64(value), depth, maxDepth)
-	case int16:
-		return encode(output, int64(value), depth, maxDepth)
-	case int32:
-		return encode(output, int64(value), depth, maxDepth)
 	case int64:
 		if value >= 0 {
 			if uint64(value) > maxSafeInteger {
@@ -191,20 +187,15 @@ func encode(output *writer, value Value, depth int, maxDepth int) error {
 			return fmt.Errorf("%w: integer exceeds the shared safe range", ErrInvalidValue)
 		}
 		return output.appendHead(1, uint64(-1-value))
-	case uint:
-		return encode(output, uint64(value), depth, maxDepth)
-	case uint8:
-		return encode(output, uint64(value), depth, maxDepth)
-	case uint16:
-		return encode(output, uint64(value), depth, maxDepth)
-	case uint32:
-		return encode(output, uint64(value), depth, maxDepth)
 	case uint64:
 		if value > maxSafeInteger {
 			return fmt.Errorf("%w: integer exceeds the shared safe range", ErrInvalidValue)
 		}
 		return output.appendHead(0, value)
 	case Array:
+		if len(value) > output.maxItems-output.items {
+			return fmt.Errorf("%w: encoded item limit %d exceeded", ErrLimitExceeded, output.maxItems)
+		}
 		if err := output.appendHead(4, uint64(len(value))); err != nil {
 			return err
 		}
@@ -215,6 +206,9 @@ func encode(output *writer, value Value, depth int, maxDepth int) error {
 		}
 		return nil
 	case Map:
+		if len(value) > (output.maxItems-output.items)/2 {
+			return fmt.Errorf("%w: encoded item limit %d exceeded", ErrLimitExceeded, output.maxItems)
+		}
 		type entry struct {
 			encoded []byte
 			value   Value
@@ -375,13 +369,20 @@ func (input *decoder) readValue(depth int) (Value, error) {
 		if argument > uint64(availableItems) {
 			return nil, fmt.Errorf("%w: decoded item limit %d exceeded", ErrLimitExceeded, input.maxItems)
 		}
-		result := make(Array, int(argument))
-		for index := range result {
+		if argument > 0 && depth >= input.maxDepth {
+			return nil, fmt.Errorf("%w: maximum depth %d", ErrLimitExceeded, input.maxDepth)
+		}
+		capacity := int(argument)
+		if capacity > 16 {
+			capacity = 16
+		}
+		result := make(Array, 0, capacity)
+		for index := uint64(0); index < argument; index++ {
 			value, err := input.readValue(depth + 1)
 			if err != nil {
 				return nil, err
 			}
-			result[index] = value
+			result = append(result, value)
 		}
 		return result, nil
 	case 5:
@@ -393,7 +394,10 @@ func (input *decoder) readValue(depth int) (Value, error) {
 		if argument > uint64(availableItems/2) {
 			return nil, fmt.Errorf("%w: decoded item limit %d exceeded", ErrLimitExceeded, input.maxItems)
 		}
-		result := make(Map, int(argument))
+		if argument > 0 && depth >= input.maxDepth {
+			return nil, fmt.Errorf("%w: maximum depth %d", ErrLimitExceeded, input.maxDepth)
+		}
+		result := make(Map)
 		previousKeyStart, previousKeyEnd := -1, -1
 		for index := uint64(0); index < argument; index++ {
 			keyStart := input.offset

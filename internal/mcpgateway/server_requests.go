@@ -66,6 +66,7 @@ func (gateway *Gateway) HandleServerRequest(ctx context.Context, request ServerR
 	if !paramsInvalid {
 		params, err = canonical.Encode(request.Params, canonical.Options{
 			MaxDepth: gateway.bounds.MaxInputDepth, MaxBytes: int(gateway.bounds.MaxInputBytes),
+			MaxItems: canonical.DefaultOptions().MaxItems,
 		})
 		paramsInvalid = err != nil
 	}
@@ -85,7 +86,7 @@ func (gateway *Gateway) HandleServerRequest(ctx context.Context, request ServerR
 			"method":               request.Method,
 			"params":               canonical.Bytes(params),
 		},
-	}, canonical.Options{})
+	}, canonical.DefaultOptions())
 	if err != nil {
 		return response, ErrInvalidRequest
 	}
@@ -269,6 +270,7 @@ func (gateway *Gateway) HandleServerRequest(ctx context.Context, request ServerR
 	if response.Error == nil {
 		encoded, encodeErr := canonical.Encode(result, canonical.Options{
 			MaxDepth: gateway.bounds.MaxInputDepth, MaxBytes: int(gateway.bounds.MaxOutputBytes),
+			MaxItems: canonical.DefaultOptions().MaxItems,
 		})
 		if encodeErr != nil {
 			response.Error = &JSONRPCError{Code: jsonRPCInternalError, Message: "Internal error"}

@@ -323,7 +323,7 @@ func MarshalCanonical(entries []Entry) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return canonical.Encode(manifestValue(canonicalEntries), canonical.Options{})
+	return canonical.Encode(manifestValue(canonicalEntries), canonical.DefaultOptions())
 }
 
 // RootDigest returns the ADR-006 structured SHA-256 digest of the deterministic

@@ -507,6 +507,7 @@ func TestServerRequestClaimCanBeSafelyTakenOverAfterOwnerFenceRotation(t *testin
 	}
 	params, err := canonical.Encode(request.Params, canonical.Options{
 		MaxDepth: testBounds().MaxInputDepth, MaxBytes: int(testBounds().MaxInputBytes),
+		MaxItems: canonical.DefaultOptions().MaxItems,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -518,7 +519,7 @@ func TestServerRequestClaimCanBeSafelyTakenOverAfterOwnerFenceRotation(t *testin
 			"providerRequest": request.ProviderRequestID, "connectionGeneration": int64(request.ConnectionGeneration), "requestId": request.RequestID,
 			"method": request.Method, "params": canonical.Bytes(params),
 		},
-	}, canonical.Options{})
+	}, canonical.DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,6 +574,7 @@ func TestExpiredServerRequestClaimDoesNotBlockParentRecovery(t *testing.T) {
 	}
 	params, err := canonical.Encode(request.Params, canonical.Options{
 		MaxDepth: testBounds().MaxInputDepth, MaxBytes: int(testBounds().MaxInputBytes),
+		MaxItems: canonical.DefaultOptions().MaxItems,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -584,7 +586,7 @@ func TestExpiredServerRequestClaimDoesNotBlockParentRecovery(t *testing.T) {
 			"providerRequest": request.ProviderRequestID, "connectionGeneration": int64(request.ConnectionGeneration),
 			"requestId": request.RequestID, "method": request.Method, "params": canonical.Bytes(params),
 		},
-	}, canonical.Options{})
+	}, canonical.DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

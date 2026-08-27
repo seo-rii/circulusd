@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -49,7 +50,7 @@ func TestTypeScriptGoldenVectors(t *testing.T) {
 				t.Fatalf("unhandled golden vector %q", vector.Name)
 			}
 
-			encoded, err := Encode(payload, Options{})
+			encoded, err := Encode(payload, DefaultOptions())
 			if err != nil {
 				t.Fatalf("Encode() error = %v", err)
 			}
@@ -70,14 +71,14 @@ func TestTypeScriptGoldenVectors(t *testing.T) {
 func TestEncodeNormalizesTextAndSortsMapKeys(t *testing.T) {
 	t.Parallel()
 
-	encoded, err := Encode(Map{"z": int64(0), "aa": int64(1), "b": int64(2)}, Options{})
+	encoded, err := Encode(Map{"z": int64(0), "aa": int64(1), "b": int64(2)}, DefaultOptions())
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
 	if got, want := hex.EncodeToString(encoded), "a3616202617a0062616101"; got != want {
 		t.Fatalf("Encode() = %s, want %s", got, want)
 	}
-	encoded, err = Encode("e\u0301", Options{})
+	encoded, err = Encode("e\u0301", DefaultOptions())
 	if err != nil {
 		t.Fatalf("Encode(NFC) error = %v", err)
 	}
@@ -104,7 +105,7 @@ func TestEncodeRejectsAmbiguousValues(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := Encode(test.value, Options{}); !errors.Is(err, ErrInvalidValue) {
+			if _, err := Encode(test.value, DefaultOptions()); !errors.Is(err, ErrInvalidValue) {
 				t.Fatalf("Encode(%T) error = %v, want ErrInvalidValue", test.value, err)
 			}
 		})
@@ -114,7 +115,7 @@ func TestEncodeRejectsAmbiguousValues(t *testing.T) {
 func TestEncodeRejectsDuplicateNormalizedKeys(t *testing.T) {
 	t.Parallel()
 
-	_, err := Encode(Map{"é": int64(1), "e\u0301": int64(2)}, Options{})
+	_, err := Encode(Map{"é": int64(1), "e\u0301": int64(2)}, DefaultOptions())
 	if !errors.Is(err, ErrDuplicateKey) {
 		t.Fatalf("Encode() error = %v, want ErrDuplicateKey", err)
 	}
@@ -123,20 +124,63 @@ func TestEncodeRejectsDuplicateNormalizedKeys(t *testing.T) {
 func TestEncodeEnforcesDepthAndSizeLimits(t *testing.T) {
 	t.Parallel()
 
-	if _, err := Encode(Array{Array{int64(0)}}, Options{MaxDepth: 1}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Encode(Array{Array{int64(0)}}, Options{MaxDepth: 1, MaxBytes: defaultMaxBytes, MaxItems: defaultMaxItems}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Encode(depth) error = %v, want ErrLimitExceeded", err)
 	}
-	if _, err := Encode("abcd", Options{MaxBytes: 4}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Encode("abcd", Options{MaxDepth: defaultMaxDepth, MaxBytes: 4, MaxItems: defaultMaxItems}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Encode(size) error = %v, want ErrLimitExceeded", err)
 	}
 	if _, err := Encode(nil, Options{MaxDepth: -1}); !errors.Is(err, ErrInvalidOption) {
 		t.Fatalf("Encode(invalid option) error = %v, want ErrInvalidOption", err)
 	}
-	if _, err := Encode(Array{nil, nil}, Options{MaxItems: 2}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Encode(Array{nil, nil}, Options{MaxDepth: defaultMaxDepth, MaxBytes: defaultMaxBytes, MaxItems: 2}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Encode(items) error = %v, want ErrLimitExceeded", err)
 	}
-	if _, err := Encode(Array{nil, nil}, Options{MaxItems: 3}); err != nil {
+	if _, err := Encode(Array{nil, nil}, Options{MaxDepth: defaultMaxDepth, MaxBytes: defaultMaxBytes, MaxItems: 3}); err != nil {
 		t.Fatalf("Encode(items within limit) error = %v", err)
+	}
+}
+
+func TestEncodeIntegerAliasesConsumeOneItem(t *testing.T) {
+	t.Parallel()
+
+	for name, value := range map[string]Value{
+		"int": int(0), "int8": int8(0), "int16": int16(0), "int32": int32(0),
+		"uint": uint(0), "uint8": uint8(0), "uint16": uint16(0), "uint32": uint32(0),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			encoded, err := Encode(value, Options{MaxDepth: 1, MaxBytes: 1, MaxItems: 1})
+			if err != nil {
+				t.Fatalf("Encode(%T) error = %v", value, err)
+			}
+			if !bytes.Equal(encoded, []byte{0}) {
+				t.Fatalf("Encode(%T) = %x, want 00", value, encoded)
+			}
+		})
+	}
+}
+
+func TestExplicitZeroLimitsFailClosedLikeTypeScript(t *testing.T) {
+	t.Parallel()
+
+	if _, err := Encode(nil, Options{MaxDepth: 1, MaxBytes: 1, MaxItems: 0}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Encode(MaxItems: 0) error = %v, want ErrLimitExceeded", err)
+	}
+	if _, err := Encode(nil, Options{MaxDepth: 1, MaxBytes: 0, MaxItems: 1}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Encode(MaxBytes: 0) error = %v, want ErrLimitExceeded", err)
+	}
+	if _, err := Encode(Array{nil}, Options{MaxDepth: 0, MaxBytes: 2, MaxItems: 2}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Encode(MaxDepth: 0) error = %v, want ErrLimitExceeded", err)
+	}
+	if _, err := Decode([]byte{0xf6}, Options{MaxDepth: 1, MaxBytes: 1, MaxItems: 0}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Decode(MaxItems: 0) error = %v, want ErrLimitExceeded", err)
+	}
+	if _, err := Decode([]byte{0xf6}, Options{MaxDepth: 1, MaxBytes: 0, MaxItems: 1}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Decode(MaxBytes: 0) error = %v, want ErrLimitExceeded", err)
+	}
+	if _, err := Decode([]byte{0x81, 0xf6}, Options{MaxDepth: 0, MaxBytes: 2, MaxItems: 2}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Decode(MaxDepth: 0) error = %v, want ErrLimitExceeded", err)
 	}
 }
 
@@ -153,18 +197,18 @@ func TestDecodeRoundTripsSupportedCanonicalValuesWithoutByteAliases(t *testing.T
 		},
 		"text": "é\uFEFF",
 	}
-	encoded, err := Encode(want, Options{})
+	encoded, err := Encode(want, DefaultOptions())
 	if err != nil {
 		t.Fatalf("Encode() error = %v", err)
 	}
-	decoded, err := Decode(encoded, Options{})
+	decoded, err := Decode(encoded, DefaultOptions())
 	if err != nil {
 		t.Fatalf("Decode() error = %v", err)
 	}
 	if !reflect.DeepEqual(decoded, want) {
 		t.Fatalf("Decode() = %#v, want %#v", decoded, want)
 	}
-	reencoded, err := Encode(decoded, Options{})
+	reencoded, err := Encode(decoded, DefaultOptions())
 	if err != nil {
 		t.Fatalf("Encode(decoded) error = %v", err)
 	}
@@ -198,7 +242,7 @@ func TestDecodeRejectsNonMinimalArguments(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DecodeString() error = %v", err)
 			}
-			if _, err := Decode(encoded, Options{}); !errors.Is(err, ErrInvalidEncoding) {
+			if _, err := Decode(encoded, DefaultOptions()); !errors.Is(err, ErrInvalidEncoding) {
 				t.Fatalf("Decode(%s) error = %v, want ErrInvalidEncoding", encodedHex, err)
 			}
 		})
@@ -220,7 +264,7 @@ func TestDecodeRejectsUnsafeIntegersAndUnsupportedForms(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DecodeString() error = %v", err)
 			}
-			if _, err := Decode(encoded, Options{}); !errors.Is(err, ErrInvalidEncoding) {
+			if _, err := Decode(encoded, DefaultOptions()); !errors.Is(err, ErrInvalidEncoding) {
 				t.Fatalf("Decode(%s) error = %v, want ErrInvalidEncoding", encodedHex, err)
 			}
 		})
@@ -246,7 +290,7 @@ func TestDecodeRejectsNonCanonicalTextAndMapKeys(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DecodeString() error = %v", err)
 			}
-			if _, err := Decode(encoded, Options{}); !errors.Is(err, ErrInvalidEncoding) {
+			if _, err := Decode(encoded, DefaultOptions()); !errors.Is(err, ErrInvalidEncoding) {
 				t.Fatalf("Decode(%s) error = %v, want ErrInvalidEncoding", encodedHex, err)
 			}
 		})
@@ -266,7 +310,7 @@ func TestDecodeRejectsTrailingTruncatedAndImpossibleLengths(t *testing.T) {
 			if err != nil {
 				t.Fatalf("DecodeString() error = %v", err)
 			}
-			if _, err := Decode(encoded, Options{}); !errors.Is(err, ErrInvalidEncoding) {
+			if _, err := Decode(encoded, DefaultOptions()); !errors.Is(err, ErrInvalidEncoding) {
 				t.Fatalf("Decode(%s) error = %v, want ErrInvalidEncoding", encodedHex, err)
 			}
 		})
@@ -276,25 +320,62 @@ func TestDecodeRejectsTrailingTruncatedAndImpossibleLengths(t *testing.T) {
 func TestDecodeEnforcesByteDepthAndAggregateItemLimits(t *testing.T) {
 	t.Parallel()
 
-	nested, err := Encode(Array{Array{Array{int64(0)}}}, Options{})
+	nested, err := Encode(Array{Array{Array{int64(0)}}}, DefaultOptions())
 	if err != nil {
 		t.Fatalf("Encode(nested) error = %v", err)
 	}
-	if _, err := Decode(nested, Options{MaxDepth: 1}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Decode(nested, Options{MaxDepth: 1, MaxBytes: defaultMaxBytes, MaxItems: defaultMaxItems}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Decode(depth) error = %v, want ErrLimitExceeded", err)
 	}
-	if _, err := Decode(nested, Options{MaxBytes: len(nested) - 1}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Decode(nested, Options{MaxDepth: defaultMaxDepth, MaxBytes: len(nested) - 1, MaxItems: defaultMaxItems}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Decode(bytes) error = %v, want ErrLimitExceeded", err)
 	}
 	threeItems, err := hex.DecodeString("83010203")
 	if err != nil {
 		t.Fatalf("DecodeString(items) error = %v", err)
 	}
-	if _, err := Decode(threeItems, Options{MaxItems: 3}); !errors.Is(err, ErrLimitExceeded) {
+	if _, err := Decode(threeItems, Options{MaxDepth: defaultMaxDepth, MaxBytes: defaultMaxBytes, MaxItems: 3}); !errors.Is(err, ErrLimitExceeded) {
 		t.Fatalf("Decode(items) error = %v, want ErrLimitExceeded", err)
 	}
 	if _, err := Decode([]byte{0xf6}, Options{MaxItems: -1}); !errors.Is(err, ErrInvalidOption) {
 		t.Fatalf("Decode(invalid items option) error = %v, want ErrInvalidOption", err)
+	}
+}
+
+func TestDecodeDoesNotPreallocateAttackerDeclaredContainers(t *testing.T) {
+	encoded := make([]byte, 1_000_003)
+	copy(encoded, []byte{0xba, 0x00, 0x07, 0xa1, 0x1f, 0x00})
+	options := Options{MaxDepth: 64, MaxBytes: len(encoded), MaxItems: 1_000_000}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Decode(encoded, options); !errors.Is(err, ErrInvalidEncoding) {
+		t.Fatalf("Decode(oversized declared map) error = %v, want ErrInvalidEncoding", err)
+	}
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("Decode(oversized declared map) allocated %d bytes before rejection", allocated)
+	}
+}
+
+func TestEncodeChecksContainerItemBudgetBeforeAuxiliaryAllocation(t *testing.T) {
+	value := make(Map, 100_000)
+	for index := range 100_000 {
+		value[string(rune(index+1))] = nil
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := Encode(value, Options{MaxDepth: 64, MaxBytes: defaultMaxBytes, MaxItems: 1}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("Encode(oversized map) error = %v, want ErrLimitExceeded", err)
+	}
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+		t.Fatalf("Encode(oversized map) allocated %d bytes before item-budget rejection", allocated)
 	}
 }
 
