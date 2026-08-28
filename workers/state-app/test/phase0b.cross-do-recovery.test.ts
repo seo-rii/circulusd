@@ -38,6 +38,8 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
       publicEventSequence: 2,
       effects: [
         {
+          service: "workspace",
+          operation: "workspace.commit",
           phase: "dispatched",
           replayPolicy: "idempotency-key",
           invocationId: "phase0b-workspace-invocation",
@@ -118,6 +120,15 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
       "tool.effect.prepared",
       "tool.externally_committed",
       "tool.settled",
+    ]);
+    expect(
+      recovered.session.publicEvents
+        .filter((event) => event.type.startsWith("tool."))
+        .map((event) => ({ service: event.service, operation: event.operation })),
+    ).toEqual([
+      { service: "workspace", operation: "workspace.commit" },
+      { service: "workspace", operation: "workspace.commit" },
+      { service: "workspace", operation: "workspace.commit" },
     ]);
     expect(replaySessionPublicEvents(recovered.session, 0, 16)).toMatchObject({
       snapshot: { lastEventSequence: 4 },

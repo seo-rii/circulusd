@@ -240,7 +240,7 @@ export class RecoverableWorkspaceEffect {
       throw new Error("Phase 0B fixture requires an admitted active turn");
     }
     const effectRequest = {
-      service: "executor" as const,
+      service: "workspace" as const,
       operation: "workspace.commit",
       replayPolicy: "idempotency-key" as const,
       payload: {
