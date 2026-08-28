@@ -124,9 +124,12 @@ func (percentage *Percentage) UnmarshalText(value []byte) error {
 }
 
 type Endpoint struct {
-	raw    string
-	scheme string
-	host   string
+	raw       string
+	scheme    string
+	authority string
+	host      string
+	port      string
+	path      string
 }
 
 func (endpoint *Endpoint) UnmarshalText(value []byte) error {
@@ -136,7 +139,7 @@ func (endpoint *Endpoint) UnmarshalText(value []byte) error {
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" ||
-		parsed.RawQuery != "" || parsed.ForceQuery || containsControl(parsed.Path) {
+		parsed.RawQuery != "" || parsed.ForceQuery || containsControl(parsed.Path) || parsed.String() != raw {
 		return fmt.Errorf("endpoint is invalid")
 	}
 	if parsed.Scheme == "unix" {
@@ -159,7 +162,10 @@ func (endpoint *Endpoint) UnmarshalText(value []byte) error {
 	}
 	endpoint.raw = raw
 	endpoint.scheme = parsed.Scheme
+	endpoint.authority = parsed.Host
 	endpoint.host = parsed.Hostname()
+	endpoint.port = parsed.Port()
+	endpoint.path = parsed.Path
 	return nil
 }
 

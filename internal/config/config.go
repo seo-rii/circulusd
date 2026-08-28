@@ -73,7 +73,13 @@ func (configuration Configuration) Validate() error {
 		!validAbsolutePath(configuration.Server.DataDirectory) || configuration.Server.DataDirectory == "/" {
 		return fmt.Errorf("%w: server", ErrInvalidConfiguration)
 	}
-	if configuration.State.Provider != "celld" || configuration.State.Endpoint.scheme != "unix" {
+	stateEndpoint := configuration.State.Endpoint
+	stateIP := net.ParseIP(stateEndpoint.host)
+	statePort, statePortErr := strconv.ParseUint(stateEndpoint.port, 10, 16)
+	if configuration.State.Provider != "celld" || stateEndpoint.scheme != "http" ||
+		stateIP == nil || !stateIP.IsLoopback() || statePortErr != nil || statePort == 0 ||
+		strconv.FormatUint(statePort, 10) != stateEndpoint.port || stateEndpoint.path != "" ||
+		stateEndpoint.authority != net.JoinHostPort(stateIP.String(), stateEndpoint.port) {
 		return fmt.Errorf("%w: state provider", ErrInvalidConfiguration)
 	}
 	objectStoreIP := net.ParseIP(configuration.ObjectStore.Endpoint.host)

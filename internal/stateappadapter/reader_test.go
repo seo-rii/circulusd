@@ -56,7 +56,7 @@ func TestNewRequiresConcreteConfiguredClientButRemainsReferenceOnly(t *testing.T
 		t.Fatalf("New(nil) = (%#v, %v), want nil ErrInvalidConfig", reader, err)
 	}
 	client, err := stateappclient.New(stateappclient.Config{
-		Endpoint: "unix:///run/circulusd/state.sock",
+		Endpoint: "http://127.0.0.1:8080",
 		KeyID:    "state-current-1",
 		RootKey:  make([]byte, 32),
 		Timeout:  time.Second,

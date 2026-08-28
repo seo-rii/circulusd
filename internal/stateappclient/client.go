@@ -15,13 +15,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/identity"
@@ -52,7 +50,6 @@ const (
 	maximumResponseHeaderBytes = 16 << 10
 	maximumEventLimit          = 256
 	maximumSharedInteger       = uint64(9_007_199_254_740_991)
-	maximumUnixSocketPathBytes = 107
 	maximumTimeout             = 30 * time.Second
 )
 
@@ -128,6 +125,7 @@ func (failure *RemoteError) Error() string {
 func (failure *RemoteError) Unwrap() error { return ErrRemote }
 
 type Client struct {
+	endpoint     string
 	keyID        string
 	requestKey   [sha256.Size]byte
 	responseKey  [sha256.Size]byte
@@ -182,22 +180,21 @@ type clientSources struct {
 }
 
 func newWithSources(config Config, sources clientSources) (*Client, error) {
-	hasControl := false
-	for _, character := range config.Endpoint {
-		if unicode.IsControl(character) {
-			hasControl = true
-			break
-		}
-	}
 	parsed, err := url.Parse(config.Endpoint)
+	var endpointIP net.IP
+	var endpointPort uint64
+	endpointPortErr := ErrInvalidConfig
+	if err == nil {
+		endpointIP = net.ParseIP(parsed.Hostname())
+		endpointPort, endpointPortErr = strconv.ParseUint(parsed.Port(), 10, 16)
+	}
 	if err != nil || config.Endpoint == "" || config.Endpoint != strings.TrimSpace(config.Endpoint) ||
-		strings.Contains(config.Endpoint, "%") || hasControl || parsed.Scheme != "unix" ||
-		parsed.Host != "" || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
+		strings.Contains(config.Endpoint, "%") || parsed.Scheme != "http" ||
+		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
 		parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" ||
-		!strings.HasPrefix(config.Endpoint, "unix:///") ||
-		parsed.Path == "" || parsed.Path == string(filepath.Separator) || !filepath.IsAbs(parsed.Path) ||
-		filepath.Clean(parsed.Path) != parsed.Path || len([]byte(parsed.Path)) > maximumUnixSocketPathBytes ||
-		(&url.URL{Scheme: "unix", Path: parsed.Path}).String() != config.Endpoint ||
+		parsed.Path != "" || endpointIP == nil || !endpointIP.IsLoopback() ||
+		endpointPortErr != nil || endpointPort == 0 || strconv.FormatUint(endpointPort, 10) != parsed.Port() ||
+		parsed.Host != net.JoinHostPort(endpointIP.String(), parsed.Port()) || parsed.String() != config.Endpoint ||
 		!keyIDPattern.MatchString(config.KeyID) ||
 		len(config.RootKey) < 32 || len(config.RootKey) > 256 ||
 		config.Timeout <= 0 || config.Timeout > maximumTimeout ||
@@ -212,6 +209,7 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 	sourceGate := make(chan struct{}, 1)
 	sourceGate <- struct{}{}
 	client := &Client{
+		endpoint:   config.Endpoint,
 		keyID:      config.KeyID,
 		requestKey: requestKey, responseKey: responseKey,
 		timeout: config.Timeout, clock: sources.clock, newRequestID: sources.newRequestID,
@@ -222,7 +220,11 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 	client.transport = &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			raw, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", parsed.Path)
+			network := "tcp6"
+			if endpointIP.To4() != nil {
+				network = "tcp4"
+			}
+			raw, dialErr := (&net.Dialer{}).DialContext(ctx, network, parsed.Host)
 			if dialErr != nil {
 				return nil, dialErr
 			}
@@ -413,7 +415,7 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 	signature := keyedDigest(client.requestKey[:], requestFrame)
 
 	httpRequest, err := http.NewRequestWithContext(
-		requestContext, http.MethodPost, "http://state.invalid"+ingressPath, bytes.NewReader(body),
+		requestContext, http.MethodPost, client.endpoint+ingressPath, bytes.NewReader(body),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot construct request", ErrInvalidRequest)

@@ -75,6 +75,56 @@ func TestConfigExportsOnlyBoundedProductionInputs(t *testing.T) {
 	}
 }
 
+func TestNewAcceptsPinnedCelldLoopbackTCPEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"http://127.0.0.1:8080", "http://[::1]:8080"} {
+		t.Run(endpoint, func(t *testing.T) {
+			rootKey := bytes.Repeat([]byte{0x11}, 32)
+			client, err := New(Config{
+				Endpoint: endpoint,
+				KeyID:    testKeyID,
+				RootKey:  rootKey,
+				Timeout:  time.Second,
+			})
+			if err != nil {
+				t.Fatalf("New(celld TCP endpoint) error = %v", err)
+			}
+			client.Close()
+		})
+	}
+}
+
+func TestReadSessionEventsUsesIPv6LoopbackWhenAvailable(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	rootKey := bytes.Repeat([]byte{0x12}, 32)
+	endpoint := startHTTPServer(t, listener, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		host, _, splitErr := net.SplitHostPort(request.RemoteAddr)
+		remoteIP := net.ParseIP(host)
+		if splitErr != nil || remoteIP == nil || !remoteIP.IsLoopback() || remoteIP.To4() != nil {
+			t.Errorf("remote address = %q, want IPv6 loopback", request.RemoteAddr)
+		}
+		requestBody := mustReadRequest(t, request)
+		requestID := requestIDFromBody(t, requestBody)
+		body := mustEncode(t, successEnvelope(requestID, canonical.Map{"transport": "tcp6"}))
+		writeWireResponse(writer, wireResponse{
+			status: http.StatusOK, contentType: testIngressContentType, keyID: testKeyID,
+			signature: responseMAC(rootKey, testKeyID, requestID, requestBody, http.StatusOK, testIngressContentType, body),
+			body:      body,
+		})
+	}))
+	client := newTestClient(t, endpoint, rootKey, func() (string, error) { return validID("req", 2), nil }, time.Second)
+	result, err := client.ReadSessionEvents(context.Background(), validRequest(2))
+	if err != nil {
+		t.Fatalf("ReadSessionEvents() error = %v", err)
+	}
+	resultMap, ok := result.(canonical.Map)
+	if !ok || resultMap["transport"] != "tcp6" {
+		t.Fatalf("result = %#v, want authenticated tcp6 response", result)
+	}
+}
+
 func TestReadSessionEventsMatchesCrossLanguageGoldenAndSnapshotsKey(t *testing.T) {
 	fixturePath := filepath.Join("..", "..", "packages", "protocol-types", "fixtures", "state-app-ingress-v1alpha1.json")
 	contents, err := os.ReadFile(fixturePath)
@@ -98,7 +148,8 @@ func TestReadSessionEventsMatchesCrossLanguageGoldenAndSnapshotsKey(t *testing.T
 		t.Fatalf("decode response CBOR: %v", err)
 	}
 
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+	var endpoint string
+	endpoint = startLoopbackHTTPServer(t, http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			t.Errorf("read request body: %v", err)
@@ -107,8 +158,8 @@ func TestReadSessionEventsMatchesCrossLanguageGoldenAndSnapshotsKey(t *testing.T
 		if request.Method != fixture.Method || request.URL.Path != fixture.Path || request.URL.RawQuery != "" {
 			t.Errorf("request target = %s %s, want %s %s", request.Method, request.URL.RequestURI(), fixture.Method, fixture.Path)
 		}
-		if request.Host != "state.invalid" {
-			t.Errorf("request Host = %q, want state.invalid", request.Host)
+		if request.Host != strings.TrimPrefix(endpoint, "http://") {
+			t.Errorf("request Host = %q, want pinned endpoint authority", request.Host)
 		}
 		if got := request.Header.Values("Content-Type"); len(got) != 1 || got[0] != fixture.ContentType {
 			t.Errorf("Content-Type = %q", got)
@@ -285,7 +336,7 @@ func TestReadSessionEventsRejectsUnauthenticatedOrMalformedResponses(t *testing.
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				requestBody := mustReadRequest(t, request)
 				requestID := requestIDFromBody(t, requestBody)
 				envelope := successEnvelope(requestID, canonical.Map{"token": requestID})
@@ -387,7 +438,7 @@ func TestReadSessionEventsValidatesSignedErrorEnvelopeAndStatus(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				requestBody := mustReadRequest(t, request)
 				requestID := requestIDFromBody(t, requestBody)
 				envelope := baseEnvelope(requestID, test.payload)
@@ -418,7 +469,7 @@ func TestReadSessionEventsValidatesSignedErrorEnvelopeAndStatus(t *testing.T) {
 func TestReadSessionEventsBoundsTransportAndDisablesRedirects(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x55}, 32)
 	t.Run("truncated body", func(t *testing.T) {
-		endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			requestBody := mustReadRequest(t, request)
 			requestID := requestIDFromBody(t, requestBody)
 			body := mustEncode(t, successEnvelope(requestID, canonical.Map{}))
@@ -436,7 +487,7 @@ func TestReadSessionEventsBoundsTransportAndDisablesRedirects(t *testing.T) {
 	})
 
 	t.Run("response headers bounded", func(t *testing.T) {
-		endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			writer.Header().Set("X-Fill", strings.Repeat("x", maximumResponseHeaderBytes+1))
 			writer.WriteHeader(http.StatusOK)
 		}))
@@ -449,7 +500,7 @@ func TestReadSessionEventsBoundsTransportAndDisablesRedirects(t *testing.T) {
 
 	t.Run("redirect disabled", func(t *testing.T) {
 		var redirected atomic.Int64
-		endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			if request.URL.Path == "/escaped" {
 				redirected.Add(1)
 				writer.WriteHeader(http.StatusOK)
@@ -468,7 +519,7 @@ func TestReadSessionEventsBoundsTransportAndDisablesRedirects(t *testing.T) {
 func TestReadSessionEventsHonorsCancellationAndConfiguredDeadline(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x66}, 32)
 	var calls atomic.Int64
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		calls.Add(1)
 		<-request.Context().Done()
 		writer.WriteHeader(http.StatusGatewayTimeout)
@@ -500,7 +551,7 @@ func TestQueuedSourceWaiterExpiresWithoutInvokingSource(t *testing.T) {
 	firstEntered := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	client, err := newWithSources(Config{
-		Endpoint: "unix:///definitely/not/present/state.sock", KeyID: testKeyID,
+		Endpoint: "http://127.0.0.1:1", KeyID: testKeyID,
 		RootKey: rootKey, Timeout: time.Second,
 	}, clientSources{
 		clock: func() time.Time { return time.UnixMilli(1_700_000_000_000) },
@@ -553,7 +604,7 @@ func TestQueuedSourceWaiterExpiresWithoutInvokingSource(t *testing.T) {
 func TestCloseLinearizesBeforePausedReadCanDial(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x69}, 32)
 	var serverCalls atomic.Int64
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		serverCalls.Add(1)
 		writer.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -607,7 +658,7 @@ func TestCloseCancelsAndJoinsActiveHTTPRead(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x6a}, 32)
 	handlerEntered := make(chan struct{})
 	handlerCanceled := make(chan struct{})
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		requestBody := mustReadRequest(t, request)
 		requestID := requestIDFromBody(t, requestBody)
 		body := mustEncode(t, successEnvelope(requestID, canonical.Map{}))
@@ -649,7 +700,7 @@ func TestCloseCancelsAndJoinsActiveHTTPRead(t *testing.T) {
 
 func TestConcurrentCloseIsIdempotentAndRejectsRacingReads(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x6b}, 32)
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 		<-request.Context().Done()
 	}))
 	client := newTestClient(t, endpoint, rootKey, func() (string, error) { return validID("req", 1), nil }, time.Second)
@@ -689,7 +740,7 @@ func TestZeroValueClientCloseDoesNotPanic(t *testing.T) {
 func TestReadSessionEventsKeepsSixtyFourConcurrentRequestsIsolated(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x77}, 32)
 	serverRootKey := append([]byte(nil), rootKey...)
-	endpoint := startUnixHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		requestBody := mustReadRequest(t, request)
 		requestID := requestIDFromBody(t, requestBody)
 		if requestID[len(requestID)-1]%2 == 0 {
@@ -770,7 +821,7 @@ func TestReadSessionEventsRejectsInvalidRequestBeforeDial(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x22}, 32)
 	var generated atomic.Int64
 	client, err := newWithSources(Config{
-		Endpoint: "unix:///definitely/not/present/state.sock", KeyID: testKeyID,
+		Endpoint: "http://127.0.0.1:1", KeyID: testKeyID,
 		RootKey: rootKey, Timeout: time.Second,
 	}, clientSources{
 		clock: time.Now,
@@ -807,7 +858,7 @@ func TestReadSessionEventsRejectsInvalidRequestBeforeDial(t *testing.T) {
 	}
 
 	badIDClient, err := newWithSources(Config{
-		Endpoint: "unix:///definitely/not/present/state.sock", KeyID: testKeyID,
+		Endpoint: "http://127.0.0.1:1", KeyID: testKeyID,
 		RootKey: rootKey, Timeout: time.Second,
 	}, clientSources{
 		clock: time.Now, newRequestID: func() (string, error) { return "req_invalid", nil },
@@ -822,7 +873,7 @@ func TestReadSessionEventsRejectsInvalidRequestBeforeDial(t *testing.T) {
 
 	generationError := errors.New("entropy unavailable")
 	failedIDClient, err := newWithSources(Config{
-		Endpoint: "unix:///definitely/not/present/state.sock", KeyID: testKeyID,
+		Endpoint: "http://127.0.0.1:1", KeyID: testKeyID,
 		RootKey: rootKey, Timeout: time.Second,
 	}, clientSources{
 		clock: time.Now, newRequestID: func() (string, error) { return "", generationError },
@@ -840,7 +891,7 @@ func TestReadSessionEventsRejectsInvalidRequestBeforeDial(t *testing.T) {
 		func() time.Time { return time.UnixMilli(int64(maximumSharedInteger) + 1) },
 	} {
 		clockClient, clockErr := newWithSources(Config{
-			Endpoint: "unix:///definitely/not/present/state.sock", KeyID: testKeyID,
+			Endpoint: "http://127.0.0.1:1", KeyID: testKeyID,
 			RootKey: rootKey, Timeout: time.Second,
 		}, clientSources{
 			clock: clock, newRequestID: func() (string, error) { return validID("req", 1), nil },
@@ -855,9 +906,9 @@ func TestReadSessionEventsRejectsInvalidRequestBeforeDial(t *testing.T) {
 	}
 }
 
-func TestNewRejectsNonUnixOrNoncanonicalEndpointAndInvalidSecrets(t *testing.T) {
+func TestNewRejectsEndpointsOutsidePinnedCelldSurfaceAndInvalidSecrets(t *testing.T) {
 	valid := Config{
-		Endpoint: "unix:///run/circulusd/state.sock", KeyID: testKeyID,
+		Endpoint: "http://127.0.0.1:8080", KeyID: testKeyID,
 		RootKey: bytes.Repeat([]byte{0x11}, 32), Timeout: time.Second,
 	}
 	tests := []struct {
@@ -865,16 +916,23 @@ func TestNewRejectsNonUnixOrNoncanonicalEndpointAndInvalidSecrets(t *testing.T) 
 		edit func(*Config)
 	}{
 		{name: "empty endpoint", edit: func(config *Config) { config.Endpoint = "" }},
-		{name: "network endpoint", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1/state" }},
-		{name: "relative Unix path", edit: func(config *Config) { config.Endpoint = "unix:state.sock" }},
-		{name: "Unix host", edit: func(config *Config) { config.Endpoint = "unix://host/run/state.sock" }},
-		{name: "root path", edit: func(config *Config) { config.Endpoint = "unix:///" }},
-		{name: "noncanonical path", edit: func(config *Config) { config.Endpoint = "unix:///run/../state.sock" }},
-		{name: "encoded path", edit: func(config *Config) { config.Endpoint = "unix:///run/state%2Esock" }},
+		{name: "Unix endpoint", edit: func(config *Config) { config.Endpoint = "unix:///run/circulusd/state.sock" }},
+		{name: "TLS endpoint", edit: func(config *Config) { config.Endpoint = "https://127.0.0.1:8080" }},
+		{name: "hostname endpoint", edit: func(config *Config) { config.Endpoint = "http://localhost:8080" }},
+		{name: "non-loopback endpoint", edit: func(config *Config) { config.Endpoint = "http://192.0.2.1:8080" }},
+		{name: "mapped IPv6 loopback", edit: func(config *Config) { config.Endpoint = "http://[::ffff:127.0.0.1]:8080" }},
+		{name: "missing port", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1" }},
+		{name: "zero port", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:0" }},
+		{name: "noncanonical port", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:08080" }},
+		{name: "root path", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:8080/" }},
+		{name: "path", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:8080/base" }},
+		{name: "encoded path", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:8080/%2e" }},
+		{name: "userinfo", edit: func(config *Config) { config.Endpoint = "http://user@127.0.0.1:8080" }},
 		{name: "query", edit: func(config *Config) { config.Endpoint += "?target=other" }},
 		{name: "fragment", edit: func(config *Config) { config.Endpoint += "#other" }},
-		{name: "NUL", edit: func(config *Config) { config.Endpoint = "unix:///run/state%00.sock" }},
-		{name: "socket path too long", edit: func(config *Config) { config.Endpoint = "unix:///" + strings.Repeat("x", 108) }},
+		{name: "empty fragment", edit: func(config *Config) { config.Endpoint += "#" }},
+		{name: "NUL", edit: func(config *Config) { config.Endpoint = "http://127.0.0.1:8080/%00" }},
+		{name: "control", edit: func(config *Config) { config.Endpoint += "\n" }},
 		{name: "empty key id", edit: func(config *Config) { config.KeyID = "" }},
 		{name: "invalid key id", edit: func(config *Config) { config.KeyID = "State Key" }},
 		{name: "short root key", edit: func(config *Config) { config.RootKey = make([]byte, 31) }},
@@ -912,29 +970,28 @@ type wireResponse struct {
 
 const testKeyID = "state-current-1"
 
-func startUnixHTTPServer(t *testing.T, handler http.Handler) string {
+func startLoopbackHTTPServer(t *testing.T, handler http.Handler) string {
 	t.Helper()
-	directory, err := os.MkdirTemp(os.TempDir(), "sac-")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("create short Unix socket directory: %v", err)
+		t.Fatalf("listen loopback TCP: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(directory) })
-	socketPath := filepath.Join(directory, "state.sock")
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatalf("listen Unix socket: %v", err)
-	}
+	return startHTTPServer(t, listener, handler)
+}
+
+func startHTTPServer(t *testing.T, listener net.Listener, handler http.Handler) string {
+	t.Helper()
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
 	go func() {
 		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			t.Errorf("serve Unix HTTP: %v", serveErr)
+			t.Errorf("serve loopback HTTP: %v", serveErr)
 		}
 	}()
 	t.Cleanup(func() {
 		_ = server.Close()
 		_ = listener.Close()
 	})
-	return "unix://" + socketPath
+	return "http://" + listener.Addr().String()
 }
 
 func newTestClient(t *testing.T, endpoint string, rootKey []byte, newRequestID func() (string, error), timeout time.Duration) *Client {

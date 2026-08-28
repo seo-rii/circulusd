@@ -18,7 +18,7 @@ deployment:
 strictInstall: true
 state:
   provider: celld
-  endpoint: unix:///run/pi-platform/celld.sock
+  endpoint: http://127.0.0.1:8080
 objectStore:
   endpoint: http://127.0.0.1:8333
   stateBucket: pi-celld-state
@@ -172,6 +172,21 @@ func TestParseAcceptsReferenceConfiguration(t *testing.T) {
 	}
 	if err := configuration.ValidateForProfile(config.InstallProfileFull); err != nil {
 		t.Fatalf("ValidateForProfile(full) error = %v", err)
+	}
+}
+
+func TestParseAcceptsPinnedCelldLoopbackTCPEndpoint(t *testing.T) {
+	for _, endpoint := range []string{"http://127.0.0.1:8080", "http://[::1]:8080"} {
+		t.Run(endpoint, func(t *testing.T) {
+			configurationText := strings.Replace(validConfiguration, "http://127.0.0.1:8080", endpoint, 1)
+			configuration, err := config.Parse(strings.NewReader(configurationText))
+			if err != nil {
+				t.Fatalf("Parse(celld TCP endpoint) error = %v", err)
+			}
+			if got := configuration.State.Endpoint.String(); got != endpoint {
+				t.Fatalf("state endpoint = %q, want %q", got, endpoint)
+			}
+		})
 	}
 }
 
@@ -383,11 +398,38 @@ func TestParseRejectsUnsafePathsAndEndpointForms(t *testing.T) {
 		{name: "control character in binary path", replace: func(value string) string {
 			return strings.Replace(value, "binary: /usr/lib/pi-platform/nsjail", "binary: \"/usr/lib/pi-platform/\\tnsjail\"", 1)
 		}, marker: config.ErrInvalidConfiguration},
-		{name: "encoded NUL in Unix endpoint", replace: func(value string) string {
-			return strings.Replace(value, "unix:///run/pi-platform/celld.sock", "unix:///run/pi-platform/%00celld.sock", 1)
+		{name: "state endpoint encoded path", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://127.0.0.1:8080/%2e", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint noncanonical port", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://127.0.0.1:08080", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint Unix transport", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "unix:///run/pi-platform/celld.sock", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint non-loopback", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://192.0.2.1:8080", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint noncanonical mapped IPv6 loopback", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "\"http://[::ffff:7f00:1]:8080\"", 1)
 		}, marker: config.ErrInvalidSyntax},
-		{name: "noncanonical Unix endpoint", replace: func(value string) string {
-			return strings.Replace(value, "unix:///run/pi-platform/celld.sock", "unix:/run/pi-platform/celld.sock", 1)
+		{name: "state endpoint hostname", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://localhost:8080", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint uppercase scheme", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "HTTP://127.0.0.1:8080", 1)
+		}, marker: config.ErrInvalidSyntax},
+		{name: "state endpoint TLS", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "https://127.0.0.1:8080", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint missing port", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://127.0.0.1", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint path", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://127.0.0.1:8080/base", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "state endpoint empty fragment", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8080", "http://127.0.0.1:8080#", 1)
 		}, marker: config.ErrInvalidSyntax},
 		{name: "object store endpoint query", replace: func(value string) string {
 			return strings.Replace(value, "http://127.0.0.1:8333", "http://127.0.0.1:8333?credential=raw", 1)

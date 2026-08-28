@@ -4625,7 +4625,7 @@ deployment:
 
 state:
   provider: celld
-  endpoint: unix:///run/pi-platform/celld.sock
+  endpoint: http://127.0.0.1:8080
 
 objectStore:
   endpoint: http://127.0.0.1:8333
@@ -4722,6 +4722,11 @@ retention:
   artifactDefault: 30d
   runtimeRollbackWindow: 24h
 ```
+
+`state.endpoint`는 pin된 celld의 public Worker listener를 가리키는 명시적
+port의 literal-loopback HTTP origin이어야 한다. Reference service는 celld를
+`--listen 127.0.0.1:8080`으로 시작한다. celld의 internal/operator listener나
+private route를 application protocol로 사용하지 않는다.
 
 `maxResidentSessions`와 shard memory limit의 실제 reference 값은 Phase 0 benchmark 후 조정해야 한다. 숫자를 product invariant로 간주하지 않는다.
 
