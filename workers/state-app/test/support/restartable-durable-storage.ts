@@ -55,6 +55,10 @@ export class RestartableDurableStorage implements TransactionalStoragePort {
     return this.#backing.values.size;
   }
 
+  get durableRevision(): number {
+    return this.#backing.revision;
+  }
+
   restart(): RestartableDurableStorage {
     return new RestartableDurableStorage(this);
   }

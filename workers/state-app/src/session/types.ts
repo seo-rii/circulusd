@@ -9,7 +9,7 @@ import type {
   NormalizedValue,
 } from "@circulusd/protocol-types";
 
-export const SESSION_STATE_SCHEMA_VERSION = 3 as const;
+export const SESSION_STATE_SCHEMA_VERSION = 4 as const;
 export const SESSION_COMMAND_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_DOMAIN = "circulusd.session.agent-checkpoint" as const;
@@ -146,6 +146,24 @@ export interface EffectDispatchMetadata extends SessionFence {
   dispatchAttempt: number;
   deadline: number;
   providerRequestId: string | null;
+  providerRouteDigest: Digest;
+  start: EffectDispatchStartMetadata | null;
+}
+
+export interface EffectDispatchStartMetadata extends SessionFence {
+  dispatchAttempt: number;
+  deadline: number;
+  providerRequestId: string | null;
+  providerRouteDigest: Digest;
+  commandDigest: Digest;
+  claimedEventSequence: number;
+}
+
+export interface DispatchStartPermitClaims {
+  readonly dispatchPermitClaims: DispatchPermitClaims;
+  readonly providerRequestId: string | null;
+  readonly commandDigest: Digest;
+  readonly claimedEventSequence: number;
 }
 
 export interface SessionEffect extends EffectClaim {
@@ -319,6 +337,17 @@ export interface DispatchEffectCommand extends EffectCommandBase {
   readonly transactionTime: number;
   readonly deadline: number;
   readonly providerRequestId?: string | null;
+  readonly providerRouteDigest: Digest;
+}
+
+export interface ClaimDispatchStartCommand extends EffectCommandBase {
+  readonly kind: "claim_dispatch_start";
+  readonly transactionTime: number;
+  readonly dispatchAttempt: number;
+  readonly providerRequestId: string | null;
+  readonly providerRouteDigest: Digest;
+  readonly dispatchPermitClaims: DispatchPermitClaims;
+  readonly commandDigest: Digest;
 }
 
 export interface RecordExternalCommitCommand extends EffectCommandBase {
@@ -339,6 +368,7 @@ export interface RecoverEffectCommand extends EffectCommandBase {
   readonly transactionTime: number;
   readonly deadline: number;
   readonly providerRequestId?: string | null;
+  readonly providerRouteDigest?: Digest;
 }
 
 export type ResolveConfirmationCommand = EffectCommandBase &
@@ -349,6 +379,7 @@ export type ResolveConfirmationCommand = EffectCommandBase &
         readonly transactionTime: number;
         readonly deadline: number;
         readonly providerRequestId?: string | null;
+        readonly providerRouteDigest: Digest;
       }
     | {
         readonly kind: "resolve_confirmation";
@@ -417,6 +448,7 @@ export type SessionCommand =
   | EnqueueTurnCommand
   | CommitEngineStepCommand
   | DispatchEffectCommand
+  | ClaimDispatchStartCommand
   | RecordExternalCommitCommand
   | SettleEffectCommand
   | RecoverEffectCommand
@@ -451,6 +483,13 @@ export type SessionCommandOutcome =
       readonly effectId: string;
       /** Seal these claims only after the enclosing state transaction is durably committed. */
       readonly dispatchPermitClaims: DispatchPermitClaims;
+    }
+  | {
+      readonly kind: "dispatch_start_claimed";
+      readonly effectId: string;
+      readonly fresh: boolean;
+      /** Seal these claims only after the enclosing state transaction is durably committed. */
+      readonly startPermit: DispatchStartPermitClaims;
     }
   | {
       readonly kind: "external_commit_recorded";

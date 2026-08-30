@@ -214,9 +214,14 @@ describe("effect and dispatch claims", () => {
         placementGeneration: 5,
         sandboxGeneration: 6,
         authorizationGeneration: 7,
+        providerRouteDigest: ONE_DIGEST,
         deadline: 1_800_000_000_000,
       }),
-    ).toMatchObject({ dispatchAttempt: 1, authorizationGeneration: 7 });
+    ).toMatchObject({
+      dispatchAttempt: 1,
+      authorizationGeneration: 7,
+      providerRouteDigest: ONE_DIGEST,
+    });
   });
 
   it("requires paired composite identity and every permit generation", () => {
@@ -231,6 +236,7 @@ describe("effect and dispatch claims", () => {
       placementGeneration: 5,
       sandboxGeneration: 6,
       authorizationGeneration: 7,
+      providerRouteDigest: ONE_DIGEST,
       deadline: 1_800_000_000_000,
     };
     expect(() => parseDispatchPermitClaims(permit)).toThrow(/dispatchAttempt/);
@@ -238,6 +244,41 @@ describe("effect and dispatch claims", () => {
     expect(() => parseDispatchPermitClaims(withoutSandboxGeneration)).toThrow(
       /sandboxGeneration/,
     );
+  });
+
+  it("requires an exact non-zero provider route digest on dispatch permits", () => {
+    const permit = {
+      ...effectClaim(),
+      dispatchAttempt: 1,
+      turnLeaseGeneration: 4,
+      placementGeneration: 5,
+      sandboxGeneration: 6,
+      authorizationGeneration: 7,
+      providerRouteDigest: ONE_DIGEST,
+      deadline: 1_800_000_000_000,
+    };
+
+    const parsed = parseDispatchPermitClaims(permit);
+    expect(parsed.providerRouteDigest).toBe(ONE_DIGEST);
+
+    const { providerRouteDigest: _omitted, ...withoutProviderRouteDigest } = permit;
+    expect(() => parseDispatchPermitClaims(withoutProviderRouteDigest)).toThrow(
+      /providerRouteDigest/,
+    );
+    expect(() =>
+      parseDispatchPermitClaims({ ...permit, providerRouteDigest: ZERO_DIGEST })
+    ).toThrow(/providerRouteDigest/);
+    expect(() =>
+      parseDispatchPermitClaims({ ...permit, providerRouteDigest: "sha256:not-a-digest" })
+    ).toThrow(/providerRouteDigest/);
+
+    const { providerRouteDigest: _relabelled, ...relabeledPermit } = permit;
+    expect(() =>
+      parseDispatchPermitClaims({
+        ...relabeledPermit,
+        providerRouteHash: ONE_DIGEST,
+      })
+    ).toThrow(/providerRouteDigest|providerRouteHash/);
   });
 });
 

@@ -40,6 +40,7 @@ const INITIAL_ROOT = `sha256:${"0".repeat(64)}` as Digest;
 const COMMITTED_ROOT = `sha256:${"4".repeat(64)}` as Digest;
 const PUBLIC_IDEMPOTENCY_KEY = `sha256:${"5".repeat(64)}` as Digest;
 const PUBLIC_REQUEST = `sha256:${"6".repeat(64)}` as Digest;
+const PROVIDER_ROUTE = `sha256:${"7".repeat(64)}` as Digest;
 
 const sessionAdapter: AggregateAdapter<
   SessionAggregateState,
@@ -311,6 +312,7 @@ export class RecoverableWorkspaceEffect {
       fence,
       transactionTime: 1_200,
       deadline: 9_000,
+      providerRouteDigest: PROVIDER_ROUTE,
     });
 
     const dispatched = await sessionKernel.query(null, (state) => state);

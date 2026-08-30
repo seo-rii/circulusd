@@ -199,6 +199,7 @@ async function dispatchEffect(state: SessionAggregateState, suffix: string) {
     fence: fence(state),
     transactionTime: TRANSACTION_TIME,
     deadline: TRANSACTION_TIME + 50_000,
+    providerRouteDigest: digest("7"),
   });
 }
 
@@ -425,6 +426,7 @@ describe("Session public durable event journal", () => {
       fence: fence(dispatched.state),
       transactionTime: TRANSACTION_TIME + 1,
       deadline: TRANSACTION_TIME + 50_001,
+      providerRouteDigest: digest("7"),
     };
     const blocked = await applySessionCommand(dispatched.state, recoveryCommand);
     const replayedBlocked = await applySessionCommand(blocked.state, recoveryCommand);
@@ -546,7 +548,7 @@ describe("Session public durable event journal", () => {
     const schemaV2 = structuredClone(admitted.state) as unknown as Record<string, unknown>;
     schemaV2.schemaVersion = 2;
     const migratedV2 = migrateSessionState(schemaV2);
-    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 3 } });
+    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 4 } });
     expect(migratedV2.state.publicEvents).toEqual(admitted.state.publicEvents);
     expect(migratedV2.state.turnAdmissionReceipts).toEqual(
       admitted.state.turnAdmissionReceipts,
@@ -572,7 +574,7 @@ describe("Session public durable event journal", () => {
     expect(migratedV1).toMatchObject({
       migrated: true,
       state: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         publicEventSequence: 0,
         publicEvents: [],
         turnAdmissionReceipts: [],

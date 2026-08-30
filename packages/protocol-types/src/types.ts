@@ -88,6 +88,7 @@ export interface DispatchPermitClaims extends EffectClaim {
   readonly placementGeneration: number;
   readonly sandboxGeneration: number;
   readonly authorizationGeneration: number;
+  readonly providerRouteDigest: Digest;
   readonly deadline: number;
 }
 

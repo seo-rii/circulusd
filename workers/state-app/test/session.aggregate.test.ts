@@ -30,6 +30,7 @@ const INPUT_DIGEST = `sha256:${"2".repeat(64)}` as Digest;
 const POLICY_DIGEST = `sha256:${"4".repeat(64)}` as Digest;
 const EMERGENCY_DIGEST = `sha256:${"5".repeat(64)}` as Digest;
 const ROTATED_EMERGENCY_DIGEST = `sha256:${"6".repeat(64)}` as Digest;
+const PROVIDER_ROUTE_DIGEST = `sha256:${"7".repeat(64)}` as Digest;
 const TRANSACTION_TIME = 1_700_000_000_000;
 
 function newSession(): SessionAggregateState {
@@ -207,6 +208,7 @@ async function dispatchActiveEffect(
     fence: currentFence(state),
     transactionTime: TRANSACTION_TIME,
     deadline: 1_800_000_000_000,
+    providerRouteDigest: PROVIDER_ROUTE_DIGEST,
   });
 }
 
@@ -458,6 +460,7 @@ describe("Session authoritative aggregate", () => {
       fence: currentFence(firstPrepared.state),
       transactionTime: TRANSACTION_TIME,
       deadline: 1_800_000_000_000,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
     };
     const dispatched = await applySessionCommand(firstPrepared.state, dispatchCommand);
     const immediateReplay = await applySessionCommand(dispatched.state, dispatchCommand);
@@ -490,6 +493,7 @@ describe("Session authoritative aggregate", () => {
       fence: currentFence(secondDispatched.state),
       transactionTime: TRANSACTION_TIME + 1,
       deadline: 1_800_000_000_001,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
     };
     const recovered = await applySessionCommand(secondDispatched.state, recoverCommand);
     const recoveryRotated = await applySessionCommand(recovered.state, {
@@ -885,6 +889,7 @@ describe("Session authoritative aggregate", () => {
         fence: currentFence(prepared.state),
         transactionTime: TRANSACTION_TIME,
         deadline: 1_900_000_000_001,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
       }),
     ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
     await expect(
@@ -899,6 +904,7 @@ describe("Session authoritative aggregate", () => {
         fence: currentFence(prepared.state),
         transactionTime: 1_800_000_000_000,
         deadline: 1_800_000_000_000,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
       }),
     ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
     const dispatched = await dispatchActiveEffect(prepared.state, "dispatch_01");
@@ -928,6 +934,7 @@ describe("Session authoritative aggregate", () => {
       sandboxGeneration: 5,
       authorizationGeneration: 6,
       deadline: 1_800_000_000_000,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
     });
 
     await expect(
@@ -1081,6 +1088,7 @@ describe("Session authoritative aggregate", () => {
           fence: { ...fence, [generation]: fence[generation] + 1 },
           transactionTime: TRANSACTION_TIME,
           deadline: 1_800_000_000_000,
+          providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         }),
       ).rejects.toMatchObject({ code: "STALE_GENERATION" });
     }
@@ -1245,6 +1253,7 @@ describe("Session authoritative aggregate", () => {
       fence: currentFence(dispatched.state),
       transactionTime: TRANSACTION_TIME,
       deadline: 1_800_000_001_000,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
     });
     await expect(
       enqueueTurn(blocked.state, "turn_02", "enqueue_while_blocked"),

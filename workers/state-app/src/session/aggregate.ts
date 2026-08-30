@@ -401,6 +401,54 @@ function assertSessionCommandOutcome(
       }
       break;
     }
+    case "dispatch_start_claimed": {
+      const outcome = validatedExactFields(
+        value,
+        ["kind", "effectId", "fresh", "startPermit"],
+        [],
+        field,
+        errorCode,
+      );
+      const effectId = validatedIdentifier(outcome.effectId, `${field}.effectId`);
+      if (outcome.fresh !== true) {
+        sessionError(errorCode, `${field}.fresh must identify the original durable claim`);
+      }
+      const permit = validatedExactFields(
+        outcome.startPermit,
+        [
+          "dispatchPermitClaims",
+          "providerRequestId",
+          "commandDigest",
+          "claimedEventSequence",
+        ],
+        [],
+        `${field}.startPermit`,
+        errorCode,
+      );
+      const dispatch = parseDispatchPermitClaims(permit.dispatchPermitClaims);
+      if (dispatch.effectId !== effectId) {
+        sessionError(errorCode, `${field}.startPermit names another effect`);
+      }
+      if (permit.providerRequestId !== null) {
+        validatedIdentifier(
+          permit.providerRequestId,
+          `${field}.startPermit.providerRequestId`,
+        );
+      }
+      const commandDigest = parseDigest(
+        permit.commandDigest,
+        `${field}.startPermit.commandDigest`,
+      );
+      if (commandDigest === `sha256:${"0".repeat(64)}`) {
+        sessionError(errorCode, `${field}.startPermit.commandDigest must not be zero`);
+      }
+      validatedInteger(
+        permit.claimedEventSequence,
+        `${field}.startPermit.claimedEventSequence`,
+        1,
+      );
+      break;
+    }
     case "external_commit_recorded": {
       const outcome = validatedExactFields(
         value,
@@ -790,27 +838,11 @@ export function migrateSessionState(state: unknown): {
     typeof state === "object" && state !== null && !Array.isArray(state)
       ? (state as { readonly schemaVersion?: unknown }).schemaVersion
       : undefined;
-  if (schemaVersion === 2) {
-    const legacy = validatedExactFields(
-      state,
-      LEGACY_SESSION_STATE_V2_FIELDS,
-      [],
-      "legacy schema-v2 session state",
-      "FAILED_PRECONDITION",
-    );
-    return {
-      state: {
-        ...structuredClone(legacy),
-        schemaVersion: SESSION_STATE_SCHEMA_VERSION,
-      } as unknown as SessionAggregateState,
-      migrated: true,
-    };
-  }
   if (
     typeof state !== "object" ||
     state === null ||
     Array.isArray(state) ||
-    schemaVersion !== 1
+    (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3)
   ) {
     return {
       state: state as SessionAggregateState,
@@ -819,19 +851,40 @@ export function migrateSessionState(state: unknown): {
   }
   const legacy = validatedExactFields(
     state,
-    LEGACY_SESSION_STATE_V1_FIELDS,
+    schemaVersion === 1
+      ? LEGACY_SESSION_STATE_V1_FIELDS
+      : LEGACY_SESSION_STATE_V2_FIELDS,
     [],
-    "legacy schema-v1 session state",
+    `legacy schema-v${schemaVersion} session state`,
     "FAILED_PRECONDITION",
   );
+  const migrated = {
+    ...structuredClone(legacy),
+    schemaVersion: SESSION_STATE_SCHEMA_VERSION,
+    ...(schemaVersion === 1
+      ? {
+          publicEventSequence: 0,
+          publicEvents: [],
+          turnAdmissionReceipts: [],
+        }
+      : {}),
+  } as unknown as SessionAggregateState;
+  if (
+    !Array.isArray(migrated.effects) ||
+    migrated.effects.some((effect) =>
+      typeof effect !== "object" ||
+      effect === null ||
+      !("lastDispatch" in effect) ||
+      effect.lastDispatch !== null
+    )
+  ) {
+    sessionError(
+      "FAILED_PRECONDITION",
+      `schema-v${schemaVersion} Session dispatch history lacks a provable provider route`,
+    );
+  }
   return {
-    state: {
-      ...structuredClone(legacy),
-      schemaVersion: SESSION_STATE_SCHEMA_VERSION,
-      publicEventSequence: 0,
-      publicEvents: [],
-      turnAdmissionReceipts: [],
-    } as unknown as SessionAggregateState,
+    state: migrated,
     migrated: true,
   };
 }
@@ -1317,6 +1370,8 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
           "authorizationGeneration",
           "deadline",
           "providerRequestId",
+          "providerRouteDigest",
+          "start",
         ],
         [],
         `state.effects[${index}].lastDispatch`,
@@ -1348,6 +1403,16 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         0,
       );
       validatedInteger(effect.lastDispatch.deadline, `effect ${effect.effectId} deadline`, 1);
+      parseDispatchPermitClaims({
+        ...claimInput,
+        dispatchAttempt: effect.lastDispatch.dispatchAttempt,
+        turnLeaseGeneration: effect.lastDispatch.turnLeaseGeneration,
+        placementGeneration: effect.lastDispatch.placementGeneration,
+        sandboxGeneration: effect.lastDispatch.sandboxGeneration,
+        authorizationGeneration: effect.lastDispatch.authorizationGeneration,
+        providerRouteDigest: effect.lastDispatch.providerRouteDigest,
+        deadline: effect.lastDispatch.deadline,
+      });
       if (effect.lastDispatch.providerRequestId !== null) {
         validatedIdentifier(
           effect.lastDispatch.providerRequestId,
@@ -1356,6 +1421,54 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       }
       if (effect.lastDispatch.dispatchAttempt !== effect.dispatchAttempt) {
         sessionError("FAILED_PRECONDITION", "last dispatch metadata is not the current attempt");
+      }
+      if (effect.lastDispatch.start !== null) {
+        const start = validatedExactFields(
+          effect.lastDispatch.start,
+          [
+            "dispatchAttempt",
+            "turnLeaseGeneration",
+            "placementGeneration",
+            "sandboxGeneration",
+            "authorizationGeneration",
+            "deadline",
+            "providerRequestId",
+            "providerRouteDigest",
+            "commandDigest",
+            "claimedEventSequence",
+          ],
+          [],
+          `state.effects[${index}].lastDispatch.start`,
+          "FAILED_PRECONDITION",
+        );
+        const commandDigest = parseDigest(
+          start.commandDigest,
+          `effect ${effect.effectId} start commandDigest`,
+        );
+        if (commandDigest === `sha256:${"0".repeat(64)}`) {
+          sessionError("FAILED_PRECONDITION", "dispatch start commandDigest must not be zero");
+        }
+        const claimedEventSequence = validatedInteger(
+          start.claimedEventSequence,
+          `effect ${effect.effectId} start claimedEventSequence`,
+          1,
+        );
+        if (
+          claimedEventSequence > state.eventSequence ||
+          start.dispatchAttempt !== effect.lastDispatch.dispatchAttempt ||
+          start.turnLeaseGeneration !== effect.lastDispatch.turnLeaseGeneration ||
+          start.placementGeneration !== effect.lastDispatch.placementGeneration ||
+          start.sandboxGeneration !== effect.lastDispatch.sandboxGeneration ||
+          start.authorizationGeneration !== effect.lastDispatch.authorizationGeneration ||
+          start.deadline !== effect.lastDispatch.deadline ||
+          start.providerRequestId !== effect.lastDispatch.providerRequestId ||
+          start.providerRouteDigest !== effect.lastDispatch.providerRouteDigest
+        ) {
+          sessionError(
+            "FAILED_PRECONDITION",
+            "dispatch start claim does not match its durable dispatch attempt",
+          );
+        }
       }
     }
     if (effect.phase === "prepared" && effect.dispatchAttempt !== 0) {
@@ -1732,6 +1845,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   }
 
   const commandIds = new Set<string>();
+  const dispatchStartReceiptEffectIds = new Set<string>();
   if (state.commandReceipts.length !== state.eventSequence) {
     sessionError("FAILED_PRECONDITION", "eventSequence does not match command receipt count");
   }
@@ -1758,6 +1872,66 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       `state.commandReceipts[${index}].outcome`,
       "FAILED_PRECONDITION",
     );
+    if (receipt.outcome.kind === "dispatch_start_claimed") {
+      const effect = effectById(state, receipt.outcome.effectId);
+      const lastDispatch = effect?.lastDispatch;
+      const start = lastDispatch?.start;
+      const dispatch = parseDispatchPermitClaims(
+        receipt.outcome.startPermit.dispatchPermitClaims,
+      );
+      if (
+        effect === undefined ||
+        lastDispatch === null ||
+        lastDispatch === undefined ||
+        start === null ||
+        start === undefined ||
+        dispatchStartReceiptEffectIds.has(effect.effectId) ||
+        receipt.outcome.startPermit.claimedEventSequence !==
+          receipt.committedEventSequence ||
+        receipt.outcome.startPermit.claimedEventSequence !==
+          start.claimedEventSequence ||
+        receipt.outcome.startPermit.providerRequestId !== lastDispatch.providerRequestId ||
+        receipt.outcome.startPermit.commandDigest !== start.commandDigest ||
+        dispatch.tenantId !== effect.tenantId ||
+        dispatch.userId !== effect.userId ||
+        dispatch.sessionId !== effect.sessionId ||
+        dispatch.turnId !== effect.turnId ||
+        dispatch.effectId !== effect.effectId ||
+        dispatch.invocationId !== effect.invocationId ||
+        dispatch.requestDigest !== effect.requestDigest ||
+        dispatch.service !== effect.service ||
+        dispatch.operation !== effect.operation ||
+        dispatch.replayPolicy !== effect.replayPolicy ||
+        dispatch.parentOperationId !== effect.parentOperationId ||
+        dispatch.ordinal !== effect.ordinal ||
+        dispatch.dispatchAttempt !== effect.dispatchAttempt ||
+        dispatch.dispatchAttempt !== lastDispatch.dispatchAttempt ||
+        dispatch.turnLeaseGeneration !== lastDispatch.turnLeaseGeneration ||
+        dispatch.placementGeneration !== lastDispatch.placementGeneration ||
+        dispatch.sandboxGeneration !== lastDispatch.sandboxGeneration ||
+        dispatch.authorizationGeneration !== lastDispatch.authorizationGeneration ||
+        dispatch.providerRouteDigest !== lastDispatch.providerRouteDigest ||
+        dispatch.deadline !== lastDispatch.deadline
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start receipt does not match its durable start tombstone",
+        );
+      }
+      dispatchStartReceiptEffectIds.add(effect.effectId);
+    }
+  }
+  for (const effect of state.effects) {
+    if (
+      effect.lastDispatch !== null &&
+      effect.lastDispatch.start !== null &&
+      !dispatchStartReceiptEffectIds.has(effect.effectId)
+    ) {
+      sessionError(
+        "FAILED_PRECONDITION",
+        "dispatch start tombstone lacks its exact durable receipt",
+      );
+    }
   }
 
   let receiptActiveRevision: typeof activeRevision | null = null;
@@ -1943,6 +2117,7 @@ export function replaySessionPublicEvents(
 export async function applySessionCommand(
   state: SessionAggregateState,
   command: SessionCommand,
+  context?: { readonly transactionTime: number },
 ): Promise<ApplySessionCommandResult> {
   await validateSessionState(state);
   validatedIdentifier(command.commandId, "commandId");
@@ -1980,6 +2155,39 @@ export async function applySessionCommand(
       ];
       break;
     case "dispatch_effect":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "turnId",
+        "effectId",
+        "invocationId",
+        "requestDigest",
+        "fence",
+        "transactionTime",
+        "deadline",
+        "providerRouteDigest",
+      ];
+      optionalCommandFields = ["providerRequestId"];
+      break;
+    case "claim_dispatch_start":
+      commandFields = [
+        "kind",
+        "commandId",
+        "expectedEventSequence",
+        "turnId",
+        "effectId",
+        "invocationId",
+        "requestDigest",
+        "fence",
+        "transactionTime",
+        "dispatchAttempt",
+        "providerRequestId",
+        "providerRouteDigest",
+        "dispatchPermitClaims",
+        "commandDigest",
+      ];
+      break;
     case "recover_effect":
       commandFields = [
         "kind",
@@ -1993,7 +2201,7 @@ export async function applySessionCommand(
         "transactionTime",
         "deadline",
       ];
-      optionalCommandFields = ["providerRequestId"];
+      optionalCommandFields = ["providerRequestId", "providerRouteDigest"];
       break;
     case "record_external_commit":
       commandFields = [
@@ -2038,7 +2246,7 @@ export async function applySessionCommand(
         "transactionTime",
         "deadline",
       ];
-      optionalCommandFields = ["providerRequestId"];
+      optionalCommandFields = ["providerRequestId", "providerRouteDigest"];
       break;
     case "request_abort":
       commandFields = [
@@ -2242,6 +2450,54 @@ export async function applySessionCommand(
       );
     }
     const receiptOutcome = existingReceipt.outcome;
+    if (receiptOutcome.kind === "dispatch_start_claimed") {
+      const effect = effectById(state, receiptOutcome.effectId);
+      const start = effect?.lastDispatch?.start;
+      const dispatch = parseDispatchPermitClaims(
+        receiptOutcome.startPermit.dispatchPermitClaims,
+      );
+      if (
+        effect === undefined ||
+        start === null ||
+        start === undefined ||
+        dispatch.tenantId !== effect.tenantId ||
+        dispatch.userId !== effect.userId ||
+        dispatch.sessionId !== effect.sessionId ||
+        dispatch.turnId !== effect.turnId ||
+        dispatch.effectId !== effect.effectId ||
+        dispatch.invocationId !== effect.invocationId ||
+        dispatch.requestDigest !== effect.requestDigest ||
+        dispatch.service !== effect.service ||
+        dispatch.operation !== effect.operation ||
+        dispatch.replayPolicy !== effect.replayPolicy ||
+        dispatch.parentOperationId !== effect.parentOperationId ||
+        dispatch.ordinal !== effect.ordinal ||
+        dispatch.dispatchAttempt !== effect.dispatchAttempt ||
+        dispatch.dispatchAttempt !== effect.lastDispatch?.dispatchAttempt ||
+        dispatch.turnLeaseGeneration !== effect.lastDispatch.turnLeaseGeneration ||
+        dispatch.placementGeneration !== effect.lastDispatch.placementGeneration ||
+        dispatch.sandboxGeneration !== effect.lastDispatch.sandboxGeneration ||
+        dispatch.authorizationGeneration !== effect.lastDispatch.authorizationGeneration ||
+        dispatch.providerRouteDigest !== effect.lastDispatch.providerRouteDigest ||
+        dispatch.deadline !== effect.lastDispatch.deadline ||
+        receiptOutcome.startPermit.providerRequestId !==
+          effect.lastDispatch.providerRequestId ||
+        receiptOutcome.startPermit.commandDigest !== start.commandDigest ||
+        receiptOutcome.startPermit.claimedEventSequence !==
+          start.claimedEventSequence
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start receipt does not match durable effect state",
+        );
+      }
+      return {
+        state,
+        outcome: { ...structuredClone(receiptOutcome), fresh: false },
+        commandDigest,
+        replayed: true,
+      };
+    }
     const dispatchPermitClaims =
       receiptOutcome.kind === "effect_dispatched"
         ? receiptOutcome.dispatchPermitClaims
@@ -2298,7 +2554,9 @@ export async function applySessionCommand(
         effect.lastDispatch.placementGeneration !== dispatchPermitClaims.placementGeneration ||
         effect.lastDispatch.sandboxGeneration !== dispatchPermitClaims.sandboxGeneration ||
         effect.lastDispatch.authorizationGeneration !==
-          dispatchPermitClaims.authorizationGeneration
+          dispatchPermitClaims.authorizationGeneration ||
+        effect.lastDispatch.providerRouteDigest !==
+          dispatchPermitClaims.providerRouteDigest
       ) {
         sessionError(
           "FAILED_PRECONDITION",
@@ -2312,6 +2570,128 @@ export async function applySessionCommand(
       commandDigest,
       replayed: true,
     };
+  }
+  if (command.kind === "claim_dispatch_start") {
+    const active = state.activeTurn;
+    const effect = effectById(state, command.effectId);
+    const lastDispatch = effect?.lastDispatch;
+    const start = lastDispatch?.start;
+    if (start !== null && start !== undefined) {
+      if (effect === undefined || lastDispatch === null || lastDispatch === undefined) {
+        sessionError("FAILED_PRECONDITION", "dispatch start state is incomplete");
+      }
+      let dispatch: ReturnType<typeof parseDispatchPermitClaims>;
+      try {
+        dispatch = parseDispatchPermitClaims(command.dispatchPermitClaims);
+      } catch (error) {
+        if (error instanceof ProtocolValidationError) {
+          sessionError("FAILED_PRECONDITION", "dispatch start used a malformed permit proof");
+        }
+        throw error;
+      }
+      const providerRouteDigest = parseDigest(
+        command.providerRouteDigest,
+        "providerRouteDigest",
+      );
+      const providerRequestId = command.providerRequestId === null
+        ? null
+        : validatedIdentifier(command.providerRequestId, "providerRequestId");
+      const providerCommandDigest = parseDigest(command.commandDigest, "commandDigest");
+      const replayFence = validatedExactFields(
+        command.fence,
+        [
+          "turnLeaseGeneration",
+          "placementGeneration",
+          "sandboxGeneration",
+          "authorizationGeneration",
+        ],
+        [],
+        "fence",
+        "INVALID_ARGUMENT",
+      );
+      const dispatchAttempt = validatedInteger(
+        command.dispatchAttempt,
+        "dispatchAttempt",
+        1,
+      );
+      validatedInteger(
+        command.transactionTime,
+        "transactionTime",
+        0,
+      );
+      if (
+        active === null ||
+        active.activeEffectId !== effect.effectId ||
+        active.turnId !== command.turnId ||
+        effect.phase !== "dispatched" ||
+        validatedInteger(replayFence.turnLeaseGeneration, "fence.turnLeaseGeneration", 0) !==
+          active.turnLeaseGeneration ||
+        validatedInteger(replayFence.placementGeneration, "fence.placementGeneration", 0) !==
+          state.placementGeneration ||
+        validatedInteger(replayFence.sandboxGeneration, "fence.sandboxGeneration", 0) !==
+          state.sandboxGeneration ||
+        validatedInteger(
+          replayFence.authorizationGeneration,
+          "fence.authorizationGeneration",
+          0,
+        ) !== state.authorizationGeneration
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start replay is no longer on the active dispatch fence",
+        );
+      }
+      if (
+        providerCommandDigest === `sha256:${"0".repeat(64)}` ||
+        providerRouteDigest !== lastDispatch.providerRouteDigest ||
+        providerRequestId !== lastDispatch.providerRequestId ||
+        dispatchAttempt !== lastDispatch.dispatchAttempt ||
+        dispatchAttempt !== effect.dispatchAttempt ||
+        command.invocationId !== effect.invocationId ||
+        command.requestDigest !== effect.requestDigest ||
+        dispatch.tenantId !== effect.tenantId ||
+        dispatch.userId !== effect.userId ||
+        dispatch.sessionId !== effect.sessionId ||
+        dispatch.turnId !== effect.turnId ||
+        dispatch.effectId !== effect.effectId ||
+        dispatch.invocationId !== effect.invocationId ||
+        dispatch.requestDigest !== effect.requestDigest ||
+        dispatch.service !== effect.service ||
+        dispatch.operation !== effect.operation ||
+        dispatch.replayPolicy !== effect.replayPolicy ||
+        dispatch.parentOperationId !== effect.parentOperationId ||
+        dispatch.ordinal !== effect.ordinal ||
+        dispatch.dispatchAttempt !== lastDispatch.dispatchAttempt ||
+        dispatch.turnLeaseGeneration !== lastDispatch.turnLeaseGeneration ||
+        dispatch.placementGeneration !== lastDispatch.placementGeneration ||
+        dispatch.sandboxGeneration !== lastDispatch.sandboxGeneration ||
+        dispatch.authorizationGeneration !== lastDispatch.authorizationGeneration ||
+        dispatch.providerRouteDigest !== lastDispatch.providerRouteDigest ||
+        dispatch.deadline !== lastDispatch.deadline ||
+        providerCommandDigest !== start.commandDigest
+      ) {
+        sessionError(
+          "IDEMPOTENCY_CONFLICT",
+          "dispatch start attempt was already claimed with another exact proof",
+        );
+      }
+      return {
+        state,
+        outcome: {
+          kind: "dispatch_start_claimed",
+          effectId: effect.effectId,
+          fresh: false,
+          startPermit: {
+            dispatchPermitClaims: dispatch,
+            providerRequestId,
+            commandDigest: providerCommandDigest,
+            claimedEventSequence: start.claimedEventSequence,
+          },
+        },
+        commandDigest,
+        replayed: true,
+      };
+    }
   }
   if (command.expectedEventSequence !== state.eventSequence) {
     sessionError(
@@ -2760,6 +3140,13 @@ export async function applySessionCommand(
           "dispatch requires transactionTime < deadline <= leaseExpiresAt",
         );
       }
+      const providerRouteDigest = parseDigest(
+        command.providerRouteDigest,
+        "providerRouteDigest",
+      );
+      if (providerRouteDigest === `sha256:${"0".repeat(64)}`) {
+        sessionError("INVALID_ARGUMENT", "providerRouteDigest must not be the zero digest");
+      }
       effect.phase = "dispatched";
       effect.dispatchAttempt += 1;
       effect.lastDispatch = {
@@ -2769,6 +3156,8 @@ export async function applySessionCommand(
         sandboxGeneration: next.sandboxGeneration,
         authorizationGeneration: next.authorizationGeneration,
         deadline,
+        providerRouteDigest,
+        start: null,
         providerRequestId:
           command.providerRequestId === undefined || command.providerRequestId === null
             ? null
@@ -2793,9 +3182,137 @@ export async function applySessionCommand(
         placementGeneration: next.placementGeneration,
         sandboxGeneration: next.sandboxGeneration,
         authorizationGeneration: next.authorizationGeneration,
+        providerRouteDigest,
         deadline,
       });
       outcome = { kind: "effect_dispatched", effectId: effect.effectId, dispatchPermitClaims };
+      break;
+    }
+
+    case "claim_dispatch_start": {
+      const active = next.activeTurn;
+      const effect = effectById(next, command.effectId);
+      if (
+        active === null ||
+        active.activeEffectId !== command.effectId ||
+        effect === undefined ||
+        effect.turnId !== command.turnId
+      ) {
+        sessionError("NOT_FOUND", `effect ${command.effectId} is not active`);
+      }
+      if (active.abortRequested) {
+        sessionError("ABORTED", "an aborted turn cannot claim a dispatch start");
+      }
+      if (
+        effect.invocationId !== command.invocationId ||
+        effect.requestDigest !== command.requestDigest
+      ) {
+        sessionError("DIGEST_MISMATCH", "effect identity or requestDigest does not match");
+      }
+      const lastDispatch = effect.lastDispatch;
+      if (effect.phase !== "dispatched" || lastDispatch === null) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "only the current dispatched effect can claim a provider start",
+        );
+      }
+      if (lastDispatch.start !== null) {
+        sessionError("IDEMPOTENCY_CONFLICT", "dispatch start was already claimed");
+      }
+      validatedInteger(command.transactionTime, "transactionTime", 0);
+      const transactionTime = validatedInteger(
+        context?.transactionTime ?? command.transactionTime,
+        context === undefined ? "transactionTime" : "host transactionTime",
+        0,
+      );
+      if (transactionTime >= lastDispatch.deadline) {
+        sessionError("FAILED_PRECONDITION", "dispatch start claim exceeded its deadline");
+      }
+      const dispatchAttempt = validatedInteger(
+        command.dispatchAttempt,
+        "dispatchAttempt",
+        1,
+      );
+      const providerRequestId = command.providerRequestId === null
+        ? null
+        : validatedIdentifier(command.providerRequestId, "providerRequestId");
+      const providerRouteDigest = parseDigest(
+        command.providerRouteDigest,
+        "providerRouteDigest",
+      );
+      const providerCommandDigest = parseDigest(command.commandDigest, "commandDigest");
+      if (
+        providerRouteDigest === `sha256:${"0".repeat(64)}` ||
+        providerCommandDigest === `sha256:${"0".repeat(64)}`
+      ) {
+        sessionError("INVALID_ARGUMENT", "dispatch start digests must not be zero");
+      }
+      let dispatch: ReturnType<typeof parseDispatchPermitClaims>;
+      try {
+        dispatch = parseDispatchPermitClaims(command.dispatchPermitClaims);
+      } catch (error) {
+        if (error instanceof ProtocolValidationError) {
+          sessionError("FAILED_PRECONDITION", "dispatch start used a malformed permit proof");
+        }
+        throw error;
+      }
+      if (
+        dispatchAttempt !== effect.dispatchAttempt ||
+        dispatchAttempt !== lastDispatch.dispatchAttempt ||
+        providerRequestId !== lastDispatch.providerRequestId ||
+        providerRouteDigest !== lastDispatch.providerRouteDigest ||
+        dispatch.tenantId !== effect.tenantId ||
+        dispatch.userId !== effect.userId ||
+        dispatch.sessionId !== effect.sessionId ||
+        dispatch.turnId !== effect.turnId ||
+        dispatch.effectId !== effect.effectId ||
+        dispatch.invocationId !== effect.invocationId ||
+        dispatch.requestDigest !== effect.requestDigest ||
+        dispatch.service !== effect.service ||
+        dispatch.operation !== effect.operation ||
+        dispatch.replayPolicy !== effect.replayPolicy ||
+        dispatch.parentOperationId !== effect.parentOperationId ||
+        dispatch.ordinal !== effect.ordinal ||
+        dispatch.dispatchAttempt !== lastDispatch.dispatchAttempt ||
+        dispatch.turnLeaseGeneration !== lastDispatch.turnLeaseGeneration ||
+        dispatch.placementGeneration !== lastDispatch.placementGeneration ||
+        dispatch.sandboxGeneration !== lastDispatch.sandboxGeneration ||
+        dispatch.authorizationGeneration !== lastDispatch.authorizationGeneration ||
+        dispatch.providerRouteDigest !== lastDispatch.providerRouteDigest ||
+        dispatch.deadline !== lastDispatch.deadline
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start claim does not match the durable dispatch permit",
+        );
+      }
+      if (next.eventSequence === Number.MAX_SAFE_INTEGER) {
+        sessionError("FAILED_PRECONDITION", "eventSequence cannot be incremented safely");
+      }
+      const claimedEventSequence = next.eventSequence + 1;
+      lastDispatch.start = {
+        dispatchAttempt,
+        turnLeaseGeneration: lastDispatch.turnLeaseGeneration,
+        placementGeneration: lastDispatch.placementGeneration,
+        sandboxGeneration: lastDispatch.sandboxGeneration,
+        authorizationGeneration: lastDispatch.authorizationGeneration,
+        deadline: lastDispatch.deadline,
+        providerRequestId,
+        providerRouteDigest,
+        commandDigest: providerCommandDigest,
+        claimedEventSequence,
+      };
+      outcome = {
+        kind: "dispatch_start_claimed",
+        effectId: effect.effectId,
+        fresh: true,
+        startPermit: {
+          dispatchPermitClaims: dispatch,
+          providerRequestId,
+          commandDigest: providerCommandDigest,
+          claimedEventSequence,
+        },
+      };
       break;
     }
 
@@ -2986,6 +3503,12 @@ export async function applySessionCommand(
       if (effect.phase !== "dispatched") {
         sessionError("FAILED_PRECONDITION", "only an uncertain dispatched effect is recoverable");
       }
+      if (effect.lastDispatch?.start !== null) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "a claimed dispatch start must be resolved through the external ledger",
+        );
+      }
       if (active.abortRequested) {
         if (effect.replayPolicy === "confirm") {
           effect.phase = "blocked";
@@ -3018,6 +3541,13 @@ export async function applySessionCommand(
         );
       }
       if (effect.replayPolicy === "safe" || effect.replayPolicy === "idempotency-key") {
+        const providerRouteDigest = parseDigest(
+          command.providerRouteDigest,
+          "providerRouteDigest",
+        );
+        if (providerRouteDigest === `sha256:${"0".repeat(64)}`) {
+          sessionError("INVALID_ARGUMENT", "providerRouteDigest must not be the zero digest");
+        }
         effect.dispatchAttempt += 1;
         effect.lastDispatch = {
           dispatchAttempt: effect.dispatchAttempt,
@@ -3026,6 +3556,8 @@ export async function applySessionCommand(
           sandboxGeneration: next.sandboxGeneration,
           authorizationGeneration: next.authorizationGeneration,
           deadline,
+          providerRouteDigest,
+          start: null,
           providerRequestId:
             command.providerRequestId === undefined || command.providerRequestId === null
               ? null
@@ -3050,6 +3582,7 @@ export async function applySessionCommand(
           placementGeneration: next.placementGeneration,
           sandboxGeneration: next.sandboxGeneration,
           authorizationGeneration: next.authorizationGeneration,
+          providerRouteDigest,
           deadline,
         });
         outcome = {
@@ -3113,6 +3646,16 @@ export async function applySessionCommand(
             "confirmed retry requires transactionTime < deadline <= leaseExpiresAt",
           );
         }
+        if (effect.lastDispatch?.start !== null) {
+          sessionError("FAILED_PRECONDITION", "a claimed dispatch attempt cannot be retried");
+        }
+        const providerRouteDigest = parseDigest(
+          command.providerRouteDigest,
+          "providerRouteDigest",
+        );
+        if (providerRouteDigest === `sha256:${"0".repeat(64)}`) {
+          sessionError("INVALID_ARGUMENT", "providerRouteDigest must not be the zero digest");
+        }
         effect.phase = "dispatched";
         effect.dispatchAttempt += 1;
         active.status = "active";
@@ -3124,6 +3667,8 @@ export async function applySessionCommand(
           sandboxGeneration: next.sandboxGeneration,
           authorizationGeneration: next.authorizationGeneration,
           deadline,
+          providerRouteDigest,
+          start: null,
           providerRequestId:
             command.providerRequestId === undefined || command.providerRequestId === null
               ? null
@@ -3148,6 +3693,7 @@ export async function applySessionCommand(
           placementGeneration: next.placementGeneration,
           sandboxGeneration: next.sandboxGeneration,
           authorizationGeneration: next.authorizationGeneration,
+          providerRouteDigest,
           deadline,
         });
         outcome = {

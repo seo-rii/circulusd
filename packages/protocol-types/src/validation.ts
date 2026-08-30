@@ -357,6 +357,7 @@ const PERMIT_FIELDS = [
   "placementGeneration",
   "sandboxGeneration",
   "authorizationGeneration",
+  "providerRouteDigest",
   "deadline",
 ] as const;
 
@@ -367,6 +368,16 @@ export function parseDispatchPermitClaims(value: unknown): DispatchPermitClaims 
     EFFECT_OPTIONAL_FIELDS,
     "$dispatchPermitClaims",
   );
+  const providerRouteDigest = parseDigest(
+    record.providerRouteDigest,
+    "$dispatchPermitClaims.providerRouteDigest",
+  );
+  if (providerRouteDigest === `sha256:${"0".repeat(64)}`) {
+    validationError(
+      "$dispatchPermitClaims.providerRouteDigest",
+      "must not be the zero digest",
+    );
+  }
   return {
     ...effectClaimFromRecord(record, "$dispatchPermitClaims"),
     dispatchAttempt: safeInteger(
@@ -394,6 +405,7 @@ export function parseDispatchPermitClaims(value: unknown): DispatchPermitClaims 
       "$dispatchPermitClaims.authorizationGeneration",
       0,
     ),
+    providerRouteDigest,
     deadline: safeInteger(record.deadline, "$dispatchPermitClaims.deadline", 1),
   };
 }

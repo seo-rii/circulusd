@@ -832,6 +832,51 @@ describe("command host transactional kernel", () => {
     expect(snapshot.commandReceipts).toHaveLength(1);
   });
 
+  it("samples authoritative host time again when a storage transaction retries", async () => {
+    interface State {
+      readonly version: number;
+      readonly observedTransactionTime: number | null;
+    }
+    const observedTimes: number[] = [];
+    const clockValues = [100, 200];
+    const adapter: AggregateAdapter<State, State, null, number> = {
+      kind: "host-clock-retry-test",
+      create: (input) => input,
+      validate: () => undefined,
+      apply: async (state, _command, context) => {
+        observedTimes.push(context.transactionTime);
+        return {
+          state: {
+            version: state.version + 1,
+            observedTransactionTime: context.transactionTime,
+          },
+          outcome: context.transactionTime,
+          replayed: false,
+        };
+      },
+      version: (state) => state.version,
+    };
+    const storage = new FakeTransactionalStorage();
+    const kernel = new TransactionalAggregateKernel(
+      stateWith(storage),
+      adapter,
+      undefined,
+      () => clockValues.shift() ?? 300,
+    );
+    await kernel.initialize({ version: 0, observedTransactionTime: null });
+    storage.forceRetryCount = 1;
+
+    await expect(kernel.execute(null)).resolves.toMatchObject({
+      outcome: 200,
+      version: 1,
+    });
+    expect(observedTimes).toEqual([100, 200]);
+    await expect(kernel.query(null, (state) => state)).resolves.toEqual({
+      version: 1,
+      observedTransactionTime: 200,
+    });
+  });
+
   it("rejects a replay result that changes the supposedly committed state", async () => {
     interface State {
       readonly version: number;
@@ -1271,7 +1316,7 @@ describe("named aggregate cells", () => {
       { authority: sessionAuthority(), now: 200 },
       (request) => cell.readSession(request),
     )).resolves.toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       eventSequence: 1,
       activeTurn: { turnId: "turn-1" },
       publicEventSequence: 0,

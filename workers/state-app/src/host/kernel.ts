@@ -3,6 +3,7 @@ import { digestStructuredValue, type Digest } from "@circulusd/protocol-types";
 import {
   HostContractError,
   type AggregateAdapter,
+  type AggregateApplyContext,
   type CellRoutePort,
   type CommittedCommandResult,
   type DurableObjectStatePort,
@@ -75,18 +76,31 @@ function checkedVersion(version: number): number {
   return version;
 }
 
+function checkedTransactionTime(transactionTime: number): number {
+  if (!Number.isSafeInteger(transactionTime) || transactionTime < 0) {
+    throw new HostContractError(
+      "INVALID_AGGREGATE_OUTPUT",
+      "host transaction time must be a non-negative safe integer",
+    );
+  }
+  return transactionTime;
+}
+
 export class TransactionalAggregateKernel<State, Initialization, Command, Outcome> {
   private readonly storage: TransactionalStoragePort;
   private readonly adapter: AggregateAdapter<State, Initialization, Command, Outcome>;
   private readonly records: ChunkedAggregateStorage<State>;
+  private readonly clock: () => number;
 
   constructor(
     state: DurableObjectStatePort,
     adapter: AggregateAdapter<State, Initialization, Command, Outcome>,
     route?: CellRoutePort,
+    clock: () => number = Date.now,
   ) {
     this.storage = transactionalStorage(state);
     this.adapter = adapter;
+    this.clock = clock;
     this.records = new ChunkedAggregateStorage(
       adapter.kind,
       adapter.validate,
@@ -139,11 +153,15 @@ export class TransactionalAggregateKernel<State, Initialization, Command, Outcom
   async execute(command: Command): Promise<CommittedCommandResult<Outcome>> {
     const commandSnapshot = cloneBoundary(command, "command input");
     const result = await this.transact(async (transaction) => {
+      const context: AggregateApplyContext = {
+        transactionTime: checkedTransactionTime(this.clock()),
+      };
       const stored = await this.loadInitialized(transaction);
       const { record } = stored;
       const applied = await this.adapter.apply(
         cloneBoundary(record.state, "stored aggregate state"),
         cloneBoundary(commandSnapshot, "command input"),
+        context,
       );
       if (
         typeof applied !== "object" ||

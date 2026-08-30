@@ -32,7 +32,7 @@ const (
 	ingressSchemaDigest = "sha256:6365dfa4e6e73b349508a46688cfcaacdeacece11cd11ed2d7f3e40af49ad3ee"
 
 	hostProtocol     = "circulus.v1alpha1"
-	hostSchemaDigest = "sha256:75eff4c0bebfc4717366fffebeb07f661d8c626cf7dd7eb7e09b8edab8d063ee"
+	hostSchemaDigest = "sha256:17eae318de36071e4587e0b2a1a2e70bc613c6ba6f62c817f104620227437e71"
 
 	keyIDHeader       = "X-Circulus-State-Key-Id"
 	signatureHeader   = "X-Circulus-State-Signature"

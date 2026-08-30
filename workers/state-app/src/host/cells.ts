@@ -95,7 +95,7 @@ const sessionAdapter: AggregateAdapter<
   create: createSessionState,
   migrate: migrateSessionState,
   validate: validateSessionState,
-  apply: applySessionCommand,
+  apply: (state, command, context) => applySessionCommand(state, command, context),
   version: (state) => state.eventSequence,
 };
 

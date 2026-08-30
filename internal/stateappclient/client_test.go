@@ -1052,7 +1052,7 @@ func requestIDFromBody(t *testing.T, body []byte) string {
 func baseEnvelope(requestID string, payload canonical.Map) canonical.Map {
 	return canonical.Map{
 		"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0),
-		"schemaDigest": "sha256:75eff4c0bebfc4717366fffebeb07f661d8c626cf7dd7eb7e09b8edab8d063ee",
+		"schemaDigest": "sha256:17eae318de36071e4587e0b2a1a2e70bc613c6ba6f62c817f104620227437e71",
 		"requestId":    requestID, "payload": payload,
 	}
 }

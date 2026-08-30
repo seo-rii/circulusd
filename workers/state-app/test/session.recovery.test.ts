@@ -18,6 +18,7 @@ import {
 } from "../src/session/index.ts";
 
 const RUNTIME_DIGEST = `sha256:${"a".repeat(64)}` as Digest;
+const PROVIDER_ROUTE_DIGEST = `sha256:${"b".repeat(64)}` as Digest;
 const TRANSACTION_TIME = 1_700_000_000_000;
 
 function freshSession(): SessionAggregateState {
@@ -146,6 +147,7 @@ async function dispatchedEffect(replayPolicy: ReplayPolicy): Promise<SessionAggr
     requestDigest: requestDigest(prepared.state),
     fence: fence(prepared.state),
     transactionTime: TRANSACTION_TIME,
+    providerRouteDigest: PROVIDER_ROUTE_DIGEST,
     deadline: 1_800_000_000_000,
   });
   return dispatched.state;
@@ -165,6 +167,7 @@ describe("effect recovery policy", () => {
         requestDigest: requestDigest(dispatched),
         fence: fence(dispatched),
         transactionTime: TRANSACTION_TIME,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         deadline: 1_800_000_001_000,
       });
 
@@ -179,6 +182,7 @@ describe("effect recovery policy", () => {
         dispatchPermitClaims: {
           invocationId: "invocation_stable",
           dispatchAttempt: 2,
+          providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         },
       });
     });
@@ -197,6 +201,7 @@ describe("effect recovery policy", () => {
         requestDigest: requestDigest(state),
         fence: fence(state),
         transactionTime: TRANSACTION_TIME,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         deadline: 1_800_000_010_000 + retry,
       });
       state = recovered.state;
@@ -220,6 +225,7 @@ describe("effect recovery policy", () => {
       requestDigest: requestDigest(dispatched),
       fence: fence(dispatched),
       transactionTime: TRANSACTION_TIME,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
       deadline: 1_800_000_001_000,
       providerRequestId: "provider_attempt_2",
     });
@@ -288,8 +294,10 @@ describe("effect recovery policy", () => {
         placementGeneration: 1,
         sandboxGeneration: 2,
         authorizationGeneration: 3,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         deadline: 1_800_000_001_000,
         providerRequestId: "provider_attempt_2",
+        start: null,
       },
     });
   });
@@ -307,6 +315,7 @@ describe("effect recovery policy", () => {
         requestDigest: requestDigest(dispatched),
         fence: fence(dispatched),
         transactionTime: 1_800_000_001_000,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         deadline: 1_800_000_001_000,
       }),
     ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
@@ -366,6 +375,7 @@ describe("effect recovery policy", () => {
         fence: fence(blocked.state),
         decision: "retry",
         transactionTime: 1_800_000_002_000,
+        providerRouteDigest: PROVIDER_ROUTE_DIGEST,
         deadline: 1_800_000_002_000,
       }),
     ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
@@ -381,6 +391,7 @@ describe("effect recovery policy", () => {
       fence: fence(blocked.state),
       decision: "retry",
       transactionTime: TRANSACTION_TIME,
+      providerRouteDigest: PROVIDER_ROUTE_DIGEST,
       deadline: 1_800_000_002_000,
     });
     expect(retried.state.activeTurn?.status).toBe("active");
