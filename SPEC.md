@@ -4765,6 +4765,77 @@ YAML에서 받지 않는다. 서명 검증된 release manifest의 정확한 arti
 offline conformance signer와 live runtime signer는 서로 다른 trust domain이다.
 `conformanceRootsFile`과 `runtimeRootsFile` 사이에는 key ID뿐 아니라 Ed25519
 public-key material도 재사용할 수 없으며, 하나라도 겹치면 startup은 실패한다.
+각 trust-roots 파일은 다음의 role-tagged JSON envelope를 사용한다.
+
+```json
+{
+  "schemaVersion": 1,
+  "trustDomain": "conformance-evidence",
+  "roots": [
+    {
+      "keyId": "conformance-root-1",
+      "algorithm": "ed25519",
+      "publicKey": "canonical-padded-standard-base64"
+    }
+  ]
+}
+```
+
+runtime roots의 `trustDomain`은 정확히 `runtime-probe`여야 한다. 각 파일에는
+1..64개의 root가 있어야 하고, 같은 파일 안에서도 key ID 또는 32-byte public-key
+material을 재사용할 수 없다. `publicKey`는 개행 없는 canonical padded standard
+base64이고 `algorithm`은 정확히 `ed25519`이다. Decode한 public key는 canonical
+Edwards25519 point encoding이어야 하며 identity, low-order point, torsion component가
+있는 mixed-order point를 거부하고 prime-order subgroup에 속해야 한다.
+
+`productionEvidenceFile`은 다음 schema version 1 JSON object이다.
+
+```json
+{
+  "schemaVersion": 1,
+  "descriptor": {
+    "schemaVersion": 1,
+    "backendKind": "celld",
+    "buildDigest": "sha256:<64-lowercase-hex>",
+    "applicationDigest": "sha256:<64-lowercase-hex>",
+    "instanceId": "state-node-1",
+    "transactionDomainId": "state-domain-1",
+    "durabilityClass": "crash-durable-rpo0",
+    "conformanceRunId": "conformance-run-1",
+    "conformanceDigest": "sha256:<64-lowercase-hex>",
+    "runtimeKeyId": "runtime-root-1",
+    "probeEpoch": 1,
+    "productionEligible": true,
+    "atomicGroups": ["command-receipt", "effect-lifecycle"]
+  },
+  "issuedAtUnix": 1788048000,
+  "expiresAtUnix": 1788051600,
+  "keyId": "conformance-root-1",
+  "algorithm": "ed25519",
+  "signature": "canonical-padded-standard-base64"
+}
+```
+
+Digest는 정확히 `sha256:`과 64개의 lowercase hex이고, ID와 atomic-group 이름은
+`[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}`이다. `probeEpoch`와 `issuedAtUnix`는 양수이고
+`expiresAtUnix > issuedAtUnix`여야 한다. `atomicGroups`는 1..64개의 고유한 이름을
+strict lexicographic ascending order로 가진다. `backendKind: celld`는
+`durabilityClass: crash-durable-rpo0`와 `productionEligible: true`를 요구한다.
+구조 검사용 `backendKind: reference-memory` descriptor는 정확히
+`durabilityClass: process-local`과 `productionEligible: false`만 허용하지만 production
+requirements에는 합격할 수 없다. `algorithm`은 정확히 `ed25519`이고 `signature`은
+64-byte Ed25519 signature의 canonical padded standard base64이다.
+
+evidence decoder는 이 envelope와 descriptor의 구조적 유효성만 검증한다. signer
+trust, freshness, 배포 요구사항, live probe는 release manifest에서 파생한 요구사항과
+분리된 두 trust domain을 전달받은 production verifier가 함께 검증해야 하며, decode
+성공 자체는 readiness를 의미하지 않는다.
+
+두 형식은 exact case-sensitive member set을 사용한다. unknown/duplicate/missing/null
+member, trailing JSON value, invalid UTF-8와 BOM을 거부하고 maximum nesting depth 32,
+maximum token count 4096를 적용한다. evidence document는 최대 64 KiB,
+trust-roots document는 최대 1 MiB이다. parser error는 document, signature, key
+material을 포함하지 않는 고정된 범주의 오류여야 한다.
 
 `maxResidentSessions`와 shard memory limit의 실제 reference 값은 Phase 0 benchmark 후 조정해야 한다. 숫자를 product invariant로 간주하지 않는다.
 

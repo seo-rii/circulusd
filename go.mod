@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	connectrpc.com/connect v1.19.1
+	filippo.io/edwards25519 v1.2.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/text v0.41.0
 	google.golang.org/protobuf v1.36.10

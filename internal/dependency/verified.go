@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/edwards25519"
 	"github.com/hancomac/circulusd/internal/canonical"
 )
 
@@ -45,6 +46,16 @@ var (
 
 	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 	digestPattern     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+	inverseEd25519Cofactor = func() edwards25519.Scalar {
+		var encoded [32]byte
+		encoded[0] = 8
+		cofactor, err := edwards25519.NewScalar().SetCanonicalBytes(encoded[:])
+		if err != nil {
+			panic("dependency: invalid internal Ed25519 cofactor")
+		}
+		return *edwards25519.NewScalar().Invert(cofactor)
+	}()
 )
 
 type AtomicGroup string
@@ -494,13 +505,43 @@ func cloneDescriptor(descriptor Descriptor) Descriptor {
 
 func copyRoots(roots map[string]ed25519.PublicKey) (map[string]ed25519.PublicKey, error) {
 	copied := make(map[string]ed25519.PublicKey, len(roots))
+	materials := make(map[[ed25519.PublicKeySize]byte]struct{}, len(roots))
 	for keyID, publicKey := range roots {
-		if !identifierPattern.MatchString(keyID) || len(publicKey) != ed25519.PublicKeySize {
+		material, valid := canonicalPrimeOrderEd25519Key(publicKey)
+		if !identifierPattern.MatchString(keyID) || !valid {
 			return nil, ErrInvalidConfiguration
 		}
-		copied[keyID] = append(ed25519.PublicKey(nil), publicKey...)
+		if _, duplicate := materials[material]; duplicate {
+			return nil, ErrInvalidConfiguration
+		}
+		materials[material] = struct{}{}
+		copied[keyID] = append(ed25519.PublicKey(nil), material[:]...)
 	}
 	return copied, nil
+}
+
+func canonicalPrimeOrderEd25519Key(publicKey []byte) ([ed25519.PublicKeySize]byte, bool) {
+	var canonical [ed25519.PublicKeySize]byte
+	if len(publicKey) != ed25519.PublicKeySize {
+		return canonical, false
+	}
+	point, err := new(edwards25519.Point).SetBytes(publicKey)
+	if err != nil {
+		return canonical, false
+	}
+	encoded := point.Bytes()
+	if !bytes.Equal(encoded, publicKey) || point.Equal(edwards25519.NewIdentityPoint()) == 1 {
+		return canonical, false
+	}
+	primeOrderProjection := new(edwards25519.Point).ScalarMult(
+		&inverseEd25519Cofactor,
+		new(edwards25519.Point).MultByCofactor(point),
+	)
+	if point.Equal(primeOrderProjection) != 1 {
+		return canonical, false
+	}
+	copy(canonical[:], encoded)
+	return canonical, true
 }
 
 func interfaceNil(value any) bool {

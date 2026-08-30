@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"filippo.io/edwards25519"
 )
 
 func TestVerifiedDependencyRequiresSignedConformanceAndLiveRuntimeProof(t *testing.T) {
@@ -257,6 +259,123 @@ func TestVerifierRejectsTrustRootReuseAcrossConformanceAndRuntimeRoles(t *testin
 				t.Fatalf("NewVerifier() verifier/error = %v/%v, want nil/ErrInvalidConfiguration", verifier, err)
 			}
 		})
+	}
+}
+
+func TestVerifierRejectsKeyMaterialAliasesWithinEachTrustRole(t *testing.T) {
+	t.Parallel()
+
+	conformanceKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(conformance) error = %v", err)
+	}
+	runtimeKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(runtime) error = %v", err)
+	}
+	tests := []struct {
+		name             string
+		conformanceRoots map[string]ed25519.PublicKey
+		runtimeRoots     map[string]ed25519.PublicKey
+	}{
+		{
+			name: "conformance aliases",
+			conformanceRoots: map[string]ed25519.PublicKey{
+				"conformance-root-1": conformanceKey,
+				"conformance-root-2": conformanceKey,
+			},
+			runtimeRoots: map[string]ed25519.PublicKey{"runtime-root-1": runtimeKey},
+		},
+		{
+			name:             "runtime aliases",
+			conformanceRoots: map[string]ed25519.PublicKey{"conformance-root-1": conformanceKey},
+			runtimeRoots: map[string]ed25519.PublicKey{
+				"runtime-root-1": runtimeKey,
+				"runtime-root-2": runtimeKey,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			verifier, err := NewVerifier(VerifierConfig{
+				ConformanceRoots: test.conformanceRoots,
+				RuntimeRoots:     test.runtimeRoots,
+				Clock:            time.Now,
+				Entropy:          strings.NewReader(strings.Repeat("n", ChallengeBytes)),
+			})
+			if verifier != nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("NewVerifier() error = %v, want ErrInvalidConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestVerifierRejectsNonCanonicalOrNonPrimeOrderTrustRoots(t *testing.T) {
+	t.Parallel()
+
+	validConformance, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(conformance) error = %v", err)
+	}
+	validRuntime, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(runtime) error = %v", err)
+	}
+	identity := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	identity[0] = 1
+	nonCanonicalIdentity := append(ed25519.PublicKey(nil), identity...)
+	nonCanonicalIdentity[ed25519.PublicKeySize-1] = 0x80
+	orderTwo := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	for index := range orderTwo {
+		orderTwo[index] = 0xff
+	}
+	orderTwo[0] = 0xec
+	orderTwo[ed25519.PublicKeySize-1] = 0x7f
+	orderFour := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	validPoint, err := new(edwards25519.Point).SetBytes(validConformance)
+	if err != nil {
+		t.Fatalf("SetBytes(valid key) error = %v", err)
+	}
+	orderTwoPoint, err := new(edwards25519.Point).SetBytes(orderTwo)
+	if err != nil {
+		t.Fatalf("SetBytes(order-two key) error = %v", err)
+	}
+	mixedOrder := ed25519.PublicKey(new(edwards25519.Point).Add(validPoint, orderTwoPoint).Bytes())
+	weakKeys := []struct {
+		name string
+		key  ed25519.PublicKey
+	}{
+		{name: "identity", key: identity},
+		{name: "noncanonical identity", key: nonCanonicalIdentity},
+		{name: "order two", key: orderTwo},
+		{name: "order four", key: orderFour},
+		{name: "mixed order", key: mixedOrder},
+	}
+	for _, weak := range weakKeys {
+		for _, role := range []string{"conformance", "runtime"} {
+			t.Run(weak.name+" "+role, func(t *testing.T) {
+				t.Parallel()
+
+				conformanceRoots := map[string]ed25519.PublicKey{"conformance-root": validConformance}
+				runtimeRoots := map[string]ed25519.PublicKey{"runtime-root": validRuntime}
+				if role == "conformance" {
+					conformanceRoots["conformance-root"] = weak.key
+				} else {
+					runtimeRoots["runtime-root"] = weak.key
+				}
+				verifier, err := NewVerifier(VerifierConfig{
+					ConformanceRoots: conformanceRoots,
+					RuntimeRoots:     runtimeRoots,
+					Clock:            time.Now,
+					Entropy:          strings.NewReader(strings.Repeat("n", ChallengeBytes)),
+				})
+				if verifier != nil || !errors.Is(err, ErrInvalidConfiguration) {
+					t.Fatalf("NewVerifier(%s %s key) error = %v, want ErrInvalidConfiguration", weak.name, role, err)
+				}
+			})
+		}
 	}
 }
 
