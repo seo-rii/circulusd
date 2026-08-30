@@ -408,6 +408,43 @@ describe("authenticated state-app ingress", () => {
     expectUnsigned(response);
   });
 
+  it("leaves the celld-native production probe route unsigned and unowned", async () => {
+    const names: string[] = [];
+    let calls = 0;
+    const fixture = JSON.parse(readFileSync(new URL(
+      "../../../packages/protocol-types/fixtures/state-production-probe-v1alpha1.json",
+      import.meta.url,
+    ), "utf8")) as {
+      readonly path: string;
+      readonly contentType: string;
+      readonly requestCborHex: string;
+    };
+    const request = new Request(
+      `http://127.0.0.1:8787${fixture.path}`,
+      {
+        method: "POST",
+        headers: {
+          accept: fixture.contentType,
+          "cache-control": "no-store",
+          "content-type": fixture.contentType,
+        },
+        body: decodeHex(fixture.requestCborHex),
+      },
+    );
+
+    const response = await worker.fetch(request, environment({
+      readSessionEvents: async () => {
+        calls += 1;
+        return hostSuccess(identity("req"));
+      },
+    }, names) as never);
+
+    expect(response.status).toBe(404);
+    expectUnsigned(response);
+    expect(names).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
   it.each([
     ["missing signature", { signature: null }],
     ["short signature", { signature: "00" }],

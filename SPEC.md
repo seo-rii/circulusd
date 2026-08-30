@@ -4866,6 +4866,53 @@ trust, freshness, 배포 요구사항, live probe는 release manifest에서 파�
 분리된 두 trust domain을 전달받은 production verifier가 함께 검증해야 하며, decode
 성공 자체는 readiness를 의미하지 않는다.
 
+live probe의 서명 주체는 state-app Worker가 아니라 celld native runtime boundary다.
+state-app에 runtime private key나 자체 작성 descriptor를 주어 celld build와 crash
+durability를 application이 self-assert하게 해서는 안 된다. celld는 public Worker
+listener와 같은 pinned loopback origin에서 다음 reserved route를 Worker dispatch보다
+먼저 처리하며, state-app Worker에 이 path를 직접 전달하면 unsigned `404`여야 한다.
+
+```text
+POST /circulusd/state/v1/production:probe
+Content-Type: application/vnd.circulusd.state-production-probe+cbor
+Accept: application/vnd.circulusd.state-production-probe+cbor
+Cache-Control: no-store
+```
+
+request는 canonical CBOR exact map
+`{protocol, major, minor, schemaDigest, nonce}`이고, protocol은
+`circulus.state-production-probe.v1alpha1`, version은 정확히 `1.0`, frozen
+schema digest는
+`sha256:33c8297cba9d6460e219e31e8c080927ed6275407c6eb159ea1f4d06fc87910f`,
+nonce는 정확히 32-byte byte string이다. request는 256 bytes, depth 2, item 16을
+넘을 수 없다. challenge는 비밀이나 authority가 아니므로 state read 또는
+dispatch-start HMAC header/key를 이 route에 재사용하지 않는다.
+
+response는 status `200`, 같은 exact content type, `Cache-Control: no-store`, no content
+encoding인 canonical CBOR exact map
+`{protocol, major, minor, schemaDigest, descriptor, keyId, algorithm, signature}`이다.
+descriptor는 evidence와 동일한 13개 exact member를 가지며, `algorithm`은
+`ed25519`, `keyId == descriptor.runtimeKeyId`, signature는 정확히 64-byte byte
+string이다. response는 32 KiB, depth 8, item 128, atomic group 64개를 넘을 수 없다.
+application HMAC header가 붙은 response도 authority 혼합으로 거부한다. frozen
+cross-language CBOR/signature vector는
+`packages/protocol-types/fixtures/state-production-probe-v1alpha1.json`이다.
+
+native signer는 boot 시 실제 celld build, 현재 load한 exact state-app bundle,
+instance/domain, conformance identity, runtime key, probe epoch, production eligibility와
+atomic group을 하나의 immutable snapshot으로 결속한다. request에서 descriptor field를
+받거나 mutable field를 서명 도중 다시 읽지 않고, 오직 그 snapshot과 받은 nonce로
+`ProbeSigningDigest`를 계산해 서명한다. key/application/domain 교체는 새 snapshot과
+증가한 epoch로 수행한다. platformd의 exact `stateappclient.Client`는 동일 origin,
+connection lifecycle, timeout/cancellation을 사용해 이 route를 호출하고, verifier는
+response descriptor를 evidence와 exact-equal 비교한 뒤 runtime root로 signature를
+검증한다. 한 verifier는 최대 4096개의 burned challenge만 발급하고, canceled probe가
+return한 뒤에는 verified seal을 만들지 않는다.
+
+repository의 client/contract 구현만으로 celld 지원을 가정하지 않는다. pinned celld가
+이 native signer와 immutable provenance를 실제 제공하고 process restart 때 기존 graph를
+폐기하는 통합 conformance가 통과하기 전까지 `state.celld`는 `NOT_WIRED`를 유지한다.
+
 두 형식은 exact case-sensitive member set을 사용한다. unknown/duplicate/missing/null
 member, trailing JSON value, invalid UTF-8와 BOM을 거부하고 maximum nesting depth 32,
 maximum token count 4096를 적용한다. evidence document는 최대 64 KiB,

@@ -713,25 +713,11 @@ func (client *Client) invokeAuthenticatedIngress(
 		requestKey = &client.dispatchStartRequestKey
 		responseKey = &client.dispatchStartResponseKey
 	}
-	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
-	client.lifecycleMu.Lock()
-	if client.closed {
-		client.lifecycleMu.Unlock()
-		cancel()
-		return nil, ErrClientClosed
+	requestContext, finish, err := client.beginActiveRequest(ctx)
+	if err != nil {
+		return nil, err
 	}
-	client.nextActiveID++
-	activeID := client.nextActiveID
-	client.active.Add(1)
-	client.activeCancel[activeID] = cancel
-	client.lifecycleMu.Unlock()
-	defer func() {
-		cancel()
-		client.lifecycleMu.Lock()
-		delete(client.activeCancel, activeID)
-		client.lifecycleMu.Unlock()
-		client.active.Done()
-	}()
+	defer finish()
 
 	select {
 	case <-requestContext.Done():
@@ -921,6 +907,29 @@ func (client *Client) invokeAuthenticatedIngress(
 		return nil, ErrInvalidResponse
 	}
 	return nil, &RemoteError{Code: code, Message: safeMessage, Status: response.StatusCode}
+}
+
+func (client *Client) beginActiveRequest(ctx context.Context) (context.Context, func(), error) {
+	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
+	client.lifecycleMu.Lock()
+	if client.closed {
+		client.lifecycleMu.Unlock()
+		cancel()
+		return nil, nil, ErrClientClosed
+	}
+	client.nextActiveID++
+	activeID := client.nextActiveID
+	client.active.Add(1)
+	client.activeCancel[activeID] = cancel
+	client.lifecycleMu.Unlock()
+	finish := func() {
+		cancel()
+		client.lifecycleMu.Lock()
+		delete(client.activeCancel, activeID)
+		client.lifecycleMu.Unlock()
+		client.active.Done()
+	}
+	return requestContext, finish, nil
 }
 
 func keyedDigest(key, value []byte) [sha256.Size]byte {
