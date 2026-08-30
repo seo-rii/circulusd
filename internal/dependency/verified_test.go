@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"sync/atomic"
@@ -398,11 +399,74 @@ func TestVerifierRejectsARepeatedRuntimeChallenge(t *testing.T) {
 	}
 }
 
+func TestVerificationDoesNotMintAfterProbeCancelsContext(t *testing.T) {
+	t.Parallel()
+
+	fixture := newVerificationFixture(t, "state-domain-a")
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := &signedProbe{
+		descriptor: fixture.descriptor, privateKey: fixture.runtimePrivateKey,
+		cancelBeforeReturn: cancel,
+	}
+
+	verified, err := VerifyDependency(ctx, fixture.verifier, probe, fixture.evidence, fixture.requirements())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("VerifyDependency(probe-canceled) error = %v, want context.Canceled", err)
+	}
+	if _, _, openErr := verified.Open(); !errors.Is(openErr, ErrUnverifiedDependency) {
+		t.Fatalf("VerifyDependency(probe-canceled).Open() error = %v, want ErrUnverifiedDependency", openErr)
+	}
+}
+
+func TestVerificationPreservesCancellationReturnedByProbe(t *testing.T) {
+	t.Parallel()
+
+	fixture := newVerificationFixture(t, "state-domain-a")
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := &signedProbe{
+		descriptor: fixture.descriptor, privateKey: fixture.runtimePrivateKey,
+		cancelBeforeReturn: cancel, returnError: context.Canceled,
+	}
+
+	_, err := VerifyDependency(ctx, fixture.verifier, probe, fixture.evidence, fixture.requirements())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("VerifyDependency(canceled probe) error = %v, want context.Canceled", err)
+	}
+}
+
+func TestVerifierBoundsBurnedRuntimeChallengesBeforeProbe(t *testing.T) {
+	t.Parallel()
+
+	const expectedMaximumIssuedChallenges = 4_096
+	fixture := newVerificationFixture(t, "state-domain-a")
+	for index := uint64(0); index < expectedMaximumIssuedChallenges; index++ {
+		var challenge [ChallengeBytes]byte
+		binary.BigEndian.PutUint64(challenge[ChallengeBytes-8:], index)
+		fixture.verifier.issuedChallenges[challenge] = struct{}{}
+	}
+	probe := &signedProbe{descriptor: fixture.descriptor, privateKey: fixture.runtimePrivateKey}
+
+	_, err := VerifyDependency(
+		context.Background(), fixture.verifier, probe, fixture.evidence, fixture.requirements(),
+	)
+	if !errors.Is(err, ErrUnverifiedDependency) {
+		t.Fatalf("VerifyDependency(exhausted challenge budget) error = %v, want ErrUnverifiedDependency", err)
+	}
+	if probe.calls.Load() != 0 {
+		t.Fatalf("ProbeProduction() calls = %d, want challenge-budget rejection before probe", probe.calls.Load())
+	}
+	if len(fixture.verifier.issuedChallenges) != expectedMaximumIssuedChallenges {
+		t.Fatalf("issued challenges = %d, want bounded %d", len(fixture.verifier.issuedChallenges), expectedMaximumIssuedChallenges)
+	}
+}
+
 type signedProbe struct {
-	descriptor   Descriptor
-	privateKey   ed25519.PrivateKey
-	signingNonce []byte
-	calls        atomic.Int64
+	descriptor         Descriptor
+	privateKey         ed25519.PrivateKey
+	signingNonce       []byte
+	cancelBeforeReturn context.CancelFunc
+	returnError        error
+	calls              atomic.Int64
 }
 
 func (probe *signedProbe) ProbeProduction(ctx context.Context, challenge ProbeChallenge) (ProbeResponse, error) {
@@ -417,6 +481,12 @@ func (probe *signedProbe) ProbeProduction(ctx context.Context, challenge ProbeCh
 	digest, err := ProbeSigningDigest(probe.descriptor, nonce)
 	if err != nil {
 		return ProbeResponse{}, err
+	}
+	if probe.cancelBeforeReturn != nil {
+		probe.cancelBeforeReturn()
+	}
+	if probe.returnError != nil {
+		return ProbeResponse{}, probe.returnError
 	}
 	return ProbeResponse{
 		Descriptor: probe.descriptor,

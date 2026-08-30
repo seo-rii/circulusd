@@ -32,6 +32,7 @@ const (
 
 	verificationSchemaVersion = 1
 	maximumIdentifierBytes    = 256
+	maximumIssuedChallenges   = 4_096
 	evidenceSignatureDomain   = "circulusd.production-dependency-evidence"
 	probeSignatureDomain      = "circulusd.production-dependency-probe"
 )
@@ -247,6 +248,13 @@ func VerifyDependency[T ProductionProbe](
 	}
 	nonce := make([]byte, ChallengeBytes)
 	verifier.challengeMu.Lock()
+	// A verifier is a startup-scoped authority. Burned nonces are deliberately
+	// never reusable, so bound the complete lifetime budget before consuming
+	// more entropy or issuing another network probe.
+	if len(verifier.issuedChallenges) >= maximumIssuedChallenges {
+		verifier.challengeMu.Unlock()
+		return Verified[T]{}, fmt.Errorf("%w: live probe challenge budget exhausted", ErrUnverifiedDependency)
+	}
 	_, challengeErr := io.ReadFull(verifier.entropy, nonce)
 	var challengeKey [ChallengeBytes]byte
 	copy(challengeKey[:], nonce)
@@ -260,7 +268,13 @@ func VerifyDependency[T ProductionProbe](
 	}
 	response, err := productionDependency.ProbeProduction(ctx, ProbeChallenge{Nonce: append([]byte(nil), nonce...)})
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return Verified[T]{}, contextErr
+		}
 		return Verified[T]{}, fmt.Errorf("%w: runtime probe failed", ErrUnverifiedDependency)
+	}
+	if err := ctx.Err(); err != nil {
+		return Verified[T]{}, err
 	}
 	if !equalDescriptor(response.Descriptor, evidence.Descriptor) || response.KeyID != evidence.Descriptor.RuntimeKeyID || len(response.Signature) != ed25519.SignatureSize {
 		return Verified[T]{}, ErrUnverifiedDependency
@@ -277,6 +291,9 @@ func VerifyDependency[T ProductionProbe](
 	descriptorDigest, err := descriptorDigest(descriptor)
 	if err != nil {
 		return Verified[T]{}, ErrUnverifiedDependency
+	}
+	if err := ctx.Err(); err != nil {
+		return Verified[T]{}, err
 	}
 	return Verified[T]{
 		dependency: productionDependency,
