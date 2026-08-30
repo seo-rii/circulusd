@@ -29,6 +29,11 @@ interface DurableBacking {
   revision: number;
 }
 
+interface ScheduledCommitCrash {
+  readonly phase: InjectedCommitCrashPhase;
+  remainingMutatingCommits: number;
+}
+
 /**
  * Deterministic reference storage for fault-boundary tests only.
  *
@@ -40,7 +45,7 @@ interface DurableBacking {
 export class RestartableDurableStorage implements TransactionalStoragePort {
   readonly evidence = RESTARTABLE_DURABLE_STORAGE_EVIDENCE;
   readonly #backing: DurableBacking;
-  #nextCrash: InjectedCommitCrashPhase | undefined;
+  #scheduledCrash: ScheduledCommitCrash | undefined;
 
   constructor(source?: RestartableDurableStorage) {
     this.#backing = source === undefined
@@ -64,10 +69,23 @@ export class RestartableDurableStorage implements TransactionalStoragePort {
   }
 
   injectCrashOnce(phase: InjectedCommitCrashPhase): void {
-    if (this.#nextCrash !== undefined) {
+    this.injectCrashOnMutatingCommit(1, phase);
+  }
+
+  injectCrashOnMutatingCommit(
+    mutatingCommit: number,
+    phase: InjectedCommitCrashPhase,
+  ): void {
+    if (!Number.isSafeInteger(mutatingCommit) || mutatingCommit < 1) {
+      throw new RangeError("mutatingCommit must be a positive safe integer");
+    }
+    if (this.#scheduledCrash !== undefined) {
       throw new Error("a commit crash is already armed");
     }
-    this.#nextCrash = phase;
+    this.#scheduledCrash = {
+      phase,
+      remainingMutatingCommits: mutatingCommit,
+    };
   }
 
   async transaction<Result>(
@@ -110,9 +128,17 @@ export class RestartableDurableStorage implements TransactionalStoragePort {
         continue;
       }
       const mutated = writes.size > 0 || deletes.size > 0;
-      if (mutated && this.#nextCrash === "before-commit") {
-        this.#nextCrash = undefined;
-        throw new InjectedDurableStorageCrash("before-commit");
+      let crashAtThisCommit: InjectedCommitCrashPhase | undefined;
+      if (mutated && this.#scheduledCrash !== undefined) {
+        if (this.#scheduledCrash.remainingMutatingCommits === 1) {
+          crashAtThisCommit = this.#scheduledCrash.phase;
+          this.#scheduledCrash = undefined;
+        } else {
+          this.#scheduledCrash.remainingMutatingCommits -= 1;
+        }
+      }
+      if (crashAtThisCommit === "before-commit") {
+        throw new InjectedDurableStorageCrash(crashAtThisCommit);
       }
       if (mutated) {
         for (const key of deletes) {
@@ -123,9 +149,8 @@ export class RestartableDurableStorage implements TransactionalStoragePort {
         }
         this.#backing.revision += 1;
       }
-      if (mutated && this.#nextCrash === "after-commit-before-result") {
-        this.#nextCrash = undefined;
-        throw new InjectedDurableStorageCrash("after-commit-before-result");
+      if (crashAtThisCommit === "after-commit-before-result") {
+        throw new InjectedDurableStorageCrash(crashAtThisCommit);
       }
       return structuredClone(result);
     }
