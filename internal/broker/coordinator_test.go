@@ -17,6 +17,7 @@ import (
 
 var (
 	tenantID     = mustID(identity.Tenant, "A")
+	workspaceID  = mustID(identity.Workspace, "W")
 	sessionID    = mustID(identity.Session, "B")
 	turnID       = mustID(identity.Turn, "C")
 	effectID     = mustID(identity.Effect, "D")
@@ -119,6 +120,14 @@ func TestAcquireEngineStepRejectsStructurallyInvalidAuthoritativeFence(t *testin
 			snapshot.TenantID = identity.ID{}
 			fence.TenantID = identity.ID{}
 		}},
+		{name: "empty workspace", mutate: func(snapshot *TurnSnapshot, fence *ValidatedTurnFence) {
+			snapshot.WorkspaceID = identity.ID{}
+			fence.WorkspaceID = identity.ID{}
+		}},
+		{name: "wrong workspace kind", mutate: func(snapshot *TurnSnapshot, fence *ValidatedTurnFence) {
+			snapshot.WorkspaceID = sessionID
+			fence.WorkspaceID = sessionID
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -133,6 +142,90 @@ func TestAcquireEngineStepRejectsStructurallyInvalidAuthoritativeFence(t *testin
 			})
 			if !errors.Is(err, ErrInvalidRequest) {
 				t.Fatalf("AcquireEngineStep() error = %v, want %v", err, ErrInvalidRequest)
+			}
+		})
+	}
+}
+
+func TestAcquireEngineStepRejectsMismatchedWorkspaceFence(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_075, 0).UTC()
+	store := newFakeStore(baseSnapshot(now))
+	authority := baseAuthority(now)
+	authority.WorkspaceID = mustID(identity.Workspace, "other-workspace")
+
+	_, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), EngineStepRequest{
+		Authority: authority,
+		Now:       now,
+		Budget: EngineStepBudget{
+			MaximumEvents:         1,
+			MaximumEphemeralBytes: 1,
+			MaximumWallClock:      time.Second,
+		},
+		OperationKey: "mismatched-workspace",
+	})
+	if !errors.Is(err, ErrFenceMismatch) {
+		t.Fatalf("AcquireEngineStep() error = %v, want %v", err, ErrFenceMismatch)
+	}
+	store.mu.Lock()
+	permits := len(store.stepPermits)
+	store.mu.Unlock()
+	if permits != 0 {
+		t.Fatalf("engine-step permits = %d, want 0", permits)
+	}
+}
+
+func TestCorePermitsRejectCorruptedAuthorityRoutes(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_090, 0).UTC()
+
+	for _, route := range []struct {
+		name       string
+		corruption receiptRouteCorruption
+	}{
+		{name: "tenant", corruption: corruptTenantRoute},
+		{name: "workspace", corruption: corruptWorkspaceRoute},
+	} {
+		t.Run(route.name+"/engine", func(t *testing.T) {
+			store := newFakeStore(baseSnapshot(now))
+			store.corruptReceiptRoute = route.corruption
+			_, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), EngineStepRequest{
+				Authority: baseAuthority(now), Now: now,
+				Budget:       EngineStepBudget{MaximumEvents: 1, MaximumEphemeralBytes: 1, MaximumWallClock: time.Second},
+				OperationKey: "corrupt-engine-route-" + route.name,
+			})
+			if !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("AcquireEngineStep() error = %v, want %v", err, ErrFenceMismatch)
+			}
+		})
+
+		t.Run(route.name+"/preparation", func(t *testing.T) {
+			store := newFakeStore(baseSnapshot(now))
+			coordinator := mustCoordinator(t, store, nil)
+			permit := acquirePermit(t, coordinator, now, "corrupt-preparation-permit-"+route.name)
+			store.mu.Lock()
+			store.corruptReceiptRoute = route.corruption
+			store.mu.Unlock()
+			_, err := coordinator.CommitEngineStep(context.Background(), EngineStepCommit{
+				Permit: permit, Now: now, OperationKey: "corrupt-preparation-route-" + route.name,
+				RequestDigest: digest(121),
+				Boundary: EngineBoundary{Kind: BoundaryEffectRequest, CheckpointDigest: digest(122), Effect: &EffectIntent{
+					Service: ServiceExecutor, Operation: "run", ReplayPolicy: ReplayIdempotencyKey, RequestDigest: digest(2),
+				}},
+			})
+			if !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("CommitEngineStep() error = %v, want %v", err, ErrFenceMismatch)
+			}
+		})
+
+		t.Run(route.name+"/dispatch", func(t *testing.T) {
+			snapshot := baseSnapshot(now)
+			snapshot.ActiveEffect = baseEffect(EffectPrepared)
+			store := newFakeStore(snapshot)
+			store.corruptReceiptRoute = route.corruption
+			_, err := mustCoordinator(t, store, nil).AdmitDispatch(context.Background(), baseDispatchRequest(now))
+			if !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("AdmitDispatch() error = %v, want %v", err, ErrFenceMismatch)
 			}
 		})
 	}
@@ -390,7 +483,8 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 	snapshot.ActiveEffect = baseEffect(EffectDispatched)
 	store := newFakeStore(snapshot)
 	ledger := &fakeLedger{record: LedgerRecord{
-		Status: LedgerCommitted, EffectID: effectID, InvocationID: invocationID,
+		Status: LedgerCommitted, TenantID: tenantID, WorkspaceID: workspaceID,
+		EffectID: effectID, InvocationID: invocationID,
 		RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run",
 		DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID,
 	}}
@@ -411,6 +505,8 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 	ledger.mu.Unlock()
 	wantLookup := LedgerLookup{
 		EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+		TenantID:          tenantID,
+		WorkspaceID:       workspaceID,
 		Service:           ServiceExecutor,
 		Operation:         "run",
 		DispatchAttempt:   1,
@@ -427,6 +523,8 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 		{name: "effect", edit: func(record *LedgerRecord) { record.EffectID = mustID(identity.Effect, "J") }},
 		{name: "invocation", edit: func(record *LedgerRecord) { record.InvocationID = mustID(identity.Invocation, "K") }},
 		{name: "digest", edit: func(record *LedgerRecord) { record.RequestDigest = digest(33) }},
+		{name: "tenant", edit: func(record *LedgerRecord) { record.TenantID = mustID(identity.Tenant, "other-tenant") }},
+		{name: "workspace", edit: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "other-workspace") }},
 		{name: "service", edit: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
 		{name: "operation", edit: func(record *LedgerRecord) { record.Operation = "write" }},
 		{name: "missing commit", edit: func(record *LedgerRecord) { record.ExternalCommitID = identity.ID{} }},
@@ -443,6 +541,9 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 			})
 			if !errors.Is(err, ErrLedgerMismatch) {
 				t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrLedgerMismatch)
+			}
+			if fresh.markExternalTransitions != 0 {
+				t.Fatalf("external commit transitions = %d, want 0", fresh.markExternalTransitions)
 			}
 		})
 	}
@@ -469,7 +570,7 @@ func TestConfirmExternalCommitAllowsAbsentProviderRequestIdentity(t *testing.T) 
 	}
 }
 
-func TestConcurrentRecoveryLedgerLookupsPreserveEffectServiceBoundary(t *testing.T) {
+func TestConcurrentRecoveryLedgerLookupsPreserveAuthoritativeRouteAndEffectBoundary(t *testing.T) {
 	t.Parallel()
 	const recoveries = 64
 	now := time.Unix(1_800_000_550, 0).UTC()
@@ -478,7 +579,8 @@ func TestConcurrentRecoveryLedgerLookupsPreserveEffectServiceBoundary(t *testing
 			return LedgerRecord{}, err
 		}
 		return LedgerRecord{
-			Status: LedgerCommitted, EffectID: query.EffectID, InvocationID: query.InvocationID,
+			Status: LedgerCommitted, TenantID: query.TenantID, WorkspaceID: query.WorkspaceID,
+			EffectID: query.EffectID, InvocationID: query.InvocationID,
 			RequestDigest: query.RequestDigest, Service: query.Service, Operation: query.Operation,
 			DispatchAttempt: query.DispatchAttempt, ProviderRequestID: query.ProviderRequestID, ExternalCommitID: commitID, ResultRef: resultID,
 		}, nil
@@ -488,28 +590,37 @@ func TestConcurrentRecoveryLedgerLookupsPreserveEffectServiceBoundary(t *testing
 	errorsByRecovery := make(chan error, recoveries)
 	wantLookups := make(map[LedgerLookup]int, recoveries)
 	for index := 0; index < recoveries; index++ {
+		tenant := mustID(identity.Tenant, fmt.Sprintf("tenant-%d", index))
+		workspace := mustID(identity.Workspace, fmt.Sprintf("workspace-%d", index))
 		service := ServiceExecutor
 		if index%2 == 1 {
 			service = ServiceWorkspace
 		}
 		operation := fmt.Sprintf("operation-%d", index)
 		snapshot := baseSnapshot(now)
+		snapshot.TenantID = tenant
+		snapshot.WorkspaceID = workspace
 		snapshot.ActiveEffect = baseEffect(EffectDispatched)
 		snapshot.ActiveEffect.Service = service
 		snapshot.ActiveEffect.Operation = operation
 		coordinator := mustCoordinator(t, newFakeStore(snapshot), ledger)
 		lookup := LedgerLookup{
 			EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+			TenantID:          tenant,
+			WorkspaceID:       workspace,
 			Service:           service,
 			Operation:         operation,
 			DispatchAttempt:   1,
 			ProviderRequestID: mustID(identity.Request, "R"),
 		}
 		wantLookups[lookup]++
+		request := baseRecoveryRequest(now, fmt.Sprintf("recover-concurrent-%d", index))
+		request.Authority.TenantID = tenant
+		request.Authority.WorkspaceID = workspace
 		wait.Add(1)
-		go func(index int, coordinator *Coordinator) {
+		go func(index int, coordinator *Coordinator, request RecoveryRequest) {
 			defer wait.Done()
-			decision, err := coordinator.RecoverEffect(context.Background(), baseRecoveryRequest(now, fmt.Sprintf("recover-concurrent-%d", index)))
+			decision, err := coordinator.RecoverEffect(context.Background(), request)
 			if err != nil {
 				errorsByRecovery <- fmt.Errorf("recovery %d: %w", index, err)
 				return
@@ -517,7 +628,7 @@ func TestConcurrentRecoveryLedgerLookupsPreserveEffectServiceBoundary(t *testing
 			if decision.Action != RecoverySettleOnly || decision.ExternalCommitID != commitID || decision.ResultRef != resultID {
 				errorsByRecovery <- fmt.Errorf("recovery %d decision = %#v", index, decision)
 			}
-		}(index, coordinator)
+		}(index, coordinator, request)
 	}
 	wait.Wait()
 	close(errorsByRecovery)
@@ -558,10 +669,10 @@ func TestRecoveryClassificationCoversEveryCrashBoundary(t *testing.T) {
 	}{
 		{name: "prepared before dispatch", state: EffectPrepared, policy: ReplayNever, want: RecoveryDispatch},
 		{name: "dispatched committed", state: EffectDispatched, policy: ReplayNever, ledger: committedRecord(), want: RecoverySettleOnly, wantMarked: true},
-		{name: "dispatched absent safe", state: EffectDispatched, policy: ReplaySafe, ledger: LedgerRecord{Status: LedgerAbsent}, want: RecoveryReplay},
-		{name: "dispatched absent idempotency", state: EffectDispatched, policy: ReplayIdempotencyKey, ledger: LedgerRecord{Status: LedgerAbsent}, want: RecoveryReplay},
-		{name: "dispatched unknown never", state: EffectDispatched, policy: ReplayNever, ledger: LedgerRecord{Status: LedgerUnknown}, want: RecoverySettleInterrupted},
-		{name: "dispatched unknown confirm", state: EffectDispatched, policy: ReplayConfirm, ledger: LedgerRecord{Status: LedgerUnknown}, want: RecoveryNeedsConfirmation},
+		{name: "dispatched absent safe", state: EffectDispatched, policy: ReplaySafe, ledger: routedRecord(LedgerAbsent), want: RecoveryReplay},
+		{name: "dispatched absent idempotency", state: EffectDispatched, policy: ReplayIdempotencyKey, ledger: routedRecord(LedgerAbsent), want: RecoveryReplay},
+		{name: "dispatched unknown never", state: EffectDispatched, policy: ReplayNever, ledger: routedRecord(LedgerUnknown), want: RecoverySettleInterrupted},
+		{name: "dispatched unknown confirm", state: EffectDispatched, policy: ReplayConfirm, ledger: routedRecord(LedgerUnknown), want: RecoveryNeedsConfirmation},
 		{name: "externally committed", state: EffectExternallyCommitted, policy: ReplaySafe, want: RecoverySettleOnly},
 		{name: "blocked", state: EffectBlocked, policy: ReplayConfirm, want: RecoveryAwaitConfirmation},
 		{name: "settled", state: EffectSettled, policy: ReplaySafe, want: RecoveryNone},
@@ -602,7 +713,7 @@ func TestRecoveryNeverInfersExternalOutcomeFromCancellationOrTime(t *testing.T) 
 	effect.ReplayPolicy = ReplayConfirm
 	snapshot.ActiveEffect = effect
 	store := newFakeStore(snapshot)
-	ledger := &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}}
+	ledger := &fakeLedger{record: routedRecord(LedgerUnknown)}
 	coordinator := mustCoordinator(t, store, ledger)
 
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -645,7 +756,7 @@ func TestRecoveryValidatesEveryDurableMutationReceipt(t *testing.T) {
 		snapshot.ActiveEffect = effect
 		store := newFakeStore(snapshot)
 		store.corruptBlockReceipt = true
-		coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+		coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)})
 
 		_, err := coordinator.RecoverEffect(context.Background(), baseRecoveryRequest(now, "recover-corrupt-block-receipt"))
 		if !errors.Is(err, ErrFenceMismatch) {
@@ -660,14 +771,14 @@ func TestCrashBeforeAndAfterDispatchBarrierAreDistinguishable(t *testing.T) {
 	prepared := baseSnapshot(now)
 	prepared.ActiveEffect = baseEffect(EffectPrepared)
 	beforeStore := newFakeStore(prepared)
-	before := mustCoordinator(t, beforeStore, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+	before := mustCoordinator(t, beforeStore, &fakeLedger{record: routedRecord(LedgerUnknown)})
 	beforeDecision, err := before.RecoverEffect(context.Background(), baseRecoveryRequest(now, "before"))
 	if err != nil || beforeDecision.Action != RecoveryDispatch {
 		t.Fatalf("before-barrier decision = %#v, %v", beforeDecision, err)
 	}
 
 	afterStore := newFakeStore(prepared)
-	after := mustCoordinator(t, afterStore, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+	after := mustCoordinator(t, afterStore, &fakeLedger{record: routedRecord(LedgerUnknown)})
 	if _, err := after.AdmitDispatch(context.Background(), baseDispatchRequest(now)); err != nil {
 		t.Fatalf("AdmitDispatch() error = %v", err)
 	}
@@ -682,7 +793,7 @@ func TestCrashBeforeAndAfterDispatchBarrierAreDistinguishable(t *testing.T) {
 
 func baseSnapshot(now time.Time) TurnSnapshot {
 	return TurnSnapshot{
-		TenantID: tenantID, UserID: mustID(identity.Subject, "U"), SessionID: sessionID, TurnID: turnID, Active: true,
+		TenantID: tenantID, WorkspaceID: workspaceID, UserID: mustID(identity.Subject, "U"), SessionID: sessionID, TurnID: turnID, Active: true,
 		LeaseExpiresAt: now.Add(time.Hour), Generations: Generations{TurnLease: 11, Placement: 12, Sandbox: 13, Authorization: 14},
 		CheckpointDigest: digest(90), EventSequence: 7,
 		EngineStepLimits: EngineStepBudget{MaximumEvents: 1, MaximumEphemeralBytes: 8192, MaximumWallClock: 2 * time.Minute},
@@ -691,7 +802,7 @@ func baseSnapshot(now time.Time) TurnSnapshot {
 
 func baseAuthority(now time.Time) ValidatedTurnFence {
 	return ValidatedTurnFence{
-		TenantID: tenantID, SessionID: sessionID, TurnID: turnID,
+		TenantID: tenantID, WorkspaceID: workspaceID, SessionID: sessionID, TurnID: turnID,
 		Generations: Generations{TurnLease: 11, Placement: 12, Sandbox: 13, Authorization: 14},
 		ExpiresAt:   now.Add(15 * time.Minute),
 	}
@@ -730,7 +841,8 @@ func baseEffect(state EffectState) *EffectSnapshot {
 	if state == EffectPrepared {
 		permit := EffectPreparationPermit{
 			EffectKey: EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
-			Opaque:    opaque(1), TenantID: tenantID, UserID: mustID(identity.Subject, "U"), Service: ServiceExecutor,
+			Opaque:    opaque(1), TenantID: tenantID, WorkspaceID: workspaceID,
+			UserID: mustID(identity.Subject, "U"), Service: ServiceExecutor,
 			Operation: "run", ReplayPolicy: ReplayIdempotencyKey, Generations: effect.Generations,
 			DispatchAttempt: 1, Deadline: time.Unix(2_000_000_000, 0).UTC(), EventSequence: 8, Durable: true,
 		}
@@ -754,7 +866,8 @@ func baseDispatchRequest(now time.Time) DispatchRequest {
 func preparationPermit(snapshot TurnSnapshot, attempt uint64, deadline time.Time) EffectPreparationPermit {
 	return EffectPreparationPermit{
 		EffectKey: EffectKey{SessionID: snapshot.SessionID, TurnID: snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
-		Opaque:    opaque(byte(attempt)), TenantID: snapshot.TenantID, UserID: snapshot.UserID,
+		Opaque:    opaque(byte(attempt)), TenantID: snapshot.TenantID, WorkspaceID: snapshot.WorkspaceID,
+		UserID:  snapshot.UserID,
 		Service: ServiceExecutor, Operation: "run", ReplayPolicy: ReplayIdempotencyKey,
 		Generations: snapshot.Generations, DispatchAttempt: attempt, Deadline: deadline, EventSequence: snapshot.EventSequence, Durable: true,
 	}
@@ -778,7 +891,11 @@ func acquirePermit(t *testing.T, coordinator *Coordinator, now time.Time, key st
 }
 
 func committedRecord() LedgerRecord {
-	return LedgerRecord{Status: LedgerCommitted, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID}
+	return LedgerRecord{Status: LedgerCommitted, TenantID: tenantID, WorkspaceID: workspaceID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID}
+}
+
+func routedRecord(status LedgerStatus) LedgerRecord {
+	return LedgerRecord{Status: status, TenantID: tenantID, WorkspaceID: workspaceID}
 }
 
 func digest(fill byte) Digest {
@@ -841,6 +958,8 @@ type fakeStore struct {
 	blocks              map[string]storedBlock
 	confirmations       map[string]ConfirmationReceipt
 	confirmationDigests map[string]Digest
+	operationLookups    []OperationLookup
+	readTurnCalls       int
 
 	eventSequence                      uint64
 	forceNonDurable                    bool
@@ -851,6 +970,7 @@ type fakeStore struct {
 	corruptSettlementIdentity          bool
 	corruptBlockIdentity               bool
 	corruptRecoverySettlementIdentity  bool
+	corruptReceiptRoute                receiptRouteCorruption
 	markDispatchTransitions            int
 	markExternalTransitions            int
 	prepareRetryTransitions            int
@@ -869,6 +989,13 @@ type fakeStore struct {
 	loseBlockResponseOnce              bool
 	blockTransitions                   int
 }
+
+type receiptRouteCorruption uint8
+
+const (
+	corruptTenantRoute receiptRouteCorruption = iota + 1
+	corruptWorkspaceRoute
+)
 
 type storedStepCommit struct {
 	digest  Digest
@@ -906,9 +1033,19 @@ func newFakeStore(snapshot TurnSnapshot) *fakeStore {
 	}
 }
 
+func (store *fakeStore) applyReceiptRouteCorruption(tenant *identity.ID, workspace *identity.ID) {
+	switch store.corruptReceiptRoute {
+	case corruptTenantRoute:
+		*tenant = mustID(identity.Tenant, "corrupt-tenant-route")
+	case corruptWorkspaceRoute:
+		*workspace = mustID(identity.Workspace, "corrupt-workspace-route")
+	}
+}
+
 func (store *fakeStore) LookupOperation(ctx context.Context, lookup OperationLookup) (OperationReceipt, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.operationLookups = append(store.operationLookups, lookup)
 	switch lookup.Kind {
 	case OperationDispatch:
 		stored, found := store.dispatches[lookup.OperationKey]
@@ -971,6 +1108,7 @@ func (store *fakeStore) ReadTurn(ctx context.Context, session identity.ID) (Turn
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.readTurnCalls++
 	copy := store.snapshot
 	if store.snapshot.ActiveEffect != nil {
 		effect := *store.snapshot.ActiveEffect
@@ -986,12 +1124,13 @@ func (store *fakeStore) AcquireEngineStep(ctx context.Context, command AcquireSt
 		return existing, nil
 	}
 	permit := EngineStepPermit{
-		Opaque: opaque(1), TenantID: command.Snapshot.TenantID, UserID: command.Snapshot.UserID,
+		Opaque: opaque(1), TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID,
 		OperationKey: command.OperationKey, SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID,
 		Generations: command.Snapshot.Generations, ExpectedEventSequence: command.Snapshot.EventSequence,
 		CheckpointDigest: command.Snapshot.CheckpointDigest, Budget: command.Budget, Deadline: command.Now.Add(command.Budget.MaximumWallClock), Durable: !store.forceNonDurable,
 		Checkpoint: command.Snapshot.Checkpoint, UnconsumedSettlement: command.Snapshot.UnconsumedSettlement,
 	}
+	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
 	store.stepPermits[command.OperationKey] = permit
 	return permit, nil
 }
@@ -1042,7 +1181,8 @@ func (store *fakeStore) CommitEngineStep(ctx context.Context, command CommitStep
 			replayPolicy = command.Boundary.Effect.ReplayPolicy
 			requestDigest = command.Boundary.Effect.RequestDigest
 		}
-		preparation := EffectPreparationPermit{EffectKey: EffectKey{SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: requestDigest}, Opaque: opaque(9), TenantID: command.Snapshot.TenantID, UserID: command.Snapshot.UserID, Service: service, Operation: operation, ReplayPolicy: replayPolicy, Generations: command.Snapshot.Generations, DispatchAttempt: 1, Deadline: command.Permit.Deadline, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+		preparation := EffectPreparationPermit{EffectKey: EffectKey{SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: requestDigest}, Opaque: opaque(9), TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID, Service: service, Operation: operation, ReplayPolicy: replayPolicy, Generations: command.Snapshot.Generations, DispatchAttempt: 1, Deadline: command.Permit.Deadline, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+		store.applyReceiptRouteCorruption(&preparation.TenantID, &preparation.WorkspaceID)
 		if store.corruptPreparedReceipt {
 			preparation.InvocationID = mustID(identity.Invocation, "bad-prepared")
 		}
@@ -1085,13 +1225,14 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 	store.markDispatchTransitions++
 	permit := DispatchPermit{
 		EffectKey: command.Key, Opaque: opaque(byte(store.snapshot.ActiveEffect.DispatchAttempt + 20)),
-		TenantID: command.Snapshot.TenantID, UserID: command.Snapshot.UserID,
+		TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID,
 		Service: command.Service, Operation: command.Operation, ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy,
 		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, Ordinal: store.snapshot.ActiveEffect.Ordinal,
 		Generations: command.Snapshot.Generations, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt,
 		ProviderRequestID: command.ProviderRequestID, Deadline: command.Deadline,
 		EventSequence: store.eventSequence, Durable: !store.forceNonDurable,
 	}
+	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
 	if store.zeroDispatchEvent {
 		permit.EventSequence = 0
 	}
@@ -1120,12 +1261,13 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 	store.snapshot.EventSequence = store.eventSequence
 	permit := EffectPreparationPermit{
 		EffectKey: command.Key, Opaque: opaque(byte(store.snapshot.ActiveEffect.DispatchAttempt + 1)),
-		TenantID: store.snapshot.TenantID, UserID: store.snapshot.UserID,
+		TenantID: store.snapshot.TenantID, WorkspaceID: store.snapshot.WorkspaceID, UserID: store.snapshot.UserID,
 		Service: store.snapshot.ActiveEffect.Service, Operation: store.snapshot.ActiveEffect.Operation,
 		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, Ordinal: store.snapshot.ActiveEffect.Ordinal,
 		ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy, Generations: store.snapshot.Generations,
 		DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt + 1, Deadline: command.Deadline, EventSequence: store.eventSequence, Durable: true,
 	}
+	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
 	store.preparations[command.OperationKey] = storedPreparation{digest: command.OperationDigest, permit: permit}
 	if store.losePrepareRetryResponseOnce {
 		store.losePrepareRetryResponseOnce = false
@@ -1154,7 +1296,8 @@ func (store *fakeStore) SettleRecovery(ctx context.Context, command SettleRecove
 	if command.Error != nil {
 		store.lastSettlementError = proto.Clone(command.Error).(*v1.PublicError)
 	}
-	receipt := SettlementReceipt{EffectKey: command.Key, State: EffectSettled, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, Error: command.Error, OperationDigest: command.OperationDigest, RecoveryKind: command.Kind, Effect: store.snapshot.ActiveEffect.Settlement, EventSequence: store.eventSequence, Durable: true}
+	receipt := SettlementReceipt{EffectKey: command.Key, TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, State: EffectSettled, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, Error: command.Error, OperationDigest: command.OperationDigest, RecoveryKind: command.Kind, Effect: store.snapshot.ActiveEffect.Settlement, EventSequence: store.eventSequence, Durable: true}
+	store.applyReceiptRouteCorruption(&receipt.TenantID, &receipt.WorkspaceID)
 	if store.corruptRecoverySettlementIdentity {
 		receipt.DispatchAttempt++
 	}
@@ -1184,7 +1327,8 @@ func (store *fakeStore) MarkExternallyCommitted(ctx context.Context, command Mar
 	store.snapshot.ActiveEffect.ResultRef = command.Record.ResultRef
 	store.snapshot.EventSequence = store.eventSequence
 	store.markExternalTransitions++
-	receipt := ConfirmationReceipt{EffectKey: command.Key, Service: command.Record.Service, Operation: command.Record.Operation, DispatchAttempt: command.DispatchAttempt, ProviderRequestID: command.Record.ProviderRequestID, ExternalCommitID: command.Record.ExternalCommitID, ResultRef: command.Record.ResultRef, OperationDigest: command.OperationDigest, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	receipt := ConfirmationReceipt{EffectKey: command.Key, TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, Service: command.Record.Service, Operation: command.Record.Operation, DispatchAttempt: command.DispatchAttempt, ProviderRequestID: command.Record.ProviderRequestID, ExternalCommitID: command.Record.ExternalCommitID, ResultRef: command.Record.ResultRef, OperationDigest: command.OperationDigest, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	store.applyReceiptRouteCorruption(&receipt.TenantID, &receipt.WorkspaceID)
 	if store.zeroConfirmationEvent {
 		receipt.EventSequence = 0
 	}
@@ -1218,7 +1362,8 @@ func (store *fakeStore) SettleEffect(ctx context.Context, command SettleCommand)
 	if command.Error != nil {
 		store.lastSettlementError = proto.Clone(command.Error).(*v1.PublicError)
 	}
-	receipt := SettlementReceipt{EffectKey: command.Key, State: EffectSettled, DispatchAttempt: command.DispatchAttempt, ExternalCommitID: command.ExternalCommitID, ResultRef: command.ResultRef, Error: command.Error, OperationDigest: command.SettlementDigest, Effect: store.snapshot.ActiveEffect.Settlement, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	receipt := SettlementReceipt{EffectKey: command.Key, TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, State: EffectSettled, DispatchAttempt: command.DispatchAttempt, ExternalCommitID: command.ExternalCommitID, ResultRef: command.ResultRef, Error: command.Error, OperationDigest: command.SettlementDigest, Effect: store.snapshot.ActiveEffect.Settlement, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	store.applyReceiptRouteCorruption(&receipt.TenantID, &receipt.WorkspaceID)
 	if store.corruptSettlementIdentity {
 		receipt.DispatchAttempt++
 	}
@@ -1248,7 +1393,8 @@ func (store *fakeStore) BlockEffect(ctx context.Context, command BlockCommand) (
 	if command.Reason != nil {
 		store.lastBlockReason = proto.Clone(command.Reason).(*v1.PublicError)
 	}
-	receipt := BlockReceipt{EffectKey: command.Key, State: EffectBlocked, ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, OperationDigest: command.OperationDigest, Reason: command.Reason, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	receipt := BlockReceipt{EffectKey: command.Key, TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, State: EffectBlocked, ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, OperationDigest: command.OperationDigest, Reason: command.Reason, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	store.applyReceiptRouteCorruption(&receipt.TenantID, &receipt.WorkspaceID)
 	if store.corruptBlockIdentity {
 		receipt.DispatchAttempt++
 	}

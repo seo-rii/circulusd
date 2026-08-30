@@ -67,7 +67,7 @@ func TestDispatchAndRecoveryBindOpaqueAttemptProviderAndDeadline(t *testing.T) {
 	preparation := preparationPermit(snapshot, 1, now.Add(time.Minute))
 	snapshot.ActiveEffect.PreparationPermit = &preparation
 	store := newFakeStore(snapshot)
-	coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerAbsent}})
+	coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerAbsent)})
 
 	request := baseDispatchRequest(now)
 	request.PreparationPermit = *snapshot.ActiveEffect.PreparationPermit
@@ -102,7 +102,7 @@ func TestNeverRecoveryDurablySettlesInsteadOfReturningAnUnenactedDecision(t *tes
 	effect.ReplayPolicy = ReplayNever
 	snapshot.ActiveEffect = effect
 	store := newFakeStore(snapshot)
-	coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+	coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)})
 
 	decision, err := coordinator.RecoverEffect(context.Background(), RecoveryRequest{
 		Authority: baseAuthority(now), Now: now, Deadline: now.Add(time.Minute),
@@ -141,7 +141,7 @@ func TestAbortRecoveryNeverAdmitsDispatchOrReplay(t *testing.T) {
 			}
 			snapshot.ActiveEffect = effect
 			store := newFakeStore(snapshot)
-			coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+			coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)})
 			decision, err := coordinator.RecoverEffect(context.Background(), RecoveryRequest{
 				Authority: baseAuthority(now), Now: now, Deadline: now.Add(time.Minute),
 				EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
@@ -204,6 +204,137 @@ func TestMutationReceiptReplaySurvivesLaterStateProgress(t *testing.T) {
 			t.Fatalf("settlement replay = %#v, %v; want %#v", replayedSettlement, settlementErr, settlement)
 		}
 	})
+}
+
+func TestReplayFirstReceiptsRejectForeignAuthorityRouteWithoutStateOrLedgerUse(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_900_000_410, 0).UTC()
+	for _, route := range []struct {
+		name   string
+		mutate func(*ValidatedTurnFence)
+	}{
+		{name: "tenant", mutate: func(authority *ValidatedTurnFence) {
+			authority.TenantID = mustID(identity.Tenant, "foreign-tenant")
+		}},
+		{name: "workspace", mutate: func(authority *ValidatedTurnFence) {
+			authority.WorkspaceID = mustID(identity.Workspace, "foreign-workspace")
+		}},
+	} {
+		t.Run(route.name+"/confirmation", func(t *testing.T) {
+			snapshot := baseSnapshot(now)
+			snapshot.ActiveEffect = baseEffect(EffectDispatched)
+			store := newFakeStore(snapshot)
+			ledger := &fakeLedger{record: committedRecord()}
+			coordinator := mustCoordinator(t, store, ledger)
+			request := ConfirmationRequest{
+				Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID,
+				RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
+				ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "route-confirm-" + route.name, OperationDigest: digest(123),
+			}
+			if _, err := coordinator.ConfirmExternalCommit(context.Background(), request); err != nil {
+				t.Fatalf("first ConfirmExternalCommit() error = %v", err)
+			}
+			store.mu.Lock()
+			reads := store.readTurnCalls
+			transitions := store.markExternalTransitions
+			store.mu.Unlock()
+			ledger.mu.Lock()
+			lookups := len(ledger.lookups)
+			ledger.mu.Unlock()
+			route.mutate(&request.Authority)
+			if receipt, err := coordinator.ConfirmExternalCommit(context.Background(), request); !errors.Is(err, ErrFenceMismatch) || receipt != (ConfirmationReceipt{}) {
+				t.Fatalf("foreign-route confirmation replay = %#v, %v; want ErrFenceMismatch", receipt, err)
+			}
+			store.mu.Lock()
+			if store.readTurnCalls != reads || store.markExternalTransitions != transitions {
+				t.Fatalf("confirmation replay side effects: reads=%d transitions=%d, want %d/%d", store.readTurnCalls, store.markExternalTransitions, reads, transitions)
+			}
+			store.mu.Unlock()
+			ledger.mu.Lock()
+			if len(ledger.lookups) != lookups {
+				t.Fatalf("confirmation replay ledger lookups = %d, want %d", len(ledger.lookups), lookups)
+			}
+			ledger.mu.Unlock()
+		})
+
+		t.Run(route.name+"/settlement", func(t *testing.T) {
+			snapshot := baseSnapshot(now)
+			snapshot.ActiveEffect = baseEffect(EffectExternallyCommitted)
+			store := newFakeStore(snapshot)
+			coordinator := mustCoordinator(t, store, nil)
+			request := SettlementRequest{
+				Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID,
+				RequestDigest: digest(2), DispatchAttempt: 1, ExternalCommitID: commitID, ResultRef: resultID,
+				OperationKey: "route-settle-" + route.name, SettlementDigest: digest(124),
+			}
+			if _, err := coordinator.SettleEffect(context.Background(), request); err != nil {
+				t.Fatalf("first SettleEffect() error = %v", err)
+			}
+			store.mu.Lock()
+			reads := store.readTurnCalls
+			settlements := len(store.settlements)
+			store.mu.Unlock()
+			route.mutate(&request.Authority)
+			if receipt, err := coordinator.SettleEffect(context.Background(), request); !errors.Is(err, ErrFenceMismatch) || receipt != (SettlementReceipt{}) {
+				t.Fatalf("foreign-route settlement replay = %#v, %v; want ErrFenceMismatch", receipt, err)
+			}
+			store.mu.Lock()
+			if store.readTurnCalls != reads || len(store.settlements) != settlements {
+				t.Fatalf("settlement replay side effects: reads=%d settlements=%d, want %d/%d", store.readTurnCalls, len(store.settlements), reads, settlements)
+			}
+			store.mu.Unlock()
+		})
+
+		for _, recovery := range []struct {
+			name             string
+			policy           ReplayPolicy
+			want             RecoveryAction
+			settleTransition bool
+		}{
+			{name: "recovery-settlement", policy: ReplayNever, want: RecoverySettleInterrupted, settleTransition: true},
+			{name: "recovery-block", policy: ReplayConfirm, want: RecoveryNeedsConfirmation},
+		} {
+			t.Run(route.name+"/"+recovery.name, func(t *testing.T) {
+				snapshot := baseSnapshot(now)
+				effect := baseEffect(EffectDispatched)
+				effect.ReplayPolicy = recovery.policy
+				snapshot.ActiveEffect = effect
+				store := newFakeStore(snapshot)
+				ledger := &fakeLedger{record: routedRecord(LedgerUnknown)}
+				coordinator := mustCoordinator(t, store, ledger)
+				request := baseRecoveryRequest(now, "route-"+recovery.name+"-"+route.name)
+				first, err := coordinator.RecoverEffect(context.Background(), request)
+				if err != nil || first.Action != recovery.want {
+					t.Fatalf("first RecoverEffect() = %#v, %v; want %q", first, err, recovery.want)
+				}
+				store.mu.Lock()
+				reads := store.readTurnCalls
+				settlements := store.recoverySettlementTransitions
+				blocks := store.blockTransitions
+				store.mu.Unlock()
+				ledger.mu.Lock()
+				lookups := len(ledger.lookups)
+				ledger.mu.Unlock()
+				route.mutate(&request.Authority)
+				if decision, err := coordinator.RecoverEffect(context.Background(), request); !errors.Is(err, ErrFenceMismatch) || decision != (RecoveryDecision{}) {
+					t.Fatalf("foreign-route recovery replay = %#v, %v; want ErrFenceMismatch", decision, err)
+				}
+				store.mu.Lock()
+				if store.readTurnCalls != reads || store.recoverySettlementTransitions != settlements || store.blockTransitions != blocks {
+					t.Fatalf("recovery replay side effects: reads=%d settlements=%d blocks=%d, want %d/%d/%d", store.readTurnCalls, store.recoverySettlementTransitions, store.blockTransitions, reads, settlements, blocks)
+				}
+				store.mu.Unlock()
+				ledger.mu.Lock()
+				if len(ledger.lookups) != lookups {
+					t.Fatalf("recovery replay ledger lookups = %d, want %d", len(ledger.lookups), lookups)
+				}
+				ledger.mu.Unlock()
+				if recovery.settleTransition && settlements == 0 {
+					t.Fatal("expected durable recovery settlement before replay")
+				}
+			})
+		}
+	}
 }
 
 func TestConfirmationReplayRejectsForeignEffectDomain(t *testing.T) {
@@ -394,7 +525,7 @@ func TestRecoveryDispatchCapabilityReplayRequiresCurrentExactAttempt(t *testing.
 	snapshot.ActiveEffect = baseEffect(EffectDispatched)
 	store := newFakeStore(snapshot)
 	store.loseDispatchResponseOnce = true
-	coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerAbsent}})
+	coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerAbsent)})
 	request := baseRecoveryRequest(now, "lost-recovery-capability-progressed")
 	if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
 		t.Fatal("first RecoverEffect() unexpectedly observed durable dispatch response")
@@ -426,6 +557,8 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 			{name: "effect", mutate: func(record *LedgerRecord) { record.EffectID = mustID(identity.Effect, "wrong-effect") }},
 			{name: "invocation", mutate: func(record *LedgerRecord) { record.InvocationID = mustID(identity.Invocation, "wrong-invocation") }},
 			{name: "digest", mutate: func(record *LedgerRecord) { record.RequestDigest = digest(117) }},
+			{name: "tenant", mutate: func(record *LedgerRecord) { record.TenantID = mustID(identity.Tenant, "wrong-tenant") }},
+			{name: "workspace", mutate: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "wrong-workspace") }},
 			{name: "service", mutate: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
 			{name: "operation", mutate: func(record *LedgerRecord) { record.Operation = "write" }},
 			{name: "attempt", mutate: func(record *LedgerRecord) { record.DispatchAttempt++ }},
@@ -436,7 +569,8 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 				snapshot.ActiveEffect = baseEffect(EffectDispatched)
 				store := newFakeStore(snapshot)
 				record := LedgerRecord{
-					Status: status, EffectID: effectID, InvocationID: invocationID,
+					Status: status, TenantID: tenantID, WorkspaceID: workspaceID,
+					EffectID: effectID, InvocationID: invocationID,
 					RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
 					ProviderRequestID: mustID(identity.Request, "R"),
 				}
@@ -450,6 +584,49 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 				}
 				if store.recoverySettlementTransitions != 0 {
 					t.Fatalf("recovery settlements = %d, want 0", store.recoverySettlementTransitions)
+				}
+			})
+		}
+	}
+}
+
+func TestRecoveryRejectsMismatchedAbsentAndUnknownLedgerRoutes(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_900_000_485, 0).UTC()
+
+	for _, status := range []LedgerStatus{LedgerAbsent, LedgerUnknown} {
+		for _, mismatch := range []struct {
+			name   string
+			mutate func(*LedgerRecord)
+		}{
+			{name: "tenant", mutate: func(record *LedgerRecord) { record.TenantID = mustID(identity.Tenant, "wrong-tenant") }},
+			{name: "workspace", mutate: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "wrong-workspace") }},
+		} {
+			t.Run(string(status)+"/"+mismatch.name, func(t *testing.T) {
+				snapshot := baseSnapshot(now)
+				snapshot.ActiveEffect = baseEffect(EffectDispatched)
+				store := newFakeStore(snapshot)
+				record := routedRecord(status)
+				mismatch.mutate(&record)
+
+				decision, err := mustCoordinator(t, store, &fakeLedger{record: record}).RecoverEffect(
+					context.Background(),
+					baseRecoveryRequest(now, "mismatched-route-"+string(status)+"-"+mismatch.name),
+				)
+				if !errors.Is(err, ErrLedgerMismatch) || decision != (RecoveryDecision{}) {
+					t.Fatalf("RecoverEffect() = %#v, %v; want ErrLedgerMismatch", decision, err)
+				}
+				if store.prepareRetryTransitions != 0 || store.markDispatchTransitions != 0 ||
+					store.markExternalTransitions != 0 || store.recoverySettlementTransitions != 0 ||
+					store.blockTransitions != 0 {
+					t.Fatalf(
+						"durable transitions = prepare:%d dispatch:%d external:%d settle:%d block:%d, want all zero",
+						store.prepareRetryTransitions,
+						store.markDispatchTransitions,
+						store.markExternalTransitions,
+						store.recoverySettlementTransitions,
+						store.blockTransitions,
+					)
 				}
 			})
 		}
@@ -516,7 +693,7 @@ func TestRecoveryRejectsEveryInvalidEffectSnapshotShape(t *testing.T) {
 			effect := baseEffect(EffectDispatched)
 			test.mutate(effect)
 			snapshot.ActiveEffect = effect
-			coordinator := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+			coordinator := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: routedRecord(LedgerUnknown)})
 			_, err := coordinator.RecoverEffect(context.Background(), RecoveryRequest{Authority: baseAuthority(now), Now: now, Deadline: now.Add(time.Minute), EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), OperationKey: "shape-" + test.name, OperationDigest: digest(77)})
 			if !errors.Is(err, ErrInvalidRequest) {
 				t.Fatalf("RecoverEffect() error = %v, want %v", err, ErrInvalidRequest)
@@ -580,7 +757,7 @@ func TestEveryDurableReceiptRejectsZeroEventSequence(t *testing.T) {
 		snapshot.ActiveEffect = effect
 		store := newFakeStore(snapshot)
 		store.zeroBlockEvent = true
-		_, err := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}}).RecoverEffect(context.Background(), RecoveryRequest{Authority: baseAuthority(now), Now: now, Deadline: now.Add(time.Minute), EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), OperationKey: "zero-block", OperationDigest: digest(83)})
+		_, err := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)}).RecoverEffect(context.Background(), RecoveryRequest{Authority: baseAuthority(now), Now: now, Deadline: now.Add(time.Minute), EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), OperationKey: "zero-block", OperationDigest: digest(83)})
 		if !errors.Is(err, ErrFenceMismatch) {
 			t.Fatalf("RecoverEffect() error = %v, want %v", err, ErrFenceMismatch)
 		}
@@ -661,7 +838,7 @@ func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 		snapshot.ActiveEffect = effect
 		store := newFakeStore(snapshot)
 		store.corruptBlockIdentity = true
-		_, err := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}}).RecoverEffect(context.Background(), baseRecoveryRequest(now, "receipt-block-identity"))
+		_, err := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)}).RecoverEffect(context.Background(), baseRecoveryRequest(now, "receipt-block-identity"))
 		if !errors.Is(err, ErrFenceMismatch) {
 			t.Fatalf("RecoverEffect() error = %v, want %v", err, ErrFenceMismatch)
 		}
@@ -673,7 +850,8 @@ func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 		store := newFakeStore(snapshot)
 		store.corruptRecoverySettlementIdentity = true
 		_, err := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{
-			Status: LedgerFailed, EffectID: effectID, InvocationID: invocationID,
+			Status: LedgerFailed, TenantID: tenantID, WorkspaceID: workspaceID,
+			EffectID: effectID, InvocationID: invocationID,
 			RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
 			ProviderRequestID: mustID(identity.Request, "R"),
 		}}).RecoverEffect(context.Background(), baseRecoveryRequest(now, "receipt-recovery-identity"))
@@ -689,7 +867,7 @@ func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 		snapshot.ActiveEffect = effect
 		store := newFakeStore(snapshot)
 		store.loseBlockResponseOnce = true
-		coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+		coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)})
 		request := baseRecoveryRequest(now, "lost-recovery-block")
 		if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
 			t.Fatal("first RecoverEffect() unexpectedly observed durable block response")
@@ -745,7 +923,7 @@ func TestRecoveryRetryRequiresCurrentTrustedAdmissionDeadline(t *testing.T) {
 	request := baseRecoveryRequest(now, "expired-recovery-retry")
 	request.Deadline = now
 
-	_, err := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: LedgerRecord{Status: LedgerAbsent}}).RecoverEffect(context.Background(), request)
+	_, err := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: routedRecord(LedgerAbsent)}).RecoverEffect(context.Background(), request)
 	if !errors.Is(err, ErrAdmissionExpired) {
 		t.Fatalf("RecoverEffect() error = %v, want %v", err, ErrAdmissionExpired)
 	}
@@ -797,7 +975,7 @@ func TestSettlementAndBlockPreserveFullPublicErrorPayload(t *testing.T) {
 	blockStore := newFakeStore(dispatched)
 	recovery := baseRecoveryRequest(now, "full-error-block")
 	recovery.Reason = publicError
-	_, err = mustCoordinator(t, blockStore, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}}).RecoverEffect(context.Background(), recovery)
+	_, err = mustCoordinator(t, blockStore, &fakeLedger{record: routedRecord(LedgerUnknown)}).RecoverEffect(context.Background(), recovery)
 	if err != nil {
 		t.Fatalf("RecoverEffect() error = %v", err)
 	}
@@ -815,7 +993,7 @@ func TestRecoveryMutationResponseLossReplaysDurableReceipt(t *testing.T) {
 		snapshot.ActiveEffect = baseEffect(EffectDispatched)
 		store := newFakeStore(snapshot)
 		store.loseDispatchResponseOnce = true
-		coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerAbsent}})
+		coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerAbsent)})
 		request := baseRecoveryRequest(now, "lost-recovery-dispatch")
 		if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
 			t.Fatal("first RecoverEffect() unexpectedly observed durable dispatch response")
@@ -831,7 +1009,7 @@ func TestRecoveryMutationResponseLossReplaysDurableReceipt(t *testing.T) {
 		snapshot.ActiveEffect = baseEffect(EffectDispatched)
 		store := newFakeStore(snapshot)
 		store.losePrepareRetryResponseOnce = true
-		coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerAbsent}})
+		coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerAbsent)})
 		request := baseRecoveryRequest(now, "lost-recovery-preparation")
 		if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
 			t.Fatal("first RecoverEffect() unexpectedly observed durable preparation response")
@@ -849,7 +1027,7 @@ func TestRecoveryMutationResponseLossReplaysDurableReceipt(t *testing.T) {
 		snapshot.ActiveEffect = effect
 		store := newFakeStore(snapshot)
 		store.loseRecoverySettlementResponseOnce = true
-		coordinator := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{Status: LedgerUnknown}})
+		coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerUnknown)})
 		request := baseRecoveryRequest(now, "lost-recovery-settlement")
 		if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
 			t.Fatal("first RecoverEffect() unexpectedly observed durable settlement response")

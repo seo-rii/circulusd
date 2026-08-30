@@ -48,6 +48,7 @@ type Generations struct {
 // DurableStore must still compare it atomically with authoritative state.
 type ValidatedTurnFence struct {
 	TenantID    identity.ID
+	WorkspaceID identity.ID
 	SessionID   identity.ID
 	TurnID      identity.ID
 	Generations Generations
@@ -116,6 +117,7 @@ type DispatchMetadata struct {
 
 type TurnSnapshot struct {
 	TenantID             identity.ID
+	WorkspaceID          identity.ID
 	UserID               identity.ID
 	SessionID            identity.ID
 	TurnID               identity.ID
@@ -147,6 +149,7 @@ type EngineStepRequest struct {
 type EngineStepPermit struct {
 	Opaque                OpaquePermit
 	TenantID              identity.ID
+	WorkspaceID           identity.ID
 	UserID                identity.ID
 	OperationKey          string
 	SessionID             identity.ID
@@ -209,6 +212,7 @@ type EffectPreparationPermit struct {
 	EffectKey
 	Opaque            OpaquePermit
 	TenantID          identity.ID
+	WorkspaceID       identity.ID
 	UserID            identity.ID
 	Service           EffectService
 	Operation         string
@@ -249,6 +253,7 @@ type DispatchPermit struct {
 	EffectKey
 	Opaque            OpaquePermit
 	TenantID          identity.ID
+	WorkspaceID       identity.ID
 	UserID            identity.ID
 	Service           EffectService
 	Operation         string
@@ -279,6 +284,8 @@ type SettlementRequest struct {
 
 type SettlementReceipt struct {
 	EffectKey
+	TenantID         identity.ID
+	WorkspaceID      identity.ID
 	State            EffectState
 	DispatchAttempt  uint64
 	ExternalCommitID identity.ID
@@ -307,6 +314,8 @@ type ConfirmationRequest struct {
 
 type ConfirmationReceipt struct {
 	EffectKey
+	TenantID          identity.ID
+	WorkspaceID       identity.ID
 	Service           EffectService
 	Operation         string
 	DispatchAttempt   uint64
@@ -330,6 +339,8 @@ const (
 
 type LedgerRecord struct {
 	Status            LedgerStatus
+	TenantID          identity.ID
+	WorkspaceID       identity.ID
 	EffectID          identity.ID
 	InvocationID      identity.ID
 	RequestDigest     Digest
@@ -343,6 +354,8 @@ type LedgerRecord struct {
 
 type LedgerLookup struct {
 	EffectKey
+	TenantID          identity.ID
+	WorkspaceID       identity.ID
 	Service           EffectService
 	Operation         string
 	DispatchAttempt   uint64
@@ -425,6 +438,8 @@ type OperationLookup struct {
 	Kind            OperationKind
 	OperationKey    string
 	OperationDigest Digest
+	TenantID        identity.ID
+	WorkspaceID     identity.ID
 	SessionID       identity.ID
 }
 
@@ -497,6 +512,8 @@ type BlockCommand struct {
 
 type BlockReceipt struct {
 	EffectKey
+	TenantID        identity.ID
+	WorkspaceID     identity.ID
 	State           EffectState
 	ReplayPolicy    ReplayPolicy
 	DispatchAttempt uint64
