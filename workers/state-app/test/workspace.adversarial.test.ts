@@ -41,6 +41,7 @@ function authority(
     turnLeaseExpiresAt: 20_000,
     effectStatus: "dispatched",
     effectService: "workspace",
+    effectOperation: "workspace.commit",
     effectId: `effect-${invocationId}`,
     invocationId,
     requestDigest: digest("a"),
@@ -870,14 +871,14 @@ describe("workspace adversarial contracts", () => {
   });
 
   it("rotates authority-bearing workspace state and command schemas", () => {
-    expect(WORKSPACE_STATE_SCHEMA_VERSION).toBe(2);
-    expect(WORKSPACE_COMMAND_SCHEMA_VERSION).toBe(2);
+    expect(WORKSPACE_STATE_SCHEMA_VERSION).toBe(3);
+    expect(WORKSPACE_COMMAND_SCHEMA_VERSION).toBe(3);
     const legacy = createWorkspaceState({
       workspaceId: "workspace-legacy-schema",
       tenantId: "tenant-1",
       initialRootDigest: digest("0"),
     }) as unknown as { schemaVersion: number };
-    legacy.schemaVersion = 1;
+    legacy.schemaVersion = 2;
 
     expect(() =>
       assertWorkspaceInvariants(legacy as unknown as WorkspaceAggregateState),

@@ -38,6 +38,7 @@ function authority(
     turnLeaseExpiresAt: 20_000,
     effectStatus: "dispatched",
     effectService: "workspace",
+    effectOperation: "workspace.commit",
     effectId: "effect-1",
     invocationId: "invocation-1",
     requestDigest: REQUEST,

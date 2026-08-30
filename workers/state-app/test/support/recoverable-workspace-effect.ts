@@ -343,6 +343,7 @@ export class RecoverableWorkspaceEffect {
       turnLeaseExpiresAt: dispatched.activeTurn.leaseExpiresAt,
       effectStatus: "dispatched",
       effectService: dispatchedEffect.service,
+      effectOperation: dispatchedEffect.operation,
       effectId: dispatchedEffect.effectId,
       invocationId: dispatchedEffect.invocationId,
       requestDigest: dispatchedEffect.requestDigest,

@@ -65,6 +65,7 @@ const WORKSPACE_AUTHORITY_FIELDS = [
   "turnLeaseExpiresAt",
   "effectStatus",
   "effectService",
+  "effectOperation",
   "effectId",
   "invocationId",
   "requestDigest",
@@ -261,6 +262,7 @@ function validatedAuthority(
     workspaceError("INVALID_ARGUMENT", `${field}.effectStatus is invalid`);
   }
   validatedEffectService(record.effectService, `${field}.effectService`);
+  validatedIdentifier(record.effectOperation, `${field}.effectOperation`);
   validatedIdentifier(record.effectId, `${field}.effectId`);
   validatedIdentifier(record.invocationId, `${field}.invocationId`);
   parseDigest(record.requestDigest, `${field}.requestDigest`);
@@ -336,6 +338,7 @@ function authorityIdentityMatches(
       (permission, index) => permission === right.effectivePermissions[index],
     ) &&
     left.effectService === right.effectService &&
+    left.effectOperation === right.effectOperation &&
     left.effectId === right.effectId &&
     left.invocationId === right.invocationId &&
     left.requestDigest === right.requestDigest &&
@@ -363,6 +366,7 @@ function stableSettlementIdentityMatches(
     current.runtimeRevision === historical.runtimeRevision &&
     current.policySnapshotDigest === historical.policySnapshotDigest &&
     current.effectService === historical.effectService &&
+    current.effectOperation === historical.effectOperation &&
     current.effectId === historical.effectId &&
     current.invocationId === historical.invocationId &&
     current.requestDigest === historical.requestDigest &&
@@ -733,6 +737,7 @@ function grantQueueHead(
     invocationId: lease.invocationId,
     requestDigest: lease.requestDigest,
     effectService: lease.admissionAuthority.effectService,
+    effectOperation: lease.admissionAuthority.effectOperation,
     effectId: lease.effectId,
     latestProjectionGeneration: lease.projectionGeneration,
     latestDispatchAttempt: lease.dispatchAttempt,
@@ -754,6 +759,7 @@ function advanceLeaseQueue(
       invocationId: expired.invocationId,
       requestDigest: expired.requestDigest,
       effectService: expired.admissionAuthority.effectService,
+      effectOperation: expired.admissionAuthority.effectOperation,
       effectId: expired.effectId,
       latestProjectionGeneration: expired.projectionGeneration,
       latestDispatchAttempt: expired.dispatchAttempt,
@@ -775,6 +781,7 @@ function advanceLeaseQueue(
       invocationId: canceled.authority.invocationId,
       requestDigest: canceled.authority.requestDigest,
       effectService: canceled.authority.effectService,
+      effectOperation: canceled.authority.effectOperation,
       effectId: canceled.authority.effectId,
       latestProjectionGeneration: canceled.projectionGeneration,
       latestDispatchAttempt: canceled.authority.dispatchAttempt,
@@ -799,6 +806,7 @@ function advanceLeaseQueue(
       invocationId: timedOut.authority.invocationId,
       requestDigest: timedOut.authority.requestDigest,
       effectService: timedOut.authority.effectService,
+      effectOperation: timedOut.authority.effectOperation,
       effectId: timedOut.authority.effectId,
       latestProjectionGeneration: timedOut.projectionGeneration,
       latestDispatchAttempt: timedOut.authority.dispatchAttempt,
@@ -819,6 +827,7 @@ function advanceLeaseQueue(
         invocationId: canceled.authority.invocationId,
         requestDigest: canceled.authority.requestDigest,
         effectService: canceled.authority.effectService,
+        effectOperation: canceled.authority.effectOperation,
         effectId: canceled.authority.effectId,
         latestProjectionGeneration: canceled.projectionGeneration,
         latestDispatchAttempt: canceled.authority.dispatchAttempt,
@@ -1434,6 +1443,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
         "invocationId",
         "requestDigest",
         "effectService",
+        "effectOperation",
         "effectId",
         "latestProjectionGeneration",
         "latestDispatchAttempt",
@@ -1450,6 +1460,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     validatedIdentifier(history.invocationId, "lease history invocationId");
     parseDigest(history.requestDigest, "lease history requestDigest");
     validatedEffectService(history.effectService, "lease history effectService");
+    validatedIdentifier(history.effectOperation, "lease history effectOperation");
     validatedIdentifier(history.effectId, "lease history effectId");
     validatedInteger(
       history.latestProjectionGeneration,
@@ -1496,6 +1507,8 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       activeHistory.requestDigest !== state.activeWriteLease.requestDigest ||
       activeHistory.effectService !==
         state.activeWriteLease.admissionAuthority.effectService ||
+      activeHistory.effectOperation !==
+        state.activeWriteLease.admissionAuthority.effectOperation ||
       activeHistory.effectId !== state.activeWriteLease.effectId ||
       activeHistory.latestLeaseGeneration !== state.activeWriteLease.leaseGeneration ||
       activeHistory.latestDispatchAttempt !== state.activeWriteLease.dispatchAttempt ||
@@ -1513,6 +1526,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       history.status !== (queued.canceled ? "canceled" : "queued") ||
       history.requestDigest !== queued.authority.requestDigest ||
       history.effectService !== queued.authority.effectService ||
+      history.effectOperation !== queued.authority.effectOperation ||
       history.effectId !== queued.authority.effectId ||
       history.latestDispatchAttempt !== queued.authority.dispatchAttempt ||
       history.latestProjectionGeneration !== queued.projectionGeneration ||
@@ -1526,7 +1540,11 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
   const conflictDigests = new Map<string, Digest>();
   const conflictEffectIdentities = new Map<
     string,
-    { readonly effectService: EffectService; readonly effectId: string }
+    {
+      readonly effectService: EffectService;
+      readonly effectOperation: string;
+      readonly effectId: string;
+    }
   >();
   for (const conflict of state.leaseConflicts) {
     validatedExactKeys(
@@ -1586,17 +1604,20 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     if (
       priorEffectIdentity !== undefined &&
       (priorEffectIdentity.effectService !== authority.effectService ||
+        priorEffectIdentity.effectOperation !== authority.effectOperation ||
         priorEffectIdentity.effectId !== authority.effectId)
     ) {
       workspaceError("FAILED_PRECONDITION", "lease conflict invocation changed effect identity");
     }
     conflictEffectIdentities.set(invocationId, {
       effectService: authority.effectService,
+      effectOperation: authority.effectOperation,
       effectId: authority.effectId,
     });
     if (
       history !== undefined &&
       (history.effectService !== authority.effectService ||
+        history.effectOperation !== authority.effectOperation ||
         history.effectId !== authority.effectId)
     ) {
       workspaceError("FAILED_PRECONDITION", "lease conflict disagrees with lease history");
@@ -1898,6 +1919,9 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       committedHistory === undefined ||
       committedHistory.status !== "committed" ||
       committedHistory.requestDigest !== record.requestDigest ||
+      committedHistory.effectService !== commitAuthority.effectService ||
+      committedHistory.effectOperation !== commitAuthority.effectOperation ||
+      committedHistory.effectId !== commitAuthority.effectId ||
       committedHistory.latestDispatchAttempt !== record.leaseFence.dispatchAttempt ||
       committedHistory.latestLeaseGeneration !== record.leaseFence.leaseGeneration ||
       committedHistory.latestProjectionGeneration !== record.leaseFence.projectionGeneration
@@ -2415,9 +2439,11 @@ export async function applyWorkspaceCommand(
       if (
         (history !== undefined &&
           (history.effectService !== authority.effectService ||
+            history.effectOperation !== authority.effectOperation ||
             history.effectId !== authority.effectId)) ||
         (priorConflict !== undefined &&
           (priorConflict.authority.effectService !== authority.effectService ||
+            priorConflict.authority.effectOperation !== authority.effectOperation ||
             priorConflict.authority.effectId !== authority.effectId))
       ) {
         workspaceError("STALE_GENERATION", "invocation effect identity changed between attempts");
@@ -2587,6 +2613,7 @@ export async function applyWorkspaceCommand(
         invocationId: authority.invocationId,
         requestDigest: authority.requestDigest,
         effectService: authority.effectService,
+        effectOperation: authority.effectOperation,
         effectId: authority.effectId,
         latestProjectionGeneration: command.projectionGeneration,
         latestDispatchAttempt: authority.dispatchAttempt,
@@ -2716,6 +2743,7 @@ export async function applyWorkspaceCommand(
         invocationId: lease.invocationId,
         requestDigest: lease.requestDigest,
         effectService: lease.admissionAuthority.effectService,
+        effectOperation: lease.admissionAuthority.effectOperation,
         effectId: lease.effectId,
         latestProjectionGeneration: lease.projectionGeneration,
         latestDispatchAttempt: lease.dispatchAttempt,
@@ -2788,6 +2816,7 @@ export async function applyWorkspaceCommand(
         invocationId,
         requestDigest,
         effectService: queued.authority.effectService,
+        effectOperation: queued.authority.effectOperation,
         effectId: queued.authority.effectId,
         latestProjectionGeneration: queued.projectionGeneration,
         latestDispatchAttempt: queued.authority.dispatchAttempt,
@@ -3051,6 +3080,7 @@ export async function applyWorkspaceCommand(
         invocationId: lease.invocationId,
         requestDigest: lease.requestDigest,
         effectService: lease.admissionAuthority.effectService,
+        effectOperation: lease.admissionAuthority.effectOperation,
         effectId: lease.effectId,
         latestProjectionGeneration: lease.projectionGeneration,
         latestDispatchAttempt: lease.dispatchAttempt,

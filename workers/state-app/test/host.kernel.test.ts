@@ -501,6 +501,7 @@ function workspaceAuthority(
     turnLeaseExpiresAt: 10_000,
     effectStatus: "dispatched",
     effectService: "workspace",
+    effectOperation: "workspace.commit",
     effectId: "effect-workspace-1",
     invocationId: "invocation-workspace-1",
     requestDigest: digest("6"),
