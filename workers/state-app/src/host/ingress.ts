@@ -1,12 +1,16 @@
 import {
   decodeCanonicalCbor,
   encodeCanonicalCbor,
+  parseDigest,
+  parseDispatchPermitClaims,
   parseNormalizedValue,
   parseRpcEnvelope,
   PROTOCOL_MAJOR,
   PROTOCOL_MINOR,
   PROTOCOL_NAME,
   ProtocolValidationError,
+  type Digest,
+  type DispatchPermitClaims,
   type NormalizedValue,
 } from "@circulusd/protocol-types";
 
@@ -41,19 +45,69 @@ const INGRESS_REQUEST_MAX_DEPTH = 2;
 const INGRESS_REQUEST_MAX_ITEMS = 32;
 const INGRESS_MAX_CLOCK_SKEW_MS = 30_000;
 const INGRESS_MAX_EVENT_LIMIT = 256;
+const DISPATCH_START_INGRESS_PATH =
+  "/circulusd/state/v1/session-dispatch-start:claim";
+const DISPATCH_START_INGRESS_CONTENT_TYPE =
+  "application/vnd.circulusd.state-dispatch-start-ingress+cbor";
+const DISPATCH_START_INGRESS_PROTOCOL =
+  "circulus.state-dispatch-start-ingress.v1alpha1";
+const DISPATCH_START_INGRESS_SCHEMA_DIGEST =
+  "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724";
+const DISPATCH_START_INGRESS_REQUEST_FIELDS = Object.freeze([
+  "protocol",
+  "major",
+  "minor",
+  "schemaDigest",
+  "requestId",
+  "sentAtUnixMs",
+  "tenantId",
+  "workspaceId",
+  "sessionId",
+  "commandId",
+  "expectedEventSequence",
+  "turnId",
+  "effectId",
+  "invocationId",
+  "requestDigest",
+  "fence",
+  "dispatchAttempt",
+  "providerRequestId",
+  "providerRouteDigest",
+  "dispatchPermitClaims",
+  "commandDigest",
+] as const);
+const DISPATCH_START_FENCE_FIELDS = Object.freeze([
+  "turnLeaseGeneration",
+  "placementGeneration",
+  "sandboxGeneration",
+  "authorizationGeneration",
+] as const);
+const DISPATCH_START_INGRESS_REQUEST_MAX_BYTES = 8_192;
+const DISPATCH_START_INGRESS_REQUEST_MAX_DEPTH = 4;
+const DISPATCH_START_INGRESS_REQUEST_MAX_ITEMS = 96;
 const KEY_ID_HEADER = "x-circulus-state-key-id";
 const SIGNATURE_HEADER = "x-circulus-state-signature";
 const REQUEST_MAC_DOMAIN = "circulusd.state-ingress.request.v1";
 const RESPONSE_MAC_DOMAIN = "circulusd.state-ingress.response.v1";
+const DISPATCH_START_REQUEST_MAC_DOMAIN =
+  "circulusd.state-dispatch-start-ingress.request.v1";
+const DISPATCH_START_RESPONSE_MAC_DOMAIN =
+  "circulusd.state-dispatch-start-ingress.response.v1";
 const REQUEST_KEY_DOMAIN = "circulusd.state-ingress.key.request.v1\0";
 const RESPONSE_KEY_DOMAIN = "circulusd.state-ingress.key.response.v1\0";
 const KEY_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SIGNATURE_PATTERN = /^[0-9a-f]{64}$/;
 const REQUEST_ID_PATTERN = /^req_[A-Z2-7]{25}[AEIMQUY4]$/;
 const TENANT_ID_PATTERN = /^tenant_[A-Z2-7]{25}[AEIMQUY4]$/;
+const WORKSPACE_ID_PATTERN = /^ws_[A-Z2-7]{25}[AEIMQUY4]$/;
 const SUBJECT_ID_PATTERN = /^subject_[A-Z2-7]{25}[AEIMQUY4]$/;
 const SESSION_ID_PATTERN = /^sess_[A-Z2-7]{25}[AEIMQUY4]$/;
+const TURN_ID_PATTERN = /^turn_[A-Z2-7]{25}[AEIMQUY4]$/;
+const EFFECT_ID_PATTERN = /^effect_[A-Z2-7]{25}[AEIMQUY4]$/;
+const INVOCATION_ID_PATTERN = /^inv_[A-Z2-7]{25}[AEIMQUY4]$/;
 const HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-events"];
+const DISPATCH_START_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.execute"];
+const ZERO_DIGEST = `sha256:${"0".repeat(64)}` as const;
 const textEncoder = new TextEncoder();
 
 const SAFE_HOST_ERROR_MESSAGES = Object.freeze({
@@ -86,6 +140,10 @@ type IngressSecretEnvironment = Env & {
   readonly CIRCULUSD_STATE_INGRESS_CURRENT_KEY?: string;
   readonly CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID?: string;
   readonly CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY?: string;
+  readonly CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY?: string;
+  readonly CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY?: string;
 };
 
 interface ConfiguredKey {
@@ -99,9 +157,27 @@ interface CapturedDirectionalKeys {
   readonly responseKey: CryptoKey;
 }
 
+type HostContract = (typeof HOST_RPC_CONTRACTS)[keyof typeof HOST_RPC_CONTRACTS];
+
+interface IngressWireContract {
+  readonly kind: "read-events" | "claim-dispatch-start";
+  readonly path: string;
+  readonly contentType: string;
+  readonly protocol: string;
+  readonly schemaDigest: string;
+  readonly requestFields: readonly string[];
+  readonly requestMaxBytes: number;
+  readonly requestMaxDepth: number;
+  readonly requestMaxItems: number;
+  readonly requestMacDomain: string;
+  readonly responseMacDomain: string;
+  readonly hostContract: HostContract;
+}
+
 interface AuthenticatedResponseContext {
   readonly keys: CapturedDirectionalKeys;
   readonly requestBodyDigest: Uint8Array;
+  readonly ingress: IngressWireContract;
 }
 
 interface IngressRequest {
@@ -114,6 +190,61 @@ interface IngressRequest {
   readonly afterSequence: number;
   readonly limit: number;
 }
+
+interface DispatchStartIngressRequest {
+  readonly requestId: string;
+  readonly sentAtUnixMs: number;
+  readonly tenantId: string;
+  readonly workspaceId: string;
+  readonly sessionId: string;
+  readonly commandId: string;
+  readonly expectedEventSequence: number;
+  readonly turnId: string;
+  readonly effectId: string;
+  readonly invocationId: string;
+  readonly requestDigest: Digest;
+  readonly fence: {
+    readonly turnLeaseGeneration: number;
+    readonly placementGeneration: number;
+    readonly sandboxGeneration: number;
+    readonly authorizationGeneration: number;
+  };
+  readonly dispatchAttempt: number;
+  readonly providerRequestId: string | null;
+  readonly providerRouteDigest: Digest;
+  readonly dispatchPermitClaims: DispatchPermitClaims;
+  readonly commandDigest: Digest;
+}
+
+const READ_EVENTS_INGRESS = Object.freeze({
+  kind: "read-events",
+  path: INGRESS_PATH,
+  contentType: INGRESS_CONTENT_TYPE,
+  protocol: INGRESS_PROTOCOL,
+  schemaDigest: INGRESS_SCHEMA_DIGEST,
+  requestFields: INGRESS_REQUEST_FIELDS,
+  requestMaxBytes: INGRESS_REQUEST_MAX_BYTES,
+  requestMaxDepth: INGRESS_REQUEST_MAX_DEPTH,
+  requestMaxItems: INGRESS_REQUEST_MAX_ITEMS,
+  requestMacDomain: REQUEST_MAC_DOMAIN,
+  responseMacDomain: RESPONSE_MAC_DOMAIN,
+  hostContract: HOST_CONTRACT,
+} as const satisfies IngressWireContract);
+
+const DISPATCH_START_INGRESS = Object.freeze({
+  kind: "claim-dispatch-start",
+  path: DISPATCH_START_INGRESS_PATH,
+  contentType: DISPATCH_START_INGRESS_CONTENT_TYPE,
+  protocol: DISPATCH_START_INGRESS_PROTOCOL,
+  schemaDigest: DISPATCH_START_INGRESS_SCHEMA_DIGEST,
+  requestFields: DISPATCH_START_INGRESS_REQUEST_FIELDS,
+  requestMaxBytes: DISPATCH_START_INGRESS_REQUEST_MAX_BYTES,
+  requestMaxDepth: DISPATCH_START_INGRESS_REQUEST_MAX_DEPTH,
+  requestMaxItems: DISPATCH_START_INGRESS_REQUEST_MAX_ITEMS,
+  requestMacDomain: DISPATCH_START_REQUEST_MAC_DOMAIN,
+  responseMacDomain: DISPATCH_START_RESPONSE_MAC_DOMAIN,
+  hostContract: DISPATCH_START_HOST_CONTRACT,
+} as const satisfies IngressWireContract);
 
 function ordinaryBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
@@ -221,17 +352,30 @@ function configuredKey(keyId: unknown, keyHex: unknown): ConfiguredKey | undefin
 function selectConfiguredKey(
   environment: IngressSecretEnvironment,
   requestedKeyId: string,
+  ingress: IngressWireContract,
 ): ConfiguredKey | "invalid-config" | undefined {
+  const currentKeyId = ingress.kind === "claim-dispatch-start"
+    ? environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID
+    : environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID;
+  const currentKey = ingress.kind === "claim-dispatch-start"
+    ? environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY
+    : environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY;
+  const previousKeyId = ingress.kind === "claim-dispatch-start"
+    ? environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY_ID
+    : environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID;
+  const previousKey = ingress.kind === "claim-dispatch-start"
+    ? environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY
+    : environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY;
   const current = configuredKey(
-    environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID,
-    environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY,
+    currentKeyId,
+    currentKey,
   );
   if (current === undefined) {
     return "invalid-config";
   }
 
-  const previousId = environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID;
-  const previousHex = environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY;
+  const previousId = previousKeyId;
+  const previousHex = previousKey;
   let previous: ConfiguredKey | undefined;
   if (previousId !== undefined || previousHex !== undefined) {
     previous = configuredKey(previousId, previousHex);
@@ -277,12 +421,13 @@ function hasExactFields(
 function hostFailureEnvelope(
   requestId: string,
   code: HostRpcErrorCode,
+  hostContract: HostContract,
 ): NormalizedValue {
   return {
     protocol: PROTOCOL_NAME,
     major: PROTOCOL_MAJOR,
     minor: PROTOCOL_MINOR,
-    schemaDigest: HOST_CONTRACT.schemaDigest,
+    schemaDigest: hostContract.schemaDigest,
     requestId,
     payload: {
       ok: false,
@@ -299,19 +444,19 @@ async function signedEncodedResponse(
 ): Promise<Response> {
   const bodyDigest = await sha256(body);
   const signature = await hmac(context.keys.responseKey, lengthPrefixed([
-    utf8(RESPONSE_MAC_DOMAIN),
+    utf8(context.ingress.responseMacDomain),
     utf8(context.keys.keyId),
     utf8(requestId),
     context.requestBodyDigest,
     utf8(String(status)),
-    utf8(INGRESS_CONTENT_TYPE),
+    utf8(context.ingress.contentType),
     bodyDigest,
   ]));
   return new Response(ordinaryBuffer(body), {
     status,
     headers: {
       "cache-control": "no-store",
-      "content-type": INGRESS_CONTENT_TYPE,
+      "content-type": context.ingress.contentType,
       [KEY_ID_HEADER]: context.keys.keyId,
       [SIGNATURE_HEADER]: hex(signature),
     },
@@ -325,11 +470,14 @@ async function signedFailure(
   context: AuthenticatedResponseContext,
 ): Promise<Response> {
   try {
-    const body = encodeCanonicalCbor(hostFailureEnvelope(requestId, code), {
-      maxBytes: HOST_CONTRACT.responseMaxEncodedBytes,
-      maxDepth: HOST_CONTRACT.responseMaxDepth,
-      maxItems: HOST_CONTRACT.responseMaxItems,
-    });
+    const body = encodeCanonicalCbor(
+      hostFailureEnvelope(requestId, code, context.ingress.hostContract),
+      {
+        maxBytes: context.ingress.hostContract.responseMaxEncodedBytes,
+        maxDepth: context.ingress.hostContract.responseMaxDepth,
+        maxItems: context.ingress.hostContract.responseMaxItems,
+      },
+    );
     return await signedEncodedResponse(body, status, requestId, context);
   } catch {
     return unsignedResponse(503);
@@ -339,15 +487,17 @@ async function signedFailure(
 function sanitizeHostResponse(
   unknownResponse: unknown,
   requestId: string,
+  ingress: IngressWireContract,
+  expectedDispatchStart?: DispatchStartIngressRequest,
 ): NormalizedValue {
   const envelope = parseRpcEnvelope(
     unknownResponse,
     parseNormalizedValue,
     {
-      expectedSchemaDigest: HOST_CONTRACT.schemaDigest,
-      maxEncodedBytes: HOST_CONTRACT.responseMaxEncodedBytes,
-      maxDepth: HOST_CONTRACT.responseMaxDepth,
-      maxItems: HOST_CONTRACT.responseMaxItems,
+      expectedSchemaDigest: ingress.hostContract.schemaDigest,
+      maxEncodedBytes: ingress.hostContract.responseMaxEncodedBytes,
+      maxDepth: ingress.hostContract.responseMaxDepth,
+      maxItems: ingress.hostContract.responseMaxItems,
     },
   );
   if (envelope.requestId !== requestId || !isRecord(envelope.payload)) {
@@ -358,11 +508,105 @@ function sanitizeHostResponse(
     payload.ok === true &&
     hasExactFields(payload, ["ok", "result"])
   ) {
+    if (expectedDispatchStart !== undefined) {
+      if (
+        !isRecord(payload.result!) ||
+        !hasExactFields(payload.result, ["outcome", "version", "replayed"]) ||
+        typeof payload.result.version !== "number" ||
+        !Number.isSafeInteger(payload.result.version) ||
+        payload.result.version < 1 ||
+        typeof payload.result.replayed !== "boolean" ||
+        !isRecord(payload.result.outcome!) ||
+        !hasExactFields(
+          payload.result.outcome,
+          ["kind", "effectId", "fresh", "startPermit"],
+        ) ||
+        payload.result.outcome.kind !== "dispatch_start_claimed" ||
+        payload.result.outcome.effectId !== expectedDispatchStart.effectId ||
+        typeof payload.result.outcome.fresh !== "boolean" ||
+        payload.result.outcome.fresh === payload.result.replayed ||
+        !isRecord(payload.result.outcome.startPermit!) ||
+        !hasExactFields(
+          payload.result.outcome.startPermit,
+          [
+            "dispatchPermitClaims",
+            "providerRequestId",
+            "commandDigest",
+            "claimedEventSequence",
+          ],
+        ) ||
+        payload.result.outcome.startPermit.providerRequestId !==
+          expectedDispatchStart.providerRequestId ||
+        payload.result.outcome.startPermit.commandDigest !==
+          expectedDispatchStart.commandDigest ||
+        typeof payload.result.outcome.startPermit.claimedEventSequence !== "number" ||
+        !Number.isSafeInteger(
+          payload.result.outcome.startPermit.claimedEventSequence,
+        ) ||
+        payload.result.outcome.startPermit.claimedEventSequence < 1 ||
+        payload.result.outcome.startPermit.claimedEventSequence <=
+          expectedDispatchStart.expectedEventSequence ||
+        payload.result.outcome.startPermit.claimedEventSequence >
+          payload.result.version ||
+        (payload.result.outcome.fresh &&
+          payload.result.outcome.startPermit.claimedEventSequence !==
+            payload.result.version)
+      ) {
+        throw new Error("invalid dispatch-start Host RPC success");
+      }
+      let dispatchPermitClaims: DispatchPermitClaims;
+      try {
+        dispatchPermitClaims = parseDispatchPermitClaims(
+          payload.result.outcome.startPermit.dispatchPermitClaims,
+        );
+      } catch {
+        throw new Error("invalid dispatch-start Host RPC success");
+      }
+      const expectedClaims = encodeCanonicalCbor(
+        expectedDispatchStart.dispatchPermitClaims,
+      );
+      const actualClaims = encodeCanonicalCbor(dispatchPermitClaims);
+      if (
+        expectedClaims.byteLength !== actualClaims.byteLength ||
+        expectedClaims.some((byte, index) => byte !== actualClaims[index])
+      ) {
+        throw new Error("invalid dispatch-start Host RPC success");
+      }
+      const normalizedDispatchPermitClaims = parseNormalizedValue(
+        dispatchPermitClaims,
+      );
+      return {
+        protocol: PROTOCOL_NAME,
+        major: PROTOCOL_MAJOR,
+        minor: PROTOCOL_MINOR,
+        schemaDigest: ingress.hostContract.schemaDigest,
+        requestId,
+        payload: {
+          ok: true,
+          result: {
+            outcome: {
+              kind: "dispatch_start_claimed",
+              effectId: expectedDispatchStart.effectId,
+              fresh: payload.result.outcome.fresh,
+              startPermit: {
+                dispatchPermitClaims: normalizedDispatchPermitClaims,
+                providerRequestId: expectedDispatchStart.providerRequestId,
+                commandDigest: expectedDispatchStart.commandDigest,
+                claimedEventSequence:
+                  payload.result.outcome.startPermit.claimedEventSequence,
+              },
+            },
+            version: payload.result.version,
+            replayed: payload.result.replayed,
+          },
+        },
+      };
+    }
     return {
       protocol: PROTOCOL_NAME,
       major: PROTOCOL_MAJOR,
       minor: PROTOCOL_MINOR,
-      schemaDigest: HOST_CONTRACT.schemaDigest,
+      schemaDigest: ingress.hostContract.schemaDigest,
       requestId,
       payload: { ok: true, result: payload.result! },
     };
@@ -380,7 +624,11 @@ function sanitizeHostResponse(
   ) {
     throw new Error("invalid Host RPC response");
   }
-  return hostFailureEnvelope(requestId, payload.error.code as HostRpcErrorCode);
+  return hostFailureEnvelope(
+    requestId,
+    payload.error.code as HostRpcErrorCode,
+    ingress.hostContract,
+  );
 }
 
 function isEncodedSizeFailure(error: unknown): boolean {
@@ -399,14 +647,22 @@ export async function handleStateIngress(
   } catch {
     return unsignedResponse(404);
   }
-  if (url.pathname !== INGRESS_PATH || url.search !== "" || url.hash !== "") {
+  let wireContract: IngressWireContract;
+  if (url.pathname === READ_EVENTS_INGRESS.path) {
+    wireContract = READ_EVENTS_INGRESS;
+  } else if (url.pathname === DISPATCH_START_INGRESS.path) {
+    wireContract = DISPATCH_START_INGRESS;
+  } else {
+    return unsignedResponse(404);
+  }
+  if (url.search !== "" || url.hash !== "") {
     return unsignedResponse(404);
   }
   if (request.method !== "POST") {
     return unsignedResponse(405);
   }
   if (
-    request.headers.get("content-type") !== INGRESS_CONTENT_TYPE ||
+    request.headers.get("content-type") !== wireContract.contentType ||
     request.headers.has("content-encoding")
   ) {
     return unsignedResponse(415);
@@ -417,7 +673,7 @@ export async function handleStateIngress(
     if (!/^(0|[1-9][0-9]*)$/.test(contentLength)) {
       return unsignedResponse(400);
     }
-    if (Number(contentLength) > INGRESS_REQUEST_MAX_BYTES) {
+    if (Number(contentLength) > wireContract.requestMaxBytes) {
       return unsignedResponse(413);
     }
   }
@@ -435,7 +691,7 @@ export async function handleStateIngress(
 
   let selected: ConfiguredKey | "invalid-config" | undefined;
   try {
-    selected = selectConfiguredKey(environment, requestedKeyId);
+    selected = selectConfiguredKey(environment, requestedKeyId, wireContract);
   } catch {
     return unsignedResponse(503);
   }
@@ -463,7 +719,7 @@ export async function handleStateIngress(
         if (done) {
           break;
         }
-        if (bodyLength + value.byteLength > INGRESS_REQUEST_MAX_BYTES) {
+        if (bodyLength + value.byteLength > wireContract.requestMaxBytes) {
           try {
             await reader.cancel();
           } catch {
@@ -498,10 +754,10 @@ export async function handleStateIngress(
       keys.requestKey,
       ordinaryBuffer(decodeHex(signatureHex)!),
       ordinaryBuffer(lengthPrefixed([
-        utf8(REQUEST_MAC_DOMAIN),
+        utf8(wireContract.requestMacDomain),
         utf8(keys.keyId),
         utf8("POST"),
-        utf8(INGRESS_PATH),
+        utf8(wireContract.path),
         requestBodyDigest,
       ])),
     );
@@ -514,14 +770,15 @@ export async function handleStateIngress(
   const responseContext = Object.freeze({
     keys,
     requestBodyDigest,
+    ingress: wireContract,
   });
 
   let decoded: NormalizedValue;
   try {
     decoded = decodeCanonicalCbor(requestBody, {
-      maxBytes: INGRESS_REQUEST_MAX_BYTES,
-      maxDepth: INGRESS_REQUEST_MAX_DEPTH,
-      maxItems: INGRESS_REQUEST_MAX_ITEMS,
+      maxBytes: wireContract.requestMaxBytes,
+      maxDepth: wireContract.requestMaxDepth,
+      maxItems: wireContract.requestMaxItems,
     });
   } catch {
     return signedFailure(
@@ -545,115 +802,319 @@ export async function handleStateIngress(
     }
   }
 
-  let ingress: IngressRequest;
   const now = Date.now();
-  if (
-    !isRecord(decoded) ||
-    !hasExactFields(decoded, INGRESS_REQUEST_FIELDS) ||
-    decoded.protocol !== INGRESS_PROTOCOL ||
-    decoded.major !== 1 ||
-    decoded.minor !== 0 ||
-    decoded.schemaDigest !== INGRESS_SCHEMA_DIGEST ||
-    typeof decoded.requestId !== "string" ||
-    !REQUEST_ID_PATTERN.test(decoded.requestId) ||
-    typeof decoded.sentAtUnixMs !== "number" ||
-    !Number.isSafeInteger(decoded.sentAtUnixMs) ||
-    decoded.sentAtUnixMs < 0 ||
-    !Number.isSafeInteger(now) ||
-    now < 0 ||
-    decoded.sentAtUnixMs < now - INGRESS_MAX_CLOCK_SKEW_MS ||
-    decoded.sentAtUnixMs > now + INGRESS_MAX_CLOCK_SKEW_MS ||
-    typeof decoded.tenantId !== "string" ||
-    !TENANT_ID_PATTERN.test(decoded.tenantId) ||
-    typeof decoded.actorSubjectId !== "string" ||
-    !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
-    typeof decoded.sessionId !== "string" ||
-    !SESSION_ID_PATTERN.test(decoded.sessionId) ||
-    typeof decoded.expectedAuthorizationGeneration !== "number" ||
-    !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) ||
-    decoded.expectedAuthorizationGeneration < 1 ||
-    typeof decoded.afterSequence !== "number" ||
-    !Number.isSafeInteger(decoded.afterSequence) ||
-    decoded.afterSequence < 0 ||
-    typeof decoded.limit !== "number" ||
-    !Number.isSafeInteger(decoded.limit) ||
-    decoded.limit < 1 ||
-    decoded.limit > INGRESS_MAX_EVENT_LIMIT
-  ) {
+  if (!Number.isSafeInteger(now) || now < 0) {
     return signedFailure(
-      400,
+      500,
       errorRequestId,
-      "INVALID_ARGUMENT",
+      "INTERNAL_ERROR",
       responseContext,
     );
   }
-  ingress = {
-    requestId: decoded.requestId,
-    sentAtUnixMs: decoded.sentAtUnixMs,
-    tenantId: decoded.tenantId,
-    actorSubjectId: decoded.actorSubjectId,
-    sessionId: decoded.sessionId,
-    expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
-    afterSequence: decoded.afterSequence,
-    limit: decoded.limit,
-  };
-
-  if (!Number.isSafeInteger(now + 1)) {
-    return signedFailure(500, ingress.requestId, "INTERNAL_ERROR", responseContext);
-  }
-  const hostRequest = {
-    protocol: PROTOCOL_NAME,
-    major: PROTOCOL_MAJOR,
-    minor: PROTOCOL_MINOR,
-    schemaDigest: HOST_CONTRACT.schemaDigest,
-    requestId: ingress.requestId,
-    payload: {
-      authority: {
-        serviceBinding: "state",
-        tenantId: ingress.tenantId,
-        actorUserId: ingress.actorSubjectId,
-        subjectKind: "session",
-        subjectId: ingress.sessionId,
-        roles: [],
-        permissions: ["session.read"],
-        authorizationGeneration: ingress.expectedAuthorizationGeneration,
-        currentAuthorizationGeneration: ingress.expectedAuthorizationGeneration,
-        issuedAt: now,
-        expiresAt: now + 1,
-      },
-      now,
-      afterSequence: ingress.afterSequence,
-      limit: ingress.limit,
-    },
-  };
 
   let sanitizedResponse: NormalizedValue;
-  try {
-    const session = environment.SESSION_CELL.getByName(
-      sessionCellName(ingress.tenantId, ingress.sessionId),
-    );
-    const unknownResponse = await session.readSessionEvents(hostRequest);
-    sanitizedResponse = sanitizeHostResponse(unknownResponse, ingress.requestId);
-  } catch (error) {
-    return signedFailure(
-      502,
-      ingress.requestId,
-      isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
-      responseContext,
-    );
+  let responseRequestId: string;
+  if (wireContract.kind === "claim-dispatch-start") {
+    let dispatchStart: DispatchStartIngressRequest;
+    let requestDigest: Digest;
+    let providerRouteDigest: Digest;
+    let commandDigest: Digest;
+    let dispatchPermitClaims: DispatchPermitClaims;
+    if (
+      !isRecord(decoded) ||
+      !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol ||
+      decoded.major !== 1 ||
+      decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest ||
+      typeof decoded.requestId !== "string" ||
+      !REQUEST_ID_PATTERN.test(decoded.requestId) ||
+      typeof decoded.sentAtUnixMs !== "number" ||
+      !Number.isSafeInteger(decoded.sentAtUnixMs) ||
+      decoded.sentAtUnixMs < 0 ||
+      decoded.sentAtUnixMs < now - INGRESS_MAX_CLOCK_SKEW_MS ||
+      decoded.sentAtUnixMs > now + INGRESS_MAX_CLOCK_SKEW_MS ||
+      typeof decoded.tenantId !== "string" ||
+      !TENANT_ID_PATTERN.test(decoded.tenantId) ||
+      typeof decoded.workspaceId !== "string" ||
+      !WORKSPACE_ID_PATTERN.test(decoded.workspaceId) ||
+      typeof decoded.sessionId !== "string" ||
+      !SESSION_ID_PATTERN.test(decoded.sessionId) ||
+      typeof decoded.commandId !== "string" ||
+      decoded.commandId.length === 0 ||
+      textEncoder.encode(decoded.commandId).byteLength > 256 ||
+      /\p{Cc}/u.test(decoded.commandId) ||
+      typeof decoded.expectedEventSequence !== "number" ||
+      !Number.isSafeInteger(decoded.expectedEventSequence) ||
+      decoded.expectedEventSequence < 0 ||
+      !Number.isSafeInteger(decoded.expectedEventSequence + 1) ||
+      typeof decoded.turnId !== "string" ||
+      !TURN_ID_PATTERN.test(decoded.turnId) ||
+      typeof decoded.effectId !== "string" ||
+      !EFFECT_ID_PATTERN.test(decoded.effectId) ||
+      typeof decoded.invocationId !== "string" ||
+      !INVOCATION_ID_PATTERN.test(decoded.invocationId) ||
+      !isRecord(decoded.fence!) ||
+      !hasExactFields(decoded.fence, DISPATCH_START_FENCE_FIELDS) ||
+      typeof decoded.fence.turnLeaseGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.fence.turnLeaseGeneration) ||
+      decoded.fence.turnLeaseGeneration < 0 ||
+      typeof decoded.fence.placementGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.fence.placementGeneration) ||
+      decoded.fence.placementGeneration < 0 ||
+      typeof decoded.fence.sandboxGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.fence.sandboxGeneration) ||
+      decoded.fence.sandboxGeneration < 0 ||
+      typeof decoded.fence.authorizationGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.fence.authorizationGeneration) ||
+      decoded.fence.authorizationGeneration < 0 ||
+      typeof decoded.dispatchAttempt !== "number" ||
+      !Number.isSafeInteger(decoded.dispatchAttempt) ||
+      decoded.dispatchAttempt < 1 ||
+      decoded.providerRequestId !== null &&
+        (typeof decoded.providerRequestId !== "string" ||
+          !REQUEST_ID_PATTERN.test(decoded.providerRequestId))
+    ) {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    try {
+      requestDigest = parseDigest(decoded.requestDigest, "$ingress.requestDigest");
+      providerRouteDigest = parseDigest(
+        decoded.providerRouteDigest,
+        "$ingress.providerRouteDigest",
+      );
+      dispatchPermitClaims = parseDispatchPermitClaims(
+        decoded.dispatchPermitClaims,
+      );
+      commandDigest = parseDigest(decoded.commandDigest, "$ingress.commandDigest");
+    } catch {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    if (
+      requestDigest === ZERO_DIGEST ||
+      providerRouteDigest === ZERO_DIGEST ||
+      commandDigest === ZERO_DIGEST ||
+      dispatchPermitClaims.tenantId !== decoded.tenantId ||
+      !SUBJECT_ID_PATTERN.test(dispatchPermitClaims.userId) ||
+      dispatchPermitClaims.sessionId !== decoded.sessionId ||
+      dispatchPermitClaims.turnId !== decoded.turnId ||
+      dispatchPermitClaims.effectId !== decoded.effectId ||
+      dispatchPermitClaims.invocationId !== decoded.invocationId ||
+      dispatchPermitClaims.requestDigest !== requestDigest ||
+      dispatchPermitClaims.turnLeaseGeneration !==
+        decoded.fence.turnLeaseGeneration ||
+      dispatchPermitClaims.placementGeneration !==
+        decoded.fence.placementGeneration ||
+      dispatchPermitClaims.sandboxGeneration !==
+        decoded.fence.sandboxGeneration ||
+      dispatchPermitClaims.authorizationGeneration !==
+        decoded.fence.authorizationGeneration ||
+      dispatchPermitClaims.dispatchAttempt !== decoded.dispatchAttempt ||
+      dispatchPermitClaims.providerRouteDigest !== providerRouteDigest
+    ) {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    dispatchStart = {
+      requestId: decoded.requestId,
+      sentAtUnixMs: decoded.sentAtUnixMs,
+      tenantId: decoded.tenantId,
+      workspaceId: decoded.workspaceId,
+      sessionId: decoded.sessionId,
+      commandId: decoded.commandId,
+      expectedEventSequence: decoded.expectedEventSequence,
+      turnId: decoded.turnId,
+      effectId: decoded.effectId,
+      invocationId: decoded.invocationId,
+      requestDigest,
+      fence: {
+        turnLeaseGeneration: decoded.fence.turnLeaseGeneration,
+        placementGeneration: decoded.fence.placementGeneration,
+        sandboxGeneration: decoded.fence.sandboxGeneration,
+        authorizationGeneration: decoded.fence.authorizationGeneration,
+      },
+      dispatchAttempt: decoded.dispatchAttempt,
+      providerRequestId: decoded.providerRequestId,
+      providerRouteDigest,
+      dispatchPermitClaims,
+      commandDigest,
+    };
+    const hostRequest = {
+      protocol: PROTOCOL_NAME,
+      major: PROTOCOL_MAJOR,
+      minor: PROTOCOL_MINOR,
+      schemaDigest: wireContract.hostContract.schemaDigest,
+      requestId: dispatchStart.requestId,
+      payload: {
+        kind: "claim_dispatch_start",
+        commandId: dispatchStart.commandId,
+        expectedEventSequence: dispatchStart.expectedEventSequence,
+        workspaceId: dispatchStart.workspaceId,
+        turnId: dispatchStart.turnId,
+        effectId: dispatchStart.effectId,
+        invocationId: dispatchStart.invocationId,
+        requestDigest: dispatchStart.requestDigest,
+        fence: dispatchStart.fence,
+        transactionTime: 0,
+        dispatchAttempt: dispatchStart.dispatchAttempt,
+        providerRequestId: dispatchStart.providerRequestId,
+        providerRouteDigest: dispatchStart.providerRouteDigest,
+        dispatchPermitClaims: dispatchStart.dispatchPermitClaims,
+        commandDigest: dispatchStart.commandDigest,
+      },
+    };
+    responseRequestId = dispatchStart.requestId;
+    try {
+      const session = environment.SESSION_CELL.getByName(
+        sessionCellName(dispatchStart.tenantId, dispatchStart.sessionId),
+      );
+      const sessionRpc = session as unknown as {
+        executeSessionCommand(request: unknown): Promise<unknown>;
+      };
+      const unknownResponse = await sessionRpc.executeSessionCommand(hostRequest);
+      sanitizedResponse = sanitizeHostResponse(
+        unknownResponse,
+        dispatchStart.requestId,
+        wireContract,
+        dispatchStart,
+      );
+    } catch (error) {
+      return signedFailure(
+        502,
+        dispatchStart.requestId,
+        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
+        responseContext,
+      );
+    }
+  } else {
+    let ingress: IngressRequest;
+    if (
+      !isRecord(decoded) ||
+      !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol ||
+      decoded.major !== 1 ||
+      decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest ||
+      typeof decoded.requestId !== "string" ||
+      !REQUEST_ID_PATTERN.test(decoded.requestId) ||
+      typeof decoded.sentAtUnixMs !== "number" ||
+      !Number.isSafeInteger(decoded.sentAtUnixMs) ||
+      decoded.sentAtUnixMs < 0 ||
+      decoded.sentAtUnixMs < now - INGRESS_MAX_CLOCK_SKEW_MS ||
+      decoded.sentAtUnixMs > now + INGRESS_MAX_CLOCK_SKEW_MS ||
+      typeof decoded.tenantId !== "string" ||
+      !TENANT_ID_PATTERN.test(decoded.tenantId) ||
+      typeof decoded.actorSubjectId !== "string" ||
+      !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
+      typeof decoded.sessionId !== "string" ||
+      !SESSION_ID_PATTERN.test(decoded.sessionId) ||
+      typeof decoded.expectedAuthorizationGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) ||
+      decoded.expectedAuthorizationGeneration < 1 ||
+      typeof decoded.afterSequence !== "number" ||
+      !Number.isSafeInteger(decoded.afterSequence) ||
+      decoded.afterSequence < 0 ||
+      typeof decoded.limit !== "number" ||
+      !Number.isSafeInteger(decoded.limit) ||
+      decoded.limit < 1 ||
+      decoded.limit > INGRESS_MAX_EVENT_LIMIT
+    ) {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    ingress = {
+      requestId: decoded.requestId,
+      sentAtUnixMs: decoded.sentAtUnixMs,
+      tenantId: decoded.tenantId,
+      actorSubjectId: decoded.actorSubjectId,
+      sessionId: decoded.sessionId,
+      expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
+      afterSequence: decoded.afterSequence,
+      limit: decoded.limit,
+    };
+    if (!Number.isSafeInteger(now + 1)) {
+      return signedFailure(
+        500,
+        ingress.requestId,
+        "INTERNAL_ERROR",
+        responseContext,
+      );
+    }
+    const hostRequest = {
+      protocol: PROTOCOL_NAME,
+      major: PROTOCOL_MAJOR,
+      minor: PROTOCOL_MINOR,
+      schemaDigest: wireContract.hostContract.schemaDigest,
+      requestId: ingress.requestId,
+      payload: {
+        authority: {
+          serviceBinding: "state",
+          tenantId: ingress.tenantId,
+          actorUserId: ingress.actorSubjectId,
+          subjectKind: "session",
+          subjectId: ingress.sessionId,
+          roles: [],
+          permissions: ["session.read"],
+          authorizationGeneration: ingress.expectedAuthorizationGeneration,
+          currentAuthorizationGeneration: ingress.expectedAuthorizationGeneration,
+          issuedAt: now,
+          expiresAt: now + 1,
+        },
+        now,
+        afterSequence: ingress.afterSequence,
+        limit: ingress.limit,
+      },
+    };
+    responseRequestId = ingress.requestId;
+    try {
+      const session = environment.SESSION_CELL.getByName(
+        sessionCellName(ingress.tenantId, ingress.sessionId),
+      );
+      const unknownResponse = await session.readSessionEvents(hostRequest);
+      sanitizedResponse = sanitizeHostResponse(
+        unknownResponse,
+        ingress.requestId,
+        wireContract,
+      );
+    } catch (error) {
+      return signedFailure(
+        502,
+        ingress.requestId,
+        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
+        responseContext,
+      );
+    }
   }
 
   let responseBody: Uint8Array;
   try {
     responseBody = encodeCanonicalCbor(sanitizedResponse, {
-      maxBytes: HOST_CONTRACT.responseMaxEncodedBytes,
-      maxDepth: HOST_CONTRACT.responseMaxDepth,
-      maxItems: HOST_CONTRACT.responseMaxItems,
+      maxBytes: wireContract.hostContract.responseMaxEncodedBytes,
+      maxDepth: wireContract.hostContract.responseMaxDepth,
+      maxItems: wireContract.hostContract.responseMaxItems,
     });
   } catch (error) {
     return signedFailure(
       502,
-      ingress.requestId,
+      responseRequestId,
       isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
       responseContext,
     );
@@ -662,7 +1123,7 @@ export async function handleStateIngress(
     return await signedEncodedResponse(
       responseBody,
       200,
-      ingress.requestId,
+      responseRequestId,
       responseContext,
     );
   } catch {

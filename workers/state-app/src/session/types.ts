@@ -342,6 +342,7 @@ export interface DispatchEffectCommand extends EffectCommandBase {
 
 export interface ClaimDispatchStartCommand extends EffectCommandBase {
   readonly kind: "claim_dispatch_start";
+  readonly workspaceId: string;
   readonly transactionTime: number;
   readonly dispatchAttempt: number;
   readonly providerRequestId: string | null;

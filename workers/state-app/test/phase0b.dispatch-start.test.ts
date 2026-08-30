@@ -49,6 +49,7 @@ type DispatchStartCommand = {
   readonly kind: "claim_dispatch_start";
   readonly commandId: string;
   readonly expectedEventSequence: number;
+  readonly workspaceId: string;
   readonly turnId: string;
   readonly effectId: string;
   readonly invocationId: string;
@@ -214,6 +215,7 @@ function startCommand(
     kind: "claim_dispatch_start",
     commandId,
     expectedEventSequence: state.eventSequence,
+    workspaceId: state.workspaceId,
     turnId: "dispatch-start-turn",
     effectId: effect.effectId,
     invocationId: effect.invocationId,
@@ -262,6 +264,81 @@ describe("Phase 0B durable dispatch start claim", () => {
         },
       },
     });
+  });
+
+  it("claims the current durable attempt after unrelated turn admission advances the journal", async () => {
+    const { storage, permit, state } = await prepareDispatchedStorage();
+    const queuedInput = { message: "queued while the provider start is pending" };
+    await kernel(storage.restart()).execute({
+      kind: "enqueue_turn",
+      commandId: "enqueue-after-dispatch",
+      expectedEventSequence: state.eventSequence,
+      transactionTime: TRANSACTION_TIME + 1,
+      turnId: "dispatch-start-queued-turn",
+      input: queuedInput,
+      inputDigest: await turnInputDigest(queuedInput),
+      genesisCheckpoint: {
+        ...(await genesis()),
+        turnId: "dispatch-start-queued-turn",
+      },
+      turnLeaseGeneration: 11,
+      leaseExpiresAt: DEADLINE + 1,
+    });
+    const advanced = await kernel(storage.restart()).query(null, (value) => value);
+    expect(advanced.eventSequence).toBe(state.eventSequence + 1);
+    expect(advanced.activeTurn?.turnId).toBe("dispatch-start-turn");
+    expect(advanced.queuedTurns.map((turn) => turn.turnId)).toEqual([
+      "dispatch-start-queued-turn",
+    ]);
+
+    const claimed = await kernel(storage.restart()).execute(
+      startCommand(state, permit, "start-after-unrelated-event"),
+    );
+    expect(claimed).toMatchObject({
+      version: advanced.eventSequence + 1,
+      replayed: false,
+      outcome: {
+        kind: "dispatch_start_claimed",
+        fresh: true,
+        startPermit: { claimedEventSequence: advanced.eventSequence + 1 },
+      },
+    });
+  });
+
+  it("binds a fresh claim to the receipt sequence that issued its dispatch permit", async () => {
+    const { storage, permit, state } = await prepareDispatchedStorage();
+    await expect(
+      kernel(storage.restart()).execute(
+        startCommand(state, permit, "wrong-dispatch-receipt", {
+          expectedEventSequence: state.eventSequence - 1,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    const unchanged = await kernel(storage.restart()).query(null, (value) => value);
+    expect(unchanged.eventSequence).toBe(state.eventSequence);
+    expect(unchanged.effects[0]?.lastDispatch?.start).toBeNull();
+  });
+
+  it("still rejects a stale dispatch fence after an intervening lease rotation", async () => {
+    const { storage, permit, state } = await prepareDispatchedStorage();
+    await kernel(storage.restart()).execute({
+      kind: "rotate_turn_lease",
+      commandId: "rotate-lease-before-start",
+      expectedEventSequence: state.eventSequence,
+      turnId: "dispatch-start-turn",
+      fence: fence(state),
+      transactionTime: TRANSACTION_TIME + 1,
+      nextTurnLeaseGeneration: 11,
+      nextLeaseExpiresAt: DEADLINE + 2,
+    });
+
+    await expect(
+      kernel(storage.restart()).execute(
+        startCommand(state, permit, "start-after-stale-lease"),
+      ),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    const unchanged = await kernel(storage.restart()).query(null, (value) => value);
+    expect(unchanged.effects[0]?.lastDispatch?.start).toBeNull();
   });
 
   it("reuses the exact proof after response loss and rejects every relabel", async () => {
@@ -317,6 +394,18 @@ describe("Phase 0B durable dispatch start claim", () => {
         { transactionTime: DEADLINE },
       ),
     ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+  });
+
+  it("atomically rejects a workspace relabel without consuming the start", async () => {
+    const { storage, permit, state } = await prepareDispatchedStorage();
+    await expect(
+      kernel(storage.restart()).execute(startCommand(state, permit, "wrong-workspace", {
+        workspaceId: "dispatch-start-workspace-relabelled",
+      })),
+    ).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    const unchanged = await kernel(storage.restart()).query(null, (value) => value);
+    expect(unchanged.eventSequence).toBe(state.eventSequence);
+    expect(unchanged.effects[0]?.lastDispatch?.start).toBeNull();
   });
 
   it("retains a committed claim when abort follows and replays it as non-fresh after restart", async () => {

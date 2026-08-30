@@ -2175,6 +2175,7 @@ export async function applySessionCommand(
         "kind",
         "commandId",
         "expectedEventSequence",
+        "workspaceId",
         "turnId",
         "effectId",
         "invocationId",
@@ -2457,9 +2458,11 @@ export async function applySessionCommand(
         receiptOutcome.startPermit.dispatchPermitClaims,
       );
       if (
+        command.kind !== "claim_dispatch_start" ||
         effect === undefined ||
         start === null ||
         start === undefined ||
+        command.workspaceId !== state.workspaceId ||
         dispatch.tenantId !== effect.tenantId ||
         dispatch.userId !== effect.userId ||
         dispatch.sessionId !== effect.sessionId ||
@@ -2619,11 +2622,13 @@ export async function applySessionCommand(
         "transactionTime",
         0,
       );
+      const workspaceId = validatedIdentifier(command.workspaceId, "workspaceId");
       if (
         active === null ||
         active.activeEffectId !== effect.effectId ||
         active.turnId !== command.turnId ||
         effect.phase !== "dispatched" ||
+        workspaceId !== state.workspaceId ||
         validatedInteger(replayFence.turnLeaseGeneration, "fence.turnLeaseGeneration", 0) !==
           active.turnLeaseGeneration ||
         validatedInteger(replayFence.placementGeneration, "fence.placementGeneration", 0) !==
@@ -2693,7 +2698,10 @@ export async function applySessionCommand(
       };
     }
   }
-  if (command.expectedEventSequence !== state.eventSequence) {
+  if (
+    command.kind !== "claim_dispatch_start" &&
+    command.expectedEventSequence !== state.eventSequence
+  ) {
     sessionError(
       "CONFLICT",
       `expected eventSequence ${command.expectedEventSequence}, current is ${state.eventSequence}`,
@@ -3203,6 +3211,10 @@ export async function applySessionCommand(
       if (active.abortRequested) {
         sessionError("ABORTED", "an aborted turn cannot claim a dispatch start");
       }
+      const workspaceId = validatedIdentifier(command.workspaceId, "workspaceId");
+      if (workspaceId !== next.workspaceId) {
+        sessionError("FAILED_PRECONDITION", "dispatch start workspace does not match");
+      }
       if (
         effect.invocationId !== command.invocationId ||
         effect.requestDigest !== command.requestDigest
@@ -3255,6 +3267,36 @@ export async function applySessionCommand(
           sessionError("FAILED_PRECONDITION", "dispatch start used a malformed permit proof");
         }
         throw error;
+      }
+      const issuingReceipt = next.commandReceipts[command.expectedEventSequence - 1];
+      const issuedDispatchPermitClaims =
+        issuingReceipt?.outcome.kind === "effect_dispatched"
+          ? issuingReceipt.outcome.dispatchPermitClaims
+          : issuingReceipt?.outcome.kind === "effect_recovered" &&
+              issuingReceipt.outcome.action === "retry"
+            ? issuingReceipt.outcome.dispatchPermitClaims
+            : issuingReceipt?.outcome.kind === "confirmation_resolved" &&
+                issuingReceipt.outcome.decision === "retry"
+              ? issuingReceipt.outcome.dispatchPermitClaims
+              : undefined;
+      if (issuedDispatchPermitClaims === undefined) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start expectedEventSequence does not identify a dispatch permit receipt",
+        );
+      }
+      const issuedDispatchBytes = encodeCanonicalCbor(issuedDispatchPermitClaims);
+      const claimedDispatchBytes = encodeCanonicalCbor(dispatch);
+      if (
+        issuedDispatchBytes.byteLength !== claimedDispatchBytes.byteLength ||
+        issuedDispatchBytes.some(
+          (byte, index) => byte !== claimedDispatchBytes[index],
+        )
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          "dispatch start does not match the permit issued at expectedEventSequence",
+        );
       }
       if (
         dispatchAttempt !== effect.dispatchAttempt ||
