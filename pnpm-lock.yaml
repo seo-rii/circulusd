@@ -47,7 +47,11 @@ importers:
         specifier: 0.84.3
         version: 0.84.3(ws@8.21.0)
 
-  workers/session-host: {}
+  workers/session-host:
+    dependencies:
+      '@circulusd/protocol-types':
+        specifier: workspace:*
+        version: link:../../packages/protocol-types
 
   workers/state-app:
     dependencies:

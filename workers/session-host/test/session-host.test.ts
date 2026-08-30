@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { digestStructuredValue } from "@circulusd/protocol-types";
+import runtimeIdentityGolden from "../../../packages/protocol-types/fixtures/runtime-identity-v1.json";
 
 import {
   SessionHost,
@@ -38,10 +40,13 @@ class FakeLoader implements WorkerLoader {
 class FakeVerifier implements RuntimeVerifier {
   calls = 0;
   fail = false;
+  runtimeIdentityDigest: string | null = null;
   started: (() => void) | null = null;
   release: (() => void) | null = null;
 
-  async verify(revision: RuntimeRevision): Promise<{ revisionDigest: string }> {
+  async verify(
+    revision: RuntimeRevision,
+  ): Promise<{ revisionDigest: string; runtimeIdentityDigest: string }> {
     this.calls += 1;
     this.started?.();
     if (this.started !== null) {
@@ -52,7 +57,18 @@ class FakeVerifier implements RuntimeVerifier {
     if (this.fail) {
       throw new Error("signature rejected");
     }
-    return { revisionDigest: revision.runtimeRevisionDigest };
+    return {
+      revisionDigest: revision.runtimeRevisionDigest,
+      runtimeIdentityDigest:
+        this.runtimeIdentityDigest ??
+        (await digestStructuredValue("agent.worker-identity", 1, [
+          revision.sessionId,
+          revision.runtimeRevisionDigest,
+          revision.piAdapterAbi,
+          revision.compatibilityDate,
+          revision.compatibilityFlags,
+        ])),
+    };
   }
 }
 
@@ -77,9 +93,8 @@ async function revision(overrides: Partial<RuntimeRevision> = {}): Promise<Runti
   const main = new TextEncoder().encode("export default { fetch() {} };");
   const extension = new TextEncoder().encode("export const value = 1;");
   return {
-    sessionId: "sess_0123456789ABCDEFGHJKMNPQRS",
+    sessionId: "sess_AAAAAAAAAAAAAAAAAAAAAAAAAA",
     runtimeRevisionDigest: digest("a"),
-    runtimeIdentityDigest: digest("b"),
     piAdapterAbi: 1,
     compatibilityDate: "2026-08-26",
     compatibilityFlags: ["nodejs_compat", "streams_enable_constructors"],
@@ -94,6 +109,27 @@ async function revision(overrides: Partial<RuntimeRevision> = {}): Promise<Runti
 }
 
 describe("SessionHost Worker Loader boundary", () => {
+  it("matches the Go worker identity golden vectors", async () => {
+    for (const vector of runtimeIdentityGolden.vectors) {
+      const host = new SessionHost({
+        loader: new FakeLoader(),
+        verifier: new FakeVerifier(),
+        bindings: bindings(`golden-${vector.name}`),
+      });
+      const runtime = await revision({
+        sessionId: vector.sessionId,
+        runtimeRevisionDigest: vector.runtimeRevisionDigest,
+        piAdapterAbi: vector.piAdapterAbi,
+        compatibilityDate: vector.compatibilityDate,
+        compatibilityFlags: [...vector.compatibilityFlags],
+      });
+
+      await expect(host.load(runtime)).resolves.toMatchObject({
+        workerId: vector.workerId,
+      });
+    }
+  });
+
   it("rejects incomplete stable binding sets during construction", () => {
     expect(
       () =>
@@ -111,10 +147,17 @@ describe("SessionHost Worker Loader boundary", () => {
     const scopedBindings = bindings("session-a");
     const host = new SessionHost({ loader, verifier, bindings: scopedBindings });
     const runtime = await revision();
+    const runtimeIdentityDigest = await digestStructuredValue("agent.worker-identity", 1, [
+      runtime.sessionId,
+      runtime.runtimeRevisionDigest,
+      runtime.piAdapterAbi,
+      runtime.compatibilityDate,
+      runtime.compatibilityFlags,
+    ]);
 
     const loaded = await host.load(runtime);
     expect(loaded.workerId).toBe(
-      `pi/${runtime.sessionId}/${runtime.runtimeIdentityDigest.replace("sha256:", "sha256-")}`,
+      `pi/${runtime.sessionId}/${runtimeIdentityDigest.replace("sha256:", "sha256-")}`,
     );
     expect(verifier.calls).toBe(1);
     const definition = loader.definitions.get(loaded.workerId);
@@ -155,6 +198,13 @@ describe("SessionHost Worker Loader boundary", () => {
         code: "RUNTIME_UNVERIFIED",
       },
       {
+        name: "mismatched verified runtime identity",
+        mutate: (_runtime, verifier) => {
+          verifier.runtimeIdentityDigest = digest("e");
+        },
+        code: "RUNTIME_UNVERIFIED",
+      },
+      {
         name: "module digest",
         mutate: (runtime) => {
           runtime.modules[0]!.digest = digest("f");
@@ -179,6 +229,36 @@ describe("SessionHost Worker Loader boundary", () => {
         name: "unsorted flags",
         mutate: (runtime) => {
           runtime.compatibilityFlags = ["z", "a"];
+        },
+        code: "INVALID_RUNTIME",
+      },
+      {
+        name: "length-first flags",
+        mutate: (runtime) => {
+          runtime.compatibilityFlags = ["z", "aa"];
+        },
+        code: "INVALID_RUNTIME",
+      },
+      {
+        name: "length-first modules",
+        mutate: (runtime) => {
+          runtime.modules[0]!.specifier = "z";
+          runtime.modules[1]!.specifier = "aa";
+          runtime.mainModule = "aa";
+        },
+        code: "INVALID_RUNTIME",
+      },
+      {
+        name: "non-canonical session identity",
+        mutate: (runtime) => {
+          runtime.sessionId = "session-caller-selected";
+        },
+        code: "INVALID_RUNTIME",
+      },
+      {
+        name: "non-calendar compatibility date",
+        mutate: (runtime) => {
+          runtime.compatibilityDate = "2026-02-30";
         },
         code: "INVALID_RUNTIME",
       },
@@ -217,6 +297,276 @@ describe("SessionHost Worker Loader boundary", () => {
     }
   });
 
+  it("rejects a caller-owned runtime identity before verification or cache lookup", async () => {
+    const loader = new FakeLoader();
+    const verifier = new FakeVerifier();
+    const host = new SessionHost({ loader, verifier, bindings: bindings("caller-identity") });
+    const runtime = {
+      ...(await revision()),
+      runtimeIdentityDigest: digest("c"),
+    };
+
+    await expect(host.load(runtime)).rejects.toMatchObject({ code: "INVALID_RUNTIME" });
+    expect(verifier.calls).toBe(0);
+    expect(loader.calls).toBe(0);
+  });
+
+  it("rejects concurrent oversized modules before cloning or verification", async () => {
+    const loader = new FakeLoader();
+    const verifier = new FakeVerifier();
+    const host = new SessionHost({
+      loader,
+      verifier,
+      bindings: bindings("oversized-module-preflight"),
+      limits: { maximumModuleBytes: 128 },
+    });
+    const runtimes = await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        const runtime = await revision();
+        runtime.modules[0]!.bytes = new Uint8Array(129);
+        return runtime;
+      }),
+    );
+    const clone = vi.spyOn(globalThis, "structuredClone");
+
+    try {
+      const outcomes = await Promise.allSettled(runtimes.map((runtime) => host.load(runtime)));
+      expect(outcomes).toHaveLength(4);
+      for (const outcome of outcomes) {
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status === "rejected") {
+          expect(outcome.reason).toMatchObject({ code: "RUNTIME_TOO_LARGE" });
+        }
+      }
+      expect(clone).not.toHaveBeenCalled();
+      expect(verifier.calls).toBe(0);
+      expect(loader.calls).toBe(0);
+    } finally {
+      clone.mockRestore();
+    }
+  });
+
+  it("rejects an oversized aggregate bundle before cloning or verification", async () => {
+    const loader = new FakeLoader();
+    const verifier = new FakeVerifier();
+    const host = new SessionHost({
+      loader,
+      verifier,
+      bindings: bindings("oversized-bundle-preflight"),
+      limits: { maximumModuleBytes: 128, maximumBundleBytes: 128 },
+    });
+    const runtime = await revision();
+    runtime.modules[0]!.bytes = new Uint8Array(80);
+    runtime.modules[1]!.bytes = new Uint8Array(80);
+    const clone = vi.spyOn(globalThis, "structuredClone");
+
+    try {
+      await expect(host.load(runtime)).rejects.toMatchObject({ code: "RUNTIME_TOO_LARGE" });
+      expect(clone).not.toHaveBeenCalled();
+      expect(verifier.calls).toBe(0);
+      expect(loader.calls).toBe(0);
+    } finally {
+      clone.mockRestore();
+    }
+  });
+
+  it("rejects oversized runtime text before cloning or verification", async () => {
+    const loader = new FakeLoader();
+    const verifier = new FakeVerifier();
+    const host = new SessionHost({
+      loader,
+      verifier,
+      bindings: bindings("oversized-text-preflight"),
+    });
+    const oversized = "x".repeat(513);
+    const runtimes = await Promise.all(
+      [
+        async () => {
+          const runtime = await revision();
+          runtime.sessionId = oversized;
+          return runtime;
+        },
+        async () => {
+          const runtime = await revision();
+          runtime.compatibilityFlags = [oversized];
+          return runtime;
+        },
+        async () => {
+          const runtime = await revision();
+          runtime.mainModule = oversized;
+          return runtime;
+        },
+        async () => {
+          const runtime = await revision();
+          runtime.modules[0]!.specifier = oversized;
+          return runtime;
+        },
+      ].map((makeRuntime) => makeRuntime()),
+    );
+    const clone = vi.spyOn(globalThis, "structuredClone");
+
+    try {
+      const outcomes = await Promise.allSettled(runtimes.map((runtime) => host.load(runtime)));
+      for (const outcome of outcomes) {
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status === "rejected") {
+          expect(outcome.reason).toMatchObject({ code: "INVALID_RUNTIME" });
+        }
+      }
+      expect(clone).not.toHaveBeenCalled();
+      expect(verifier.calls).toBe(0);
+      expect(loader.calls).toBe(0);
+    } finally {
+      clone.mockRestore();
+    }
+  });
+
+  it("rejects a non-string compatibility date without coercing it", async () => {
+    const loader = new FakeLoader();
+    const verifier = new FakeVerifier();
+    const host = new SessionHost({
+      loader,
+      verifier,
+      bindings: bindings("compatibility-date-coercion"),
+    });
+    const runtime = await revision();
+    let coercions = 0;
+    Object.defineProperty(runtime, "compatibilityDate", {
+      enumerable: true,
+      configurable: true,
+      writable: true,
+      value: {
+        [Symbol.toPrimitive]: () => {
+          coercions += 1;
+          return "2026-08-26";
+        },
+      },
+    });
+    const clone = vi.spyOn(globalThis, "structuredClone");
+
+    try {
+      await expect(host.load(runtime)).rejects.toMatchObject({ code: "INVALID_RUNTIME" });
+      expect(coercions).toBe(0);
+      expect(clone).not.toHaveBeenCalled();
+      expect(verifier.calls).toBe(0);
+      expect(loader.calls).toBe(0);
+    } finally {
+      clone.mockRestore();
+    }
+  });
+
+  it("rejects a changing verifier attestation before cache lookup", async () => {
+    const loader = new FakeLoader();
+    let identityReads = 0;
+    const verifier: RuntimeVerifier = {
+      verify: async (runtime) =>
+        new Proxy(
+          {
+            revisionDigest: runtime.runtimeRevisionDigest,
+            runtimeIdentityDigest: digest("b"),
+          },
+          {
+            get: (target, property, receiver) => {
+              if (property === "runtimeIdentityDigest") {
+                identityReads += 1;
+                return identityReads === 1 ? digest("b") : digest("c");
+              }
+              return Reflect.get(target, property, receiver);
+            },
+          },
+        ),
+    };
+    const host = new SessionHost({
+      loader,
+      verifier,
+      bindings: bindings("changing-attestation"),
+    });
+
+    await expect(host.load(await revision())).rejects.toMatchObject({
+      code: "RUNTIME_UNVERIFIED",
+    });
+    expect(loader.calls).toBe(0);
+  });
+
+  it("uses independently attested identities for concurrent revisions of one session", async () => {
+    const loader = new FakeLoader();
+    const firstVerifier = new FakeVerifier();
+    const secondVerifier = new FakeVerifier();
+    const first = new SessionHost({
+      loader,
+      verifier: firstVerifier,
+      bindings: bindings("same-session-first"),
+    });
+    const second = new SessionHost({
+      loader,
+      verifier: secondVerifier,
+      bindings: bindings("same-session-second"),
+    });
+    const firstRuntime = await revision();
+    const secondRuntime = await revision({ runtimeRevisionDigest: digest("d") });
+    const firstIdentity = await digestStructuredValue("agent.worker-identity", 1, [
+      firstRuntime.sessionId,
+      firstRuntime.runtimeRevisionDigest,
+      firstRuntime.piAdapterAbi,
+      firstRuntime.compatibilityDate,
+      firstRuntime.compatibilityFlags,
+    ]);
+    const secondIdentity = await digestStructuredValue("agent.worker-identity", 1, [
+      secondRuntime.sessionId,
+      secondRuntime.runtimeRevisionDigest,
+      secondRuntime.piAdapterAbi,
+      secondRuntime.compatibilityDate,
+      secondRuntime.compatibilityFlags,
+    ]);
+
+    const [firstWorker, secondWorker] = await Promise.all([
+      first.load(firstRuntime),
+      second.load(secondRuntime),
+    ]);
+
+    expect(firstWorker.workerId).toBe(
+      `pi/${firstRuntime.sessionId}/${firstIdentity.replace("sha256:", "sha256-")}`,
+    );
+    expect(secondWorker.workerId).toBe(
+      `pi/${secondRuntime.sessionId}/${secondIdentity.replace("sha256:", "sha256-")}`,
+    );
+    expect(firstWorker.workerId).not.toBe(secondWorker.workerId);
+    expect(loader.definitions.size).toBe(2);
+  });
+
+  it("rejects a verifier that reuses an old cached identity for a new revision", async () => {
+    const loader = new FakeLoader();
+    const oldVerifier = new FakeVerifier();
+    const nextVerifier = new FakeVerifier();
+    const oldHost = new SessionHost({
+      loader,
+      verifier: oldVerifier,
+      bindings: bindings("revision-cache-rotation"),
+    });
+    const nextHost = new SessionHost({
+      loader,
+      verifier: nextVerifier,
+      bindings: bindings("revision-cache-rotation"),
+    });
+    const oldRuntime = await revision();
+    const nextRuntime = await revision({ runtimeRevisionDigest: digest("d") });
+    nextVerifier.runtimeIdentityDigest = await digestStructuredValue("agent.worker-identity", 1, [
+      oldRuntime.sessionId,
+      oldRuntime.runtimeRevisionDigest,
+      oldRuntime.piAdapterAbi,
+      oldRuntime.compatibilityDate,
+      oldRuntime.compatibilityFlags,
+    ]);
+
+    await oldHost.load(oldRuntime);
+
+    await expect(nextHost.load(nextRuntime)).rejects.toMatchObject({
+      code: "RUNTIME_UNVERIFIED",
+    });
+    expect(loader.calls).toBe(1);
+    expect(loader.definitions.size).toBe(1);
+  });
+
   it("keeps two sessions' broker bindings and module bytes isolated", async () => {
     const loader = new FakeLoader();
     const verifier = new FakeVerifier();
@@ -224,8 +574,7 @@ describe("SessionHost Worker Loader boundary", () => {
     const second = new SessionHost({ loader, verifier, bindings: bindings("second") });
     const firstRuntime = await revision();
     const secondRuntime = await revision({
-      sessionId: "sess_ZYXWVUTSRQPONMLKJHGFEDCBA1",
-      runtimeIdentityDigest: digest("c"),
+      sessionId: "sess_BBBBBBBBBBBBBBBBBBBBBBBBBA",
     });
     const [firstWorker, secondWorker] = await Promise.all([
       first.load(firstRuntime),

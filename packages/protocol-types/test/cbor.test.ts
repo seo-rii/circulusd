@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import golden from "../fixtures/v1alpha-golden.json";
+import runtimeIdentityGolden from "../fixtures/runtime-identity-v1.json";
 import {
   ProtocolValidationError,
   decodeCanonicalCbor,
@@ -13,6 +14,23 @@ import {
 } from "../src/index.ts";
 
 describe("RFC 8949 deterministic CBOR", () => {
+  it("matches cross-language runtime identity vectors", async () => {
+    for (const vector of runtimeIdentityGolden.vectors) {
+      await expect(
+        digestStructuredValue(runtimeIdentityGolden.domain, runtimeIdentityGolden.schemaVersion, [
+          vector.sessionId,
+          vector.runtimeRevisionDigest,
+          vector.piAdapterAbi,
+          vector.compatibilityDate,
+          vector.compatibilityFlags,
+        ]),
+      ).resolves.toBe(vector.runtimeIdentityDigest);
+      expect(
+        `pi/${vector.sessionId}/${vector.runtimeIdentityDigest.replace("sha256:", "sha256-")}`,
+      ).toBe(vector.workerId);
+    }
+  });
+
   it("matches cross-language golden encodings and versioned digests", async () => {
     for (const vector of golden.vectors) {
       let payload: unknown;

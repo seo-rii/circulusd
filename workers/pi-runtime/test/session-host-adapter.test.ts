@@ -32,7 +32,12 @@ function makeHost(): SessionHost {
   return new SessionHost({
     bindings,
     loader: { get: async () => ({}) },
-    verifier: { verify: async () => ({ revisionDigest: `sha256:${"0".repeat(64)}` }) },
+    verifier: {
+      verify: async () => ({
+        revisionDigest: `sha256:${"0".repeat(64)}`,
+        runtimeIdentityDigest: `sha256:${"1".repeat(64)}`,
+      }),
+    },
   });
 }
 

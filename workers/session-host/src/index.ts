@@ -1,3 +1,5 @@
+import { digestStructuredValue, normalizeStringSet } from "@circulusd/protocol-types";
+
 export type SessionHostErrorCode =
   | "INVALID_RUNTIME"
   | "RUNTIME_UNVERIFIED"
@@ -28,7 +30,6 @@ export interface RuntimeModule {
 export interface RuntimeRevision {
   sessionId: string;
   runtimeRevisionDigest: string;
-  runtimeIdentityDigest: string;
   piAdapterAbi: number;
   compatibilityDate: string;
   compatibilityFlags: string[];
@@ -41,7 +42,10 @@ export interface RuntimeRevision {
 }
 
 export interface RuntimeVerifier {
-  verify(revision: RuntimeRevision): Promise<{ readonly revisionDigest: string }>;
+  verify(revision: RuntimeRevision): Promise<{
+    readonly revisionDigest: string;
+    readonly runtimeIdentityDigest: string;
+  }>;
 }
 
 export interface BrokerBindings {
@@ -179,7 +183,6 @@ const MAXIMUM_COMPATIBILITY_FLAGS = 256;
 const RUNTIME_FIELDS = [
   "sessionId",
   "runtimeRevisionDigest",
-  "runtimeIdentityDigest",
   "piAdapterAbi",
   "compatibilityDate",
   "compatibilityFlags",
@@ -389,6 +392,7 @@ function validatedIdentifier(value: unknown, field: string, code: SessionHostErr
   if (
     typeof value !== "string" ||
     value.length === 0 ||
+    value.length > 512 ||
     value.normalize("NFC") !== value ||
     textEncoder.encode(value).byteLength > 512 ||
     /\p{Cc}/u.test(value)
@@ -500,14 +504,63 @@ export class SessionHost {
       "INVALID_RUNTIME",
       MAXIMUM_COMPATIBILITY_FLAGS,
     );
-    for (const [index, flag] of compatibilityFlags.entries()) {
-      if (typeof flag !== "string") {
-        throw new SessionHostError(
-          "INVALID_RUNTIME",
-          `runtime.compatibilityFlags[${index}] must be a string`,
-        );
-      }
+    const sessionId = validatedIdentifier(runtime.sessionId, "sessionId", "INVALID_RUNTIME");
+    const runtimeRevisionDigest = runtime.runtimeRevisionDigest;
+    const piAdapterAbi = runtime.piAdapterAbi;
+    const compatibilityDate = runtime.compatibilityDate;
+    const cpuMs = runtime.limits.cpuMs;
+    const subRequests = runtime.limits.subRequests;
+    const parsedCompatibilityDate =
+      typeof compatibilityDate === "string" && compatibilityDate.length === 10
+        ? new Date(`${compatibilityDate}T00:00:00.000Z`)
+        : null;
+    if (
+      !/^sess_[A-Z2-7]{25}[AEIMQUY4]$/.test(sessionId) ||
+      typeof runtimeRevisionDigest !== "string" ||
+      runtimeRevisionDigest.length !== 71 ||
+      !/^sha256:[0-9a-f]{64}$/.test(runtimeRevisionDigest) ||
+      !Number.isSafeInteger(piAdapterAbi) ||
+      piAdapterAbi <= 0 ||
+      typeof compatibilityDate !== "string" ||
+      compatibilityDate.length !== 10 ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(compatibilityDate) ||
+      parsedCompatibilityDate === null ||
+      Number.isNaN(parsedCompatibilityDate.getTime()) ||
+      parsedCompatibilityDate.toISOString().slice(0, 10) !== compatibilityDate ||
+      !Number.isSafeInteger(cpuMs) ||
+      cpuMs <= 0 ||
+      !Number.isSafeInteger(subRequests) ||
+      subRequests < 0
+    ) {
+      throw new SessionHostError("INVALID_RUNTIME", "runtime revision or limits are invalid");
     }
+    const validatedCompatibilityFlags: string[] = [];
+    for (const [index, candidate] of compatibilityFlags.entries()) {
+      validatedCompatibilityFlags.push(
+        validatedIdentifier(candidate, `compatibilityFlags[${index}]`, "INVALID_RUNTIME"),
+      );
+    }
+    let canonicalCompatibilityFlags: readonly string[];
+    try {
+      canonicalCompatibilityFlags = normalizeStringSet(validatedCompatibilityFlags);
+    } catch (error) {
+      throw new SessionHostError(
+        "INVALID_RUNTIME",
+        "compatibilityFlags must be a unique UTF-8-sorted set",
+        { cause: error },
+      );
+    }
+    if (
+      canonicalCompatibilityFlags.some(
+        (flag, index) => flag !== validatedCompatibilityFlags[index],
+      )
+    ) {
+      throw new SessionHostError(
+        "INVALID_RUNTIME",
+        "compatibilityFlags must be a unique UTF-8-sorted set",
+      );
+    }
+    const mainModule = validatedIdentifier(runtime.mainModule, "mainModule", "INVALID_RUNTIME");
     const moduleCandidates = validatedDataArray(
       runtime.modules,
       "runtime.modules",
@@ -515,13 +568,90 @@ export class SessionHost {
       this.#limits.maximumModules,
       "RUNTIME_TOO_LARGE",
     );
+    if (moduleCandidates.length === 0) {
+      throw new SessionHostError("INVALID_RUNTIME", "runtime modules must be a non-empty array");
+    }
+    let preflightBundleBytes = 0;
     for (const [index, candidate] of moduleCandidates.entries()) {
-      validatedExactKeys(
+      const record = validatedExactKeys(
         candidate,
         ["specifier", "bytes", "digest"],
         `runtime.modules[${index}]`,
         "INVALID_RUNTIME",
       );
+      const specifierDescriptor = Object.getOwnPropertyDescriptor(record, "specifier");
+      const digestDescriptor = Object.getOwnPropertyDescriptor(record, "digest");
+      const preflightSpecifier = validatedIdentifier(
+        specifierDescriptor !== undefined && "value" in specifierDescriptor
+          ? specifierDescriptor.value
+          : null,
+        `runtime.modules[${index}].specifier`,
+        "INVALID_RUNTIME",
+      );
+      if (
+        preflightSpecifier.startsWith("/") ||
+        preflightSpecifier
+          .split("/")
+          .some((component) => component === "" || component === "." || component === "..")
+      ) {
+        throw new SessionHostError(
+          "INVALID_RUNTIME",
+          `module specifier ${preflightSpecifier} is unsafe`,
+        );
+      }
+      const preflightDigest =
+        digestDescriptor !== undefined && "value" in digestDescriptor
+          ? digestDescriptor.value
+          : null;
+      if (
+        typeof preflightDigest !== "string" ||
+        preflightDigest.length !== 71 ||
+        !/^sha256:[0-9a-f]{64}$/.test(preflightDigest)
+      ) {
+        throw new SessionHostError(
+          "INVALID_RUNTIME",
+          `runtime.modules[${index}].digest is invalid`,
+        );
+      }
+      let moduleByteLength: number;
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(record, "bytes");
+        const bytes = descriptor !== undefined && "value" in descriptor ? descriptor.value : null;
+        if (
+          !(bytes instanceof Uint8Array) ||
+          Object.getPrototypeOf(bytes) !== Uint8Array.prototype ||
+          !(bytes.buffer instanceof ArrayBuffer) ||
+          Object.getPrototypeOf(bytes.buffer) !== ArrayBuffer.prototype ||
+          bytes.byteOffset !== 0 ||
+          bytes.byteLength !== bytes.buffer.byteLength
+        ) {
+          throw new SessionHostError(
+            "INVALID_RUNTIME",
+            `runtime.modules[${index}].bytes is not a canonical byte view`,
+          );
+        }
+        moduleByteLength = bytes.byteLength;
+      } catch (error) {
+        if (error instanceof SessionHostError) throw error;
+        throw new SessionHostError(
+          "INVALID_RUNTIME",
+          `runtime.modules[${index}].bytes is not safely inspectable`,
+          { cause: error },
+        );
+      }
+      if (moduleByteLength > this.#limits.maximumModuleBytes) {
+        throw new SessionHostError(
+          "RUNTIME_TOO_LARGE",
+          `runtime.modules[${index}] exceeds its limit`,
+        );
+      }
+      preflightBundleBytes += moduleByteLength;
+      if (
+        !Number.isSafeInteger(preflightBundleBytes) ||
+        preflightBundleBytes > this.#limits.maximumBundleBytes
+      ) {
+        throw new SessionHostError("RUNTIME_TOO_LARGE", "runtime bundle exceeds its limit");
+      }
     }
     try {
       runtime = structuredClone(runtime);
@@ -530,68 +660,61 @@ export class SessionHost {
         cause: error,
       });
     }
-    const sessionId = validatedIdentifier(runtime.sessionId, "sessionId", "INVALID_RUNTIME");
-    if (
-      !/^sha256:[0-9a-f]{64}$/.test(runtime.runtimeRevisionDigest) ||
-      !/^sha256:[0-9a-f]{64}$/.test(runtime.runtimeIdentityDigest) ||
-      !Number.isSafeInteger(runtime.piAdapterAbi) ||
-      runtime.piAdapterAbi <= 0 ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(runtime.compatibilityDate) ||
-      !Number.isSafeInteger(runtime.limits?.cpuMs) ||
-      runtime.limits.cpuMs <= 0 ||
-      !Number.isSafeInteger(runtime.limits.subRequests) ||
-      runtime.limits.subRequests < 0
-    ) {
-      throw new SessionHostError("INVALID_RUNTIME", "runtime identity or limits are invalid");
-    }
-    validatedExactKeys(runtime.limits, ["cpuMs", "subRequests"], "runtime.limits", "INVALID_RUNTIME");
-    if (!Array.isArray(runtime.compatibilityFlags)) {
-      throw new SessionHostError("INVALID_RUNTIME", "compatibilityFlags must be an array");
-    }
-    let previousFlag: Uint8Array | null = null;
-    for (const [index, candidate] of runtime.compatibilityFlags.entries()) {
-      const flag = validatedIdentifier(candidate, `compatibilityFlags[${index}]`, "INVALID_RUNTIME");
-      const encoded = textEncoder.encode(flag);
-      if (previousFlag !== null) {
-        let comparison = previousFlag.byteLength - encoded.byteLength;
-        const length = Math.min(previousFlag.byteLength, encoded.byteLength);
-        for (let byteIndex = 0; byteIndex < length; byteIndex += 1) {
-          const left = previousFlag[byteIndex];
-          const right = encoded[byteIndex];
-          if (left !== right) {
-            comparison = (left ?? 0) - (right ?? 0);
-            break;
-          }
-        }
-        if (comparison >= 0) {
-          throw new SessionHostError(
-            "INVALID_RUNTIME",
-            "compatibilityFlags must be a unique UTF-8-sorted set",
-          );
-        }
-      }
-      previousFlag = encoded;
-    }
-    const mainModule = validatedIdentifier(runtime.mainModule, "mainModule", "INVALID_RUNTIME");
-    if (!Array.isArray(runtime.modules) || runtime.modules.length === 0) {
-      throw new SessionHostError("INVALID_RUNTIME", "runtime modules must be a non-empty array");
-    }
-    if (runtime.modules.length > this.#limits.maximumModules) {
-      throw new SessionHostError("RUNTIME_TOO_LARGE", "runtime has too many modules");
-    }
-
-    let verified;
+    let verifiedRevisionDigest: string;
+    let verifiedRuntimeIdentityDigest: string;
     try {
-      verified = await this.#verifier.verify(runtime);
+      const verified = validatedExactKeys(
+        validatedStructuredClone(
+          await this.#verifier.verify(structuredClone(runtime)),
+          "runtime verification",
+          "RUNTIME_UNVERIFIED",
+          1_024,
+        ),
+        ["revisionDigest", "runtimeIdentityDigest"],
+        "runtime verification",
+        "RUNTIME_UNVERIFIED",
+      );
+      if (
+        typeof verified.revisionDigest !== "string" ||
+        typeof verified.runtimeIdentityDigest !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(verified.runtimeIdentityDigest)
+      ) {
+        throw new SessionHostError(
+          "RUNTIME_UNVERIFIED",
+          "runtime verifier returned an invalid attestation",
+        );
+      }
+      verifiedRevisionDigest = verified.revisionDigest;
+      verifiedRuntimeIdentityDigest = verified.runtimeIdentityDigest;
     } catch (error) {
       throw new SessionHostError("RUNTIME_UNVERIFIED", "runtime signature verification failed", {
         cause: error,
       });
     }
-    if (verified.revisionDigest !== runtime.runtimeRevisionDigest) {
+    if (verifiedRevisionDigest !== runtimeRevisionDigest) {
       throw new SessionHostError(
         "RUNTIME_UNVERIFIED",
         "runtime verifier returned a different revision digest",
+      );
+    }
+    let expectedRuntimeIdentityDigest: string;
+    try {
+      expectedRuntimeIdentityDigest = await digestStructuredValue("agent.worker-identity", 1, [
+        sessionId,
+        runtimeRevisionDigest,
+        piAdapterAbi,
+        compatibilityDate,
+        canonicalCompatibilityFlags,
+      ]);
+    } catch (error) {
+      throw new SessionHostError("RUNTIME_UNVERIFIED", "runtime identity derivation failed", {
+        cause: error,
+      });
+    }
+    if (verifiedRuntimeIdentityDigest !== expectedRuntimeIdentityDigest) {
+      throw new SessionHostError(
+        "RUNTIME_UNVERIFIED",
+        "runtime verifier returned a different runtime identity digest",
       );
     }
 
@@ -619,7 +742,7 @@ export class SessionHost {
       }
       const encodedSpecifier = textEncoder.encode(specifier);
       if (previousSpecifier !== null) {
-        let comparison = previousSpecifier.byteLength - encodedSpecifier.byteLength;
+        let comparison = 0;
         const length = Math.min(previousSpecifier.byteLength, encodedSpecifier.byteLength);
         for (let byteIndex = 0; byteIndex < length; byteIndex += 1) {
           const left = previousSpecifier[byteIndex];
@@ -628,6 +751,9 @@ export class SessionHost {
             comparison = (left ?? 0) - (right ?? 0);
             break;
           }
+        }
+        if (comparison === 0) {
+          comparison = previousSpecifier.byteLength - encodedSpecifier.byteLength;
         }
         if (comparison >= 0) {
           throw new SessionHostError(
@@ -668,11 +794,11 @@ export class SessionHost {
       throw new SessionHostError("INVALID_RUNTIME", "mainModule is absent from the module graph");
     }
 
-    const workerId = `pi/${sessionId}/${runtime.runtimeIdentityDigest.replace("sha256:", "sha256-")}`;
+    const workerId = `pi/${sessionId}/${expectedRuntimeIdentityDigest.replace("sha256:", "sha256-")}`;
     const worker = await this.#loader.get(workerId, async () => ({
-      compatibilityDate: runtime.compatibilityDate,
-      compatibilityFlags: [...runtime.compatibilityFlags],
-      limits: { cpuMs: runtime.limits.cpuMs, subRequests: runtime.limits.subRequests },
+      compatibilityDate,
+      compatibilityFlags: [...canonicalCompatibilityFlags],
+      limits: { cpuMs, subRequests },
       mainModule,
       modules: modules.map((module) => ({ ...module, bytes: new Uint8Array(module.bytes) })),
       env: {

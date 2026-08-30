@@ -7,6 +7,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "dependencies": {
+    "@circulusd/protocol-types": "workspace:*"
+  },
   "scripts": {
     "check": "tsc -p tsconfig.json",
     "test": "vitest run",

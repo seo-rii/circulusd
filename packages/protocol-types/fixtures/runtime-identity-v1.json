@@ -1,0 +1,37 @@
+{
+  "format": "circulusd.runtime-identity.v1-golden",
+  "domain": "agent.worker-identity",
+  "schemaVersion": 1,
+  "vectors": [
+    {
+      "name": "base",
+      "sessionId": "sess_AAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "runtimeRevisionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "piAdapterAbi": 3,
+      "compatibilityDate": "2026-08-26",
+      "compatibilityFlags": ["nodejs_compat", "streams_enable_constructors"],
+      "runtimeIdentityDigest": "sha256:db64b9ce4a4f780196dc179b8daf4d4b0cc6ec80c7ab920a983819c09e248269",
+      "workerId": "pi/sess_AAAAAAAAAAAAAAAAAAAAAAAAAA/sha256-db64b9ce4a4f780196dc179b8daf4d4b0cc6ec80c7ab920a983819c09e248269"
+    },
+    {
+      "name": "session-rotation",
+      "sessionId": "sess_BBBBBBBBBBBBBBBBBBBBBBBBBE",
+      "runtimeRevisionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "piAdapterAbi": 3,
+      "compatibilityDate": "2026-08-26",
+      "compatibilityFlags": ["nodejs_compat", "streams_enable_constructors"],
+      "runtimeIdentityDigest": "sha256:6c5faf58b903e1e690a9f836342da1cfddf7740a1fc61bc60ed6e828e6e5c499",
+      "workerId": "pi/sess_BBBBBBBBBBBBBBBBBBBBBBBBBE/sha256-6c5faf58b903e1e690a9f836342da1cfddf7740a1fc61bc60ed6e828e6e5c499"
+    },
+    {
+      "name": "flag-removal",
+      "sessionId": "sess_AAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "runtimeRevisionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "piAdapterAbi": 3,
+      "compatibilityDate": "2026-08-26",
+      "compatibilityFlags": ["nodejs_compat"],
+      "runtimeIdentityDigest": "sha256:60cd657c57a640d2e3dba5730aa9464987a0d6e0e72b74669ed4d9ee7780f975",
+      "workerId": "pi/sess_AAAAAAAAAAAAAAAAAAAAAAAAAA/sha256-60cd657c57a640d2e3dba5730aa9464987a0d6e0e72b74669ed4d9ee7780f975"
+    }
+  ]
+}

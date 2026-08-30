@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -130,6 +132,55 @@ func TestWorkerIdentityIsContentAddressedAndCanonical(t *testing.T) {
 	}
 	if changed == left {
 		t.Fatal("runtime revision change did not rotate worker identity")
+	}
+}
+
+func TestWorkerIdentityMatchesTypeScriptGoldenVectors(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := os.ReadFile("../../packages/protocol-types/fixtures/runtime-identity-v1.json")
+	if err != nil {
+		t.Fatalf("ReadFile(runtime identity golden) error = %v", err)
+	}
+	var fixture struct {
+		Vectors []struct {
+			Name                  string   `json:"name"`
+			SessionID             string   `json:"sessionId"`
+			RuntimeRevisionDigest string   `json:"runtimeRevisionDigest"`
+			PiAdapterABI          uint64   `json:"piAdapterAbi"`
+			CompatibilityDate     string   `json:"compatibilityDate"`
+			CompatibilityFlags    []string `json:"compatibilityFlags"`
+			RuntimeIdentityDigest string   `json:"runtimeIdentityDigest"`
+			WorkerID              string   `json:"workerId"`
+		} `json:"vectors"`
+	}
+	if err := json.Unmarshal(encoded, &fixture); err != nil {
+		t.Fatalf("Unmarshal(runtime identity golden) error = %v", err)
+	}
+	for _, vector := range fixture.Vectors {
+		vector := vector
+		t.Run(vector.Name, func(t *testing.T) {
+			t.Parallel()
+			sessionID, err := identity.Parse(identity.Session, vector.SessionID)
+			if err != nil {
+				t.Fatalf("Parse(session ID) error = %v", err)
+			}
+			workerID, err := WorkerIdentity(sessionID, RuntimeIdentity{
+				RuntimeRevisionDigest: vector.RuntimeRevisionDigest,
+				PiAdapterABI:          vector.PiAdapterABI,
+				CompatibilityDate:     vector.CompatibilityDate,
+				CompatibilityFlags:    vector.CompatibilityFlags,
+			})
+			if err != nil {
+				t.Fatalf("WorkerIdentity() error = %v", err)
+			}
+			if workerID != vector.WorkerID {
+				t.Fatalf("WorkerIdentity() = %q, want %q", workerID, vector.WorkerID)
+			}
+			if strings.TrimPrefix(workerID, "pi/"+vector.SessionID+"/sha256-") != strings.TrimPrefix(vector.RuntimeIdentityDigest, "sha256:") {
+				t.Fatalf("WorkerIdentity() digest does not match %q", vector.RuntimeIdentityDigest)
+			}
+		})
 	}
 }
 
