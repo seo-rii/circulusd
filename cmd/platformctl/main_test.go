@@ -255,6 +255,7 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 	artifactSize := uint64(1)
 	for _, componentName := range []string{
 		"platformd", "agentd", "executord", "sandboxd", "workerd", "celld",
+		"session-host", "pi-runtime", "state-app",
 	} {
 		component := release.Component{
 			Name:          componentName,

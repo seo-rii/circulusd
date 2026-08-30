@@ -30,6 +30,9 @@ var (
 		"sandboxd",
 		"workerd",
 		"celld",
+		"session-host",
+		"pi-runtime",
+		"state-app",
 	}
 	requiredProtocolPairs = []string{
 		"platformd-agentd",

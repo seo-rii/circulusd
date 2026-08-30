@@ -175,6 +175,41 @@ func TestCandidateAndProductionRequireCompleteSignedArtifacts(t *testing.T) {
 	}
 }
 
+func TestCandidateAndProductionRequireTrustedWorkerComponents(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status        string
+		componentName string
+	}{
+		{status: "candidate", componentName: "session-host"},
+		{status: "candidate", componentName: "pi-runtime"},
+		{status: "candidate", componentName: "state-app"},
+		{status: "production", componentName: "session-host"},
+		{status: "production", componentName: "pi-runtime"},
+		{status: "production", componentName: "state-app"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.status+"/"+test.componentName, func(t *testing.T) {
+			t.Parallel()
+
+			manifest := completeRelease(test.status)
+			for index, component := range manifest.Components {
+				if component.Name == test.componentName {
+					manifest.Components = append(manifest.Components[:index], manifest.Components[index+1:]...)
+					break
+				}
+			}
+
+			err := manifest.Validate()
+			if err == nil || !strings.Contains(err.Error(), `missing component "`+test.componentName+`"`) {
+				t.Fatalf("Validate() error = %v, want missing %q component error", err, test.componentName)
+			}
+		})
+	}
+}
+
 func TestCompleteCandidateAndProductionShapeIsValid(t *testing.T) {
 	t.Parallel()
 

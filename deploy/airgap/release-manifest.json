@@ -151,6 +151,9 @@
     "curated execution-environment rootfs",
     "Firecracker guest kernel and rootfs",
     "sandboxd binaries",
+    "session-host Worker bundle",
+    "pi-runtime Worker bundle",
+    "state-app Worker bundle",
     "signed SBOM and release signatures"
   ]
 }
