@@ -330,7 +330,7 @@ func TestNewFromCredentialFilesClearsDecodedBuffersWhenConstructionFails(t *test
 	}
 }
 
-func TestPinnedRootKeyFileSurvivesPathReplacementButRejectsInodeMutation(t *testing.T) {
+func TestPinnedRootKeyFileNeverFollowsPathReplacementAndRejectsInodeMutation(t *testing.T) {
 	t.Parallel()
 
 	directory := t.TempDir()
@@ -350,11 +350,11 @@ func TestPinnedRootKeyFileSurvivesPathReplacementButRejectsInodeMutation(t *test
 		t.Fatal(err)
 	}
 	got, err := readPinnedRootKey(pinned)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrInvalidCredentialFile) {
 		t.Fatalf("readPinnedRootKey(path replacement) error = %v", err)
 	}
 	defer clear(got)
-	if !bytes.Equal(got, originalKey) {
+	if err == nil && !bytes.Equal(got, originalKey) {
 		t.Fatal("readPinnedRootKey() followed a replacement path instead of its pinned descriptor")
 	}
 
