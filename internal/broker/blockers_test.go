@@ -295,6 +295,8 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 			{name: "effect", mutate: func(record *LedgerRecord) { record.EffectID = mustID(identity.Effect, "wrong-effect") }},
 			{name: "invocation", mutate: func(record *LedgerRecord) { record.InvocationID = mustID(identity.Invocation, "wrong-invocation") }},
 			{name: "digest", mutate: func(record *LedgerRecord) { record.RequestDigest = digest(117) }},
+			{name: "service", mutate: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
+			{name: "operation", mutate: func(record *LedgerRecord) { record.Operation = "write" }},
 			{name: "attempt", mutate: func(record *LedgerRecord) { record.DispatchAttempt++ }},
 			{name: "provider request", mutate: func(record *LedgerRecord) { record.ProviderRequestID = mustID(identity.Request, "wrong-provider") }},
 		} {
@@ -304,7 +306,7 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 				store := newFakeStore(snapshot)
 				record := LedgerRecord{
 					Status: status, EffectID: effectID, InvocationID: invocationID,
-					RequestDigest: digest(2), DispatchAttempt: 1,
+					RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
 					ProviderRequestID: mustID(identity.Request, "R"),
 				}
 				mismatch.mutate(&record)
@@ -526,7 +528,7 @@ func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 		store.corruptRecoverySettlementIdentity = true
 		_, err := mustCoordinator(t, store, &fakeLedger{record: LedgerRecord{
 			Status: LedgerFailed, EffectID: effectID, InvocationID: invocationID,
-			RequestDigest: digest(2), DispatchAttempt: 1,
+			RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
 			ProviderRequestID: mustID(identity.Request, "R"),
 		}}).RecoverEffect(context.Background(), baseRecoveryRequest(now, "receipt-recovery-identity"))
 		if !errors.Is(err, ErrFenceMismatch) {

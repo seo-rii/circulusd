@@ -326,14 +326,24 @@ type LedgerRecord struct {
 	EffectID          identity.ID
 	InvocationID      identity.ID
 	RequestDigest     Digest
+	Service           EffectService
+	Operation         string
 	DispatchAttempt   uint64
 	ProviderRequestID identity.ID
 	ExternalCommitID  identity.ID
 	ResultRef         identity.ID
 }
 
+type LedgerLookup struct {
+	EffectKey
+	Service           EffectService
+	Operation         string
+	DispatchAttempt   uint64
+	ProviderRequestID identity.ID
+}
+
 type InvocationLedger interface {
-	Lookup(context.Context, EffectKey) (LedgerRecord, error)
+	Lookup(context.Context, LedgerLookup) (LedgerRecord, error)
 }
 
 type RecoveryAction string

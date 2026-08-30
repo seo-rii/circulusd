@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
@@ -390,7 +391,8 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 	store := newFakeStore(snapshot)
 	ledger := &fakeLedger{record: LedgerRecord{
 		Status: LedgerCommitted, EffectID: effectID, InvocationID: invocationID,
-		RequestDigest: digest(2), DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID,
+		RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run",
+		DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID,
 	}}
 	coordinator := mustCoordinator(t, store, ledger)
 
@@ -404,6 +406,19 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 	if receipt.ExternalCommitID != commitID || receipt.ResultRef != resultID || !receipt.Durable {
 		t.Fatalf("confirmation receipt = %#v", receipt)
 	}
+	ledger.mu.Lock()
+	lookups := append([]LedgerLookup(nil), ledger.lookups...)
+	ledger.mu.Unlock()
+	wantLookup := LedgerLookup{
+		EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+		Service:           ServiceExecutor,
+		Operation:         "run",
+		DispatchAttempt:   1,
+		ProviderRequestID: mustID(identity.Request, "R"),
+	}
+	if len(lookups) != 1 || lookups[0] != wantLookup {
+		t.Fatalf("ledger lookups = %#v, want [%#v]", lookups, wantLookup)
+	}
 
 	for _, mutation := range []struct {
 		name string
@@ -412,6 +427,8 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 		{name: "effect", edit: func(record *LedgerRecord) { record.EffectID = mustID(identity.Effect, "J") }},
 		{name: "invocation", edit: func(record *LedgerRecord) { record.InvocationID = mustID(identity.Invocation, "K") }},
 		{name: "digest", edit: func(record *LedgerRecord) { record.RequestDigest = digest(33) }},
+		{name: "service", edit: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
+		{name: "operation", edit: func(record *LedgerRecord) { record.Operation = "write" }},
 		{name: "missing commit", edit: func(record *LedgerRecord) { record.ExternalCommitID = identity.ID{} }},
 		{name: "wrong commit kind", edit: func(record *LedgerRecord) { record.ExternalCommitID = sessionID }},
 	} {
@@ -428,6 +445,82 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 				t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrLedgerMismatch)
 			}
 		})
+	}
+}
+
+func TestConcurrentRecoveryLedgerLookupsPreserveEffectServiceBoundary(t *testing.T) {
+	t.Parallel()
+	const recoveries = 64
+	now := time.Unix(1_800_000_550, 0).UTC()
+	ledger := &fakeLedger{lookup: func(ctx context.Context, query LedgerLookup) (LedgerRecord, error) {
+		if err := ctx.Err(); err != nil {
+			return LedgerRecord{}, err
+		}
+		return LedgerRecord{
+			Status: LedgerCommitted, EffectID: query.EffectID, InvocationID: query.InvocationID,
+			RequestDigest: query.RequestDigest, Service: query.Service, Operation: query.Operation,
+			DispatchAttempt: query.DispatchAttempt, ProviderRequestID: query.ProviderRequestID, ExternalCommitID: commitID, ResultRef: resultID,
+		}, nil
+	}}
+
+	var wait sync.WaitGroup
+	errorsByRecovery := make(chan error, recoveries)
+	wantLookups := make(map[LedgerLookup]int, recoveries)
+	for index := 0; index < recoveries; index++ {
+		service := ServiceExecutor
+		if index%2 == 1 {
+			service = ServiceWorkspace
+		}
+		operation := fmt.Sprintf("operation-%d", index)
+		snapshot := baseSnapshot(now)
+		snapshot.ActiveEffect = baseEffect(EffectDispatched)
+		snapshot.ActiveEffect.Service = service
+		snapshot.ActiveEffect.Operation = operation
+		coordinator := mustCoordinator(t, newFakeStore(snapshot), ledger)
+		lookup := LedgerLookup{
+			EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+			Service:           service,
+			Operation:         operation,
+			DispatchAttempt:   1,
+			ProviderRequestID: mustID(identity.Request, "R"),
+		}
+		wantLookups[lookup]++
+		wait.Add(1)
+		go func(index int, coordinator *Coordinator) {
+			defer wait.Done()
+			decision, err := coordinator.RecoverEffect(context.Background(), baseRecoveryRequest(now, fmt.Sprintf("recover-concurrent-%d", index)))
+			if err != nil {
+				errorsByRecovery <- fmt.Errorf("recovery %d: %w", index, err)
+				return
+			}
+			if decision.Action != RecoverySettleOnly || decision.ExternalCommitID != commitID || decision.ResultRef != resultID {
+				errorsByRecovery <- fmt.Errorf("recovery %d decision = %#v", index, decision)
+			}
+		}(index, coordinator)
+	}
+	wait.Wait()
+	close(errorsByRecovery)
+	for err := range errorsByRecovery {
+		t.Error(err)
+	}
+
+	ledger.mu.Lock()
+	gotLookups := append([]LedgerLookup(nil), ledger.lookups...)
+	ledger.mu.Unlock()
+	if len(gotLookups) != recoveries {
+		t.Fatalf("ledger lookup count = %d, want %d", len(gotLookups), recoveries)
+	}
+	for _, lookup := range gotLookups {
+		if wantLookups[lookup] == 0 {
+			t.Errorf("unexpected ledger lookup: %#v", lookup)
+			continue
+		}
+		wantLookups[lookup]--
+	}
+	for lookup, remaining := range wantLookups {
+		if remaining != 0 {
+			t.Errorf("ledger lookup %#v remaining count = %d", lookup, remaining)
+		}
 	}
 }
 
@@ -664,7 +757,7 @@ func acquirePermit(t *testing.T, coordinator *Coordinator, now time.Time, key st
 }
 
 func committedRecord() LedgerRecord {
-	return LedgerRecord{Status: LedgerCommitted, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID}
+	return LedgerRecord{Status: LedgerCommitted, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID}
 }
 
 func digest(fill byte) Digest {
@@ -693,14 +786,25 @@ func mustCoordinator(t *testing.T, store DurableStore, ledger InvocationLedger) 
 }
 
 type fakeLedger struct {
-	record LedgerRecord
+	mu      sync.Mutex
+	record  LedgerRecord
+	lookup  func(context.Context, LedgerLookup) (LedgerRecord, error)
+	lookups []LedgerLookup
 }
 
-func (ledger *fakeLedger) Lookup(ctx context.Context, key EffectKey) (LedgerRecord, error) {
+func (ledger *fakeLedger) Lookup(ctx context.Context, query LedgerLookup) (LedgerRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return LedgerRecord{}, err
 	}
-	return ledger.record, nil
+	ledger.mu.Lock()
+	ledger.lookups = append(ledger.lookups, query)
+	lookup := ledger.lookup
+	record := ledger.record
+	ledger.mu.Unlock()
+	if lookup != nil {
+		return lookup(ctx, query)
+	}
+	return record, nil
 }
 
 type fakeStore struct {

@@ -304,11 +304,12 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	if request.DispatchAttempt == 0 || effect.LastDispatch == nil || request.DispatchAttempt != effect.DispatchAttempt || request.DispatchAttempt != effect.LastDispatch.DispatchAttempt {
 		return ConfirmationReceipt{}, ErrFenceMismatch
 	}
-	record, err := coordinator.ledger.Lookup(ctx, key)
+	lookup := LedgerLookup{EffectKey: key, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: request.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID}
+	record, err := coordinator.ledger.Lookup(ctx, lookup)
 	if err != nil {
 		return ConfirmationReceipt{}, fmt.Errorf("lookup invocation ledger: %w", err)
 	}
-	if err := validateCommittedRecord(record, key, request.DispatchAttempt, effect.LastDispatch.ProviderRequestID); err != nil {
+	if err := validateCommittedRecord(record, lookup); err != nil {
 		return ConfirmationReceipt{}, err
 	}
 	receipt, err := coordinator.store.MarkExternallyCommitted(ctx, MarkExternalCommand{
@@ -501,12 +502,13 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		if coordinator.ledger == nil {
 			return RecoveryDecision{}, ErrLedgerUnavailable
 		}
-		record, err := coordinator.ledger.Lookup(ctx, decision.EffectKey)
+		lookup := LedgerLookup{EffectKey: decision.EffectKey, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: effect.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID}
+		record, err := coordinator.ledger.Lookup(ctx, lookup)
 		if err != nil {
 			return RecoveryDecision{}, fmt.Errorf("lookup invocation ledger for recovery: %w", err)
 		}
 		if record.Status == LedgerCommitted {
-			if err := validateCommittedRecord(record, decision.EffectKey, effect.DispatchAttempt, effect.LastDispatch.ProviderRequestID); err != nil {
+			if err := validateCommittedRecord(record, lookup); err != nil {
 				return RecoveryDecision{}, err
 			}
 			receipt, err := coordinator.store.MarkExternallyCommitted(ctx, MarkExternalCommand{
@@ -527,11 +529,13 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 			return decision, nil
 		}
 		if record.Status == LedgerInflight || record.Status == LedgerFailed {
-			if record.EffectID != decision.EffectKey.EffectID ||
-				record.InvocationID != decision.EffectKey.InvocationID ||
-				record.RequestDigest != decision.EffectKey.RequestDigest ||
-				record.DispatchAttempt != effect.DispatchAttempt ||
-				record.ProviderRequestID != effect.LastDispatch.ProviderRequestID ||
+			if record.EffectID != lookup.EffectID ||
+				record.InvocationID != lookup.InvocationID ||
+				record.RequestDigest != lookup.RequestDigest ||
+				record.Service != lookup.Service ||
+				record.Operation != lookup.Operation ||
+				record.DispatchAttempt != lookup.DispatchAttempt ||
+				record.ProviderRequestID != lookup.ProviderRequestID ||
 				record.ExternalCommitID != (identity.ID{}) ||
 				record.ResultRef != (identity.ID{}) {
 				return RecoveryDecision{}, ErrLedgerMismatch
@@ -745,8 +749,8 @@ func validateTurn(snapshot TurnSnapshot, authority ValidatedTurnFence) error {
 	return nil
 }
 
-func validateCommittedRecord(record LedgerRecord, key EffectKey, dispatchAttempt uint64, providerRequestID identity.ID) error {
-	if record.Status != LedgerCommitted || record.EffectID != key.EffectID || record.InvocationID != key.InvocationID || record.RequestDigest != key.RequestDigest || record.DispatchAttempt != dispatchAttempt || record.ProviderRequestID != providerRequestID || record.ExternalCommitID.Kind() != identity.Commit || record.ResultRef != (identity.ID{}) && record.ResultRef.Kind() != identity.Artifact {
+func validateCommittedRecord(record LedgerRecord, lookup LedgerLookup) error {
+	if record.Status != LedgerCommitted || record.EffectID != lookup.EffectID || record.InvocationID != lookup.InvocationID || record.RequestDigest != lookup.RequestDigest || record.Service != lookup.Service || record.Operation != lookup.Operation || record.DispatchAttempt != lookup.DispatchAttempt || record.ProviderRequestID != lookup.ProviderRequestID || record.ExternalCommitID.Kind() != identity.Commit || record.ResultRef != (identity.ID{}) && record.ResultRef.Kind() != identity.Artifact {
 		return ErrLedgerMismatch
 	}
 	return nil
