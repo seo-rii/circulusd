@@ -4745,17 +4745,39 @@ state read와 dispatch-start 권한은 서로 다른 key ID와 root-key 파일�
 key material을 YAML에 직접 넣지 않으며, 모든 credential/evidence/root 경로는
 서로 다른 canonical absolute non-root 파일이어야 한다. credential 파일 내용은
 공백이나 개행이 없는 canonical lowercase hex이고, decode 결과는 32..256
-bytes여야 한다. Linux startup은 모든 경로 component를 pinned descriptor로
-순회하며 symbolic/magic link를 거부한다. parent는 root 또는 platformd effective
-UID 소유이고 group/other writable이 아니어야 한다(root-owned sticky directory는
-허용한다). 최종 파일은 platformd effective UID가 소유한 link-count 1의 regular
-file이며 mode는 정확히 `0400` 또는 `0600`이어야 한다. 두 credential은 path,
-device/inode, decoded key material이 모두 달라야 한다.
+bytes여야 한다. Linux credential loader는 모든 경로 component를 pinned descriptor로
+순회하며 symbolic/magic link를 거부한다. credential parent는 root 또는 platformd
+effective UID 소유이고 group/other writable이 아니어야 한다(root-owned sticky
+directory는 허용한다). 최종 credential은 platformd effective UID가 소유한
+link-count 1의 regular file이며 mode는 정확히 `0400` 또는 `0600`이어야 한다. 두
+credential은 path, device/inode, decoded key material이 모두 달라야 한다.
 
 startup은 두 파일 descriptor를 함께 고정하고 `fstat` 전후의 identity, metadata,
 size가 같은 bounded snapshot을 한 번만 읽는다. client가 key를 복사한 뒤 encoded와
 decoded loader buffer를 지우며, 비-Linux build는 안전하지 않은 fallback 없이
 fail-closed한다. request별 파일 재읽기는 key rotation protocol로 간주하지 않는다.
+
+production evidence와 두 trust-roots 파일은 credential과 다른 public trust-anchor
+정책을 사용한다. Linux loader는 `/`부터 각 component를 `openat2`의
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`로 순회한다. 모든
+parent는 root-owned directory이고 group/other writable이 아니어야 하며 sticky
+world-writable 예외를 허용하지 않는다. 최종 proof 파일은 root-owned, link-count
+1의 regular file이고 mode는 정확히 `0444` 또는 `0644`이다.
+
+loader는 evidence, conformance roots, runtime roots의 세 descriptor를 모두 먼저
+고정하고 device/inode가 pairwise distinct인지 확인한 후에만 읽는다. 각 파일은 initial
+`fstat` size의 bounded exact read와 EOF 확인, post-read `fstat`을 수행하며 세 파일을
+모두 읽은 뒤 전체 descriptor를 다시 `fstat`한다. 비교 항목은 device, inode, mode,
+link count, UID/GID, size, mtime, ctime이다. load 중 path가 교체되어도 pathname을
+다시 조회하지 않으므로 결과는 pinned inode의 기존 snapshot이거나 안전한 오류이며
+replacement 내용일 수 없다. pinned inode의 ctime/link count 변화가 관측되면 전체
+결과를 버린다. decode와 role binding 및
+cross-role verifier 구성이 끝난 뒤 descriptor를 닫으며 request 처리 중 다시 열지
+않는다. 비-Linux build와 `openat2`를 지원하지 않는 Linux는 fallback 없이
+fail-closed한다. 이 snapshot은 세 파일의 공통 rollout generation 자체를 증명하지
+않으므로 readiness는 이후 signature, release-derived requirements, live probe가 모두
+성공한 경우에만 성립한다.
+
 `httpTimeout`은 30초 이하, `dispatchStartTimeout`은 5분 이하,
 `maximumEvidenceAge`는 24시간 이하로 fail-closed 검증한다.
 
