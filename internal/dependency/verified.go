@@ -5,6 +5,7 @@
 package dependency
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -148,6 +149,13 @@ func NewVerifier(config VerifierConfig) (*Verifier, error) {
 	runtimeRoots, err := copyRoots(config.RuntimeRoots)
 	if err != nil {
 		return nil, err
+	}
+	for conformanceKeyID, conformanceRoot := range conformanceRoots {
+		for runtimeKeyID, runtimeRoot := range runtimeRoots {
+			if conformanceKeyID == runtimeKeyID || bytes.Equal(conformanceRoot, runtimeRoot) {
+				return nil, ErrInvalidConfiguration
+			}
+		}
 	}
 	return &Verifier{
 		conformanceRoots: conformanceRoots,

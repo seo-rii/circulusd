@@ -4762,6 +4762,9 @@ fail-closed한다. request별 파일 재읽기는 key rotation protocol로 간�
 production dependency의 celld build digest와 state-app application digest는 이
 YAML에서 받지 않는다. 서명 검증된 release manifest의 정확한 artifact digest에서
 파생하여 live probe와 conformance evidence의 descriptor에 함께 결속한다.
+offline conformance signer와 live runtime signer는 서로 다른 trust domain이다.
+`conformanceRootsFile`과 `runtimeRootsFile` 사이에는 key ID뿐 아니라 Ed25519
+public-key material도 재사용할 수 없으며, 하나라도 겹치면 startup은 실패한다.
 
 `maxResidentSessions`와 shard memory limit의 실제 reference 값은 Phase 0 benchmark 후 조정해야 한다. 숫자를 product invariant로 간주하지 않는다.
 

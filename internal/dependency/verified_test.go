@@ -216,6 +216,50 @@ func TestZeroVerifiedDependencyAndMutatedCallerRootsFailClosed(t *testing.T) {
 	}
 }
 
+func TestVerifierRejectsTrustRootReuseAcrossConformanceAndRuntimeRoles(t *testing.T) {
+	t.Parallel()
+
+	firstPublicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(first) error = %v", err)
+	}
+	secondPublicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(second) error = %v", err)
+	}
+	tests := []struct {
+		name             string
+		conformanceRoots map[string]ed25519.PublicKey
+		runtimeRoots     map[string]ed25519.PublicKey
+	}{
+		{
+			name:             "same key ID with different material",
+			conformanceRoots: map[string]ed25519.PublicKey{"shared-root": firstPublicKey},
+			runtimeRoots:     map[string]ed25519.PublicKey{"shared-root": secondPublicKey},
+		},
+		{
+			name:             "same key material with different IDs",
+			conformanceRoots: map[string]ed25519.PublicKey{"conformance-root": firstPublicKey},
+			runtimeRoots:     map[string]ed25519.PublicKey{"runtime-root": firstPublicKey},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			verifier, err := NewVerifier(VerifierConfig{
+				ConformanceRoots: test.conformanceRoots,
+				RuntimeRoots:     test.runtimeRoots,
+				Clock:            time.Now,
+				Entropy:          strings.NewReader(strings.Repeat("n", ChallengeBytes)),
+			})
+			if verifier != nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("NewVerifier() verifier/error = %v/%v, want nil/ErrInvalidConfiguration", verifier, err)
+			}
+		})
+	}
+}
+
 func TestVerifierRejectsARepeatedRuntimeChallenge(t *testing.T) {
 	t.Parallel()
 
