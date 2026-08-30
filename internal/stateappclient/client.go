@@ -1,5 +1,5 @@
-// Package stateappclient provides the bounded, authenticated, read-only
-// platformd-to-state-app ingress client.
+// Package stateappclient provides bounded, authenticated platformd-to-state-app
+// ingress clients.
 package stateappclient
 
 import (
@@ -15,14 +15,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/identity"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -32,7 +36,15 @@ const (
 	ingressSchemaDigest = "sha256:6365dfa4e6e73b349508a46688cfcaacdeacece11cd11ed2d7f3e40af49ad3ee"
 
 	hostProtocol     = "circulus.v1alpha1"
-	hostSchemaDigest = "sha256:17eae318de36071e4587e0b2a1a2e70bc613c6ba6f62c817f104620227437e71"
+	hostSchemaDigest = "sha256:6cb00fe7ab84e4177c704c4eec53c2028c248ae38d06916c68a24045d141a5bc"
+
+	dispatchStartIngressPath         = "/circulusd/state/v1/session-dispatch-start:claim"
+	dispatchStartIngressContentType  = "application/vnd.circulusd.state-dispatch-start-ingress+cbor"
+	dispatchStartIngressProtocol     = "circulus.state-dispatch-start-ingress.v1alpha1"
+	dispatchStartIngressSchemaDigest = "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724"
+	dispatchStartHostSchemaDigest    = "sha256:91ae9bd8a93e99916a3e1e1e200d5cdf90bdc693bb0b3791066e1e1d5a559db5"
+	dispatchStartRequestMACDomain    = "circulusd.state-dispatch-start-ingress.request.v1"
+	dispatchStartResponseMACDomain   = "circulusd.state-dispatch-start-ingress.response.v1"
 
 	keyIDHeader       = "X-Circulus-State-Key-Id"
 	signatureHeader   = "X-Circulus-State-Signature"
@@ -41,16 +53,19 @@ const (
 	requestKeyDomain  = "circulusd.state-ingress.key.request.v1\x00"
 	responseKeyDomain = "circulusd.state-ingress.key.response.v1\x00"
 
-	maximumRequestBytes        = 4_096
-	maximumRequestDepth        = 2
-	maximumRequestItems        = 32
-	maximumResponseBytes       = 1_048_576 + 65_536
-	maximumResponseDepth       = 72
-	maximumResponseItems       = 100_000
-	maximumResponseHeaderBytes = 16 << 10
-	maximumEventLimit          = 256
-	maximumSharedInteger       = uint64(9_007_199_254_740_991)
-	maximumTimeout             = 30 * time.Second
+	maximumRequestBytes              = 4_096
+	maximumRequestDepth              = 2
+	maximumRequestItems              = 32
+	maximumDispatchStartRequestBytes = 8_192
+	maximumDispatchStartRequestDepth = 4
+	maximumDispatchStartRequestItems = 96
+	maximumResponseBytes             = 1_048_576 + 65_536
+	maximumResponseDepth             = 72
+	maximumResponseItems             = 100_000
+	maximumResponseHeaderBytes       = 16 << 10
+	maximumEventLimit                = 256
+	maximumSharedInteger             = uint64(9_007_199_254_740_991)
+	maximumTimeout                   = 30 * time.Second
 )
 
 var (
@@ -64,6 +79,7 @@ var (
 
 	keyIDPattern     = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 	signaturePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	digestPattern    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 var safeHostErrorMessages = map[string]string{
@@ -92,10 +108,12 @@ var safeHostErrorMessages = map[string]string{
 }
 
 type Config struct {
-	Endpoint string
-	KeyID    string
-	RootKey  []byte
-	Timeout  time.Duration
+	Endpoint             string
+	KeyID                string
+	RootKey              []byte
+	DispatchStartKeyID   string
+	DispatchStartRootKey []byte
+	Timeout              time.Duration
 }
 
 type Request struct {
@@ -105,6 +123,78 @@ type Request struct {
 	ExpectedAuthorizationGeneration uint64
 	AfterSequence                   uint64
 	Limit                           int
+}
+
+type DispatchStartFence struct {
+	TurnLeaseGeneration     uint64
+	PlacementGeneration     uint64
+	SandboxGeneration       uint64
+	AuthorizationGeneration uint64
+}
+
+type DispatchPermitClaims struct {
+	TenantID                string
+	UserID                  string
+	SessionID               string
+	TurnID                  string
+	EffectID                string
+	InvocationID            string
+	RequestDigest           string
+	Service                 string
+	Operation               string
+	ReplayPolicy            string
+	ParentOperationID       string
+	Ordinal                 uint64
+	DispatchAttempt         uint64
+	TurnLeaseGeneration     uint64
+	PlacementGeneration     uint64
+	SandboxGeneration       uint64
+	AuthorizationGeneration uint64
+	ProviderRouteDigest     string
+	DeadlineUnixMS          uint64
+}
+
+type ClaimDispatchStartRequest struct {
+	TenantID              string
+	WorkspaceID           string
+	SessionID             string
+	CommandID             string
+	ExpectedEventSequence uint64
+	TurnID                string
+	EffectID              string
+	InvocationID          string
+	RequestDigest         string
+	Fence                 DispatchStartFence
+	DispatchAttempt       uint64
+	ProviderRequestID     string
+	ProviderRouteDigest   string
+	DispatchPermitClaims  DispatchPermitClaims
+	CommandDigest         string
+}
+
+type DispatchStartPermit struct {
+	DispatchPermitClaims DispatchPermitClaims
+	ProviderRequestID    string
+	CommandDigest        string
+	ClaimedEventSequence uint64
+}
+
+type ClaimDispatchStartResult struct {
+	OutcomeFresh bool
+	HostReplayed bool
+	Version      uint64
+	EffectID     string
+	Permit       DispatchStartPermit
+}
+
+type authenticatedIngressContract struct {
+	path                     string
+	contentType              string
+	requestMACDomain         string
+	responseMACDomain        string
+	hostSchemaDigest         string
+	requestOptions           canonical.Options
+	dispatchStartCredentials bool
 }
 
 // RemoteError is a validated, allowlisted state-app failure. Message is always
@@ -125,23 +215,26 @@ func (failure *RemoteError) Error() string {
 func (failure *RemoteError) Unwrap() error { return ErrRemote }
 
 type Client struct {
-	endpoint     string
-	keyID        string
-	requestKey   [sha256.Size]byte
-	responseKey  [sha256.Size]byte
-	timeout      time.Duration
-	clock        func() time.Time
-	newRequestID func() (string, error)
-	sourceGate   chan struct{}
-	transport    *http.Transport
-	httpClient   *http.Client
-	lifecycleMu  sync.Mutex
-	closed       bool
-	closeDone    chan struct{}
-	nextActiveID uint64
-	active       sync.WaitGroup
-	activeCancel map[uint64]context.CancelFunc
-	connections  map[*trackedConnection]struct{}
+	endpoint                 string
+	keyID                    string
+	requestKey               [sha256.Size]byte
+	responseKey              [sha256.Size]byte
+	dispatchStartKeyID       string
+	dispatchStartRequestKey  [sha256.Size]byte
+	dispatchStartResponseKey [sha256.Size]byte
+	timeout                  time.Duration
+	clock                    func() time.Time
+	newRequestID             func() (string, error)
+	sourceGate               chan struct{}
+	transport                *http.Transport
+	httpClient               *http.Client
+	lifecycleMu              sync.Mutex
+	closed                   bool
+	closeDone                chan struct{}
+	nextActiveID             uint64
+	active                   sync.WaitGroup
+	activeCancel             map[uint64]context.CancelFunc
+	connections              map[*trackedConnection]struct{}
 }
 
 type trackedConnection struct {
@@ -188,6 +281,10 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 		endpointIP = net.ParseIP(parsed.Hostname())
 		endpointPort, endpointPortErr = strconv.ParseUint(parsed.Port(), 10, 16)
 	}
+	dispatchStartCredentialsAbsent := config.DispatchStartKeyID == "" && len(config.DispatchStartRootKey) == 0
+	dispatchStartCredentialsValid := keyIDPattern.MatchString(config.DispatchStartKeyID) &&
+		len(config.DispatchStartRootKey) >= 32 && len(config.DispatchStartRootKey) <= 256 &&
+		config.DispatchStartKeyID != config.KeyID && !bytes.Equal(config.DispatchStartRootKey, config.RootKey)
 	if err != nil || config.Endpoint == "" || config.Endpoint != strings.TrimSpace(config.Endpoint) ||
 		strings.Contains(config.Endpoint, "%") || parsed.Scheme != "http" ||
 		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
@@ -197,6 +294,7 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 		parsed.Host != net.JoinHostPort(endpointIP.String(), parsed.Port()) || parsed.String() != config.Endpoint ||
 		!keyIDPattern.MatchString(config.KeyID) ||
 		len(config.RootKey) < 32 || len(config.RootKey) > 256 ||
+		!dispatchStartCredentialsAbsent && !dispatchStartCredentialsValid ||
 		config.Timeout <= 0 || config.Timeout > maximumTimeout ||
 		sources.clock == nil || sources.newRequestID == nil {
 		return nil, ErrInvalidConfig
@@ -205,14 +303,26 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 	requestKey := keyedDigest(rootKey, []byte(requestKeyDomain))
 	responseKey := keyedDigest(rootKey, []byte(responseKeyDomain))
 	clear(rootKey)
+	var dispatchStartRequestKey [sha256.Size]byte
+	var dispatchStartResponseKey [sha256.Size]byte
+	if !dispatchStartCredentialsAbsent {
+		dispatchStartRootKey := append([]byte(nil), config.DispatchStartRootKey...)
+		dispatchStartRequestKey = keyedDigest(dispatchStartRootKey, []byte(requestKeyDomain))
+		dispatchStartResponseKey = keyedDigest(dispatchStartRootKey, []byte(responseKeyDomain))
+		clear(dispatchStartRootKey)
+	}
 
 	sourceGate := make(chan struct{}, 1)
 	sourceGate <- struct{}{}
 	client := &Client{
-		endpoint:   config.Endpoint,
-		keyID:      config.KeyID,
-		requestKey: requestKey, responseKey: responseKey,
-		timeout: config.Timeout, clock: sources.clock, newRequestID: sources.newRequestID,
+		endpoint:                 config.Endpoint,
+		keyID:                    config.KeyID,
+		requestKey:               requestKey,
+		responseKey:              responseKey,
+		dispatchStartKeyID:       config.DispatchStartKeyID,
+		dispatchStartRequestKey:  dispatchStartRequestKey,
+		dispatchStartResponseKey: dispatchStartResponseKey,
+		timeout:                  config.Timeout, clock: sources.clock, newRequestID: sources.newRequestID,
 		sourceGate: sourceGate, closeDone: make(chan struct{}),
 		activeCancel: make(map[uint64]context.CancelFunc),
 		connections:  make(map[*trackedConnection]struct{}),
@@ -299,6 +409,12 @@ func (client *Client) Close() {
 	}
 	client.active.Wait()
 	client.transport.CloseIdleConnections()
+	client.lifecycleMu.Lock()
+	clear(client.requestKey[:])
+	clear(client.responseKey[:])
+	clear(client.dispatchStartRequestKey[:])
+	clear(client.dispatchStartResponseKey[:])
+	client.lifecycleMu.Unlock()
 	close(closed)
 }
 
@@ -324,6 +440,278 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 		request.AfterSequence > maximumSharedInteger ||
 		request.Limit < 1 || request.Limit > maximumEventLimit {
 		return nil, ErrInvalidRequest
+	}
+	return client.invokeAuthenticatedIngress(
+		ctx,
+		authenticatedIngressContract{
+			path: ingressPath, contentType: ingressContentType,
+			requestMACDomain: requestMACDomain, responseMACDomain: responseMACDomain,
+			hostSchemaDigest: hostSchemaDigest,
+			requestOptions: canonical.Options{
+				MaxBytes: maximumRequestBytes, MaxDepth: maximumRequestDepth, MaxItems: maximumRequestItems,
+			},
+		},
+		func(requestID string, sentAtUnixMS int64) canonical.Map {
+			return canonical.Map{
+				"protocol": ingressProtocol, "major": int64(1), "minor": int64(0),
+				"schemaDigest": ingressSchemaDigest,
+				"requestId":    requestID, "sentAtUnixMs": sentAtUnixMS,
+				"tenantId": request.TenantID, "actorSubjectId": request.ActorSubjectID,
+				"sessionId":                       request.SessionID,
+				"expectedAuthorizationGeneration": request.ExpectedAuthorizationGeneration,
+				"afterSequence":                   request.AfterSequence, "limit": request.Limit,
+			}
+		},
+	)
+}
+
+func (client *Client) ClaimDispatchStart(
+	ctx context.Context,
+	request ClaimDispatchStartRequest,
+) (ClaimDispatchStartResult, error) {
+	if ctx == nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return ClaimDispatchStartResult{}, err
+	}
+	if client == nil || client.httpClient == nil {
+		return ClaimDispatchStartResult{}, ErrInvalidConfig
+	}
+	if client.dispatchStartKeyID == "" {
+		return ClaimDispatchStartResult{}, ErrInvalidConfig
+	}
+	claims := request.DispatchPermitClaims
+	if _, err := identity.Parse(identity.Tenant, request.TenantID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Workspace, request.WorkspaceID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Session, request.SessionID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Turn, request.TurnID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Effect, request.EffectID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Invocation, request.InvocationID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if request.ProviderRequestID != "" {
+		if _, err := identity.Parse(identity.Request, request.ProviderRequestID); err != nil {
+			return ClaimDispatchStartResult{}, ErrInvalidRequest
+		}
+	}
+	if _, err := identity.Parse(identity.Tenant, claims.TenantID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Subject, claims.UserID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Session, claims.SessionID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Turn, claims.TurnID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Effect, claims.EffectID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if _, err := identity.Parse(identity.Invocation, claims.InvocationID); err != nil {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if claims.ParentOperationID != "" {
+		if _, err := identity.Parse(identity.Operation, claims.ParentOperationID); err != nil {
+			return ClaimDispatchStartResult{}, ErrInvalidRequest
+		}
+	} else if claims.Ordinal != 0 {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	for _, value := range []string{request.CommandID, claims.Operation} {
+		if value == "" || len(value) > 256 || !utf8.ValidString(value) || !norm.NFC.IsNormalString(value) {
+			return ClaimDispatchStartResult{}, ErrInvalidRequest
+		}
+		for _, character := range value {
+			if unicode.Is(unicode.Cc, character) {
+				return ClaimDispatchStartResult{}, ErrInvalidRequest
+			}
+		}
+	}
+	zeroDigest := "sha256:" + strings.Repeat("0", 64)
+	for _, candidate := range []struct {
+		value   string
+		nonzero bool
+	}{
+		{value: request.RequestDigest, nonzero: true},
+		{value: request.ProviderRouteDigest, nonzero: true},
+		{value: claims.RequestDigest, nonzero: true},
+		{value: claims.ProviderRouteDigest, nonzero: true},
+		{value: request.CommandDigest, nonzero: true},
+	} {
+		if !digestPattern.MatchString(candidate.value) || candidate.nonzero && candidate.value == zeroDigest {
+			return ClaimDispatchStartResult{}, ErrInvalidRequest
+		}
+	}
+	switch claims.Service {
+	case "model", "workspace", "executor", "mcp", "artifact", "external-tool":
+	default:
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	switch claims.ReplayPolicy {
+	case "safe", "idempotency-key", "never", "confirm":
+	default:
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if request.ExpectedEventSequence >= maximumSharedInteger ||
+		request.DispatchAttempt < 1 || request.DispatchAttempt > maximumSharedInteger ||
+		request.Fence.TurnLeaseGeneration > maximumSharedInteger ||
+		request.Fence.PlacementGeneration > maximumSharedInteger ||
+		request.Fence.SandboxGeneration > maximumSharedInteger ||
+		request.Fence.AuthorizationGeneration > maximumSharedInteger ||
+		claims.DispatchAttempt < 1 || claims.DispatchAttempt > maximumSharedInteger ||
+		claims.TurnLeaseGeneration > maximumSharedInteger ||
+		claims.PlacementGeneration > maximumSharedInteger ||
+		claims.SandboxGeneration > maximumSharedInteger ||
+		claims.AuthorizationGeneration > maximumSharedInteger ||
+		claims.Ordinal > maximumSharedInteger ||
+		claims.DeadlineUnixMS < 1 || claims.DeadlineUnixMS > maximumSharedInteger {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+	if request.TenantID != claims.TenantID ||
+		request.SessionID != claims.SessionID ||
+		request.TurnID != claims.TurnID ||
+		request.EffectID != claims.EffectID ||
+		request.InvocationID != claims.InvocationID ||
+		request.RequestDigest != claims.RequestDigest ||
+		request.DispatchAttempt != claims.DispatchAttempt ||
+		request.ProviderRouteDigest != claims.ProviderRouteDigest ||
+		request.Fence.TurnLeaseGeneration != claims.TurnLeaseGeneration ||
+		request.Fence.PlacementGeneration != claims.PlacementGeneration ||
+		request.Fence.SandboxGeneration != claims.SandboxGeneration ||
+		request.Fence.AuthorizationGeneration != claims.AuthorizationGeneration {
+		return ClaimDispatchStartResult{}, ErrInvalidRequest
+	}
+
+	claimMap := canonical.Map{
+		"tenantId": claims.TenantID, "userId": claims.UserID,
+		"sessionId": claims.SessionID, "turnId": claims.TurnID,
+		"effectId": claims.EffectID, "invocationId": claims.InvocationID,
+		"requestDigest": claims.RequestDigest, "service": claims.Service,
+		"operation": claims.Operation, "replayPolicy": claims.ReplayPolicy,
+		"dispatchAttempt":         int64(claims.DispatchAttempt),
+		"turnLeaseGeneration":     int64(claims.TurnLeaseGeneration),
+		"placementGeneration":     int64(claims.PlacementGeneration),
+		"sandboxGeneration":       int64(claims.SandboxGeneration),
+		"authorizationGeneration": int64(claims.AuthorizationGeneration),
+		"providerRouteDigest":     claims.ProviderRouteDigest,
+		"deadline":                int64(claims.DeadlineUnixMS),
+	}
+	if claims.ParentOperationID != "" {
+		claimMap["parentOperationId"] = claims.ParentOperationID
+		claimMap["ordinal"] = int64(claims.Ordinal)
+	}
+	var providerRequestID canonical.Value
+	if request.ProviderRequestID != "" {
+		providerRequestID = request.ProviderRequestID
+	}
+	rawResult, err := client.invokeAuthenticatedIngress(
+		ctx,
+		authenticatedIngressContract{
+			path: dispatchStartIngressPath, contentType: dispatchStartIngressContentType,
+			requestMACDomain:  dispatchStartRequestMACDomain,
+			responseMACDomain: dispatchStartResponseMACDomain,
+			hostSchemaDigest:  dispatchStartHostSchemaDigest,
+			requestOptions: canonical.Options{
+				MaxBytes: maximumDispatchStartRequestBytes,
+				MaxDepth: maximumDispatchStartRequestDepth,
+				MaxItems: maximumDispatchStartRequestItems,
+			},
+			dispatchStartCredentials: true,
+		},
+		func(requestID string, sentAtUnixMS int64) canonical.Map {
+			return canonical.Map{
+				"protocol": dispatchStartIngressProtocol, "major": int64(1), "minor": int64(0),
+				"schemaDigest": dispatchStartIngressSchemaDigest,
+				"requestId":    requestID, "sentAtUnixMs": sentAtUnixMS,
+				"tenantId": request.TenantID, "workspaceId": request.WorkspaceID,
+				"sessionId": request.SessionID,
+				"commandId": request.CommandID, "expectedEventSequence": int64(request.ExpectedEventSequence),
+				"turnId": request.TurnID, "effectId": request.EffectID,
+				"invocationId": request.InvocationID, "requestDigest": request.RequestDigest,
+				"fence": canonical.Map{
+					"turnLeaseGeneration":     int64(request.Fence.TurnLeaseGeneration),
+					"placementGeneration":     int64(request.Fence.PlacementGeneration),
+					"sandboxGeneration":       int64(request.Fence.SandboxGeneration),
+					"authorizationGeneration": int64(request.Fence.AuthorizationGeneration),
+				},
+				"dispatchAttempt":      int64(request.DispatchAttempt),
+				"providerRequestId":    providerRequestID,
+				"providerRouteDigest":  request.ProviderRouteDigest,
+				"dispatchPermitClaims": claimMap,
+				"commandDigest":        request.CommandDigest,
+			}
+		},
+	)
+	if err != nil {
+		return ClaimDispatchStartResult{}, err
+	}
+	result, ok := rawResult.(canonical.Map)
+	if !ok || len(result) != 3 {
+		return ClaimDispatchStartResult{}, ErrInvalidResponse
+	}
+	outcome, outcomeOK := result["outcome"].(canonical.Map)
+	version, versionOK := result["version"].(int64)
+	hostReplayed, replayedOK := result["replayed"].(bool)
+	if !outcomeOK || len(outcome) != 4 || !versionOK || version < 1 || !replayedOK ||
+		outcome["kind"] != "dispatch_start_claimed" || outcome["effectId"] != request.EffectID {
+		return ClaimDispatchStartResult{}, ErrInvalidResponse
+	}
+	fresh, freshOK := outcome["fresh"].(bool)
+	permit, permitOK := outcome["startPermit"].(canonical.Map)
+	if !freshOK || !permitOK || len(permit) != 4 || fresh == hostReplayed {
+		return ClaimDispatchStartResult{}, ErrInvalidResponse
+	}
+	responseClaims, claimsOK := permit["dispatchPermitClaims"].(canonical.Map)
+	claimedEventSequence, sequenceOK := permit["claimedEventSequence"].(int64)
+	if !claimsOK || !reflect.DeepEqual(responseClaims, claimMap) ||
+		permit["providerRequestId"] != providerRequestID ||
+		permit["commandDigest"] != request.CommandDigest ||
+		!sequenceOK || claimedEventSequence < 1 || uint64(claimedEventSequence) <= request.ExpectedEventSequence ||
+		version < claimedEventSequence || fresh && version != claimedEventSequence {
+		return ClaimDispatchStartResult{}, ErrInvalidResponse
+	}
+	return ClaimDispatchStartResult{
+		OutcomeFresh: fresh,
+		HostReplayed: hostReplayed,
+		Version:      uint64(version),
+		EffectID:     request.EffectID,
+		Permit: DispatchStartPermit{
+			DispatchPermitClaims: request.DispatchPermitClaims,
+			ProviderRequestID:    request.ProviderRequestID,
+			CommandDigest:        request.CommandDigest,
+			ClaimedEventSequence: uint64(claimedEventSequence),
+		},
+	}, nil
+}
+
+func (client *Client) invokeAuthenticatedIngress(
+	ctx context.Context,
+	contract authenticatedIngressContract,
+	bodyFor func(string, int64) canonical.Map,
+) (canonical.Value, error) {
+	keyID := client.keyID
+	requestKey := &client.requestKey
+	responseKey := &client.responseKey
+	if contract.dispatchStartCredentials {
+		if client.dispatchStartKeyID == "" {
+			return nil, ErrInvalidConfig
+		}
+		keyID = client.dispatchStartKeyID
+		requestKey = &client.dispatchStartRequestKey
+		responseKey = &client.dispatchStartResponseKey
 	}
 	requestContext, cancel := context.WithTimeout(ctx, client.timeout)
 	client.lifecycleMu.Lock()
@@ -382,24 +770,14 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 		return nil, fmt.Errorf("%w: clock is outside the shared integer range", ErrInvalidRequest)
 	}
 
-	body, err := canonical.Encode(canonical.Map{
-		"protocol": ingressProtocol, "major": int64(1), "minor": int64(0),
-		"schemaDigest": ingressSchemaDigest,
-		"requestId":    requestID, "sentAtUnixMs": sentAtUnixMS,
-		"tenantId": request.TenantID, "actorSubjectId": request.ActorSubjectID,
-		"sessionId":                       request.SessionID,
-		"expectedAuthorizationGeneration": request.ExpectedAuthorizationGeneration,
-		"afterSequence":                   request.AfterSequence, "limit": request.Limit,
-	}, canonical.Options{
-		MaxBytes: maximumRequestBytes, MaxDepth: maximumRequestDepth, MaxItems: maximumRequestItems,
-	})
+	body, err := canonical.Encode(bodyFor(requestID, sentAtUnixMS), contract.requestOptions)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot encode request", ErrInvalidRequest)
 	}
 	requestDigest := sha256.Sum256(body)
 	requestParts := [][]byte{
-		[]byte(requestMACDomain), []byte(client.keyID), []byte(http.MethodPost),
-		[]byte(ingressPath), requestDigest[:],
+		[]byte(contract.requestMACDomain), []byte(keyID), []byte(http.MethodPost),
+		[]byte(contract.path), requestDigest[:],
 	}
 	requestFrameLength := 0
 	for _, part := range requestParts {
@@ -412,16 +790,16 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 		requestFrame = append(requestFrame, lengthPrefix[:]...)
 		requestFrame = append(requestFrame, part...)
 	}
-	signature := keyedDigest(client.requestKey[:], requestFrame)
+	signature := keyedDigest(requestKey[:], requestFrame)
 
 	httpRequest, err := http.NewRequestWithContext(
-		requestContext, http.MethodPost, client.endpoint+ingressPath, bytes.NewReader(body),
+		requestContext, http.MethodPost, client.endpoint+contract.path, bytes.NewReader(body),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot construct request", ErrInvalidRequest)
 	}
-	httpRequest.Header.Set("Content-Type", ingressContentType)
-	httpRequest.Header.Set(keyIDHeader, client.keyID)
+	httpRequest.Header.Set("Content-Type", contract.contentType)
+	httpRequest.Header.Set(keyIDHeader, keyID)
 	httpRequest.Header.Set(signatureHeader, hex.EncodeToString(signature[:]))
 
 	response, err := client.httpClient.Do(httpRequest)
@@ -445,8 +823,8 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 	keyIDs := response.Header.Values(keyIDHeader)
 	signatures := response.Header.Values(signatureHeader)
 	_, hasContentEncoding := response.Header[http.CanonicalHeaderKey("Content-Encoding")]
-	if len(contentTypes) != 1 || contentTypes[0] != ingressContentType ||
-		len(keyIDs) != 1 || keyIDs[0] != client.keyID ||
+	if len(contentTypes) != 1 || contentTypes[0] != contract.contentType ||
+		len(keyIDs) != 1 || keyIDs[0] != keyID ||
 		len(signatures) != 1 || !signaturePattern.MatchString(signatures[0]) ||
 		hasContentEncoding {
 		return nil, ErrUnauthenticatedResponse
@@ -476,7 +854,7 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 	}
 	bodyDigest := sha256.Sum256(body)
 	responseParts := [][]byte{
-		[]byte(responseMACDomain), []byte(client.keyID), []byte(requestID), requestDigest[:],
+		[]byte(contract.responseMACDomain), []byte(keyID), []byte(requestID), requestDigest[:],
 		[]byte(strconv.Itoa(response.StatusCode)), []byte(contentTypes[0]), bodyDigest[:],
 	}
 	responseFrameLength := 0
@@ -489,7 +867,7 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 		responseFrame = append(responseFrame, lengthPrefix[:]...)
 		responseFrame = append(responseFrame, part...)
 	}
-	wantSignature := keyedDigest(client.responseKey[:], responseFrame)
+	wantSignature := keyedDigest(responseKey[:], responseFrame)
 	if !hmac.Equal(receivedSignature, wantSignature[:]) {
 		return nil, ErrUnauthenticatedResponse
 	}
@@ -503,7 +881,7 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 	envelope, ok := decoded.(canonical.Map)
 	if !ok || len(envelope) != 6 ||
 		envelope["protocol"] != hostProtocol || envelope["major"] != int64(1) || envelope["minor"] != int64(0) ||
-		envelope["schemaDigest"] != hostSchemaDigest || envelope["requestId"] != requestID {
+		envelope["schemaDigest"] != contract.hostSchemaDigest || envelope["requestId"] != requestID {
 		return nil, ErrInvalidResponse
 	}
 	payload, ok := envelope["payload"].(canonical.Map)
