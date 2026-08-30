@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import type { Digest } from "@circulusd/protocol-types";
 
 import {
+  WORKSPACE_COMMAND_SCHEMA_VERSION,
+  WORKSPACE_STATE_SCHEMA_VERSION,
   applyWorkspaceCommand,
   assertWorkspaceInvariants,
   createWorkspaceState,
+  lookupWorkspaceInvocation,
   type WorkspaceAggregateState,
   type WorkspaceAuthoritySnapshot,
   type WorkspaceLeaseFence,
@@ -37,6 +40,7 @@ function authority(
     turnLeaseActive: true,
     turnLeaseExpiresAt: 20_000,
     effectStatus: "dispatched",
+    effectService: "workspace",
     effectId: `effect-${invocationId}`,
     invocationId,
     requestDigest: digest("a"),
@@ -107,21 +111,28 @@ async function acquire(
   });
 }
 
-async function acquiredLease(state: WorkspaceAggregateState, invocationId: string, now: number) {
-  const result = await acquire(state, invocationId, now);
+async function acquiredLease(
+  state: WorkspaceAggregateState,
+  invocationId: string,
+  now: number,
+  authorityOverrides: Partial<WorkspaceAuthoritySnapshot> = {},
+) {
+  const result = await acquire(state, invocationId, now, authorityOverrides);
   if (result.outcome.kind !== "write_lease_acquired") {
     throw new Error("expected acquired lease");
   }
   return { ...result, lease: result.outcome.lease };
 }
 
-async function preparedWriter() {
+async function preparedWriter(
+  authorityOverrides: Partial<WorkspaceAuthoritySnapshot> = {},
+) {
   const initial = createWorkspaceState({
     workspaceId: "workspace-1",
     tenantId: "tenant-1",
     initialRootDigest: digest("0"),
   });
-  const acquired = await acquiredLease(initial, "writer", 100);
+  const acquired = await acquiredLease(initial, "writer", 100, authorityOverrides);
   const leaseFence = fence(acquired.lease);
   const prepared = await applyWorkspaceCommand(acquired.state, {
     kind: "prepare_materialization",
@@ -130,7 +141,7 @@ async function preparedWriter() {
     ticketId: "ticket-writer",
     accessMode: "read_write",
     requestedRevision: 0,
-    authority: authority("writer"),
+    authority: authority("writer", authorityOverrides),
     sandboxId: "sandbox-writer",
     backend: "nsjail",
     projectionGeneration: 1,
@@ -141,6 +152,128 @@ async function preparedWriter() {
 }
 
 describe("workspace adversarial contracts", () => {
+  it("requires an authoritative protocol effect service before lease admission", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const missingService = { ...authority("missing-service") } as Record<string, unknown>;
+    Reflect.deleteProperty(missingService, "effectService");
+
+    await expect(
+      applyWorkspaceCommand(initial, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: 0,
+        now: 1,
+        authority: missingService as unknown as WorkspaceAuthoritySnapshot,
+        requestedLeaseId: "lease-missing-service",
+        sandboxId: "sandbox-missing-service",
+        backend: "nsjail",
+        projectionGeneration: 1,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "queue",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+
+    await expect(
+      applyWorkspaceCommand(initial, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: 0,
+        now: 1,
+        authority: {
+          ...authority("workspace-service"),
+          effectService: "workspace",
+        } as unknown as WorkspaceAuthoritySnapshot,
+        requestedLeaseId: "lease-workspace-service",
+        sandboxId: "sandbox-workspace-service",
+        backend: "nsjail",
+        projectionGeneration: 1,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "queue",
+      }),
+    ).resolves.toMatchObject({ outcome: { kind: "write_lease_acquired" } });
+
+    for (const effectService of ["model", "executor", "mcp", "artifact", "external-tool"]) {
+      await expect(
+        applyWorkspaceCommand(initial, {
+          kind: "acquire_write_lease",
+          expectedEventSequence: 0,
+          now: 1,
+          authority: {
+            ...authority(`foreign-${effectService}`),
+            effectService,
+          } as unknown as WorkspaceAuthoritySnapshot,
+          requestedLeaseId: `lease-foreign-${effectService}`,
+          sandboxId: `sandbox-foreign-${effectService}`,
+          backend: "nsjail",
+          projectionGeneration: 1,
+          requestedLeaseTtlMs: 100,
+          requestedMaximumHoldMs: 500,
+          acquireDeadline: 1_000,
+          waitPolicy: "queue",
+        }),
+      ).resolves.toMatchObject({ outcome: { kind: "write_lease_acquired" } });
+    }
+
+    await expect(
+      applyWorkspaceCommand(initial, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: 0,
+        now: 1,
+        authority: {
+          ...authority("unknown-service"),
+          effectService: "unknown",
+        } as unknown as WorkspaceAuthoritySnapshot,
+        requestedLeaseId: "lease-unknown-service",
+        sandboxId: "sandbox-unknown-service",
+        backend: "nsjail",
+        projectionGeneration: 1,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "queue",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+
+    expect(initial).toMatchObject({ eventSequence: 0, activeWriteLease: null, writeQueue: [] });
+  });
+
+  it("allows an executor effect to prepare read-only materialization", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+
+    await expect(
+      applyWorkspaceCommand(initial, {
+        kind: "prepare_materialization",
+        expectedEventSequence: 0,
+        now: 1,
+        ticketId: "ticket-executor-reader",
+        accessMode: "read_only",
+        requestedRevision: 0,
+        authority: {
+          ...authority("executor-reader", {
+            effectivePermissions: ["workspace.read"],
+          }),
+          effectService: "executor",
+        } as unknown as WorkspaceAuthoritySnapshot,
+        sandboxId: "sandbox-executor-reader",
+        backend: "nsjail",
+        projectionGeneration: 1,
+        leaseFence: null,
+        ticketTtlMs: 100,
+      }),
+    ).resolves.toMatchObject({ outcome: { kind: "materialization_prepared" } });
+    expect(initial.materializationTickets).toEqual([]);
+  });
+
   it("does not let a read-only authority acquire writer authority", async () => {
     const initial = createWorkspaceState({
       workspaceId: "workspace-1",
@@ -291,6 +424,138 @@ describe("workspace adversarial contracts", () => {
       }),
     ).rejects.toMatchObject({ code: "STALE_GENERATION" });
     expect(cancelled.state.nextLeaseEnqueueSequence).toBe(2);
+  });
+
+  it("does not relabel a released invocation effect on the next dispatch attempt", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-retry-service",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const acquired = await acquiredLease(initial, "retry-service", 1, {
+      effectService: "executor",
+    });
+    const released = await applyWorkspaceCommand(acquired.state, {
+      kind: "release_write_lease",
+      expectedEventSequence: acquired.state.eventSequence,
+      now: 2,
+      leaseFence: fence(acquired.lease),
+      authority: authority("retry-service", {
+        workspaceId: initial.workspaceId,
+        effectService: "executor",
+      }),
+    });
+
+    await expect(
+      applyWorkspaceCommand(released.state, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: released.state.eventSequence,
+        now: 3,
+        authority: authority("retry-service", {
+          workspaceId: initial.workspaceId,
+          effectService: "workspace",
+          dispatchAttempt: 2,
+        }),
+        requestedLeaseId: "lease-retry-service-2",
+        sandboxId: "sandbox-retry-service",
+        backend: "nsjail",
+        projectionGeneration: 2,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "queue",
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    await expect(
+      applyWorkspaceCommand(released.state, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: released.state.eventSequence,
+        now: 3,
+        authority: authority("retry-service", {
+          workspaceId: initial.workspaceId,
+          effectService: "executor",
+          effectId: "effect-retry-service-replaced",
+          dispatchAttempt: 2,
+        }),
+        requestedLeaseId: "lease-retry-service-2",
+        sandboxId: "sandbox-retry-service",
+        backend: "nsjail",
+        projectionGeneration: 2,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "queue",
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+  });
+
+  it("does not relabel a conflict-only invocation effect on the next dispatch attempt", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-conflict-service",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const owner = await acquiredLease(initial, "owner", 1);
+    const conflicted = await applyWorkspaceCommand(owner.state, {
+      kind: "acquire_write_lease",
+      expectedEventSequence: owner.state.eventSequence,
+      now: 2,
+      authority: authority("conflict-service", {
+        workspaceId: initial.workspaceId,
+        effectService: "executor",
+      }),
+      requestedLeaseId: "lease-conflict-service-1",
+      sandboxId: "sandbox-conflict-service",
+      backend: "nsjail",
+      projectionGeneration: 1,
+      requestedLeaseTtlMs: 100,
+      requestedMaximumHoldMs: 500,
+      acquireDeadline: 1_000,
+      waitPolicy: "fail",
+    });
+    expect(conflicted.outcome.kind).toBe("write_lease_conflict");
+
+    await expect(
+      applyWorkspaceCommand(conflicted.state, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: conflicted.state.eventSequence,
+        now: 3,
+        authority: authority("conflict-service", {
+          workspaceId: initial.workspaceId,
+          effectService: "workspace",
+          dispatchAttempt: 2,
+        }),
+        requestedLeaseId: "lease-conflict-service-2",
+        sandboxId: "sandbox-conflict-service",
+        backend: "nsjail",
+        projectionGeneration: 2,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "fail",
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    await expect(
+      applyWorkspaceCommand(conflicted.state, {
+        kind: "acquire_write_lease",
+        expectedEventSequence: conflicted.state.eventSequence,
+        now: 3,
+        authority: authority("conflict-service", {
+          workspaceId: initial.workspaceId,
+          effectService: "executor",
+          effectId: "effect-conflict-service-replaced",
+          dispatchAttempt: 2,
+        }),
+        requestedLeaseId: "lease-conflict-service-2",
+        sandboxId: "sandbox-conflict-service",
+        backend: "nsjail",
+        projectionGeneration: 2,
+        requestedLeaseTtlMs: 100,
+        requestedMaximumHoldMs: 500,
+        acquireDeadline: 1_000,
+        waitPolicy: "fail",
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
   });
 
   it("keeps a write materialization usable while its lease is validly renewed", async () => {
@@ -463,6 +728,73 @@ describe("workspace adversarial contracts", () => {
     ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
+  it("allows executor commit replay but reserves ledger recovery for workspace effects", async () => {
+    const { prepared, leaseFence } = await preparedWriter({
+      effectService: "executor",
+    });
+    const executorSettlement: WorkspaceAuthoritySnapshot = {
+      ...authority("writer"),
+      purpose: "settlement",
+      effectService: "executor",
+    };
+
+    const committed = await applyWorkspaceCommand(prepared.state, {
+      kind: "commit_workspace",
+      expectedEventSequence: prepared.state.eventSequence,
+      now: 120,
+      materializationTicketId: "ticket-writer",
+      leaseFence,
+      baseRevision: 0,
+      workspaceCommitId: "commit-executor",
+      postExecutionRootDigest: digest("1"),
+      referencedObjectDigests: [digest("1")],
+      protectionProofs: [protectionProof("protect-executor", digest("1"))],
+      authority: executorSettlement,
+    });
+
+    const replayed = await applyWorkspaceCommand(committed.state, {
+      kind: "commit_workspace",
+      expectedEventSequence: committed.state.eventSequence,
+      now: 121,
+      materializationTicketId: "ticket-writer",
+      leaseFence,
+      baseRevision: 0,
+      workspaceCommitId: "commit-executor",
+      postExecutionRootDigest: digest("1"),
+      referencedObjectDigests: [digest("1")],
+      protectionProofs: [protectionProof("protect-executor", digest("1"))],
+      authority: executorSettlement,
+    });
+    expect(replayed).toMatchObject({
+      replayed: true,
+      outcome: { kind: "workspace_committed" },
+    });
+    await expect(
+      applyWorkspaceCommand(committed.state, {
+        kind: "commit_workspace",
+        expectedEventSequence: committed.state.eventSequence,
+        now: 121,
+        materializationTicketId: "ticket-writer",
+        leaseFence,
+        baseRevision: 0,
+        workspaceCommitId: "commit-executor",
+        postExecutionRootDigest: digest("1"),
+        referencedObjectDigests: [digest("1")],
+        protectionProofs: [protectionProof("protect-executor", digest("1"))],
+        authority: { ...executorSettlement, effectService: "workspace" },
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    expect(() =>
+      lookupWorkspaceInvocation(
+        committed.state,
+        "writer",
+        digest("a"),
+        executorSettlement,
+        121,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "PERMISSION_DENIED" }));
+  });
+
   it("validates the complete request before replaying a materialization ticket", async () => {
     const { prepared, leaseFence } = await preparedWriter();
 
@@ -535,6 +867,47 @@ describe("workspace adversarial contracts", () => {
     expect(() =>
       assertWorkspaceInvariants(corrupted as unknown as WorkspaceAggregateState),
     ).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
+  });
+
+  it("rotates authority-bearing workspace state and command schemas", () => {
+    expect(WORKSPACE_STATE_SCHEMA_VERSION).toBe(2);
+    expect(WORKSPACE_COMMAND_SCHEMA_VERSION).toBe(2);
+    const legacy = createWorkspaceState({
+      workspaceId: "workspace-legacy-schema",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    }) as unknown as { schemaVersion: number };
+    legacy.schemaVersion = 1;
+
+    expect(() =>
+      assertWorkspaceInvariants(legacy as unknown as WorkspaceAggregateState),
+    ).toThrowError(expect.objectContaining({ code: "FAILED_PRECONDITION" }));
+  });
+
+  it("rejects a stored invalid effect service before internal promotion", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const owner = await acquiredLease(initial, "owner", 1);
+    const queued = await acquire(owner.state, "waiter", 2);
+    const corrupted = structuredClone(queued.state);
+    const queuedAuthority = corrupted.writeQueue[0]?.authority as unknown as Record<
+      string,
+      unknown
+    >;
+    queuedAuthority.effectService = "unknown";
+
+    await expect(
+      applyWorkspaceCommand(corrupted, {
+        kind: "reconcile_write_queue",
+        expectedEventSequence: corrupted.eventSequence,
+        now: 3,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(corrupted.activeWriteLease?.invocationId).toBe("owner");
+    expect(corrupted.writeQueue).toHaveLength(1);
   });
 
   it("copies current authority snapshots instead of aliasing caller-owned objects", async () => {

@@ -2,6 +2,7 @@ import type { Digest } from "@circulusd/protocol-types";
 import { describe, expect, it } from "vitest";
 
 import { replaySessionPublicEvents } from "../src/session/index.ts";
+import type { WorkspaceAuthoritySnapshot } from "../src/workspace/index.ts";
 import { RecoverableWorkspaceEffect } from "./support/recoverable-workspace-effect.ts";
 
 describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
@@ -173,6 +174,13 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
         authorityOverrides: { dispatchAttempt: 2 },
       }),
     ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    await expect(
+      crashed.restart().recover({
+        authorityOverrides: {
+          effectService: "executor",
+        } as unknown as Partial<WorkspaceAuthoritySnapshot>,
+      }),
+    ).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
 
     const afterRejectedRecovery = await crashed.restart().snapshot();
     expect(afterRejectedRecovery.workspace.revision).toBe(1);
@@ -183,7 +191,7 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
       workspaceAcquireExecutions: 1,
       workspacePrepareExecutions: 1,
       workspaceCommitExecutions: 1,
-      workspaceLedgerQueries: 6,
+      workspaceLedgerQueries: 7,
     });
   });
 });

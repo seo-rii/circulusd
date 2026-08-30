@@ -322,6 +322,9 @@ export class RecoverableWorkspaceEffect {
     ) {
       throw new Error("Phase 0B fixture requires a dispatched workspace effect");
     }
+    if (dispatchedEffect.service !== "workspace") {
+      throw new Error("Phase 0B fixture cannot mint Workspace authority for another service");
+    }
     const admissionAuthority: WorkspaceAuthoritySnapshot = {
       purpose: "admission",
       serviceBinding: "workspace",
@@ -339,6 +342,7 @@ export class RecoverableWorkspaceEffect {
       turnLeaseActive: true,
       turnLeaseExpiresAt: dispatched.activeTurn.leaseExpiresAt,
       effectStatus: "dispatched",
+      effectService: dispatchedEffect.service,
       effectId: dispatchedEffect.effectId,
       invocationId: dispatchedEffect.invocationId,
       requestDigest: dispatchedEffect.requestDigest,

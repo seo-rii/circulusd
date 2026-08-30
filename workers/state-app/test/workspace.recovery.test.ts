@@ -37,6 +37,7 @@ function authority(
     turnLeaseActive: true,
     turnLeaseExpiresAt: 20_000,
     effectStatus: "dispatched",
+    effectService: "workspace",
     effectId: "effect-1",
     invocationId: "invocation-1",
     requestDigest: REQUEST,

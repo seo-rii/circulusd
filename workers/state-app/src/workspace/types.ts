@@ -1,7 +1,7 @@
-import type { Digest, ReplayPolicy } from "@circulusd/protocol-types";
+import type { Digest, EffectService, ReplayPolicy } from "@circulusd/protocol-types";
 
-export const WORKSPACE_STATE_SCHEMA_VERSION = 1 as const;
-export const WORKSPACE_COMMAND_SCHEMA_VERSION = 1 as const;
+export const WORKSPACE_STATE_SCHEMA_VERSION = 2 as const;
+export const WORKSPACE_COMMAND_SCHEMA_VERSION = 2 as const;
 
 export type WorkspaceBackend = "nsjail" | "docker" | "firecracker";
 export type WorkspaceAccessMode = "read_only" | "read_write";
@@ -31,6 +31,7 @@ export interface WorkspaceAuthoritySnapshot {
   readonly turnLeaseActive: boolean;
   readonly turnLeaseExpiresAt: number;
   readonly effectStatus: "prepared" | "dispatched" | "externally_committed";
+  readonly effectService: EffectService;
   readonly effectId: string;
   readonly invocationId: string;
   readonly requestDigest: Digest;
@@ -138,6 +139,8 @@ export type WorkspaceLeaseHistoryStatus =
 export interface WorkspaceLeaseHistoryRecord {
   readonly invocationId: string;
   readonly requestDigest: Digest;
+  readonly effectService: EffectService;
+  readonly effectId: string;
   readonly latestProjectionGeneration: number;
   readonly latestDispatchAttempt: number;
   readonly latestLeaseGeneration: number | null;

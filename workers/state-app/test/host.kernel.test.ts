@@ -500,6 +500,7 @@ function workspaceAuthority(
     turnLeaseActive: true,
     turnLeaseExpiresAt: 10_000,
     effectStatus: "dispatched",
+    effectService: "workspace",
     effectId: "effect-workspace-1",
     invocationId: "invocation-workspace-1",
     requestDigest: digest("6"),
@@ -1727,7 +1728,26 @@ describe("named aggregate cells", () => {
       workspaceInitialization(),
       (request) => cell.initializeWorkspace(request),
     );
-    const command = acquireWorkspaceCommand();
+    const command = {
+      ...acquireWorkspaceCommand(),
+      authority: {
+        ...workspaceAuthority(),
+        effectService: "executor",
+      },
+    } as unknown as WorkspaceCommand;
+    const revisionBeforeRejectedService = storage.revision;
+    await expect(hostRpcResult(
+      "workspace.execute",
+      {
+        ...command,
+        authority: {
+          ...command.authority,
+          effectService: "unknown",
+        },
+      } as unknown as WorkspaceCommand,
+      (request) => cell.executeWorkspaceCommand(request),
+    )).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(storage.revision).toBe(revisionBeforeRejectedService);
 
     const committed = await hostRpcResult(
       "workspace.execute",
@@ -1747,12 +1767,81 @@ describe("named aggregate cells", () => {
       {
         invocationId: "invocation-workspace-1",
         requestDigest: digest("6"),
+        authority: {
+          ...workspaceAuthority({ purpose: "settlement" }),
+          effectService: "executor",
+        },
+        now: 101,
+      },
+      (request) => cell.lookupWorkspaceInvocation(request),
+    )).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+    await expect(hostRpcResult(
+      "workspace.lookup-invocation",
+      {
+        invocationId: "invocation-workspace-1",
+        requestDigest: digest("6"),
         authority: workspaceAuthority({ purpose: "settlement" }),
         now: 101,
       },
       (request) => cell.lookupWorkspaceInvocation(request),
     )).resolves.toBeNull();
     expect("readWorkspace" in cell).toBe(false);
+  });
+
+  it("serializes concurrent Workspace lease acquisition through one durable state", async () => {
+    const storage = new FakeTransactionalStorage();
+    const route = routedCellContext(
+      storage,
+      "WORKSPACE_CELL",
+      workspaceCellName("tenant-1", "workspace-1"),
+    );
+    const cell = new WorkspaceCell(route.state, route.environment);
+    await hostRpcResult(
+      "workspace.initialize",
+      workspaceInitialization(),
+      (request) => cell.initializeWorkspace(request),
+    );
+    const commands = [
+      acquireWorkspaceCommand(),
+      {
+        ...acquireWorkspaceCommand(),
+        authority: workspaceAuthority({
+          sessionId: "session-workspace-2",
+          turnId: "turn-workspace-2",
+          effectId: "effect-workspace-2",
+          invocationId: "invocation-workspace-2",
+          requestDigest: digest("7"),
+          sandboxId: "sandbox-workspace-2",
+        }),
+        requestedLeaseId: "lease-workspace-2",
+        sandboxId: "sandbox-workspace-2",
+      },
+    ] satisfies readonly WorkspaceCommand[];
+
+    const contenders = await Promise.allSettled(
+      commands.map((command) =>
+        hostRpcResult(
+          "workspace.execute",
+          command,
+          (request) => cell.executeWorkspaceCommand(request),
+        ),
+      ),
+    );
+    expect(contenders.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(contenders.find((result) => result.status === "rejected")).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "CONFLICT" }),
+    });
+    expect(storage.revision).toBe(2);
+
+    const winnerIndex = contenders.findIndex((result) => result.status === "fulfilled");
+    const revisionAfterWinner = storage.revision;
+    await expect(hostRpcResult(
+      "workspace.execute",
+      commands[winnerIndex],
+      (request) => cell.executeWorkspaceCommand(request),
+    )).resolves.toMatchObject({ replayed: true });
+    expect(storage.revision).toBe(revisionAfterWinner);
   });
 
   it("routes ExtensionState commands through its authorized read model", async () => {

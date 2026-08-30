@@ -4,6 +4,7 @@ import {
   normalizeProtocolValue,
   parseDigest,
   type Digest,
+  type EffectService,
 } from "@circulusd/protocol-types";
 
 import { workspaceError } from "./errors.ts";
@@ -63,6 +64,7 @@ const WORKSPACE_AUTHORITY_FIELDS = [
   "turnLeaseActive",
   "turnLeaseExpiresAt",
   "effectStatus",
+  "effectService",
   "effectId",
   "invocationId",
   "requestDigest",
@@ -170,6 +172,20 @@ function validatedBackend(value: unknown, field: string): WorkspaceBackend {
   return value;
 }
 
+function validatedEffectService(value: unknown, field: string): EffectService {
+  if (
+    value !== "model" &&
+    value !== "workspace" &&
+    value !== "executor" &&
+    value !== "mcp" &&
+    value !== "artifact" &&
+    value !== "external-tool"
+  ) {
+    workspaceError("INVALID_ARGUMENT", `${field} is invalid`);
+  }
+  return value;
+}
+
 function validatedAuthority(
   value: unknown,
   state: WorkspaceAggregateState,
@@ -244,6 +260,7 @@ function validatedAuthority(
   ) {
     workspaceError("INVALID_ARGUMENT", `${field}.effectStatus is invalid`);
   }
+  validatedEffectService(record.effectService, `${field}.effectService`);
   validatedIdentifier(record.effectId, `${field}.effectId`);
   validatedIdentifier(record.invocationId, `${field}.invocationId`);
   parseDigest(record.requestDigest, `${field}.requestDigest`);
@@ -318,6 +335,7 @@ function authorityIdentityMatches(
     left.effectivePermissions.every(
       (permission, index) => permission === right.effectivePermissions[index],
     ) &&
+    left.effectService === right.effectService &&
     left.effectId === right.effectId &&
     left.invocationId === right.invocationId &&
     left.requestDigest === right.requestDigest &&
@@ -344,6 +362,7 @@ function stableSettlementIdentityMatches(
     current.turnId === historical.turnId &&
     current.runtimeRevision === historical.runtimeRevision &&
     current.policySnapshotDigest === historical.policySnapshotDigest &&
+    current.effectService === historical.effectService &&
     current.effectId === historical.effectId &&
     current.invocationId === historical.invocationId &&
     current.requestDigest === historical.requestDigest &&
@@ -713,6 +732,8 @@ function grantQueueHead(
   setLeaseHistory(state, {
     invocationId: lease.invocationId,
     requestDigest: lease.requestDigest,
+    effectService: lease.admissionAuthority.effectService,
+    effectId: lease.effectId,
     latestProjectionGeneration: lease.projectionGeneration,
     latestDispatchAttempt: lease.dispatchAttempt,
     latestLeaseGeneration: lease.leaseGeneration,
@@ -732,6 +753,8 @@ function advanceLeaseQueue(
     setLeaseHistory(state, {
       invocationId: expired.invocationId,
       requestDigest: expired.requestDigest,
+      effectService: expired.admissionAuthority.effectService,
+      effectId: expired.effectId,
       latestProjectionGeneration: expired.projectionGeneration,
       latestDispatchAttempt: expired.dispatchAttempt,
       latestLeaseGeneration: expired.leaseGeneration,
@@ -751,6 +774,8 @@ function advanceLeaseQueue(
     setLeaseHistory(state, {
       invocationId: canceled.authority.invocationId,
       requestDigest: canceled.authority.requestDigest,
+      effectService: canceled.authority.effectService,
+      effectId: canceled.authority.effectId,
       latestProjectionGeneration: canceled.projectionGeneration,
       latestDispatchAttempt: canceled.authority.dispatchAttempt,
       latestLeaseGeneration:
@@ -773,6 +798,8 @@ function advanceLeaseQueue(
     setLeaseHistory(state, {
       invocationId: timedOut.authority.invocationId,
       requestDigest: timedOut.authority.requestDigest,
+      effectService: timedOut.authority.effectService,
+      effectId: timedOut.authority.effectId,
       latestProjectionGeneration: timedOut.projectionGeneration,
       latestDispatchAttempt: timedOut.authority.dispatchAttempt,
       latestLeaseGeneration:
@@ -791,6 +818,8 @@ function advanceLeaseQueue(
       setLeaseHistory(state, {
         invocationId: canceled.authority.invocationId,
         requestDigest: canceled.authority.requestDigest,
+        effectService: canceled.authority.effectService,
+        effectId: canceled.authority.effectId,
         latestProjectionGeneration: canceled.projectionGeneration,
         latestDispatchAttempt: canceled.authority.dispatchAttempt,
         latestLeaseGeneration:
@@ -1404,6 +1433,8 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       [
         "invocationId",
         "requestDigest",
+        "effectService",
+        "effectId",
         "latestProjectionGeneration",
         "latestDispatchAttempt",
         "latestLeaseGeneration",
@@ -1418,6 +1449,8 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
     historyInvocations.add(history.invocationId);
     validatedIdentifier(history.invocationId, "lease history invocationId");
     parseDigest(history.requestDigest, "lease history requestDigest");
+    validatedEffectService(history.effectService, "lease history effectService");
+    validatedIdentifier(history.effectId, "lease history effectId");
     validatedInteger(
       history.latestProjectionGeneration,
       "lease history projection generation",
@@ -1461,6 +1494,9 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       activeHistory === undefined ||
       activeHistory.status !== "active" ||
       activeHistory.requestDigest !== state.activeWriteLease.requestDigest ||
+      activeHistory.effectService !==
+        state.activeWriteLease.admissionAuthority.effectService ||
+      activeHistory.effectId !== state.activeWriteLease.effectId ||
       activeHistory.latestLeaseGeneration !== state.activeWriteLease.leaseGeneration ||
       activeHistory.latestDispatchAttempt !== state.activeWriteLease.dispatchAttempt ||
       activeHistory.latestEnqueueSequence !== state.activeWriteLease.enqueueSequence ||
@@ -1476,6 +1512,8 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       history === undefined ||
       history.status !== (queued.canceled ? "canceled" : "queued") ||
       history.requestDigest !== queued.authority.requestDigest ||
+      history.effectService !== queued.authority.effectService ||
+      history.effectId !== queued.authority.effectId ||
       history.latestDispatchAttempt !== queued.authority.dispatchAttempt ||
       history.latestProjectionGeneration !== queued.projectionGeneration ||
       history.latestEnqueueSequence !== queued.enqueueSequence
@@ -1486,6 +1524,10 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
 
   const conflictAttempts = new Set<string>();
   const conflictDigests = new Map<string, Digest>();
+  const conflictEffectIdentities = new Map<
+    string,
+    { readonly effectService: EffectService; readonly effectId: string }
+  >();
   for (const conflict of state.leaseConflicts) {
     validatedExactKeys(
       conflict,
@@ -1540,6 +1582,25 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       "workspace.write",
       "admission",
     );
+    const priorEffectIdentity = conflictEffectIdentities.get(invocationId);
+    if (
+      priorEffectIdentity !== undefined &&
+      (priorEffectIdentity.effectService !== authority.effectService ||
+        priorEffectIdentity.effectId !== authority.effectId)
+    ) {
+      workspaceError("FAILED_PRECONDITION", "lease conflict invocation changed effect identity");
+    }
+    conflictEffectIdentities.set(invocationId, {
+      effectService: authority.effectService,
+      effectId: authority.effectId,
+    });
+    if (
+      history !== undefined &&
+      (history.effectService !== authority.effectService ||
+        history.effectId !== authority.effectId)
+    ) {
+      workspaceError("FAILED_PRECONDITION", "lease conflict disagrees with lease history");
+    }
     validatedIdentifier(conflict.requestedLeaseId, "lease conflict requestedLeaseId");
     validatedIdentifier(conflict.sandboxId, "lease conflict sandboxId");
     validatedBackend(conflict.backend, "lease conflict backend");
@@ -1888,6 +1949,12 @@ export function lookupWorkspaceInvocation(
     null,
     "settlement",
   );
+  if (authority.effectService !== "workspace") {
+    workspaceError(
+      "PERMISSION_DENIED",
+      "only a workspace effect can recover a Workspace invocation",
+    );
+  }
   const invocationId = validatedIdentifier(invocationIdInput, "invocationId");
   const requestDigest = parseDigest(requestDigestInput, "requestDigest");
   if (authority.invocationId !== invocationId || authority.requestDigest !== requestDigest) {
@@ -2332,11 +2399,28 @@ export async function applyWorkspaceCommand(
       const history = next.leaseHistory.find(
         (record) => record.invocationId === authority.invocationId,
       );
-      if (history !== undefined && history.requestDigest !== authority.requestDigest) {
+      const priorConflict = next.leaseConflicts.find(
+        (record) => record.invocationId === authority.invocationId,
+      );
+      if (
+        (history !== undefined && history.requestDigest !== authority.requestDigest) ||
+        (priorConflict !== undefined &&
+          priorConflict.requestDigest !== authority.requestDigest)
+      ) {
         workspaceError(
           "IDEMPOTENCY_CONFLICT",
           `invocationId ${authority.invocationId} was reused with a different request digest`,
         );
+      }
+      if (
+        (history !== undefined &&
+          (history.effectService !== authority.effectService ||
+            history.effectId !== authority.effectId)) ||
+        (priorConflict !== undefined &&
+          (priorConflict.authority.effectService !== authority.effectService ||
+            priorConflict.authority.effectId !== authority.effectId))
+      ) {
+        workspaceError("STALE_GENERATION", "invocation effect identity changed between attempts");
       }
       if (history?.status === "committed") {
         workspaceError("ALREADY_EXISTS", `invocation ${authority.invocationId} already committed`);
@@ -2502,6 +2586,8 @@ export async function applyWorkspaceCommand(
       setLeaseHistory(next, {
         invocationId: authority.invocationId,
         requestDigest: authority.requestDigest,
+        effectService: authority.effectService,
+        effectId: authority.effectId,
         latestProjectionGeneration: command.projectionGeneration,
         latestDispatchAttempt: authority.dispatchAttempt,
         latestLeaseGeneration: history?.latestLeaseGeneration ?? null,
@@ -2629,6 +2715,8 @@ export async function applyWorkspaceCommand(
       setLeaseHistory(next, {
         invocationId: lease.invocationId,
         requestDigest: lease.requestDigest,
+        effectService: lease.admissionAuthority.effectService,
+        effectId: lease.effectId,
         latestProjectionGeneration: lease.projectionGeneration,
         latestDispatchAttempt: lease.dispatchAttempt,
         latestLeaseGeneration: lease.leaseGeneration,
@@ -2699,6 +2787,8 @@ export async function applyWorkspaceCommand(
       setLeaseHistory(next, {
         invocationId,
         requestDigest,
+        effectService: queued.authority.effectService,
+        effectId: queued.authority.effectId,
         latestProjectionGeneration: queued.projectionGeneration,
         latestDispatchAttempt: queued.authority.dispatchAttempt,
         latestLeaseGeneration: history?.latestLeaseGeneration ?? null,
@@ -2960,6 +3050,8 @@ export async function applyWorkspaceCommand(
       setLeaseHistory(next, {
         invocationId: lease.invocationId,
         requestDigest: lease.requestDigest,
+        effectService: lease.admissionAuthority.effectService,
+        effectId: lease.effectId,
         latestProjectionGeneration: lease.projectionGeneration,
         latestDispatchAttempt: lease.dispatchAttempt,
         latestLeaseGeneration: lease.leaseGeneration,
