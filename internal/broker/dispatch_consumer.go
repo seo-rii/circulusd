@@ -13,9 +13,16 @@ const maximumDispatchStartTimeout = 5 * time.Minute
 // Its registry is immutable after construction and every starter must honor
 // the finite context supplied to Start.
 type DispatchConsumer struct {
-	coordinator *Coordinator
-	starters    map[EffectService]dispatchStarterBinding
-	timeout     time.Duration
+	claimer  DispatchStartClaimer
+	starters map[EffectService]dispatchStarterBinding
+	timeout  time.Duration
+}
+
+// DispatchStartClaimer is the narrow durability boundary required before any
+// provider start. Coordinator and external authoritative adapters both satisfy
+// it without granting the consumer access to unrelated state mutations.
+type DispatchStartClaimer interface {
+	ClaimDispatchStart(context.Context, DispatchStartRequest) (DispatchStartClaim, error)
 }
 
 type dispatchStarterBinding struct {
@@ -24,11 +31,19 @@ type dispatchStarterBinding struct {
 }
 
 func NewDispatchConsumer(
-	coordinator *Coordinator,
+	claimer DispatchStartClaimer,
 	starters map[EffectService]DispatchStarter,
 	timeout time.Duration,
 ) (*DispatchConsumer, error) {
-	if coordinator == nil || timeout <= 0 || timeout > maximumDispatchStartTimeout || len(starters) == 0 {
+	claimerIsNil := claimer == nil
+	if !claimerIsNil {
+		value := reflect.ValueOf(claimer)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			claimerIsNil = value.IsNil()
+		}
+	}
+	if claimerIsNil || timeout <= 0 || timeout > maximumDispatchStartTimeout || len(starters) == 0 {
 		return nil, ErrDispatchStarterUnavailable
 	}
 	registry := make(map[EffectService]dispatchStarterBinding, len(starters))
@@ -50,7 +65,7 @@ func NewDispatchConsumer(
 		}
 		registry[service] = dispatchStarterBinding{starter: starter, routeDigest: routeDigest}
 	}
-	return &DispatchConsumer{coordinator: coordinator, starters: registry, timeout: timeout}, nil
+	return &DispatchConsumer{claimer: claimer, starters: registry, timeout: timeout}, nil
 }
 
 // StartExactAttempt makes no provider retry. Once the durable store returns a
@@ -74,16 +89,18 @@ func (consumer *DispatchConsumer) StartExactAttempt(
 	if request.Dispatch.ProviderRouteDigest != binding.routeDigest {
 		return DispatchStartExecution{}, ErrFenceMismatch
 	}
-	claim, err := consumer.coordinator.ClaimDispatchStart(ctx, request)
+	claim, err := consumer.claimer.ClaimDispatchStart(ctx, request)
 	if err != nil {
 		return DispatchStartExecution{}, err
+	}
+	if claim.Permit.Opaque == "" || !claim.Permit.Durable || claim.Permit.EventSequence == 0 ||
+		claim.Permit.CommandDigest != request.CommandDigest ||
+		!sameDispatchPermit(claim.Permit.Dispatch, request.Dispatch) {
+		return DispatchStartExecution{}, fmt.Errorf("%w: consumer received a mismatched dispatch start claim", ErrFenceMismatch)
 	}
 	execution := DispatchStartExecution{Claim: claim, Outcome: DispatchStartOutcomeUnknown}
 	if !claim.Fresh {
 		return execution, ErrDispatchAlreadyStarted
-	}
-	if claim.Permit.CommandDigest != request.CommandDigest || !sameDispatchPermit(claim.Permit.Dispatch, request.Dispatch) {
-		return DispatchStartExecution{}, fmt.Errorf("%w: consumer received a mismatched dispatch start claim", ErrFenceMismatch)
 	}
 	startContext, cancelStart := context.WithTimeout(context.WithoutCancel(ctx), consumer.timeout)
 	defer cancelStart()

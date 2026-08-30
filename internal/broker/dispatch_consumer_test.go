@@ -68,6 +68,65 @@ func TestConcurrentStartExactAttemptClaimsAndStartsOnce(t *testing.T) {
 	}
 }
 
+func TestDispatchConsumerAcceptsNarrowClaimerAndValidatesItsDurableReceipt(t *testing.T) {
+	t.Parallel()
+	routeDigest := digest(200)
+	commandDigest := digest(201)
+	dispatch := DispatchPermit{
+		Service:             ServiceExecutor,
+		ProviderRouteDigest: routeDigest,
+	}
+	claimer := &recordingDispatchClaimer{claim: DispatchStartClaim{
+		Permit: DispatchStartPermit{
+			Dispatch: dispatch, Opaque: opaque(200), CommandDigest: commandDigest,
+			EventSequence: 1, Durable: true,
+		},
+		Fresh: true,
+	}}
+	starter := &recordingDispatchStarter{routeDigest: routeDigest}
+	consumer, err := NewDispatchConsumer(
+		claimer,
+		map[EffectService]DispatchStarter{ServiceExecutor: starter},
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("NewDispatchConsumer() error = %v", err)
+	}
+	request := DispatchStartRequest{Dispatch: dispatch, CommandDigest: commandDigest}
+	execution, err := consumer.StartExactAttempt(context.Background(), request)
+	if err != nil || !execution.Claim.Fresh || execution.Outcome != DispatchStartOutcomeStarted {
+		t.Fatalf("StartExactAttempt() = %#v, %v", execution, err)
+	}
+	claimer.mu.Lock()
+	claimCalls := claimer.calls
+	claimer.mu.Unlock()
+	starter.mu.Lock()
+	startCalls := starter.calls
+	starter.mu.Unlock()
+	if claimCalls != 1 || startCalls != 1 {
+		t.Fatalf("claim/start calls = %d/%d, want 1/1", claimCalls, startCalls)
+	}
+
+	claimer.claim.Permit.Durable = false
+	consumer, err = NewDispatchConsumer(
+		claimer,
+		map[EffectService]DispatchStarter{ServiceExecutor: starter},
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("NewDispatchConsumer(malformed claimer) error = %v", err)
+	}
+	if malformed, startErr := consumer.StartExactAttempt(context.Background(), request); !errors.Is(startErr, ErrFenceMismatch) || malformed != (DispatchStartExecution{}) {
+		t.Fatalf("malformed StartExactAttempt() = %#v, %v; want fence mismatch", malformed, startErr)
+	}
+	starter.mu.Lock()
+	startCalls = starter.calls
+	starter.mu.Unlock()
+	if startCalls != 1 {
+		t.Fatalf("starter calls after malformed claim = %d, want 1", startCalls)
+	}
+}
+
 func TestDispatchConsumerRejectsInvalidConfigurationBeforeClaim(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_900_001_050, 0).UTC()
@@ -831,6 +890,23 @@ type recordingDispatchStarter struct {
 	contextErr  error
 	hadDeadline bool
 	routeDigest Digest
+}
+
+type recordingDispatchClaimer struct {
+	mu    sync.Mutex
+	calls int
+	claim DispatchStartClaim
+	err   error
+}
+
+func (claimer *recordingDispatchClaimer) ClaimDispatchStart(
+	_ context.Context,
+	_ DispatchStartRequest,
+) (DispatchStartClaim, error) {
+	claimer.mu.Lock()
+	defer claimer.mu.Unlock()
+	claimer.calls++
+	return claimer.claim, claimer.err
 }
 
 type zeroRouteDispatchStarter struct{}
