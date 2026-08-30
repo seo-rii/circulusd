@@ -6,11 +6,24 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	maximumStateHTTPTimeout          = 30 * time.Second
+	maximumStateDispatchStartTimeout = 5 * time.Minute
+	maximumStateEvidenceAge          = 24 * time.Hour
+)
+
+var (
+	stateKeyIDPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+	stateIdentityPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 )
 
 func Parse(reader io.Reader) (Configuration, error) {
@@ -81,6 +94,38 @@ func (configuration Configuration) Validate() error {
 		strconv.FormatUint(statePort, 10) != stateEndpoint.port || stateEndpoint.path != "" ||
 		stateEndpoint.authority != net.JoinHostPort(stateIP.String(), stateEndpoint.port) {
 		return fmt.Errorf("%w: state provider", ErrInvalidConfiguration)
+	}
+	state := configuration.State
+	if !stateKeyIDPattern.MatchString(state.ReadKeyID) ||
+		!stateKeyIDPattern.MatchString(state.DispatchStartKeyID) ||
+		state.ReadKeyID == state.DispatchStartKeyID ||
+		state.HTTPTimeout.Duration() <= 0 ||
+		state.HTTPTimeout.Duration() > maximumStateHTTPTimeout ||
+		state.DispatchStartTimeout.Duration() <= 0 ||
+		state.DispatchStartTimeout.Duration() > maximumStateDispatchStartTimeout ||
+		!stateIdentityPattern.MatchString(state.InstanceID) ||
+		!stateIdentityPattern.MatchString(state.TransactionDomainID) ||
+		state.MinimumProbeEpoch == 0 ||
+		state.MaximumEvidenceAge.Duration() <= 0 ||
+		state.MaximumEvidenceAge.Duration() > maximumStateEvidenceAge {
+		return fmt.Errorf("%w: state production boundary", ErrInvalidConfiguration)
+	}
+	stateFiles := []string{
+		state.ReadRootKeyFile,
+		state.DispatchStartRootKeyFile,
+		state.ProductionEvidenceFile,
+		state.ConformanceRootsFile,
+		state.RuntimeRootsFile,
+	}
+	seenStateFiles := make(map[string]struct{}, len(stateFiles))
+	for _, path := range stateFiles {
+		if !validAbsolutePath(path) || path == "/" {
+			return fmt.Errorf("%w: state production file", ErrInvalidConfiguration)
+		}
+		if _, duplicate := seenStateFiles[path]; duplicate {
+			return fmt.Errorf("%w: state production files must be distinct", ErrInvalidConfiguration)
+		}
+		seenStateFiles[path] = struct{}{}
 	}
 	objectStoreIP := net.ParseIP(configuration.ObjectStore.Endpoint.host)
 	if (configuration.ObjectStore.Endpoint.scheme != "http" && configuration.ObjectStore.Endpoint.scheme != "https") ||

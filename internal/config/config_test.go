@@ -19,6 +19,19 @@ strictInstall: true
 state:
   provider: celld
   endpoint: http://127.0.0.1:8080
+  readKeyId: state-read-current-1
+  readRootKeyFile: /run/credentials/pi-platform/state-read.key
+  dispatchStartKeyId: state-dispatch-current-1
+  dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key
+  httpTimeout: 5s
+  dispatchStartTimeout: 30s
+  instanceId: state-node-1
+  transactionDomainId: state-domain-1
+  minimumProbeEpoch: 1
+  maximumEvidenceAge: 1h
+  productionEvidenceFile: /etc/pi-platform/state/celld-evidence.json
+  conformanceRootsFile: /etc/pi-platform/state/conformance-roots.json
+  runtimeRootsFile: /etc/pi-platform/state/runtime-roots.json
 objectStore:
   endpoint: http://127.0.0.1:8333
   stateBucket: pi-celld-state
@@ -150,6 +163,21 @@ func TestParseAcceptsReferenceConfiguration(t *testing.T) {
 	if configuration.Models.Endpoints["local/primary"].Endpoint.String() != "http://127.0.0.1:8000/v1" {
 		t.Fatalf("model endpoint = %q", configuration.Models.Endpoints["local/primary"].Endpoint.String())
 	}
+	if configuration.State.ReadKeyID != "state-read-current-1" ||
+		configuration.State.ReadRootKeyFile != "/run/credentials/pi-platform/state-read.key" ||
+		configuration.State.DispatchStartKeyID != "state-dispatch-current-1" ||
+		configuration.State.DispatchStartRootKeyFile != "/run/credentials/pi-platform/state-dispatch-start.key" ||
+		configuration.State.HTTPTimeout.Duration() != 5*time.Second ||
+		configuration.State.DispatchStartTimeout.Duration() != 30*time.Second ||
+		configuration.State.InstanceID != "state-node-1" ||
+		configuration.State.TransactionDomainID != "state-domain-1" ||
+		configuration.State.MinimumProbeEpoch != 1 ||
+		configuration.State.MaximumEvidenceAge.Duration() != time.Hour ||
+		configuration.State.ProductionEvidenceFile != "/etc/pi-platform/state/celld-evidence.json" ||
+		configuration.State.ConformanceRootsFile != "/etc/pi-platform/state/conformance-roots.json" ||
+		configuration.State.RuntimeRootsFile != "/etc/pi-platform/state/runtime-roots.json" {
+		t.Fatalf("state production configuration = %#v", configuration.State)
+	}
 	if configuration.API.DurableEventRetention.Duration() != 7*24*time.Hour ||
 		configuration.Retention.ArtifactDefault.Duration() != 30*24*time.Hour ||
 		configuration.Network.DefaultMode != "none" ||
@@ -185,6 +213,113 @@ func TestParseAcceptsPinnedCelldLoopbackTCPEndpoint(t *testing.T) {
 			}
 			if got := configuration.State.Endpoint.String(); got != endpoint {
 				t.Fatalf("state endpoint = %q, want %q", got, endpoint)
+			}
+		})
+	}
+}
+
+func TestParseRequiresEveryStateProductionField(t *testing.T) {
+	requiredLines := []string{
+		"  readKeyId: state-read-current-1\n",
+		"  readRootKeyFile: /run/credentials/pi-platform/state-read.key\n",
+		"  dispatchStartKeyId: state-dispatch-current-1\n",
+		"  dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key\n",
+		"  httpTimeout: 5s\n",
+		"  dispatchStartTimeout: 30s\n",
+		"  instanceId: state-node-1\n",
+		"  transactionDomainId: state-domain-1\n",
+		"  minimumProbeEpoch: 1\n",
+		"  maximumEvidenceAge: 1h\n",
+		"  productionEvidenceFile: /etc/pi-platform/state/celld-evidence.json\n",
+		"  conformanceRootsFile: /etc/pi-platform/state/conformance-roots.json\n",
+		"  runtimeRootsFile: /etc/pi-platform/state/runtime-roots.json\n",
+	}
+	for _, line := range requiredLines {
+		t.Run(strings.TrimSpace(line), func(t *testing.T) {
+			misconfigured := strings.Replace(validConfiguration, line, "", 1)
+			if misconfigured == validConfiguration {
+				t.Fatalf("required fixture line %q was not found", line)
+			}
+			_, err := config.Parse(strings.NewReader(misconfigured))
+			if !errors.Is(err, config.ErrInvalidConfiguration) {
+				t.Fatalf("Parse() error = %v, want ErrInvalidConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestParseAcceptsBoundedStateProductionTimeouts(t *testing.T) {
+	bounded := strings.Replace(validConfiguration, "httpTimeout: 5s", "httpTimeout: 30s", 1)
+	bounded = strings.Replace(bounded, "dispatchStartTimeout: 30s", "dispatchStartTimeout: 5m", 1)
+	bounded = strings.Replace(bounded, "maximumEvidenceAge: 1h", "maximumEvidenceAge: 24h", 1)
+	configuration, err := config.Parse(strings.NewReader(bounded))
+	if err != nil {
+		t.Fatalf("Parse(bounded state production config) error = %v", err)
+	}
+	if configuration.State.HTTPTimeout.Duration() != 30*time.Second ||
+		configuration.State.DispatchStartTimeout.Duration() != 5*time.Minute ||
+		configuration.State.MaximumEvidenceAge.Duration() != 24*time.Hour {
+		t.Fatalf("bounded state production config = %#v", configuration.State)
+	}
+}
+
+func TestParseRejectsUnsafeStateProductionConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{name: "uppercase read key ID", old: "readKeyId: state-read-current-1", new: "readKeyId: State-Read-Current-1"},
+		{name: "oversized read key ID", old: "readKeyId: state-read-current-1", new: "readKeyId: " + strings.Repeat("a", 65)},
+		{name: "shared operation key ID", old: "dispatchStartKeyId: state-dispatch-current-1", new: "dispatchStartKeyId: state-read-current-1"},
+		{name: "relative read key file", old: "readRootKeyFile: /run/credentials/pi-platform/state-read.key", new: "readRootKeyFile: credentials/state-read.key"},
+		{name: "noncanonical dispatch key file", old: "dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key", new: "dispatchStartRootKeyFile: /run/credentials/../state-dispatch-start.key"},
+		{name: "root credential path", old: "readRootKeyFile: /run/credentials/pi-platform/state-read.key", new: "readRootKeyFile: /"},
+		{name: "credential path control", old: "readRootKeyFile: /run/credentials/pi-platform/state-read.key", new: "readRootKeyFile: \"/run/credentials/pi-platform/state-read\\0.key\""},
+		{name: "shared operation key file", old: "dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key", new: "dispatchStartRootKeyFile: /run/credentials/pi-platform/state-read.key"},
+		{name: "zero HTTP timeout", old: "httpTimeout: 5s", new: "httpTimeout: 0s"},
+		{name: "negative HTTP timeout", old: "httpTimeout: 5s", new: "httpTimeout: -1s"},
+		{name: "excessive HTTP timeout", old: "httpTimeout: 5s", new: "httpTimeout: 30s1ms"},
+		{name: "zero dispatch start timeout", old: "dispatchStartTimeout: 30s", new: "dispatchStartTimeout: 0s"},
+		{name: "excessive dispatch start timeout", old: "dispatchStartTimeout: 30s", new: "dispatchStartTimeout: 5m1ms"},
+		{name: "invalid instance ID", old: "instanceId: state-node-1", new: "instanceId: state node 1"},
+		{name: "oversized transaction domain ID", old: "transactionDomainId: state-domain-1", new: "transactionDomainId: " + strings.Repeat("d", 257)},
+		{name: "zero minimum probe epoch", old: "minimumProbeEpoch: 1", new: "minimumProbeEpoch: 0"},
+		{name: "zero evidence age", old: "maximumEvidenceAge: 1h", new: "maximumEvidenceAge: 0s"},
+		{name: "excessive evidence age", old: "maximumEvidenceAge: 1h", new: "maximumEvidenceAge: 24h1ms"},
+		{name: "relative evidence file", old: "productionEvidenceFile: /etc/pi-platform/state/celld-evidence.json", new: "productionEvidenceFile: state/celld-evidence.json"},
+		{name: "root conformance path", old: "conformanceRootsFile: /etc/pi-platform/state/conformance-roots.json", new: "conformanceRootsFile: /"},
+		{name: "shared evidence and runtime roots file", old: "runtimeRootsFile: /etc/pi-platform/state/runtime-roots.json", new: "runtimeRootsFile: /etc/pi-platform/state/celld-evidence.json"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			misconfigured := strings.Replace(validConfiguration, test.old, test.new, 1)
+			if misconfigured == validConfiguration {
+				t.Fatalf("fixture marker %q was not found", test.old)
+			}
+			_, err := config.Parse(strings.NewReader(misconfigured))
+			if !errors.Is(err, config.ErrInvalidConfiguration) {
+				t.Fatalf("Parse() error = %v, want ErrInvalidConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInlineStateRootSecrets(t *testing.T) {
+	for _, rawSecret := range []string{
+		"  readRootKey: 00112233\n",
+		"  dispatchStartRootKeyHex: 00112233\n",
+	} {
+		t.Run(strings.TrimSpace(rawSecret), func(t *testing.T) {
+			misconfigured := strings.Replace(
+				validConfiguration,
+				"  readRootKeyFile: /run/credentials/pi-platform/state-read.key\n",
+				"  readRootKeyFile: /run/credentials/pi-platform/state-read.key\n"+rawSecret,
+				1,
+			)
+			_, err := config.Parse(strings.NewReader(misconfigured))
+			if !errors.Is(err, config.ErrInvalidSyntax) {
+				t.Fatalf("Parse() error = %v, want ErrInvalidSyntax", err)
 			}
 		})
 	}

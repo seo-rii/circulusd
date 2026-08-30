@@ -4626,6 +4626,19 @@ deployment:
 state:
   provider: celld
   endpoint: http://127.0.0.1:8080
+  readKeyId: state-read-current-1
+  readRootKeyFile: /run/credentials/pi-platform/state-read.key
+  dispatchStartKeyId: state-dispatch-current-1
+  dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key
+  httpTimeout: 5s
+  dispatchStartTimeout: 30s
+  instanceId: state-node-1
+  transactionDomainId: state-domain-1
+  minimumProbeEpoch: 1
+  maximumEvidenceAge: 1h
+  productionEvidenceFile: /etc/pi-platform/state/celld-evidence.json
+  conformanceRootsFile: /etc/pi-platform/state/conformance-roots.json
+  runtimeRootsFile: /etc/pi-platform/state/runtime-roots.json
 
 objectStore:
   endpoint: http://127.0.0.1:8333
@@ -4727,6 +4740,18 @@ retention:
 port의 literal-loopback HTTP origin이어야 한다. Reference service는 celld를
 `--listen 127.0.0.1:8080`으로 시작한다. celld의 internal/operator listener나
 private route를 application protocol로 사용하지 않는다.
+
+state read와 dispatch-start 권한은 서로 다른 key ID와 root-key 파일을 사용한다.
+key material을 YAML에 직접 넣지 않으며, 모든 credential/evidence/root 경로는
+서로 다른 canonical absolute non-root 파일이어야 한다. startup은 credential을
+한 번만 읽어 파일 종류·소유권·권한과 key 길이를 검증하고 client가 key를 복사한
+뒤 loader buffer를 지운다. request별 파일 재읽기는 key rotation protocol로
+간주하지 않는다. `httpTimeout`은 30초 이하, `dispatchStartTimeout`은 5분 이하,
+`maximumEvidenceAge`는 24시간 이하로 fail-closed 검증한다.
+
+production dependency의 celld build digest와 state-app application digest는 이
+YAML에서 받지 않는다. 서명 검증된 release manifest의 정확한 artifact digest에서
+파생하여 live probe와 conformance evidence의 descriptor에 함께 결속한다.
 
 `maxResidentSessions`와 shard memory limit의 실제 reference 값은 Phase 0 benchmark 후 조정해야 한다. 숫자를 product invariant로 간주하지 않는다.
 

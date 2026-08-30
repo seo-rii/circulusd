@@ -203,8 +203,21 @@ type DeploymentConfiguration struct {
 }
 
 type StateConfiguration struct {
-	Provider string   `yaml:"provider"`
-	Endpoint Endpoint `yaml:"endpoint"`
+	Provider                 string   `yaml:"provider"`
+	Endpoint                 Endpoint `yaml:"endpoint"`
+	ReadKeyID                string   `yaml:"readKeyId"`
+	ReadRootKeyFile          string   `yaml:"readRootKeyFile"`
+	DispatchStartKeyID       string   `yaml:"dispatchStartKeyId"`
+	DispatchStartRootKeyFile string   `yaml:"dispatchStartRootKeyFile"`
+	HTTPTimeout              Duration `yaml:"httpTimeout"`
+	DispatchStartTimeout     Duration `yaml:"dispatchStartTimeout"`
+	InstanceID               string   `yaml:"instanceId"`
+	TransactionDomainID      string   `yaml:"transactionDomainId"`
+	MinimumProbeEpoch        uint64   `yaml:"minimumProbeEpoch"`
+	MaximumEvidenceAge       Duration `yaml:"maximumEvidenceAge"`
+	ProductionEvidenceFile   string   `yaml:"productionEvidenceFile"`
+	ConformanceRootsFile     string   `yaml:"conformanceRootsFile"`
+	RuntimeRootsFile         string   `yaml:"runtimeRootsFile"`
 }
 
 type ObjectStoreConfiguration struct {
