@@ -13,17 +13,20 @@ import (
 )
 
 var (
-	ErrInvalidRequest      = errors.New("broker: invalid request")
-	ErrAdmissionExpired    = errors.New("broker: new admission authority expired")
-	ErrLeaseExpired        = errors.New("broker: turn lease expired")
-	ErrStaleGeneration     = errors.New("broker: stale generation")
-	ErrFenceMismatch       = errors.New("broker: identity fence mismatch")
-	ErrEffectInFlight      = errors.New("broker: effect already in flight")
-	ErrInvalidEffectState  = errors.New("broker: invalid effect state")
-	ErrIdempotencyConflict = errors.New("broker: idempotency key reused with different input")
-	ErrDurabilityBarrier   = errors.New("broker: durability barrier not confirmed")
-	ErrLedgerUnavailable   = errors.New("broker: invocation ledger unavailable")
-	ErrLedgerMismatch      = errors.New("broker: invocation ledger proof mismatch")
+	ErrInvalidRequest             = errors.New("broker: invalid request")
+	ErrAdmissionExpired           = errors.New("broker: new admission authority expired")
+	ErrLeaseExpired               = errors.New("broker: turn lease expired")
+	ErrStaleGeneration            = errors.New("broker: stale generation")
+	ErrFenceMismatch              = errors.New("broker: identity fence mismatch")
+	ErrEffectInFlight             = errors.New("broker: effect already in flight")
+	ErrInvalidEffectState         = errors.New("broker: invalid effect state")
+	ErrIdempotencyConflict        = errors.New("broker: idempotency key reused with different input")
+	ErrDurabilityBarrier          = errors.New("broker: durability barrier not confirmed")
+	ErrLedgerUnavailable          = errors.New("broker: invocation ledger unavailable")
+	ErrLedgerMismatch             = errors.New("broker: invocation ledger proof mismatch")
+	ErrDispatchAlreadyStarted     = errors.New("broker: dispatch attempt already started")
+	ErrDispatchStartUnknown       = errors.New("broker: dispatch start outcome unknown")
+	ErrDispatchStarterUnavailable = errors.New("broker: dispatch starter unavailable")
 )
 
 type Digest [32]byte
@@ -109,10 +112,12 @@ type EffectSnapshot struct {
 }
 
 type DispatchMetadata struct {
-	DispatchAttempt   uint64
-	Generations       Generations
-	ProviderRequestID identity.ID
-	Deadline          time.Time
+	DispatchAttempt     uint64
+	Generations         Generations
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	Deadline            time.Time
+	Start               *DispatchStartPermit
 }
 
 type TurnSnapshot struct {
@@ -235,37 +240,91 @@ type EffectKey struct {
 }
 
 type DispatchRequest struct {
-	Authority         ValidatedTurnFence
-	Now               time.Time
-	EffectID          identity.ID
-	InvocationID      identity.ID
-	RequestDigest     Digest
-	Service           EffectService
-	Operation         string
-	OperationKey      string
-	OperationDigest   Digest
-	PreparationPermit EffectPreparationPermit
-	ProviderRequestID identity.ID
-	Deadline          time.Time
+	Authority           ValidatedTurnFence
+	Now                 time.Time
+	EffectID            identity.ID
+	InvocationID        identity.ID
+	RequestDigest       Digest
+	Service             EffectService
+	Operation           string
+	OperationKey        string
+	OperationDigest     Digest
+	PreparationPermit   EffectPreparationPermit
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	Deadline            time.Time
 }
 
 type DispatchPermit struct {
 	EffectKey
-	Opaque            OpaquePermit
-	TenantID          identity.ID
-	WorkspaceID       identity.ID
-	UserID            identity.ID
-	Service           EffectService
-	Operation         string
-	ParentOperationID identity.ID
-	Ordinal           uint64
-	ReplayPolicy      ReplayPolicy
-	Generations       Generations
-	DispatchAttempt   uint64
-	ProviderRequestID identity.ID
-	Deadline          time.Time
-	EventSequence     uint64
-	Durable           bool
+	Opaque              OpaquePermit
+	TenantID            identity.ID
+	WorkspaceID         identity.ID
+	UserID              identity.ID
+	Service             EffectService
+	Operation           string
+	ParentOperationID   identity.ID
+	Ordinal             uint64
+	ReplayPolicy        ReplayPolicy
+	Generations         Generations
+	DispatchAttempt     uint64
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	Deadline            time.Time
+	EventSequence       uint64
+	Durable             bool
+}
+
+// DispatchStartRequest consumes one exact durable dispatch attempt before any
+// provider I/O. CommandDigest binds the immutable adapter command without
+// exposing service-specific payloads to the broker.
+type DispatchStartRequest struct {
+	Authority     ValidatedTurnFence
+	Now           time.Time
+	Dispatch      DispatchPermit
+	CommandDigest Digest
+}
+
+// DispatchStartPermit is a non-expiring single-start claim. Once durable, an
+// absent provider result is uncertain and the same dispatch attempt must never
+// be started again.
+type DispatchStartPermit struct {
+	Dispatch      DispatchPermit
+	Opaque        OpaquePermit
+	CommandDigest Digest
+	EventSequence uint64
+	Durable       bool
+}
+
+func (DispatchStartPermit) String() string { return "dispatch-start-permit<redacted>" }
+
+func (DispatchStartPermit) GoString() string { return "dispatch-start-permit<redacted>" }
+
+type DispatchStartClaim struct {
+	Permit DispatchStartPermit
+	Fresh  bool
+}
+
+type DispatchStartOutcome string
+
+const (
+	DispatchStartOutcomeStarted DispatchStartOutcome = "started"
+	DispatchStartOutcomeUnknown DispatchStartOutcome = "unknown"
+)
+
+type DispatchStartExecution struct {
+	Claim   DispatchStartClaim
+	Outcome DispatchStartOutcome
+}
+
+// DispatchStarter performs exactly one outbound start for one immutable route.
+// RouteDigest identifies the adapter revision and provider endpoint/config;
+// Start must independently verify both that route and the canonical
+// CommandDigest. It must not retry the provider operation internally; every
+// returned error is classified unknown.
+type DispatchStarter interface {
+	RouteDigest() Digest
+	Start(context.Context, DispatchStartPermit) error
 }
 
 type SettlementRequest struct {
@@ -338,28 +397,30 @@ const (
 )
 
 type LedgerRecord struct {
-	Status            LedgerStatus
-	TenantID          identity.ID
-	WorkspaceID       identity.ID
-	EffectID          identity.ID
-	InvocationID      identity.ID
-	RequestDigest     Digest
-	Service           EffectService
-	Operation         string
-	DispatchAttempt   uint64
-	ProviderRequestID identity.ID
-	ExternalCommitID  identity.ID
-	ResultRef         identity.ID
+	Status              LedgerStatus
+	TenantID            identity.ID
+	WorkspaceID         identity.ID
+	EffectID            identity.ID
+	InvocationID        identity.ID
+	RequestDigest       Digest
+	Service             EffectService
+	Operation           string
+	DispatchAttempt     uint64
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	ExternalCommitID    identity.ID
+	ResultRef           identity.ID
 }
 
 type LedgerLookup struct {
 	EffectKey
-	TenantID          identity.ID
-	WorkspaceID       identity.ID
-	Service           EffectService
-	Operation         string
-	DispatchAttempt   uint64
-	ProviderRequestID identity.ID
+	TenantID            identity.ID
+	WorkspaceID         identity.ID
+	Service             EffectService
+	Operation           string
+	DispatchAttempt     uint64
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
 }
 
 type InvocationLedger interface {
@@ -381,17 +442,18 @@ const (
 )
 
 type RecoveryRequest struct {
-	Authority         ValidatedTurnFence
-	Now               time.Time
-	EffectID          identity.ID
-	InvocationID      identity.ID
-	RequestDigest     Digest
-	OperationKey      string
-	OperationDigest   Digest
-	UserConfirmed     bool
-	ProviderRequestID identity.ID
-	Deadline          time.Time
-	Reason            *v1.PublicError
+	Authority           ValidatedTurnFence
+	Now                 time.Time
+	EffectID            identity.ID
+	InvocationID        identity.ID
+	RequestDigest       Digest
+	OperationKey        string
+	OperationDigest     Digest
+	UserConfirmed       bool
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	Deadline            time.Time
+	Reason              *v1.PublicError
 }
 
 type RecoveryDecision struct {
@@ -410,13 +472,17 @@ type RecoveryDecision struct {
 // DurableStore is the authoritative Session-state adapter. Every mutation is
 // atomic, compares the supplied snapshot/fences, provides idempotency, and
 // returns only after its durability barrier completes. Durable=false is a
-// fail-closed signal used by adapters that cannot prove that contract.
+// fail-closed signal used by adapters that cannot prove that contract. A start
+// claim compares the exact originally persisted DispatchPermit proof and is
+// mutually exclusive with retry preparation, uncertain blocking, and
+// interrupted recovery settlement for that attempt.
 type DurableStore interface {
 	LookupOperation(context.Context, OperationLookup) (OperationReceipt, error)
 	ReadTurn(context.Context, identity.ID) (TurnSnapshot, error)
 	AcquireEngineStep(context.Context, AcquireStepCommand) (EngineStepPermit, error)
 	CommitEngineStep(context.Context, CommitStepCommand) (EngineStepReceipt, error)
 	MarkDispatched(context.Context, MarkDispatchedCommand) (DispatchPermit, error)
+	ClaimDispatchStart(context.Context, ClaimDispatchStartCommand) (DispatchStartClaim, error)
 	MarkExternallyCommitted(context.Context, MarkExternalCommand) (ConfirmationReceipt, error)
 	SettleEffect(context.Context, SettleCommand) (SettlementReceipt, error)
 	BlockEffect(context.Context, BlockCommand) (BlockReceipt, error)
@@ -470,16 +536,31 @@ type CommitStepCommand struct {
 }
 
 type MarkDispatchedCommand struct {
-	Snapshot          TurnSnapshot
-	Key               EffectKey
-	Service           EffectService
-	Operation         string
-	OperationKey      string
-	OperationDigest   Digest
-	PreparationPermit EffectPreparationPermit
-	ProviderRequestID identity.ID
-	Now               time.Time
-	Deadline          time.Time
+	Snapshot            TurnSnapshot
+	Key                 EffectKey
+	Service             EffectService
+	Operation           string
+	OperationKey        string
+	OperationDigest     Digest
+	PreparationPermit   EffectPreparationPermit
+	ProviderRequestID   identity.ID
+	ProviderRouteDigest Digest
+	Now                 time.Time
+	Deadline            time.Time
+}
+
+// ClaimDispatchStartCommand must atomically compare Snapshot and the exact
+// originally persisted Dispatch proof with current authoritative state, reject
+// a concurrent retry preparation, and persist the exact command digest before
+// returning Fresh=true. Exact replays return the original permit with
+// Fresh=false. PrepareRetry, BlockEffect, and interrupted SettleRecovery must
+// atomically reject an already persisted start claim in the same transaction
+// domain.
+type ClaimDispatchStartCommand struct {
+	Snapshot      TurnSnapshot
+	Dispatch      DispatchPermit
+	CommandDigest Digest
+	Now           time.Time
 }
 
 type MarkExternalCommand struct {

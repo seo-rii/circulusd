@@ -304,7 +304,7 @@ func TestDispatchPermitRequiresDurablePreparedIdentityAndAllFences(t *testing.T)
 	if err != nil {
 		t.Fatalf("AdmitDispatch() error = %v", err)
 	}
-	if !permit.Durable || permit.DispatchAttempt != 1 {
+	if !permit.Durable || permit.DispatchAttempt != 1 || permit.ProviderRouteDigest != request.ProviderRouteDigest {
 		t.Fatalf("permit = %#v, want durable attempt 1", permit)
 	}
 	duplicate, err := coordinator.AdmitDispatch(context.Background(), request)
@@ -486,7 +486,7 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 		Status: LedgerCommitted, TenantID: tenantID, WorkspaceID: workspaceID,
 		EffectID: effectID, InvocationID: invocationID,
 		RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run",
-		DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID,
+		DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152), ExternalCommitID: commitID, ResultRef: resultID,
 	}}
 	coordinator := mustCoordinator(t, store, ledger)
 
@@ -504,13 +504,14 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 	lookups := append([]LedgerLookup(nil), ledger.lookups...)
 	ledger.mu.Unlock()
 	wantLookup := LedgerLookup{
-		EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
-		TenantID:          tenantID,
-		WorkspaceID:       workspaceID,
-		Service:           ServiceExecutor,
-		Operation:         "run",
-		DispatchAttempt:   1,
-		ProviderRequestID: mustID(identity.Request, "R"),
+		EffectKey:           EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+		TenantID:            tenantID,
+		WorkspaceID:         workspaceID,
+		Service:             ServiceExecutor,
+		Operation:           "run",
+		DispatchAttempt:     1,
+		ProviderRequestID:   mustID(identity.Request, "R"),
+		ProviderRouteDigest: digest(152),
 	}
 	if len(lookups) != 1 || lookups[0] != wantLookup {
 		t.Fatalf("ledger lookups = %#v, want [%#v]", lookups, wantLookup)
@@ -527,6 +528,7 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 		{name: "workspace", edit: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "other-workspace") }},
 		{name: "service", edit: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
 		{name: "operation", edit: func(record *LedgerRecord) { record.Operation = "write" }},
+		{name: "provider route", edit: func(record *LedgerRecord) { record.ProviderRouteDigest = digest(153) }},
 		{name: "missing commit", edit: func(record *LedgerRecord) { record.ExternalCommitID = identity.ID{} }},
 		{name: "wrong commit kind", edit: func(record *LedgerRecord) { record.ExternalCommitID = sessionID }},
 	} {
@@ -582,7 +584,7 @@ func TestConcurrentRecoveryLedgerLookupsPreserveAuthoritativeRouteAndEffectBound
 			Status: LedgerCommitted, TenantID: query.TenantID, WorkspaceID: query.WorkspaceID,
 			EffectID: query.EffectID, InvocationID: query.InvocationID,
 			RequestDigest: query.RequestDigest, Service: query.Service, Operation: query.Operation,
-			DispatchAttempt: query.DispatchAttempt, ProviderRequestID: query.ProviderRequestID, ExternalCommitID: commitID, ResultRef: resultID,
+			DispatchAttempt: query.DispatchAttempt, ProviderRequestID: query.ProviderRequestID, ProviderRouteDigest: query.ProviderRouteDigest, ExternalCommitID: commitID, ResultRef: resultID,
 		}, nil
 	}}
 
@@ -605,13 +607,14 @@ func TestConcurrentRecoveryLedgerLookupsPreserveAuthoritativeRouteAndEffectBound
 		snapshot.ActiveEffect.Operation = operation
 		coordinator := mustCoordinator(t, newFakeStore(snapshot), ledger)
 		lookup := LedgerLookup{
-			EffectKey:         EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
-			TenantID:          tenant,
-			WorkspaceID:       workspace,
-			Service:           service,
-			Operation:         operation,
-			DispatchAttempt:   1,
-			ProviderRequestID: mustID(identity.Request, "R"),
+			EffectKey:           EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+			TenantID:            tenant,
+			WorkspaceID:         workspace,
+			Service:             service,
+			Operation:           operation,
+			DispatchAttempt:     1,
+			ProviderRequestID:   mustID(identity.Request, "R"),
+			ProviderRouteDigest: digest(152),
 		}
 		wantLookups[lookup]++
 		request := baseRecoveryRequest(now, fmt.Sprintf("recover-concurrent-%d", index))
@@ -812,7 +815,7 @@ func baseRecoveryRequest(now time.Time, operationKey string) RecoveryRequest {
 	return RecoveryRequest{
 		Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID,
 		RequestDigest: digest(2), OperationKey: operationKey, OperationDigest: digest(88),
-		ProviderRequestID: mustID(identity.Request, "R"), Deadline: now.Add(time.Minute),
+		ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152), Deadline: now.Add(time.Minute),
 	}
 }
 
@@ -836,7 +839,7 @@ func baseEffect(state EffectState) *EffectSnapshot {
 		}(),
 	}
 	if state != EffectPrepared {
-		effect.LastDispatch = &DispatchMetadata{DispatchAttempt: effect.DispatchAttempt, Generations: effect.Generations, ProviderRequestID: mustID(identity.Request, "R"), Deadline: time.Unix(2_000_000_000, 0).UTC()}
+		effect.LastDispatch = &DispatchMetadata{DispatchAttempt: effect.DispatchAttempt, Generations: effect.Generations, ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152), Deadline: time.Unix(2_000_000_000, 0).UTC()}
 	}
 	if state == EffectPrepared {
 		permit := EffectPreparationPermit{
@@ -859,7 +862,7 @@ func baseDispatchRequest(now time.Time) DispatchRequest {
 	return DispatchRequest{
 		Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID,
 		RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", OperationKey: "dispatch-1", OperationDigest: digest(81),
-		PreparationPermit: preparationPermit(snapshot, 1, now.Add(time.Minute)), ProviderRequestID: mustID(identity.Request, "R"), Deadline: now.Add(time.Minute),
+		PreparationPermit: preparationPermit(snapshot, 1, now.Add(time.Minute)), ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152), Deadline: now.Add(time.Minute),
 	}
 }
 
@@ -891,11 +894,11 @@ func acquirePermit(t *testing.T, coordinator *Coordinator, now time.Time, key st
 }
 
 func committedRecord() LedgerRecord {
-	return LedgerRecord{Status: LedgerCommitted, TenantID: tenantID, WorkspaceID: workspaceID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID}
+	return LedgerRecord{Status: LedgerCommitted, TenantID: tenantID, WorkspaceID: workspaceID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152), ExternalCommitID: commitID, ResultRef: resultID}
 }
 
 func routedRecord(status LedgerStatus) LedgerRecord {
-	return LedgerRecord{Status: status, TenantID: tenantID, WorkspaceID: workspaceID}
+	return LedgerRecord{Status: status, TenantID: tenantID, WorkspaceID: workspaceID, ProviderRouteDigest: digest(152)}
 }
 
 func digest(fill byte) Digest {
@@ -948,18 +951,20 @@ func (ledger *fakeLedger) Lookup(ctx context.Context, query LedgerLookup) (Ledge
 type fakeStore struct {
 	mu sync.Mutex
 
-	snapshot            TurnSnapshot
-	stepPermits         map[string]EngineStepPermit
-	stepCommits         map[string]storedStepCommit
-	dispatches          map[string]storedDispatch
-	settlements         map[string]storedSettlement
-	recoverySettlements map[string]storedSettlement
-	preparations        map[string]storedPreparation
-	blocks              map[string]storedBlock
-	confirmations       map[string]ConfirmationReceipt
-	confirmationDigests map[string]Digest
-	operationLookups    []OperationLookup
-	readTurnCalls       int
+	snapshot             TurnSnapshot
+	stepPermits          map[string]EngineStepPermit
+	stepCommits          map[string]storedStepCommit
+	dispatches           map[string]storedDispatch
+	settlements          map[string]storedSettlement
+	recoverySettlements  map[string]storedSettlement
+	preparations         map[string]storedPreparation
+	blocks               map[string]storedBlock
+	confirmations        map[string]ConfirmationReceipt
+	confirmationDigests  map[string]Digest
+	operationLookups     []OperationLookup
+	readTurnCalls        int
+	retryPreparedAttempt uint64
+	issuedDispatch       *DispatchPermit
 
 	eventSequence                      uint64
 	forceNonDurable                    bool
@@ -987,6 +992,10 @@ type fakeStore struct {
 	losePrepareRetryResponseOnce       bool
 	loseRecoverySettlementResponseOnce bool
 	loseBlockResponseOnce              bool
+	loseDispatchStartResponseOnce      bool
+	afterFreshDispatchStartClaim       func()
+	corruptDispatchStartReceipt        func(*DispatchStartPermit)
+	dispatchStartTransitions           int
 	blockTransitions                   int
 }
 
@@ -1112,6 +1121,18 @@ func (store *fakeStore) ReadTurn(ctx context.Context, session identity.ID) (Turn
 	copy := store.snapshot
 	if store.snapshot.ActiveEffect != nil {
 		effect := *store.snapshot.ActiveEffect
+		if effect.PreparationPermit != nil {
+			preparation := *effect.PreparationPermit
+			effect.PreparationPermit = &preparation
+		}
+		if effect.LastDispatch != nil {
+			dispatch := *effect.LastDispatch
+			if dispatch.Start != nil {
+				start := *dispatch.Start
+				dispatch.Start = &start
+			}
+			effect.LastDispatch = &dispatch
+		}
 		copy.ActiveEffect = &effect
 	}
 	return copy, nil
@@ -1217,10 +1238,17 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 	if command.PreparationPermit.DispatchAttempt != store.snapshot.ActiveEffect.DispatchAttempt+1 {
 		return DispatchPermit{}, ErrStaleGeneration
 	}
+	if store.snapshot.ActiveEffect.LastDispatch != nil && store.snapshot.ActiveEffect.LastDispatch.Start != nil {
+		return DispatchPermit{}, ErrDispatchAlreadyStarted
+	}
+	if store.retryPreparedAttempt != 0 && store.retryPreparedAttempt != command.PreparationPermit.DispatchAttempt {
+		return DispatchPermit{}, ErrInvalidEffectState
+	}
 	store.eventSequence++
 	store.snapshot.ActiveEffect.State = EffectDispatched
 	store.snapshot.ActiveEffect.DispatchAttempt++
-	store.snapshot.ActiveEffect.LastDispatch = &DispatchMetadata{DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, Generations: command.Snapshot.Generations, ProviderRequestID: command.ProviderRequestID, Deadline: command.Deadline}
+	store.snapshot.ActiveEffect.LastDispatch = &DispatchMetadata{DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt, Generations: command.Snapshot.Generations, ProviderRequestID: command.ProviderRequestID, ProviderRouteDigest: command.ProviderRouteDigest, Deadline: command.Deadline}
+	store.retryPreparedAttempt = 0
 	store.snapshot.EventSequence = store.eventSequence
 	store.markDispatchTransitions++
 	permit := DispatchPermit{
@@ -1229,9 +1257,11 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 		Service: command.Service, Operation: command.Operation, ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy,
 		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, Ordinal: store.snapshot.ActiveEffect.Ordinal,
 		Generations: command.Snapshot.Generations, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt,
-		ProviderRequestID: command.ProviderRequestID, Deadline: command.Deadline,
+		ProviderRequestID: command.ProviderRequestID, ProviderRouteDigest: command.ProviderRouteDigest, Deadline: command.Deadline,
 		EventSequence: store.eventSequence, Durable: !store.forceNonDurable,
 	}
+	issued := permit
+	store.issuedDispatch = &issued
 	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
 	if store.zeroDispatchEvent {
 		permit.EventSequence = 0
@@ -1242,6 +1272,76 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 		return DispatchPermit{}, errors.New("simulated response loss after dispatch commit")
 	}
 	return permit, nil
+}
+
+func (store *fakeStore) ClaimDispatchStart(ctx context.Context, command ClaimDispatchStartCommand) (DispatchStartClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return DispatchStartClaim{}, err
+	}
+	store.mu.Lock()
+	if store.snapshot.ActiveEffect == nil || store.snapshot.ActiveEffect.State != EffectDispatched || store.snapshot.ActiveEffect.LastDispatch == nil {
+		store.mu.Unlock()
+		return DispatchStartClaim{}, ErrInvalidEffectState
+	}
+	if store.snapshot.AbortRequested {
+		store.mu.Unlock()
+		return DispatchStartClaim{}, ErrInvalidEffectState
+	}
+	if store.retryPreparedAttempt != 0 {
+		store.mu.Unlock()
+		return DispatchStartClaim{}, ErrInvalidEffectState
+	}
+	effect := store.snapshot.ActiveEffect
+	if effect.LastDispatch.Start != nil {
+		start := *effect.LastDispatch.Start
+		store.mu.Unlock()
+		if !sameDispatchPermit(start.Dispatch, command.Dispatch) || start.CommandDigest != command.CommandDigest {
+			return DispatchStartClaim{}, ErrIdempotencyConflict
+		}
+		return DispatchStartClaim{Permit: start}, nil
+	}
+	if store.issuedDispatch == nil || !sameDispatchPermit(*store.issuedDispatch, command.Dispatch) {
+		store.mu.Unlock()
+		return DispatchStartClaim{}, ErrFenceMismatch
+	}
+	if command.Snapshot.EventSequence != store.snapshot.EventSequence || command.Snapshot.Generations != store.snapshot.Generations ||
+		command.Snapshot.TenantID != store.snapshot.TenantID || command.Snapshot.WorkspaceID != store.snapshot.WorkspaceID ||
+		command.Dispatch.TenantID != store.snapshot.TenantID || command.Dispatch.WorkspaceID != store.snapshot.WorkspaceID ||
+		command.Dispatch.EffectID != effect.EffectID || command.Dispatch.InvocationID != effect.InvocationID ||
+		command.Dispatch.RequestDigest != effect.RequestDigest || command.Dispatch.Service != effect.Service ||
+		command.Dispatch.Operation != effect.Operation || command.Dispatch.DispatchAttempt != effect.DispatchAttempt ||
+		command.Dispatch.Generations != effect.Generations || command.Dispatch.ProviderRequestID != effect.LastDispatch.ProviderRequestID ||
+		command.Dispatch.ProviderRouteDigest != effect.LastDispatch.ProviderRouteDigest ||
+		!command.Dispatch.Deadline.Equal(effect.LastDispatch.Deadline) {
+		store.mu.Unlock()
+		return DispatchStartClaim{}, ErrFenceMismatch
+	}
+	store.eventSequence++
+	start := DispatchStartPermit{
+		Dispatch: command.Dispatch, Opaque: opaque(byte(command.Dispatch.DispatchAttempt + 40)),
+		CommandDigest: command.CommandDigest, EventSequence: store.eventSequence, Durable: !store.forceNonDurable,
+	}
+	dispatch := *effect.LastDispatch
+	dispatch.Start = &start
+	effect.LastDispatch = &dispatch
+	store.snapshot.EventSequence = store.eventSequence
+	store.dispatchStartTransitions++
+	response := start
+	if store.corruptDispatchStartReceipt != nil {
+		store.corruptDispatchStartReceipt(&response)
+	}
+	callback := store.afterFreshDispatchStartClaim
+	store.afterFreshDispatchStartClaim = nil
+	loseResponse := store.loseDispatchStartResponseOnce
+	store.loseDispatchStartResponseOnce = false
+	store.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
+	if loseResponse {
+		return DispatchStartClaim{}, errors.New("simulated response loss after dispatch start commit")
+	}
+	return DispatchStartClaim{Permit: response, Fresh: true}, nil
 }
 
 func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCommand) (EffectPreparationPermit, error) {
@@ -1256,6 +1356,16 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 	if store.snapshot.ActiveEffect == nil {
 		return EffectPreparationPermit{}, ErrInvalidEffectState
 	}
+	if store.snapshot.ActiveEffect.LastDispatch != nil && store.snapshot.ActiveEffect.LastDispatch.Start != nil {
+		return EffectPreparationPermit{}, ErrDispatchAlreadyStarted
+	}
+	if command.Snapshot.EventSequence != store.snapshot.EventSequence || command.Snapshot.Generations != store.snapshot.Generations ||
+		command.Snapshot.ActiveEffect == nil || command.Snapshot.ActiveEffect.DispatchAttempt != store.snapshot.ActiveEffect.DispatchAttempt {
+		return EffectPreparationPermit{}, ErrInvalidEffectState
+	}
+	if store.retryPreparedAttempt != 0 {
+		return EffectPreparationPermit{}, ErrEffectInFlight
+	}
 	store.prepareRetryTransitions++
 	store.eventSequence++
 	store.snapshot.EventSequence = store.eventSequence
@@ -1268,6 +1378,7 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 		DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt + 1, Deadline: command.Deadline, EventSequence: store.eventSequence, Durable: true,
 	}
 	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
+	store.retryPreparedAttempt = permit.DispatchAttempt
 	store.preparations[command.OperationKey] = storedPreparation{digest: command.OperationDigest, permit: permit}
 	if store.losePrepareRetryResponseOnce {
 		store.losePrepareRetryResponseOnce = false
@@ -1286,6 +1397,13 @@ func (store *fakeStore) SettleRecovery(ctx context.Context, command SettleRecove
 		return existing.receipt, nil
 	}
 	if store.snapshot.ActiveEffect == nil {
+		return SettlementReceipt{}, ErrInvalidEffectState
+	}
+	if command.Kind == RecoverySettlementInterrupted && store.snapshot.ActiveEffect.LastDispatch != nil && store.snapshot.ActiveEffect.LastDispatch.Start != nil {
+		return SettlementReceipt{}, ErrDispatchAlreadyStarted
+	}
+	if command.Snapshot.EventSequence != store.snapshot.EventSequence || command.Snapshot.Generations != store.snapshot.Generations ||
+		command.Snapshot.ActiveEffect == nil || command.Snapshot.ActiveEffect.DispatchAttempt != store.snapshot.ActiveEffect.DispatchAttempt {
 		return SettlementReceipt{}, ErrInvalidEffectState
 	}
 	store.eventSequence++
@@ -1384,6 +1502,13 @@ func (store *fakeStore) BlockEffect(ctx context.Context, command BlockCommand) (
 		return existing.receipt, nil
 	}
 	if store.snapshot.ActiveEffect == nil || store.snapshot.ActiveEffect.State != EffectDispatched {
+		return BlockReceipt{}, ErrInvalidEffectState
+	}
+	if store.snapshot.ActiveEffect.LastDispatch != nil && store.snapshot.ActiveEffect.LastDispatch.Start != nil {
+		return BlockReceipt{}, ErrDispatchAlreadyStarted
+	}
+	if command.Snapshot.EventSequence != store.snapshot.EventSequence || command.Snapshot.Generations != store.snapshot.Generations ||
+		command.Snapshot.ActiveEffect == nil || command.Snapshot.ActiveEffect.DispatchAttempt != store.snapshot.ActiveEffect.DispatchAttempt {
 		return BlockReceipt{}, ErrInvalidEffectState
 	}
 	store.eventSequence++

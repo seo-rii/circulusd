@@ -3,6 +3,7 @@ package broker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -224,7 +225,7 @@ func (coordinator *Coordinator) AdmitDispatch(ctx context.Context, request Dispa
 	if err := ctx.Err(); err != nil {
 		return DispatchPermit{}, err
 	}
-	if request.Now.IsZero() || request.Deadline.IsZero() || !request.Now.Before(request.Deadline) || request.Deadline.After(request.Authority.ExpiresAt) || request.OperationKey == "" || request.OperationDigest == (Digest{}) || request.RequestDigest == (Digest{}) || request.Operation == "" || !validService(request.Service) {
+	if request.Now.IsZero() || request.Deadline.IsZero() || !request.Now.Before(request.Deadline) || request.Deadline.After(request.Authority.ExpiresAt) || request.OperationKey == "" || request.OperationDigest == (Digest{}) || request.RequestDigest == (Digest{}) || request.ProviderRouteDigest == (Digest{}) || request.Operation == "" || !validService(request.Service) {
 		return DispatchPermit{}, ErrInvalidRequest
 	}
 	if request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
@@ -245,10 +246,10 @@ func (coordinator *Coordinator) AdmitDispatch(ctx context.Context, request Dispa
 		return DispatchPermit{}, fmt.Errorf("lookup dispatch receipt: %w", err)
 	}
 	if replay.Found {
-		if replay.Kind != OperationDispatch || replay.OperationDigest != request.OperationDigest || replay.Dispatch == nil || !replay.Dispatch.Durable || replay.Dispatch.EventSequence == 0 || replay.Dispatch.EffectKey != key || replay.Dispatch.Opaque == "" || replay.Dispatch.TenantID != snapshot.TenantID || replay.Dispatch.WorkspaceID != snapshot.WorkspaceID || replay.Dispatch.TenantID != request.PreparationPermit.TenantID || replay.Dispatch.WorkspaceID != request.PreparationPermit.WorkspaceID || replay.Dispatch.UserID != request.PreparationPermit.UserID || replay.Dispatch.Service != request.Service || replay.Dispatch.Operation != request.Operation || replay.Dispatch.ParentOperationID != request.PreparationPermit.ParentOperationID || replay.Dispatch.Ordinal != request.PreparationPermit.Ordinal || replay.Dispatch.ReplayPolicy != request.PreparationPermit.ReplayPolicy || replay.Dispatch.Generations != request.Authority.Generations || replay.Dispatch.DispatchAttempt != request.PreparationPermit.DispatchAttempt || replay.Dispatch.ProviderRequestID != request.ProviderRequestID || !replay.Dispatch.Deadline.Equal(request.Deadline) {
+		if replay.Kind != OperationDispatch || replay.OperationDigest != request.OperationDigest || replay.Dispatch == nil || !replay.Dispatch.Durable || replay.Dispatch.EventSequence == 0 || replay.Dispatch.EffectKey != key || replay.Dispatch.Opaque == "" || replay.Dispatch.TenantID != snapshot.TenantID || replay.Dispatch.WorkspaceID != snapshot.WorkspaceID || replay.Dispatch.TenantID != request.PreparationPermit.TenantID || replay.Dispatch.WorkspaceID != request.PreparationPermit.WorkspaceID || replay.Dispatch.UserID != request.PreparationPermit.UserID || replay.Dispatch.Service != request.Service || replay.Dispatch.Operation != request.Operation || replay.Dispatch.ParentOperationID != request.PreparationPermit.ParentOperationID || replay.Dispatch.Ordinal != request.PreparationPermit.Ordinal || replay.Dispatch.ReplayPolicy != request.PreparationPermit.ReplayPolicy || replay.Dispatch.Generations != request.Authority.Generations || replay.Dispatch.DispatchAttempt != request.PreparationPermit.DispatchAttempt || replay.Dispatch.ProviderRequestID != request.ProviderRequestID || replay.Dispatch.ProviderRouteDigest != request.ProviderRouteDigest || !replay.Dispatch.Deadline.Equal(request.Deadline) {
 			return DispatchPermit{}, fmt.Errorf("%w: invalid replayed dispatch receipt", ErrFenceMismatch)
 		}
-		if err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, *replay.Dispatch); err != nil {
+		if _, err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, *replay.Dispatch, false); err != nil {
 			return DispatchPermit{}, err
 		}
 		return *replay.Dispatch, nil
@@ -262,7 +263,7 @@ func (coordinator *Coordinator) AdmitDispatch(ctx context.Context, request Dispa
 	permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{
 		Snapshot: snapshot, Key: key, Service: request.Service, Operation: request.Operation, OperationKey: request.OperationKey,
 		OperationDigest: request.OperationDigest, PreparationPermit: request.PreparationPermit,
-		ProviderRequestID: request.ProviderRequestID, Now: request.Now, Deadline: request.Deadline,
+		ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline,
 	})
 	if err != nil {
 		return DispatchPermit{}, fmt.Errorf("mark effect dispatched: %w", err)
@@ -270,13 +271,85 @@ func (coordinator *Coordinator) AdmitDispatch(ctx context.Context, request Dispa
 	if !permit.Durable {
 		return DispatchPermit{}, ErrDurabilityBarrier
 	}
-	if permit.EffectKey != key || permit.Opaque == "" || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != request.Service || permit.Operation != request.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != request.PreparationPermit.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || !permit.Deadline.Equal(request.Deadline) {
+	if permit.EffectKey != key || permit.Opaque == "" || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != request.Service || permit.Operation != request.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != request.PreparationPermit.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || permit.ProviderRouteDigest != request.ProviderRouteDigest || !permit.Deadline.Equal(request.Deadline) {
 		return DispatchPermit{}, fmt.Errorf("%w: invalid dispatch permit", ErrFenceMismatch)
 	}
-	if err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, permit); err != nil {
+	if _, err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, permit, false); err != nil {
 		return DispatchPermit{}, err
 	}
 	return permit, nil
+}
+
+// ClaimDispatchStart durably consumes one exact dispatch attempt before any
+// provider I/O. The claim never expires or reopens; recovery must use an
+// external ledger instead of starting the same attempt again.
+func (coordinator *Coordinator) ClaimDispatchStart(ctx context.Context, request DispatchStartRequest) (DispatchStartClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return DispatchStartClaim{}, err
+	}
+	permit := request.Dispatch
+	if request.Now.IsZero() || request.CommandDigest == (Digest{}) || !validAuthorityRoute(request.Authority) ||
+		!permit.Durable || permit.Opaque == "" || permit.EventSequence == 0 || permit.TenantID.Kind() != identity.Tenant ||
+		permit.WorkspaceID.Kind() != identity.Workspace || permit.UserID.Kind() != identity.Subject ||
+		permit.SessionID.Kind() != identity.Session || permit.TurnID.Kind() != identity.Turn ||
+		permit.EffectID.Kind() != identity.Effect || permit.InvocationID.Kind() != identity.Invocation ||
+		permit.RequestDigest == (Digest{}) || permit.ProviderRouteDigest == (Digest{}) || !validService(permit.Service) || permit.Operation == "" ||
+		permit.DispatchAttempt == 0 || permit.Deadline.IsZero() || !request.Now.Before(permit.Deadline) ||
+		permit.ProviderRequestID != (identity.ID{}) && permit.ProviderRequestID.Kind() != identity.Request {
+		return DispatchStartClaim{}, ErrInvalidRequest
+	}
+	snapshot, effect, key, err := coordinator.readAndFenceEffect(
+		ctx,
+		request.Authority,
+		request.Now,
+		permit.EffectID,
+		permit.InvocationID,
+		permit.RequestDigest,
+		false,
+	)
+	if err != nil {
+		return DispatchStartClaim{}, err
+	}
+	if snapshot.AbortRequested || effect.State != EffectDispatched || effect.LastDispatch == nil {
+		return DispatchStartClaim{}, ErrInvalidEffectState
+	}
+	if err := validateDispatchPermitAgainstSnapshot(snapshot, effect, key, permit); err != nil {
+		return DispatchStartClaim{}, err
+	}
+	claim, err := coordinator.store.ClaimDispatchStart(ctx, ClaimDispatchStartCommand{
+		Snapshot: snapshot, Dispatch: permit, CommandDigest: request.CommandDigest, Now: request.Now,
+	})
+	if err != nil {
+		return DispatchStartClaim{}, fmt.Errorf("claim dispatch start: %w", err)
+	}
+	if claim.Permit.Opaque == "" || !claim.Permit.Durable || claim.Permit.EventSequence == 0 ||
+		claim.Permit.CommandDigest != request.CommandDigest || !sameDispatchPermit(claim.Permit.Dispatch, permit) {
+		return DispatchStartClaim{}, fmt.Errorf("%w: invalid dispatch start receipt", ErrFenceMismatch)
+	}
+	if effect.LastDispatch.Start != nil && claim.Fresh {
+		return DispatchStartClaim{}, fmt.Errorf("%w: invalid fresh dispatch start receipt", ErrFenceMismatch)
+	}
+	verificationContext, cancelVerification := context.WithDeadline(
+		context.WithoutCancel(ctx),
+		permit.Deadline,
+	)
+	defer cancelVerification()
+	persisted, err := coordinator.readExactDispatchStart(
+		verificationContext,
+		request.Authority,
+		request.Now,
+		effect,
+		key,
+	)
+	if err != nil {
+		return DispatchStartClaim{}, fmt.Errorf("validate persisted dispatch start: %w", err)
+	}
+	if !sameDispatchPermit(claim.Permit.Dispatch, persisted.Dispatch) || claim.Permit.Opaque != persisted.Opaque ||
+		claim.Permit.CommandDigest != persisted.CommandDigest || claim.Permit.EventSequence != persisted.EventSequence ||
+		claim.Permit.Durable != persisted.Durable {
+		return DispatchStartClaim{}, fmt.Errorf("%w: invalid dispatch start receipt", ErrFenceMismatch)
+	}
+	return claim, nil
 }
 
 func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, request ConfirmationRequest) (ConfirmationReceipt, error) {
@@ -316,7 +389,7 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	if effect.LastDispatch == nil || request.DispatchAttempt != effect.DispatchAttempt || request.DispatchAttempt != effect.LastDispatch.DispatchAttempt || request.ProviderRequestID != effect.LastDispatch.ProviderRequestID {
 		return ConfirmationReceipt{}, ErrFenceMismatch
 	}
-	lookup := LedgerLookup{EffectKey: key, TenantID: snapshot.TenantID, WorkspaceID: snapshot.WorkspaceID, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: request.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID}
+	lookup := LedgerLookup{EffectKey: key, TenantID: snapshot.TenantID, WorkspaceID: snapshot.WorkspaceID, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: request.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID, ProviderRouteDigest: effect.LastDispatch.ProviderRouteDigest}
 	record, err := coordinator.ledger.Lookup(ctx, lookup)
 	if err != nil {
 		return ConfirmationReceipt{}, fmt.Errorf("lookup invocation ledger: %w", err)
@@ -409,11 +482,15 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 	}
 	if dispatchReplay.Found {
 		permit := dispatchReplay.Dispatch
-		if dispatchReplay.Kind != OperationDispatch || dispatchReplay.OperationDigest != request.OperationDigest || permit == nil || !permit.Durable || permit.EventSequence == 0 || permit.EffectKey != requestedKey || permit.Opaque == "" || permit.TenantID != request.Authority.TenantID || permit.WorkspaceID != request.Authority.WorkspaceID || permit.UserID.Kind() != identity.Subject || permit.Generations != request.Authority.Generations || permit.DispatchAttempt == 0 || permit.ProviderRequestID != request.ProviderRequestID || !permit.Deadline.Equal(request.Deadline) || !validService(permit.Service) || !validReplayPolicy(permit.ReplayPolicy) || permit.Operation == "" {
+		if dispatchReplay.Kind != OperationDispatch || dispatchReplay.OperationDigest != request.OperationDigest || permit == nil || !permit.Durable || permit.EventSequence == 0 || permit.EffectKey != requestedKey || permit.Opaque == "" || permit.TenantID != request.Authority.TenantID || permit.WorkspaceID != request.Authority.WorkspaceID || permit.UserID.Kind() != identity.Subject || permit.Generations != request.Authority.Generations || permit.DispatchAttempt == 0 || permit.ProviderRequestID != request.ProviderRequestID || permit.ProviderRouteDigest == (Digest{}) || permit.ProviderRouteDigest != request.ProviderRouteDigest || !permit.Deadline.Equal(request.Deadline) || !validService(permit.Service) || !validReplayPolicy(permit.ReplayPolicy) || permit.Operation == "" {
 			return RecoveryDecision{}, fmt.Errorf("%w: invalid replayed recovery dispatch receipt", ErrFenceMismatch)
 		}
-		if err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, *permit); err != nil {
+		current, err := coordinator.validateCurrentDispatchReplay(ctx, request.Authority, request.Now, *permit, true)
+		if err != nil {
 			return RecoveryDecision{}, err
+		}
+		if current.LastDispatch.Start != nil {
+			return RecoveryDecision{Action: RecoveryWaitExternal, EffectKey: requestedKey, ReplayPolicy: permit.ReplayPolicy, DispatchAttempt: permit.DispatchAttempt}, nil
 		}
 		return RecoveryDecision{Action: RecoveryReplay, EffectKey: requestedKey, ReplayPolicy: permit.ReplayPolicy, DispatchAttempt: permit.DispatchAttempt, DispatchPermit: permit}, nil
 	}
@@ -479,6 +556,13 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		if snapshot.AbortRequested {
 			receipt, err := coordinator.store.SettleRecovery(ctx, SettleRecoveryCommand{Snapshot: snapshot, Key: key, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, Kind: RecoverySettlementInterrupted, Error: request.Reason})
 			if err != nil {
+				if errors.Is(err, ErrDispatchAlreadyStarted) {
+					if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+						return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+					}
+					decision.Action = RecoveryWaitExternal
+					return decision, nil
+				}
 				return RecoveryDecision{}, fmt.Errorf("settle aborted blocked effect: %w", err)
 			}
 			if !validRecoverySettlementReceipt(receipt, key, snapshot.TenantID, snapshot.WorkspaceID, effect.DispatchAttempt, request.OperationDigest, RecoverySettlementInterrupted, request.Reason) {
@@ -495,21 +579,28 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 			if !request.Now.Before(snapshot.LeaseExpiresAt) || request.Deadline.After(snapshot.LeaseExpiresAt) {
 				return RecoveryDecision{}, ErrLeaseExpired
 			}
-			if request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
+			if request.ProviderRouteDigest == (Digest{}) || request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
 				return RecoveryDecision{}, ErrInvalidRequest
 			}
 			preparation, err := coordinator.store.PrepareRetry(ctx, PrepareRetryCommand{Snapshot: snapshot, Key: key, OperationKey: request.OperationKey + ":prepare", OperationDigest: request.OperationDigest, Now: request.Now, Deadline: request.Deadline, UserConfirmed: true})
 			if err != nil {
+				if errors.Is(err, ErrDispatchAlreadyStarted) {
+					if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+						return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+					}
+					decision.Action = RecoveryWaitExternal
+					return decision, nil
+				}
 				return RecoveryDecision{}, fmt.Errorf("prepare confirmed retry: %w", err)
 			}
 			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, Now: request.Now, Deadline: request.Deadline})
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch confirmed retry: %w", err)
 			}
-			if permit.EffectKey != key || permit.Opaque == "" || !permit.Durable || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != effect.Service || permit.Operation != effect.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != preparation.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || !permit.Deadline.Equal(request.Deadline) {
+			if permit.EffectKey != key || permit.Opaque == "" || !permit.Durable || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != effect.Service || permit.Operation != effect.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != preparation.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || permit.ProviderRouteDigest != request.ProviderRouteDigest || !permit.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid confirmed retry permit", ErrFenceMismatch)
 			}
 			decision.Action = RecoveryReplay
@@ -523,7 +614,7 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		if coordinator.ledger == nil {
 			return RecoveryDecision{}, ErrLedgerUnavailable
 		}
-		lookup := LedgerLookup{EffectKey: decision.EffectKey, TenantID: snapshot.TenantID, WorkspaceID: snapshot.WorkspaceID, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: effect.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID}
+		lookup := LedgerLookup{EffectKey: decision.EffectKey, TenantID: snapshot.TenantID, WorkspaceID: snapshot.WorkspaceID, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: effect.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID, ProviderRouteDigest: effect.LastDispatch.ProviderRouteDigest}
 		record, err := coordinator.ledger.Lookup(ctx, lookup)
 		if err != nil {
 			return RecoveryDecision{}, fmt.Errorf("lookup invocation ledger for recovery: %w", err)
@@ -584,11 +675,22 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		if record.Status != LedgerAbsent && record.Status != LedgerUnknown {
 			return RecoveryDecision{}, fmt.Errorf("%w: invalid ledger status %q", ErrLedgerMismatch, record.Status)
 		}
+		if effect.LastDispatch.Start != nil {
+			decision.Action = RecoveryWaitExternal
+			return decision, nil
+		}
 		switch effect.ReplayPolicy {
 		case ReplaySafe, ReplayIdempotencyKey:
 			if snapshot.AbortRequested {
 				receipt, err := coordinator.store.SettleRecovery(ctx, SettleRecoveryCommand{Snapshot: snapshot, Key: key, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, Kind: RecoverySettlementInterrupted, Error: request.Reason})
 				if err != nil {
+					if errors.Is(err, ErrDispatchAlreadyStarted) {
+						if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+							return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+						}
+						decision.Action = RecoveryWaitExternal
+						return decision, nil
+					}
 					return RecoveryDecision{}, fmt.Errorf("settle aborted dispatched effect: %w", err)
 				}
 				if !validRecoverySettlementReceipt(receipt, key, snapshot.TenantID, snapshot.WorkspaceID, effect.DispatchAttempt, request.OperationDigest, RecoverySettlementInterrupted, request.Reason) {
@@ -604,21 +706,28 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 			if !request.Now.Before(snapshot.LeaseExpiresAt) || request.Deadline.After(snapshot.LeaseExpiresAt) {
 				return RecoveryDecision{}, ErrLeaseExpired
 			}
-			if request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
+			if request.ProviderRouteDigest == (Digest{}) || request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
 				return RecoveryDecision{}, ErrInvalidRequest
 			}
 			preparation, err := coordinator.store.PrepareRetry(ctx, PrepareRetryCommand{Snapshot: snapshot, Key: key, OperationKey: request.OperationKey + ":prepare", OperationDigest: request.OperationDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
+				if errors.Is(err, ErrDispatchAlreadyStarted) {
+					if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+						return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+					}
+					decision.Action = RecoveryWaitExternal
+					return decision, nil
+				}
 				return RecoveryDecision{}, fmt.Errorf("prepare effect retry: %w", err)
 			}
 			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, Now: request.Now, Deadline: request.Deadline})
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch effect retry: %w", err)
 			}
-			if permit.EffectKey != key || permit.Opaque == "" || !permit.Durable || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != effect.Service || permit.Operation != effect.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != preparation.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || !permit.Deadline.Equal(request.Deadline) {
+			if permit.EffectKey != key || permit.Opaque == "" || !permit.Durable || permit.EventSequence == 0 || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.Service != effect.Service || permit.Operation != effect.Operation || permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal || permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations || permit.DispatchAttempt != preparation.DispatchAttempt || permit.ProviderRequestID != request.ProviderRequestID || permit.ProviderRouteDigest != request.ProviderRouteDigest || !permit.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry dispatch permit", ErrFenceMismatch)
 			}
 			decision.Action = RecoveryReplay
@@ -627,6 +736,13 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		case ReplayNever:
 			receipt, err := coordinator.store.SettleRecovery(ctx, SettleRecoveryCommand{Snapshot: snapshot, Key: key, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, Kind: RecoverySettlementInterrupted, Error: request.Reason})
 			if err != nil {
+				if errors.Is(err, ErrDispatchAlreadyStarted) {
+					if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+						return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+					}
+					decision.Action = RecoveryWaitExternal
+					return decision, nil
+				}
 				return RecoveryDecision{}, fmt.Errorf("settle interrupted effect: %w", err)
 			}
 			if !validRecoverySettlementReceipt(receipt, key, snapshot.TenantID, snapshot.WorkspaceID, effect.DispatchAttempt, request.OperationDigest, RecoverySettlementInterrupted, request.Reason) {
@@ -637,6 +753,13 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 		case ReplayConfirm:
 			receipt, err := coordinator.store.BlockEffect(ctx, BlockCommand{Snapshot: snapshot, Key: decision.EffectKey, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, Reason: request.Reason})
 			if err != nil {
+				if errors.Is(err, ErrDispatchAlreadyStarted) {
+					if _, readErr := coordinator.readExactDispatchStart(ctx, request.Authority, request.Now, effect, key); readErr != nil {
+						return RecoveryDecision{}, fmt.Errorf("validate concurrent dispatch start: %w", readErr)
+					}
+					decision.Action = RecoveryWaitExternal
+					return decision, nil
+				}
 				return RecoveryDecision{}, fmt.Errorf("block uncertain effect: %w", err)
 			}
 			if !receipt.Durable {
@@ -656,7 +779,7 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 	}
 }
 
-func (coordinator *Coordinator) validateCurrentDispatchReplay(ctx context.Context, authority ValidatedTurnFence, now time.Time, permit DispatchPermit) error {
+func (coordinator *Coordinator) validateCurrentDispatchReplay(ctx context.Context, authority ValidatedTurnFence, now time.Time, permit DispatchPermit, allowClaimedAbort bool) (*EffectSnapshot, error) {
 	snapshot, effect, key, err := coordinator.readAndFenceEffect(
 		ctx,
 		authority,
@@ -667,28 +790,44 @@ func (coordinator *Coordinator) validateCurrentDispatchReplay(ctx context.Contex
 		false,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if snapshot.AbortRequested || effect.State != EffectDispatched || effect.LastDispatch == nil {
-		return ErrInvalidEffectState
+	if effect.State != EffectDispatched || effect.LastDispatch == nil ||
+		snapshot.AbortRequested && (!allowClaimedAbort || effect.LastDispatch.Start == nil) {
+		return nil, ErrInvalidEffectState
 	}
-	if permit.EffectKey != key ||
-		permit.TenantID != snapshot.TenantID ||
-		permit.WorkspaceID != snapshot.WorkspaceID ||
-		permit.UserID != snapshot.UserID ||
-		permit.Service != effect.Service ||
-		permit.Operation != effect.Operation ||
-		permit.ParentOperationID != effect.ParentOperationID ||
-		permit.Ordinal != effect.Ordinal ||
-		permit.ReplayPolicy != effect.ReplayPolicy ||
-		permit.Generations != snapshot.Generations ||
-		permit.DispatchAttempt != effect.DispatchAttempt ||
-		permit.DispatchAttempt != effect.LastDispatch.DispatchAttempt ||
-		permit.ProviderRequestID != effect.LastDispatch.ProviderRequestID ||
-		!permit.Deadline.Equal(effect.LastDispatch.Deadline) {
-		return ErrFenceMismatch
+	if err := validateDispatchPermitAgainstSnapshot(snapshot, effect, key, permit); err != nil {
+		return nil, err
 	}
-	return nil
+	return effect, nil
+}
+
+func (coordinator *Coordinator) readExactDispatchStart(ctx context.Context, authority ValidatedTurnFence, now time.Time, expected *EffectSnapshot, key EffectKey) (DispatchStartPermit, error) {
+	_, current, currentKey, err := coordinator.readAndFenceEffect(
+		ctx,
+		authority,
+		now,
+		key.EffectID,
+		key.InvocationID,
+		key.RequestDigest,
+		false,
+	)
+	if err != nil {
+		return DispatchStartPermit{}, err
+	}
+	if expected == nil || expected.LastDispatch == nil || currentKey != key || current.State != EffectDispatched ||
+		current.LastDispatch == nil || current.LastDispatch.Start == nil || current.Service != expected.Service ||
+		current.Operation != expected.Operation || current.ParentOperationID != expected.ParentOperationID ||
+		current.Ordinal != expected.Ordinal || current.ReplayPolicy != expected.ReplayPolicy ||
+		current.Generations != expected.Generations || current.DispatchAttempt != expected.DispatchAttempt ||
+		current.LastDispatch.DispatchAttempt != expected.LastDispatch.DispatchAttempt ||
+		current.LastDispatch.Generations != expected.LastDispatch.Generations ||
+		current.LastDispatch.ProviderRequestID != expected.LastDispatch.ProviderRequestID ||
+		current.LastDispatch.ProviderRouteDigest != expected.LastDispatch.ProviderRouteDigest ||
+		!current.LastDispatch.Deadline.Equal(expected.LastDispatch.Deadline) {
+		return DispatchStartPermit{}, ErrFenceMismatch
+	}
+	return *current.LastDispatch.Start, nil
 }
 
 func (coordinator *Coordinator) readAndFenceEffect(ctx context.Context, authority ValidatedTurnFence, now time.Time, effectID, invocationID identity.ID, requestDigest Digest, newAdmission bool) (TurnSnapshot, *EffectSnapshot, EffectKey, error) {
@@ -744,7 +883,7 @@ func (coordinator *Coordinator) readAndFenceEffect(ctx context.Context, authorit
 	default:
 		return TurnSnapshot{}, nil, EffectKey{}, ErrInvalidRequest
 	}
-	if effect.LastDispatch != nil && (effect.LastDispatch.DispatchAttempt == 0 || effect.LastDispatch.Generations != effect.Generations || effect.LastDispatch.Deadline.IsZero() || effect.LastDispatch.ProviderRequestID != (identity.ID{}) && effect.LastDispatch.ProviderRequestID.Kind() != identity.Request) {
+	if effect.LastDispatch != nil && (effect.LastDispatch.DispatchAttempt == 0 || effect.LastDispatch.Generations != effect.Generations || effect.LastDispatch.ProviderRouteDigest == (Digest{}) || effect.LastDispatch.Deadline.IsZero() || effect.LastDispatch.ProviderRequestID != (identity.ID{}) && effect.LastDispatch.ProviderRequestID.Kind() != identity.Request) {
 		return TurnSnapshot{}, nil, EffectKey{}, ErrInvalidRequest
 	}
 	if effect.EffectID != effectID || effect.InvocationID != invocationID || effect.RequestDigest != requestDigest {
@@ -754,7 +893,38 @@ func (coordinator *Coordinator) readAndFenceEffect(ctx context.Context, authorit
 		return TurnSnapshot{}, nil, EffectKey{}, ErrStaleGeneration
 	}
 	key := EffectKey{SessionID: snapshot.SessionID, TurnID: snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: requestDigest}
+	if effect.LastDispatch != nil && effect.LastDispatch.Start != nil {
+		start := effect.LastDispatch.Start
+		if start.Opaque == "" || !start.Durable || start.EventSequence == 0 || start.EventSequence > snapshot.EventSequence ||
+			start.CommandDigest == (Digest{}) || validateDispatchPermitAgainstSnapshot(snapshot, effect, key, start.Dispatch) != nil {
+			return TurnSnapshot{}, nil, EffectKey{}, ErrInvalidRequest
+		}
+	}
 	return snapshot, effect, key, nil
+}
+
+func validateDispatchPermitAgainstSnapshot(snapshot TurnSnapshot, effect *EffectSnapshot, key EffectKey, permit DispatchPermit) error {
+	if effect == nil || effect.LastDispatch == nil || !permit.Durable || permit.Opaque == "" || permit.EventSequence == 0 ||
+		permit.EffectKey != key || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID ||
+		permit.UserID != snapshot.UserID || permit.Service != effect.Service || permit.Operation != effect.Operation ||
+		permit.ParentOperationID != effect.ParentOperationID || permit.Ordinal != effect.Ordinal ||
+		permit.ReplayPolicy != effect.ReplayPolicy || permit.Generations != snapshot.Generations ||
+		permit.DispatchAttempt != effect.DispatchAttempt || permit.DispatchAttempt != effect.LastDispatch.DispatchAttempt ||
+		permit.ProviderRequestID != effect.LastDispatch.ProviderRequestID ||
+		permit.ProviderRouteDigest != effect.LastDispatch.ProviderRouteDigest || !permit.Deadline.Equal(effect.LastDispatch.Deadline) {
+		return ErrFenceMismatch
+	}
+	return nil
+}
+
+func sameDispatchPermit(left, right DispatchPermit) bool {
+	return left.EffectKey == right.EffectKey && left.Opaque == right.Opaque && left.TenantID == right.TenantID &&
+		left.WorkspaceID == right.WorkspaceID && left.UserID == right.UserID && left.Service == right.Service &&
+		left.Operation == right.Operation && left.ParentOperationID == right.ParentOperationID && left.Ordinal == right.Ordinal &&
+		left.ReplayPolicy == right.ReplayPolicy && left.Generations == right.Generations &&
+		left.DispatchAttempt == right.DispatchAttempt && left.ProviderRequestID == right.ProviderRequestID &&
+		left.ProviderRouteDigest == right.ProviderRouteDigest &&
+		left.Deadline.Equal(right.Deadline) && left.EventSequence == right.EventSequence && left.Durable == right.Durable
 }
 
 func validateTurn(snapshot TurnSnapshot, authority ValidatedTurnFence) error {
@@ -779,14 +949,15 @@ func validAuthorityRoute(authority ValidatedTurnFence) bool {
 }
 
 func validateLedgerRoute(record LedgerRecord, lookup LedgerLookup) error {
-	if record.TenantID != lookup.TenantID || record.WorkspaceID != lookup.WorkspaceID {
+	if record.TenantID != lookup.TenantID || record.WorkspaceID != lookup.WorkspaceID ||
+		record.ProviderRouteDigest != lookup.ProviderRouteDigest {
 		return ErrLedgerMismatch
 	}
 	return nil
 }
 
 func validateCommittedRecord(record LedgerRecord, lookup LedgerLookup) error {
-	if record.Status != LedgerCommitted || record.EffectID != lookup.EffectID || record.InvocationID != lookup.InvocationID || record.RequestDigest != lookup.RequestDigest || record.Service != lookup.Service || record.Operation != lookup.Operation || record.DispatchAttempt != lookup.DispatchAttempt || record.ProviderRequestID != lookup.ProviderRequestID || record.ExternalCommitID.Kind() != identity.Commit || record.ResultRef != (identity.ID{}) && record.ResultRef.Kind() != identity.Artifact {
+	if record.Status != LedgerCommitted || record.EffectID != lookup.EffectID || record.InvocationID != lookup.InvocationID || record.RequestDigest != lookup.RequestDigest || record.Service != lookup.Service || record.Operation != lookup.Operation || record.DispatchAttempt != lookup.DispatchAttempt || record.ProviderRequestID != lookup.ProviderRequestID || record.ProviderRouteDigest != lookup.ProviderRouteDigest || record.ExternalCommitID.Kind() != identity.Commit || record.ResultRef != (identity.ID{}) && record.ResultRef.Kind() != identity.Artifact {
 		return ErrLedgerMismatch
 	}
 	return nil

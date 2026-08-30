@@ -77,13 +77,13 @@ func TestDispatchAndRecoveryBindOpaqueAttemptProviderAndDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AdmitDispatch() error = %v", err)
 	}
-	if permit.Opaque == "" || permit.DispatchAttempt != 1 || permit.ProviderRequestID != providerID || !permit.Deadline.Equal(request.Deadline) {
+	if permit.Opaque == "" || permit.DispatchAttempt != 1 || permit.ProviderRequestID != providerID || permit.ProviderRouteDigest != request.ProviderRouteDigest || !permit.Deadline.Equal(request.Deadline) {
 		t.Fatalf("dispatch permit did not bind opaque attempt/provider/deadline: %#v", permit)
 	}
 
 	decision, err := coordinator.RecoverEffect(context.Background(), RecoveryRequest{
 		Authority: baseAuthority(now), Now: now.Add(time.Second), Deadline: now.Add(2 * time.Minute),
-		ProviderRequestID: mustID(identity.Request, "Q"), EffectID: effectID, InvocationID: invocationID,
+		ProviderRequestID: mustID(identity.Request, "Q"), ProviderRouteDigest: digest(152), EffectID: effectID, InvocationID: invocationID,
 		RequestDigest: digest(2), OperationKey: "retry-attempt-2", OperationDigest: digest(72),
 	})
 	if err != nil {
@@ -563,6 +563,7 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 			{name: "operation", mutate: func(record *LedgerRecord) { record.Operation = "write" }},
 			{name: "attempt", mutate: func(record *LedgerRecord) { record.DispatchAttempt++ }},
 			{name: "provider request", mutate: func(record *LedgerRecord) { record.ProviderRequestID = mustID(identity.Request, "wrong-provider") }},
+			{name: "provider route", mutate: func(record *LedgerRecord) { record.ProviderRouteDigest = digest(158) }},
 		} {
 			t.Run(string(status)+"/"+mismatch.name, func(t *testing.T) {
 				snapshot := baseSnapshot(now)
@@ -572,7 +573,7 @@ func TestRecoveryRejectsMismatchedInflightAndFailedLedgerProofs(t *testing.T) {
 					Status: status, TenantID: tenantID, WorkspaceID: workspaceID,
 					EffectID: effectID, InvocationID: invocationID,
 					RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
-					ProviderRequestID: mustID(identity.Request, "R"),
+					ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152),
 				}
 				mismatch.mutate(&record)
 				decision, err := mustCoordinator(t, store, &fakeLedger{record: record}).RecoverEffect(
@@ -601,6 +602,7 @@ func TestRecoveryRejectsMismatchedAbsentAndUnknownLedgerRoutes(t *testing.T) {
 		}{
 			{name: "tenant", mutate: func(record *LedgerRecord) { record.TenantID = mustID(identity.Tenant, "wrong-tenant") }},
 			{name: "workspace", mutate: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "wrong-workspace") }},
+			{name: "provider route", mutate: func(record *LedgerRecord) { record.ProviderRouteDigest = digest(159) }},
 		} {
 			t.Run(string(status)+"/"+mismatch.name, func(t *testing.T) {
 				snapshot := baseSnapshot(now)
@@ -853,7 +855,7 @@ func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 			Status: LedgerFailed, TenantID: tenantID, WorkspaceID: workspaceID,
 			EffectID: effectID, InvocationID: invocationID,
 			RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
-			ProviderRequestID: mustID(identity.Request, "R"),
+			ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152),
 		}}).RecoverEffect(context.Background(), baseRecoveryRequest(now, "receipt-recovery-identity"))
 		if !errors.Is(err, ErrFenceMismatch) {
 			t.Fatalf("RecoverEffect() error = %v, want %v", err, ErrFenceMismatch)
