@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,7 +182,7 @@ func TestMutationReceiptReplaySurvivesLaterStateProgress(t *testing.T) {
 		snapshot.ActiveEffect = baseEffect(EffectDispatched)
 		store := newFakeStore(snapshot)
 		coordinator := mustCoordinator(t, store, &fakeLedger{record: committedRecord()})
-		confirmationRequest := ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, OperationKey: "lost-confirm", OperationDigest: digest(75)}
+		confirmationRequest := ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "lost-confirm", OperationDigest: digest(75)}
 		confirmation, err := coordinator.ConfirmExternalCommit(context.Background(), confirmationRequest)
 		if err != nil {
 			t.Fatalf("first ConfirmExternalCommit() error = %v", err)
@@ -194,7 +195,7 @@ func TestMutationReceiptReplaySurvivesLaterStateProgress(t *testing.T) {
 		store.mu.Lock()
 		store.snapshot.ActiveEffect = nil
 		store.mu.Unlock()
-		replayedConfirmation, confirmationErr := coordinator.ConfirmExternalCommit(context.Background(), confirmationRequest)
+		replayedConfirmation, confirmationErr := mustCoordinator(t, store, nil).ConfirmExternalCommit(context.Background(), confirmationRequest)
 		replayedSettlement, settlementErr := coordinator.SettleEffect(context.Background(), settlementRequest)
 		if confirmationErr != nil || replayedConfirmation != confirmation {
 			t.Fatalf("confirmation replay = %#v, %v; want %#v", replayedConfirmation, confirmationErr, confirmation)
@@ -203,6 +204,136 @@ func TestMutationReceiptReplaySurvivesLaterStateProgress(t *testing.T) {
 			t.Fatalf("settlement replay = %#v, %v; want %#v", replayedSettlement, settlementErr, settlement)
 		}
 	})
+}
+
+func TestConfirmationReplayRejectsForeignEffectDomain(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_900_000_425, 0).UTC()
+	for _, mismatch := range []struct {
+		name   string
+		mutate func(*ConfirmationReceipt)
+	}{
+		{name: "service", mutate: func(receipt *ConfirmationReceipt) { receipt.Service = ServiceWorkspace }},
+		{name: "operation", mutate: func(receipt *ConfirmationReceipt) { receipt.Operation = "write" }},
+		{name: "provider request", mutate: func(receipt *ConfirmationReceipt) {
+			receipt.ProviderRequestID = mustID(identity.Request, "wrong-provider")
+		}},
+		{name: "operation digest", mutate: func(receipt *ConfirmationReceipt) { receipt.OperationDigest = digest(78) }},
+		{name: "result kind", mutate: func(receipt *ConfirmationReceipt) { receipt.ResultRef = sessionID }},
+	} {
+		t.Run(mismatch.name, func(t *testing.T) {
+			store := newFakeStore(baseSnapshot(now))
+			receipt := ConfirmationReceipt{
+				EffectKey: EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+				Service:   ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID, OperationDigest: digest(77), EventSequence: 8, Durable: true,
+			}
+			mismatch.mutate(&receipt)
+			store.confirmations["foreign-confirmation"] = receipt
+			store.confirmationDigests["foreign-confirmation"] = digest(77)
+			ledger := &fakeLedger{record: committedRecord()}
+			_, err := mustCoordinator(t, store, ledger).ConfirmExternalCommit(context.Background(), ConfirmationRequest{
+				Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
+				Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "foreign-confirmation", OperationDigest: digest(77),
+			})
+			if !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrFenceMismatch)
+			}
+			ledger.mu.Lock()
+			ledgerLookups := len(ledger.lookups)
+			ledger.mu.Unlock()
+			if ledgerLookups != 0 {
+				t.Fatalf("ledger lookups = %d, want 0", ledgerLookups)
+			}
+			store.mu.Lock()
+			transitions := store.markExternalTransitions
+			store.mu.Unlock()
+			if transitions != 0 {
+				t.Fatalf("external commit transitions = %d, want 0", transitions)
+			}
+		})
+	}
+}
+
+func TestConfirmationReplayRejectsZeroDispatchAttempt(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_900_000_426, 0).UTC()
+	store := newFakeStore(baseSnapshot(now))
+	store.confirmations["zero-attempt-confirmation"] = ConfirmationReceipt{
+		EffectKey: EffectKey{SessionID: sessionID, TurnID: turnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2)},
+		Service:   ServiceExecutor, Operation: "run", ProviderRequestID: mustID(identity.Request, "R"), ExternalCommitID: commitID, ResultRef: resultID, OperationDigest: digest(79), EventSequence: 8, Durable: true,
+	}
+	store.confirmationDigests["zero-attempt-confirmation"] = digest(79)
+	_, err := mustCoordinator(t, store, &fakeLedger{record: committedRecord()}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{
+		Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
+		Service: ServiceExecutor, Operation: "run", ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "zero-attempt-confirmation", OperationDigest: digest(79),
+	})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrInvalidRequest)
+	}
+}
+
+func TestConcurrentConfirmationDigestConflictTransitionsOnce(t *testing.T) {
+	t.Parallel()
+	const callers = 64
+	now := time.Unix(1_900_000_427, 0).UTC()
+	snapshot := baseSnapshot(now)
+	snapshot.ActiveEffect = baseEffect(EffectDispatched)
+	store := newFakeStore(snapshot)
+	coordinator := mustCoordinator(t, store, &fakeLedger{record: committedRecord()})
+	digests := [2]Digest{digest(80), digest(81)}
+	type outcome struct {
+		digest  Digest
+		receipt ConfirmationReceipt
+		err     error
+	}
+	outcomes := make(chan outcome, callers)
+	var wait sync.WaitGroup
+	for index := 0; index < callers; index++ {
+		operationDigest := digests[index%len(digests)]
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			receipt, err := coordinator.ConfirmExternalCommit(context.Background(), ConfirmationRequest{
+				Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
+				Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "concurrent-confirmation", OperationDigest: operationDigest,
+			})
+			outcomes <- outcome{digest: operationDigest, receipt: receipt, err: err}
+		}()
+	}
+	wait.Wait()
+	close(outcomes)
+
+	var winningDigest Digest
+	successes := 0
+	conflicts := 0
+	for result := range outcomes {
+		if result.err == nil {
+			successes++
+			if result.receipt.OperationDigest != result.digest {
+				t.Errorf("successful receipt digest = %x, want %x", result.receipt.OperationDigest, result.digest)
+			}
+			if winningDigest == (Digest{}) {
+				winningDigest = result.digest
+			} else if winningDigest != result.digest {
+				t.Errorf("multiple winning digests: %x and %x", winningDigest, result.digest)
+			}
+			continue
+		}
+		if errors.Is(result.err, ErrIdempotencyConflict) {
+			conflicts++
+			continue
+		}
+		t.Errorf("unexpected confirmation error: %v", result.err)
+	}
+	if successes != callers/2 || conflicts != callers/2 {
+		t.Fatalf("confirmation outcomes: success=%d conflict=%d, want %d each", successes, conflicts, callers/2)
+	}
+	store.mu.Lock()
+	transitions := store.markExternalTransitions
+	store.mu.Unlock()
+	if transitions != 1 {
+		t.Fatalf("external commit transitions = %d, want 1", transitions)
+	}
 }
 
 func TestDispatchCapabilityReplayRejectsStateProgressAbortAndGenerationRotation(t *testing.T) {
@@ -425,7 +556,7 @@ func TestEveryDurableReceiptRejectsZeroEventSequence(t *testing.T) {
 		snapshot.ActiveEffect = baseEffect(EffectDispatched)
 		store := newFakeStore(snapshot)
 		store.zeroConfirmationEvent = true
-		_, err := mustCoordinator(t, store, &fakeLedger{record: committedRecord()}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, OperationKey: "zero-confirm", OperationDigest: digest(80)})
+		_, err := mustCoordinator(t, store, &fakeLedger{record: committedRecord()}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "zero-confirm", OperationDigest: digest(80)})
 		if !errors.Is(err, ErrFenceMismatch) {
 			t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrFenceMismatch)
 		}
@@ -492,6 +623,21 @@ func TestEngineStepPermitCarriesOpaqueFullFenceAndDeadline(t *testing.T) {
 func TestDurableMutationReceiptsBindStateAttemptAndOperation(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(1_800_002_800, 0).UTC()
+
+	t.Run("confirmation effect domain", func(t *testing.T) {
+		snapshot := baseSnapshot(now)
+		snapshot.ActiveEffect = baseEffect(EffectDispatched)
+		store := newFakeStore(snapshot)
+		store.corruptExternalReceiptDomain = true
+		_, err := mustCoordinator(t, store, &fakeLedger{record: committedRecord()}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{
+			Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID,
+			RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"),
+			OperationKey: "receipt-confirmation-domain", OperationDigest: digest(100),
+		})
+		if !errors.Is(err, ErrFenceMismatch) {
+			t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrFenceMismatch)
+		}
+	})
 
 	t.Run("settlement", func(t *testing.T) {
 		snapshot := baseSnapshot(now)
@@ -566,7 +712,7 @@ func TestExternalCommitAndSettlementFenceTheExactDispatchAttempt(t *testing.T) {
 	staleLedger := committedRecord()
 	staleLedger.DispatchAttempt = 1
 	coordinator := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: staleLedger})
-	_, err := coordinator.ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 2, OperationKey: "stale-ledger-attempt", OperationDigest: digest(84)})
+	_, err := coordinator.ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 2, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "stale-ledger-attempt", OperationDigest: digest(84)})
 	if !errors.Is(err, ErrLedgerMismatch) {
 		t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrLedgerMismatch)
 	}
@@ -575,7 +721,7 @@ func TestExternalCommitAndSettlementFenceTheExactDispatchAttempt(t *testing.T) {
 	providerMismatch.ActiveEffect = baseEffect(EffectDispatched)
 	wrongProviderLedger := committedRecord()
 	wrongProviderLedger.ProviderRequestID = mustID(identity.Request, "wrong-provider")
-	_, err = mustCoordinator(t, newFakeStore(providerMismatch), &fakeLedger{record: wrongProviderLedger}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, OperationKey: "wrong-ledger-provider", OperationDigest: digest(102)})
+	_, err = mustCoordinator(t, newFakeStore(providerMismatch), &fakeLedger{record: wrongProviderLedger}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "wrong-ledger-provider", OperationDigest: digest(102)})
 	if !errors.Is(err, ErrLedgerMismatch) {
 		t.Fatalf("provider-mismatched ConfirmExternalCommit() error = %v, want %v", err, ErrLedgerMismatch)
 	}

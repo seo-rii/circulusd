@@ -398,7 +398,7 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 
 	receipt, err := coordinator.ConfirmExternalCommit(context.Background(), ConfirmationRequest{
 		Authority: baseAuthority(now), Now: now.Add(time.Second), EffectID: effectID,
-		InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, OperationKey: "confirm-1", OperationDigest: digest(91),
+		InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "confirm-1", OperationDigest: digest(91),
 	})
 	if err != nil {
 		t.Fatalf("ConfirmExternalCommit() error = %v", err)
@@ -439,12 +439,33 @@ func TestConfirmExternalCommitRequiresExactLedgerProof(t *testing.T) {
 			underTest := mustCoordinator(t, fresh, &fakeLedger{record: badRecord})
 			_, err := underTest.ConfirmExternalCommit(context.Background(), ConfirmationRequest{
 				Authority: baseAuthority(now), Now: now.Add(time.Second), EffectID: effectID,
-				InvocationID: invocationID, RequestDigest: digest(2), DispatchAttempt: 1, OperationKey: "bad-proof", OperationDigest: digest(92),
+				InvocationID: invocationID, RequestDigest: digest(2), Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, ProviderRequestID: mustID(identity.Request, "R"), OperationKey: "bad-proof", OperationDigest: digest(92),
 			})
 			if !errors.Is(err, ErrLedgerMismatch) {
 				t.Fatalf("ConfirmExternalCommit() error = %v, want %v", err, ErrLedgerMismatch)
 			}
 		})
+	}
+}
+
+func TestConfirmExternalCommitAllowsAbsentProviderRequestIdentity(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_525, 0).UTC()
+	snapshot := baseSnapshot(now)
+	snapshot.ActiveEffect = baseEffect(EffectDispatched)
+	snapshot.ActiveEffect.LastDispatch.ProviderRequestID = identity.ID{}
+	record := committedRecord()
+	record.ProviderRequestID = identity.ID{}
+
+	receipt, err := mustCoordinator(t, newFakeStore(snapshot), &fakeLedger{record: record}).ConfirmExternalCommit(context.Background(), ConfirmationRequest{
+		Authority: baseAuthority(now), Now: now, EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
+		Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1, OperationKey: "confirm-without-provider", OperationDigest: digest(93),
+	})
+	if err != nil {
+		t.Fatalf("ConfirmExternalCommit() error = %v", err)
+	}
+	if receipt.ProviderRequestID != (identity.ID{}) || receipt.OperationDigest != digest(93) {
+		t.Fatalf("confirmation receipt = %#v", receipt)
 	}
 }
 
@@ -824,6 +845,7 @@ type fakeStore struct {
 	eventSequence                      uint64
 	forceNonDurable                    bool
 	corruptExternalReceipt             bool
+	corruptExternalReceiptDomain       bool
 	corruptBlockReceipt                bool
 	corruptPreparedReceipt             bool
 	corruptSettlementIdentity          bool
@@ -1148,6 +1170,9 @@ func (store *fakeStore) MarkExternallyCommitted(ctx context.Context, command Mar
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if existing, found := store.confirmations[command.OperationKey]; found {
+		if store.confirmationDigests[command.OperationKey] != command.OperationDigest {
+			return ConfirmationReceipt{}, ErrIdempotencyConflict
+		}
 		return existing, nil
 	}
 	if store.snapshot.ActiveEffect == nil || (store.snapshot.ActiveEffect.State != EffectDispatched && store.snapshot.ActiveEffect.State != EffectBlocked) {
@@ -1159,12 +1184,15 @@ func (store *fakeStore) MarkExternallyCommitted(ctx context.Context, command Mar
 	store.snapshot.ActiveEffect.ResultRef = command.Record.ResultRef
 	store.snapshot.EventSequence = store.eventSequence
 	store.markExternalTransitions++
-	receipt := ConfirmationReceipt{EffectKey: command.Key, DispatchAttempt: command.DispatchAttempt, ExternalCommitID: command.Record.ExternalCommitID, ResultRef: command.Record.ResultRef, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+	receipt := ConfirmationReceipt{EffectKey: command.Key, Service: command.Record.Service, Operation: command.Record.Operation, DispatchAttempt: command.DispatchAttempt, ProviderRequestID: command.Record.ProviderRequestID, ExternalCommitID: command.Record.ExternalCommitID, ResultRef: command.Record.ResultRef, OperationDigest: command.OperationDigest, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
 	if store.zeroConfirmationEvent {
 		receipt.EventSequence = 0
 	}
 	if store.corruptExternalReceipt {
 		receipt.EffectID = mustID(identity.Effect, "Z")
+	}
+	if store.corruptExternalReceiptDomain {
+		receipt.Operation = "write"
 	}
 	store.confirmations[command.OperationKey] = receipt
 	store.confirmationDigests[command.OperationKey] = command.OperationDigest

@@ -277,10 +277,7 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	if err := ctx.Err(); err != nil {
 		return ConfirmationReceipt{}, err
 	}
-	if coordinator.ledger == nil {
-		return ConfirmationReceipt{}, ErrLedgerUnavailable
-	}
-	if request.Now.IsZero() || request.OperationKey == "" || request.OperationDigest == (Digest{}) || request.RequestDigest == (Digest{}) {
+	if request.Now.IsZero() || request.OperationKey == "" || request.OperationDigest == (Digest{}) || request.RequestDigest == (Digest{}) || !validService(request.Service) || request.Operation == "" || request.DispatchAttempt == 0 || request.ProviderRequestID != (identity.ID{}) && request.ProviderRequestID.Kind() != identity.Request {
 		return ConfirmationReceipt{}, ErrInvalidRequest
 	}
 	replay, err := coordinator.store.LookupOperation(ctx, OperationLookup{Kind: OperationConfirmation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, SessionID: request.Authority.SessionID})
@@ -289,10 +286,13 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	}
 	if replay.Found {
 		key := EffectKey{SessionID: request.Authority.SessionID, TurnID: request.Authority.TurnID, EffectID: request.EffectID, InvocationID: request.InvocationID, RequestDigest: request.RequestDigest}
-		if replay.Kind != OperationConfirmation || replay.OperationDigest != request.OperationDigest || replay.Confirmation == nil || !replay.Confirmation.Durable || replay.Confirmation.EventSequence == 0 || replay.Confirmation.EffectKey != key || replay.Confirmation.DispatchAttempt != request.DispatchAttempt || replay.Confirmation.ExternalCommitID.Kind() != identity.Commit {
+		if replay.Kind != OperationConfirmation || replay.OperationDigest != request.OperationDigest || replay.Confirmation == nil || !replay.Confirmation.Durable || replay.Confirmation.EventSequence == 0 || replay.Confirmation.EffectKey != key || replay.Confirmation.Service != request.Service || replay.Confirmation.Operation != request.Operation || replay.Confirmation.DispatchAttempt != request.DispatchAttempt || replay.Confirmation.ProviderRequestID != request.ProviderRequestID || replay.Confirmation.ExternalCommitID.Kind() != identity.Commit || replay.Confirmation.ResultRef != (identity.ID{}) && replay.Confirmation.ResultRef.Kind() != identity.Artifact || replay.Confirmation.OperationDigest != request.OperationDigest {
 			return ConfirmationReceipt{}, fmt.Errorf("%w: invalid replayed confirmation receipt", ErrFenceMismatch)
 		}
 		return *replay.Confirmation, nil
+	}
+	if coordinator.ledger == nil {
+		return ConfirmationReceipt{}, ErrLedgerUnavailable
 	}
 	snapshot, effect, key, err := coordinator.readAndFenceEffect(ctx, request.Authority, request.Now, request.EffectID, request.InvocationID, request.RequestDigest, false)
 	if err != nil {
@@ -301,7 +301,10 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	if effect.State != EffectDispatched && effect.State != EffectBlocked && effect.State != EffectExternallyCommitted {
 		return ConfirmationReceipt{}, ErrInvalidEffectState
 	}
-	if request.DispatchAttempt == 0 || effect.LastDispatch == nil || request.DispatchAttempt != effect.DispatchAttempt || request.DispatchAttempt != effect.LastDispatch.DispatchAttempt {
+	if request.Service != effect.Service || request.Operation != effect.Operation {
+		return ConfirmationReceipt{}, ErrFenceMismatch
+	}
+	if effect.LastDispatch == nil || request.DispatchAttempt != effect.DispatchAttempt || request.DispatchAttempt != effect.LastDispatch.DispatchAttempt || request.ProviderRequestID != effect.LastDispatch.ProviderRequestID {
 		return ConfirmationReceipt{}, ErrFenceMismatch
 	}
 	lookup := LedgerLookup{EffectKey: key, Service: effect.Service, Operation: effect.Operation, DispatchAttempt: request.DispatchAttempt, ProviderRequestID: effect.LastDispatch.ProviderRequestID}
@@ -321,7 +324,7 @@ func (coordinator *Coordinator) ConfirmExternalCommit(ctx context.Context, reque
 	if !receipt.Durable {
 		return ConfirmationReceipt{}, ErrDurabilityBarrier
 	}
-	if err := validateConfirmationReceipt(receipt, key, record); err != nil {
+	if err := validateConfirmationReceipt(receipt, key, record, request.OperationDigest); err != nil {
 		return ConfirmationReceipt{}, err
 	}
 	return receipt, nil
@@ -520,7 +523,7 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 			if !receipt.Durable {
 				return RecoveryDecision{}, ErrDurabilityBarrier
 			}
-			if err := validateConfirmationReceipt(receipt, decision.EffectKey, record); err != nil {
+			if err := validateConfirmationReceipt(receipt, decision.EffectKey, record, request.OperationDigest); err != nil {
 				return RecoveryDecision{}, err
 			}
 			decision.Action = RecoverySettleOnly
@@ -756,8 +759,8 @@ func validateCommittedRecord(record LedgerRecord, lookup LedgerLookup) error {
 	return nil
 }
 
-func validateConfirmationReceipt(receipt ConfirmationReceipt, key EffectKey, record LedgerRecord) error {
-	if receipt.EventSequence == 0 || receipt.EffectKey != key || receipt.DispatchAttempt != record.DispatchAttempt || receipt.ExternalCommitID != record.ExternalCommitID || receipt.ResultRef != record.ResultRef {
+func validateConfirmationReceipt(receipt ConfirmationReceipt, key EffectKey, record LedgerRecord, operationDigest Digest) error {
+	if receipt.EventSequence == 0 || receipt.EffectKey != key || receipt.Service != record.Service || receipt.Operation != record.Operation || receipt.DispatchAttempt != record.DispatchAttempt || receipt.ProviderRequestID != record.ProviderRequestID || receipt.ExternalCommitID != record.ExternalCommitID || receipt.ResultRef != record.ResultRef || receipt.OperationDigest != operationDigest {
 		return fmt.Errorf("%w: invalid external commit receipt", ErrFenceMismatch)
 	}
 	return nil

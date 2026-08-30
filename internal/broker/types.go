@@ -292,23 +292,30 @@ type SettlementReceipt struct {
 }
 
 type ConfirmationRequest struct {
-	Authority       ValidatedTurnFence
-	Now             time.Time
-	EffectID        identity.ID
-	InvocationID    identity.ID
-	RequestDigest   Digest
-	DispatchAttempt uint64
-	OperationKey    string
-	OperationDigest Digest
+	Authority         ValidatedTurnFence
+	Now               time.Time
+	EffectID          identity.ID
+	InvocationID      identity.ID
+	RequestDigest     Digest
+	Service           EffectService
+	Operation         string
+	DispatchAttempt   uint64
+	ProviderRequestID identity.ID
+	OperationKey      string
+	OperationDigest   Digest
 }
 
 type ConfirmationReceipt struct {
 	EffectKey
-	DispatchAttempt  uint64
-	ExternalCommitID identity.ID
-	ResultRef        identity.ID
-	EventSequence    uint64
-	Durable          bool
+	Service           EffectService
+	Operation         string
+	DispatchAttempt   uint64
+	ProviderRequestID identity.ID
+	ExternalCommitID  identity.ID
+	ResultRef         identity.ID
+	OperationDigest   Digest
+	EventSequence     uint64
+	Durable           bool
 }
 
 type LedgerStatus string
