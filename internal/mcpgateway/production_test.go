@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/dependency"
+	releasecontract "github.com/hancomac/circulusd/internal/release/contracttest"
 )
 
 func TestProductionGatewayRejectsProbeVerifiedButUnsealedOperationalGraph(t *testing.T) {
@@ -241,13 +242,17 @@ func newMCPProductionProofs(t *testing.T, domain string, groups []dependency.Ato
 
 func verifyMCPProduction[T dependency.ProductionProbe](t *testing.T, proofs mcpProductionProofs, adapter T) dependency.Verified[T] {
 	t.Helper()
-	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, adapter, proofs.evidence, dependency.Requirements{
-		BackendKind: proofs.descriptor.BackendKind, BuildDigest: proofs.descriptor.BuildDigest,
-		ApplicationDigest: proofs.descriptor.ApplicationDigest, InstanceID: proofs.descriptor.InstanceID,
+	artifacts := releasecontract.StateArtifactDigests(t, proofs.descriptor.BuildDigest, proofs.descriptor.ApplicationDigest)
+	requirements, err := dependency.NewProductionRequirements(artifacts, dependency.ProductionRequirementsConfig{
+		InstanceID:           proofs.descriptor.InstanceID,
 		TransactionDomainID:  proofs.descriptor.TransactionDomainID,
 		RequiredAtomicGroups: append([]dependency.AtomicGroup(nil), proofs.descriptor.AtomicGroups...),
 		MinimumProbeEpoch:    proofs.descriptor.ProbeEpoch, MaximumEvidenceAge: time.Hour,
 	})
+	if err != nil {
+		t.Fatalf("NewProductionRequirements() error=%v", err)
+	}
+	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, adapter, proofs.evidence, requirements)
 	if err != nil {
 		t.Fatalf("VerifyDependency() error=%v", err)
 	}

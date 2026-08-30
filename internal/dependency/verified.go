@@ -129,6 +129,7 @@ type Requirements struct {
 	RequiredAtomicGroups []AtomicGroup
 	MinimumProbeEpoch    uint64
 	MaximumEvidenceAge   time.Duration
+	seal                 *productionRequirementsSeal
 }
 
 type VerifierConfig struct {
@@ -235,6 +236,10 @@ func VerifyDependency[T ProductionProbe](
 	if verifier == nil || len(verifier.conformanceRoots) == 0 || len(verifier.runtimeRoots) == 0 || verifier.clock == nil || interfaceNil(verifier.entropy) || interfaceNil(productionDependency) {
 		return Verified[T]{}, ErrInvalidConfiguration
 	}
+	requirements.RequiredAtomicGroups = append([]AtomicGroup(nil), requirements.RequiredAtomicGroups...)
+	if err := validateRequirements(requirements); err != nil {
+		return Verified[T]{}, err
+	}
 
 	evidenceDigest, err := verifier.verifyEvidence(evidence, requirements)
 	if err != nil {
@@ -332,9 +337,6 @@ func (verifier *Verifier) verifyEvidence(evidence Evidence, requirements Require
 	root, trusted := verifier.conformanceRoots[evidence.KeyID]
 	if !trusted || !ed25519.Verify(root, []byte(digest), evidence.Signature) {
 		return "", ErrUnverifiedDependency
-	}
-	if err := validateRequirements(requirements); err != nil {
-		return "", err
 	}
 	now := verifier.clock().Unix()
 	if now < evidence.IssuedAtUnix || now >= evidence.ExpiresAtUnix || time.Duration(now-evidence.IssuedAtUnix)*time.Second > requirements.MaximumEvidenceAge {
@@ -439,10 +441,22 @@ func validateDescriptor(descriptor Descriptor) error {
 }
 
 func validateRequirements(requirements Requirements) error {
+	if err := validateRequirementsShape(requirements); err != nil || requirements.seal == nil {
+		return ErrInvalidConfiguration
+	}
+	digest, err := productionRequirementsDigest(requirements)
+	if err != nil || digest != requirements.seal.digest {
+		return ErrInvalidConfiguration
+	}
+	return nil
+}
+
+func validateRequirementsShape(requirements Requirements) error {
 	if requirements.BackendKind != BackendCelld || !digestPattern.MatchString(requirements.BuildDigest) ||
 		!digestPattern.MatchString(requirements.ApplicationDigest) || !identifierPattern.MatchString(requirements.InstanceID) ||
 		!identifierPattern.MatchString(requirements.TransactionDomainID) || len(requirements.RequiredAtomicGroups) == 0 ||
-		requirements.MinimumProbeEpoch == 0 || requirements.MaximumEvidenceAge <= 0 {
+		len(requirements.RequiredAtomicGroups) > maximumProductionAtomicGroups || requirements.MinimumProbeEpoch == 0 ||
+		requirements.MaximumEvidenceAge <= 0 || requirements.MaximumEvidenceAge > maximumProductionEvidenceAge {
 		return ErrInvalidConfiguration
 	}
 	if err := validateAtomicGroups(requirements.RequiredAtomicGroups, false); err != nil {

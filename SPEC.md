@@ -4784,6 +4784,19 @@ fail-closed한다. 이 snapshot은 세 파일의 공통 rollout generation 자�
 production dependency의 celld build digest와 state-app application digest는 이
 YAML에서 받지 않는다. 서명 검증된 release manifest의 정확한 artifact digest에서
 파생하여 live probe와 conformance evidence의 descriptor에 함께 결속한다.
+파생은 하나의 깊은 복사된 manifest snapshot에서 두 role을 함께 선택해야 하며,
+`celld`와 `state-app` component에 요청 architecture 또는 `any`로 적용 가능한
+artifact가 각각 정확히 하나일 때만 성공한다. 현 manifest schema에는 component
+내 artifact의 runtime identity purpose를 구분하는 field가 없으므로, 둘 이상의
+applicable artifact 중 첫 항목, 정렬 결과, 파일 이름 규칙으로 하나를 추측하지
+않는다. release manifest의 lowercase 64-hex `sha256` 값에는 `sha256:` prefix를
+정확히 한 번 붙이고 재hash하지 않는다. 이 결과는 설치 또는 runtime artifact bytes를
+직접 hash한 attestation이 아니라 signed manifest에서 인증한 expected digest pair이며,
+그 자체만으로 readiness가 아니다. production requirements constructor는 이 opaque
+pair 전체와 instance/domain/epoch/age/필수 atomic-group policy를 함께 받아 immutable
+seal을 만들고, raw digest string으로 직접 조립했거나 생성 후 한 field라도 바뀐
+requirements를 signature 검증이나 live probe 전에 거부한다. 따라서 서로 다른 release
+snapshot의 celld와 state-app digest를 production admission에 결합할 수 없다.
 offline conformance signer와 live runtime signer는 서로 다른 trust domain이다.
 `conformanceRootsFile`과 `runtimeRootsFile` 사이에는 key ID뿐 아니라 Ed25519
 public-key material도 재사용할 수 없으며, 하나라도 겹치면 startup은 실패한다.

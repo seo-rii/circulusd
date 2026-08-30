@@ -155,6 +155,10 @@ func ManifestSigningDigest(manifest Manifest) (string, error) {
 }
 
 func (store *TrustStore) VerifyPromotion(manifest Manifest) error {
+	return store.verifyPromotionSnapshot(cloneManifest(manifest))
+}
+
+func (store *TrustStore) verifyPromotionSnapshot(manifest Manifest) error {
 	if store == nil || len(store.roots) == 0 {
 		return fmt.Errorf("release trust store is not configured")
 	}

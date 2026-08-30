@@ -76,7 +76,8 @@ func (store *TrustStore) VerifyArtifacts(
 			return nil, fmt.Errorf("%w: artifact source is required", ErrArtifactVerification)
 		}
 	}
-	if err := store.VerifyPromotion(manifest); err != nil {
+	snapshot := cloneManifest(manifest)
+	if err := store.verifyPromotionSnapshot(snapshot); err != nil {
 		return nil, fmt.Errorf("%w: authenticate manifest: %w", ErrArtifactVerification, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -86,7 +87,7 @@ func (store *TrustStore) VerifyArtifacts(
 		return nil, fmt.Errorf("%w: architecture %q is unsupported", ErrArtifactVerification, architecture)
 	}
 	releasedArchitecture := false
-	for _, released := range manifest.Release.Architectures {
+	for _, released := range snapshot.Release.Architectures {
 		if released == architecture {
 			releasedArchitecture = true
 			break
@@ -96,8 +97,8 @@ func (store *TrustStore) VerifyArtifacts(
 		return nil, fmt.Errorf("%w: architecture %q is not present in the release", ErrArtifactVerification, architecture)
 	}
 
-	selected := make([]selectedArtifact, 0, len(manifest.Components))
-	for _, component := range manifest.Components {
+	selected := make([]selectedArtifact, 0, len(snapshot.Components))
+	for _, component := range snapshot.Components {
 		componentArtifacts := 0
 		for _, artifact := range component.Artifacts {
 			if artifact.Architecture != "any" && artifact.Architecture != architecture {

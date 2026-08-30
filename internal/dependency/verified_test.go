@@ -487,19 +487,26 @@ func newVerificationFixture(t *testing.T, transactionDomainID string) verificati
 }
 
 func (fixture verificationFixture) requirements() Requirements {
+	var requirements Requirements
 	if fixture.requirementOverride != nil {
-		return *fixture.requirementOverride
+		requirements = *fixture.requirementOverride
+	} else {
+		requirements = Requirements{
+			BackendKind:          fixture.descriptor.BackendKind,
+			BuildDigest:          fixture.descriptor.BuildDigest,
+			ApplicationDigest:    fixture.descriptor.ApplicationDigest,
+			InstanceID:           fixture.descriptor.InstanceID,
+			TransactionDomainID:  fixture.descriptor.TransactionDomainID,
+			RequiredAtomicGroups: []AtomicGroup{AtomicCommandReceipt, AtomicEffectLifecycle},
+			MinimumProbeEpoch:    fixture.descriptor.ProbeEpoch,
+			MaximumEvidenceAge:   time.Hour,
+		}
 	}
-	return Requirements{
-		BackendKind:          fixture.descriptor.BackendKind,
-		BuildDigest:          fixture.descriptor.BuildDigest,
-		ApplicationDigest:    fixture.descriptor.ApplicationDigest,
-		InstanceID:           fixture.descriptor.InstanceID,
-		TransactionDomainID:  fixture.descriptor.TransactionDomainID,
-		RequiredAtomicGroups: []AtomicGroup{AtomicCommandReceipt, AtomicEffectLifecycle},
-		MinimumProbeEpoch:    fixture.descriptor.ProbeEpoch,
-		MaximumEvidenceAge:   time.Hour,
+	sealed, err := sealProductionRequirements(requirements)
+	if err != nil {
+		return requirements
 	}
+	return sealed
 }
 
 func signEvidence(t *testing.T, evidence Evidence, privateKey ed25519.PrivateKey) Evidence {

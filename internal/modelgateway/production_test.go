@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/dependency"
+	releasecontract "github.com/hancomac/circulusd/internal/release/contracttest"
 )
 
 func TestProductionGatewayAcceptsOnlyVerifiedAdapterInstances(t *testing.T) {
@@ -220,7 +221,7 @@ func newModelProductionProofs(t *testing.T, atomicGroups []dependency.AtomicGrou
 
 func (proofs *modelProductionProofs) verifyAuthority(t *testing.T, adapter *productionAuthority, group dependency.AtomicGroup) dependency.Verified[ProductionAuthorityValidator] {
 	t.Helper()
-	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionAuthorityValidator(adapter), proofs.evidence, proofs.requirements(group))
+	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionAuthorityValidator(adapter), proofs.evidence, proofs.requirements(t, group))
 	if err != nil {
 		t.Fatalf("VerifyDependency(authority) error = %v", err)
 	}
@@ -229,7 +230,7 @@ func (proofs *modelProductionProofs) verifyAuthority(t *testing.T, adapter *prod
 
 func (proofs *modelProductionProofs) verifyQuota(t *testing.T, adapter *productionQuota, group dependency.AtomicGroup) dependency.Verified[ProductionQuotaAdmitter] {
 	t.Helper()
-	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionQuotaAdmitter(adapter), proofs.evidence, proofs.requirements(group))
+	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionQuotaAdmitter(adapter), proofs.evidence, proofs.requirements(t, group))
 	if err != nil {
 		t.Fatalf("VerifyDependency(quota) error = %v", err)
 	}
@@ -238,22 +239,25 @@ func (proofs *modelProductionProofs) verifyQuota(t *testing.T, adapter *producti
 
 func (proofs *modelProductionProofs) verifyDispatch(t *testing.T, adapter *productionDispatch, group dependency.AtomicGroup) dependency.Verified[ProductionDispatchCoordinator] {
 	t.Helper()
-	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionDispatchCoordinator(adapter), proofs.evidence, proofs.requirements(group))
+	verified, err := dependency.VerifyDependency(context.Background(), proofs.verifier, ProductionDispatchCoordinator(adapter), proofs.evidence, proofs.requirements(t, group))
 	if err != nil {
 		t.Fatalf("VerifyDependency(dispatch) error = %v", err)
 	}
 	return verified
 }
 
-func (proofs modelProductionProofs) requirements(group dependency.AtomicGroup) dependency.Requirements {
-	return dependency.Requirements{
-		BackendKind:          proofs.descriptor.BackendKind,
-		BuildDigest:          proofs.descriptor.BuildDigest,
-		ApplicationDigest:    proofs.descriptor.ApplicationDigest,
+func (proofs modelProductionProofs) requirements(t *testing.T, group dependency.AtomicGroup) dependency.Requirements {
+	t.Helper()
+	artifacts := releasecontract.StateArtifactDigests(t, proofs.descriptor.BuildDigest, proofs.descriptor.ApplicationDigest)
+	requirements, err := dependency.NewProductionRequirements(artifacts, dependency.ProductionRequirementsConfig{
 		InstanceID:           proofs.descriptor.InstanceID,
 		TransactionDomainID:  proofs.descriptor.TransactionDomainID,
 		RequiredAtomicGroups: []dependency.AtomicGroup{group},
 		MinimumProbeEpoch:    proofs.descriptor.ProbeEpoch,
 		MaximumEvidenceAge:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewProductionRequirements() error = %v", err)
 	}
+	return requirements
 }
