@@ -4743,10 +4743,20 @@ private route를 application protocol로 사용하지 않는다.
 
 state read와 dispatch-start 권한은 서로 다른 key ID와 root-key 파일을 사용한다.
 key material을 YAML에 직접 넣지 않으며, 모든 credential/evidence/root 경로는
-서로 다른 canonical absolute non-root 파일이어야 한다. startup은 credential을
-한 번만 읽어 파일 종류·소유권·권한과 key 길이를 검증하고 client가 key를 복사한
-뒤 loader buffer를 지운다. request별 파일 재읽기는 key rotation protocol로
-간주하지 않는다. `httpTimeout`은 30초 이하, `dispatchStartTimeout`은 5분 이하,
+서로 다른 canonical absolute non-root 파일이어야 한다. credential 파일 내용은
+공백이나 개행이 없는 canonical lowercase hex이고, decode 결과는 32..256
+bytes여야 한다. Linux startup은 모든 경로 component를 pinned descriptor로
+순회하며 symbolic/magic link를 거부한다. parent는 root 또는 platformd effective
+UID 소유이고 group/other writable이 아니어야 한다(root-owned sticky directory는
+허용한다). 최종 파일은 platformd effective UID가 소유한 link-count 1의 regular
+file이며 mode는 정확히 `0400` 또는 `0600`이어야 한다. 두 credential은 path,
+device/inode, decoded key material이 모두 달라야 한다.
+
+startup은 두 파일 descriptor를 함께 고정하고 `fstat` 전후의 identity, metadata,
+size가 같은 bounded snapshot을 한 번만 읽는다. client가 key를 복사한 뒤 encoded와
+decoded loader buffer를 지우며, 비-Linux build는 안전하지 않은 fallback 없이
+fail-closed한다. request별 파일 재읽기는 key rotation protocol로 간주하지 않는다.
+`httpTimeout`은 30초 이하, `dispatchStartTimeout`은 5분 이하,
 `maximumEvidenceAge`는 24시간 이하로 fail-closed 검증한다.
 
 production dependency의 celld build digest와 state-app application digest는 이
