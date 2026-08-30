@@ -323,18 +323,15 @@ func TestSettlementOutlivesAuthorityTTLAndBindsExactEffect(t *testing.T) {
 
 	validator, reader, clock, scope := newFixture(t)
 	reader.Update(func(snapshot *authority.Snapshot) {
-		snapshot.ActiveEffect = &authority.EffectSnapshot{
-			EffectID:     "effect-long-command",
-			InvocationID: "invocation-long-command",
-			Status:       authority.EffectDispatched,
-		}
+		snapshot.ActiveEffect = settlementEffect(
+			"effect-long-command",
+			"invocation-long-command",
+		)
 	})
-	settlement := authority.SettlementRequest{
-		Scope:        scope,
-		Permission:   permissionEffectSettle,
-		EffectID:     "effect-long-command",
-		InvocationID: "invocation-long-command",
-	}
+	settlement := settlementRequest(
+		scope,
+		settlementEffect("effect-long-command", "invocation-long-command"),
+	)
 	settlementOnly, err := validator.IssueSettlementAuthority(
 		context.Background(),
 		authority.BindingWorkspace,
@@ -376,6 +373,219 @@ func TestSettlementOutlivesAuthorityTTLAndBindsExactEffect(t *testing.T) {
 	}
 }
 
+func TestWorkspaceSettlementRejectsForeignEffectService(t *testing.T) {
+	t.Parallel()
+
+	validator, reader, _, scope := newFixture(t)
+	effect := settlementEffect("effect-foreign-service", "invocation-foreign-service")
+	effect.Service = authority.EffectServiceExecutor
+	effect.Operation = "executor.run"
+	reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+	request := settlementRequest(scope, effect)
+
+	if _, err := validator.IssueSettlementAuthority(
+		context.Background(),
+		authority.BindingWorkspace,
+		request,
+	); !errors.Is(err, authority.ErrServiceBindingMismatch) {
+		t.Fatalf("IssueSettlementAuthority(executor effect) error = %v, want ErrServiceBindingMismatch", err)
+	}
+}
+
+func TestSettlementAuthorityBindsFullEffectIdentityAcrossFreshSnapshot(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*authority.EffectSnapshot)
+	}{
+		{name: "request digest", mutate: func(effect *authority.EffectSnapshot) { effect.RequestDigest = digest("d") }},
+		{name: "service", mutate: func(effect *authority.EffectSnapshot) { effect.Service = authority.EffectServiceExternalTool }},
+		{name: "operation", mutate: func(effect *authority.EffectSnapshot) { effect.Operation = "executor.retry" }},
+		{name: "dispatch attempt", mutate: func(effect *authority.EffectSnapshot) { effect.DispatchAttempt = 2 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			validator, reader, _, scope := newFixture(t)
+			effect := settlementEffect("effect-identity", "invocation-identity")
+			effect.Service = authority.EffectServiceExecutor
+			effect.Operation = "executor.run"
+			reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+			request := settlementRequest(scope, effect)
+			handle, err := validator.IssueSettlementAuthority(
+				context.Background(),
+				authority.BindingExecutor,
+				request,
+			)
+			if err != nil {
+				t.Fatalf("IssueSettlementAuthority() error = %v", err)
+			}
+			readsAfterIssue := reader.reads.Load()
+
+			changed := *effect
+			test.mutate(&changed)
+			reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = &changed })
+			changedRequest := settlementRequest(scope, &changed)
+			if err := validator.ValidateSettlement(
+				context.Background(),
+				handle,
+				authority.BindingExecutor,
+				changedRequest,
+			); !errors.Is(err, authority.ErrEffectMismatch) {
+				t.Fatalf("ValidateSettlement(changed identity) error = %v, want ErrEffectMismatch", err)
+			}
+			if got := reader.reads.Load(); got != readsAfterIssue {
+				t.Fatalf("snapshot reads after claims mismatch = %d, want %d", got, readsAfterIssue)
+			}
+			if err := validator.ValidateSettlement(
+				context.Background(),
+				handle,
+				authority.BindingExecutor,
+				request,
+			); !errors.Is(err, authority.ErrEffectMismatch) {
+				t.Fatalf("ValidateSettlement(changed snapshot) error = %v, want ErrEffectMismatch", err)
+			}
+			if got := reader.reads.Load(); got != readsAfterIssue+1 {
+				t.Fatalf("snapshot reads after fresh mismatch = %d, want %d", got, readsAfterIssue+1)
+			}
+		})
+	}
+}
+
+func TestSettlementRejectsMalformedEffectIdentityBeforeIssuance(t *testing.T) {
+	t.Parallel()
+
+	requestTests := []struct {
+		name   string
+		mutate func(*authority.EffectSnapshot)
+	}{
+		{name: "request digest", mutate: func(effect *authority.EffectSnapshot) { effect.RequestDigest = "sha256:not-a-digest" }},
+		{name: "service", mutate: func(effect *authority.EffectSnapshot) { effect.Service = authority.EffectService("unknown") }},
+		{name: "operation", mutate: func(effect *authority.EffectSnapshot) { effect.Operation = "" }},
+		{name: "dispatch attempt", mutate: func(effect *authority.EffectSnapshot) { effect.DispatchAttempt = 0 }},
+	}
+	for _, test := range requestTests {
+		t.Run("request/"+test.name, func(t *testing.T) {
+			t.Parallel()
+
+			validator, reader, _, scope := newFixture(t)
+			effect := settlementEffect("effect-invalid-request", "invocation-invalid-request")
+			reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+			invalid := *effect
+			test.mutate(&invalid)
+			if _, err := validator.IssueSettlementAuthority(
+				context.Background(),
+				authority.BindingWorkspace,
+				settlementRequest(scope, &invalid),
+			); !errors.Is(err, authority.ErrInvalidRequest) {
+				t.Fatalf("IssueSettlementAuthority(invalid request) error = %v, want ErrInvalidRequest", err)
+			}
+			if got := reader.reads.Load(); got != 0 {
+				t.Fatalf("snapshot reads for invalid request = %d, want 0", got)
+			}
+		})
+	}
+
+	for _, test := range requestTests {
+		t.Run("snapshot/"+test.name, func(t *testing.T) {
+			t.Parallel()
+
+			validator, reader, _, scope := newFixture(t)
+			effect := settlementEffect("effect-invalid-snapshot", "invocation-invalid-snapshot")
+			request := settlementRequest(scope, effect)
+			invalid := *effect
+			test.mutate(&invalid)
+			reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = &invalid })
+			if _, err := validator.IssueSettlementAuthority(
+				context.Background(),
+				authority.BindingWorkspace,
+				request,
+			); !errors.Is(err, authority.ErrInvalidSnapshot) {
+				t.Fatalf("IssueSettlementAuthority(invalid snapshot) error = %v, want ErrInvalidSnapshot", err)
+			}
+		})
+	}
+}
+
+func TestSettlementAllowsExternallyCommittedStatusTransition(t *testing.T) {
+	t.Parallel()
+
+	validator, reader, _, scope := newFixture(t)
+	effect := settlementEffect("effect-external-commit", "invocation-external-commit")
+	reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+	request := settlementRequest(scope, effect)
+	handle, err := validator.IssueSettlementAuthority(
+		context.Background(),
+		authority.BindingWorkspace,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("IssueSettlementAuthority() error = %v", err)
+	}
+	reader.Update(func(snapshot *authority.Snapshot) {
+		snapshot.ActiveEffect.Status = authority.EffectExternallyCommitted
+	})
+	if err := validator.ValidateSettlement(
+		context.Background(),
+		handle,
+		authority.BindingWorkspace,
+		request,
+	); err != nil {
+		t.Fatalf("ValidateSettlement(externally committed) error = %v", err)
+	}
+}
+
+func TestConcurrentSettlementServiceRotationFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	validator, reader, _, scope := newFixture(t)
+	effect := settlementEffect("effect-concurrent", "invocation-concurrent")
+	reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+	request := settlementRequest(scope, effect)
+	handle, err := validator.IssueSettlementAuthority(
+		context.Background(),
+		authority.BindingWorkspace,
+		request,
+	)
+	if err != nil {
+		t.Fatalf("IssueSettlementAuthority() error = %v", err)
+	}
+	reader.Update(func(snapshot *authority.Snapshot) {
+		snapshot.ActiveEffect.Service = authority.EffectServiceExecutor
+	})
+
+	const workers = 32
+	const attempts = 100
+	start := make(chan struct{})
+	errs := make(chan error, workers*attempts)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for range attempts {
+				errs <- validator.ValidateSettlement(
+					context.Background(),
+					handle,
+					authority.BindingWorkspace,
+					request,
+				)
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if !errors.Is(err, authority.ErrServiceBindingMismatch) {
+			t.Fatalf("concurrent ValidateSettlement() error = %v, want ErrServiceBindingMismatch", err)
+		}
+	}
+}
+
 func TestSettlementRejectsEveryGenerationRotation(t *testing.T) {
 	t.Parallel()
 
@@ -396,18 +606,15 @@ func TestSettlementRejectsEveryGenerationRotation(t *testing.T) {
 
 			validator, reader, _, scope := newFixture(t)
 			reader.Update(func(snapshot *authority.Snapshot) {
-				snapshot.ActiveEffect = &authority.EffectSnapshot{
-					EffectID:     "effect-generation-test",
-					InvocationID: "invocation-generation-test",
-					Status:       authority.EffectDispatched,
-				}
+				snapshot.ActiveEffect = settlementEffect(
+					"effect-generation-test",
+					"invocation-generation-test",
+				)
 			})
-			request := authority.SettlementRequest{
-				Scope:        scope,
-				Permission:   permissionEffectSettle,
-				EffectID:     "effect-generation-test",
-				InvocationID: "invocation-generation-test",
-			}
+			request := settlementRequest(
+				scope,
+				settlementEffect("effect-generation-test", "invocation-generation-test"),
+			)
 			handle, err := validator.IssueSettlementAuthority(
 				context.Background(),
 				authority.BindingWorkspace,
@@ -429,18 +636,12 @@ func TestEmergencyRotationCanIssueSettlementOnlyAuthority(t *testing.T) {
 
 	validator, reader, _, scope := newFixture(t)
 	reader.Update(func(snapshot *authority.Snapshot) {
-		snapshot.ActiveEffect = &authority.EffectSnapshot{
-			EffectID:     "effect-recovery",
-			InvocationID: "invocation-recovery",
-			Status:       authority.EffectDispatched,
-		}
+		snapshot.ActiveEffect = settlementEffect("effect-recovery", "invocation-recovery")
 	})
-	settlement := authority.SettlementRequest{
-		Scope:        scope,
-		Permission:   permissionEffectSettle,
-		EffectID:     "effect-recovery",
-		InvocationID: "invocation-recovery",
-	}
+	settlement := settlementRequest(
+		scope,
+		settlementEffect("effect-recovery", "invocation-recovery"),
+	)
 	oldSettlementAuthority, err := validator.IssueSettlementAuthority(
 		context.Background(),
 		authority.BindingWorkspace,
@@ -493,18 +694,19 @@ func TestAuthorityFormattingAlwaysRedactsClaims(t *testing.T) {
 	}
 
 	reader.Update(func(snapshot *authority.Snapshot) {
-		snapshot.ActiveEffect = &authority.EffectSnapshot{
-			EffectID:     "effect-format-secret",
-			InvocationID: "invocation-format-secret",
-			Status:       authority.EffectDispatched,
-		}
+		snapshot.ActiveEffect = settlementEffect(
+			"effect-format-secret",
+			"invocation-format-secret",
+		)
 	})
-	settlementOnly, err := validator.IssueSettlementAuthority(context.Background(), authority.BindingWorkspace, authority.SettlementRequest{
-		Scope:        scope,
-		Permission:   permissionEffectSettle,
-		EffectID:     "effect-format-secret",
-		InvocationID: "invocation-format-secret",
-	})
+	settlementOnly, err := validator.IssueSettlementAuthority(
+		context.Background(),
+		authority.BindingWorkspace,
+		settlementRequest(
+			scope,
+			settlementEffect("effect-format-secret", "invocation-format-secret"),
+		),
+	)
 	if err != nil {
 		t.Fatalf("IssueSettlementAuthority() error = %v", err)
 	}
@@ -627,6 +829,34 @@ func issueAuthority(t *testing.T, validator *authority.Validator, scope authorit
 
 func digest(nibble string) string {
 	return "sha256:" + strings.Repeat(nibble, 64)
+}
+
+func settlementEffect(effectID, invocationID string) *authority.EffectSnapshot {
+	return &authority.EffectSnapshot{
+		EffectID:        effectID,
+		InvocationID:    invocationID,
+		RequestDigest:   digest("c"),
+		Service:         authority.EffectServiceWorkspace,
+		Operation:       "workspace.commit",
+		DispatchAttempt: 1,
+		Status:          authority.EffectDispatched,
+	}
+}
+
+func settlementRequest(
+	scope authority.Scope,
+	effect *authority.EffectSnapshot,
+) authority.SettlementRequest {
+	return authority.SettlementRequest{
+		Scope:           scope,
+		Permission:      permissionEffectSettle,
+		EffectID:        effect.EffectID,
+		InvocationID:    effect.InvocationID,
+		RequestDigest:   effect.RequestDigest,
+		Service:         effect.Service,
+		Operation:       effect.Operation,
+		DispatchAttempt: effect.DispatchAttempt,
+	}
 }
 
 type mutableClock struct {

@@ -16,7 +16,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-const authorityMACDomain = "circulusd.turn-authority.v1\x00"
+const authorityMACDomain = "circulusd.turn-authority.v2\x00"
 
 type Validator struct {
 	reader SnapshotReader
@@ -241,7 +241,7 @@ func (validator *Validator) IssueSettlementAuthority(
 	if !hasPermission(snapshot.EffectivePermissions, request.Permission) {
 		return SettlementAuthority{}, ErrPermissionDenied
 	}
-	if err := validateEffect(snapshot, request); err != nil {
+	if err := validateEffect(snapshot, binding, request); err != nil {
 		return SettlementAuthority{}, err
 	}
 	claims := authorityClaims{
@@ -257,6 +257,10 @@ func (validator *Validator) IssueSettlementAuthority(
 		issuedAtUnixNano:        now.UnixNano(),
 		effectID:                snapshot.ActiveEffect.EffectID,
 		invocationID:            snapshot.ActiveEffect.InvocationID,
+		requestDigest:           snapshot.ActiveEffect.RequestDigest,
+		effectService:           snapshot.ActiveEffect.Service,
+		effectOperation:         snapshot.ActiveEffect.Operation,
+		dispatchAttempt:         snapshot.ActiveEffect.DispatchAttempt,
 	}
 	return SettlementAuthority{signed: validator.signClaims(claims)}, nil
 }
@@ -296,7 +300,15 @@ func (validator *Validator) ValidateSettlement(
 	if !hasPermission(claims.permissions, request.Permission) {
 		return ErrPermissionDenied
 	}
-	if claims.effectID != request.EffectID || claims.invocationID != request.InvocationID {
+	if err := validateEffectBinding(binding, claims.effectService); err != nil {
+		return err
+	}
+	if claims.effectID != request.EffectID ||
+		claims.invocationID != request.InvocationID ||
+		claims.requestDigest != request.RequestDigest ||
+		claims.effectService != request.Service ||
+		claims.effectOperation != request.Operation ||
+		claims.dispatchAttempt != request.DispatchAttempt {
 		return ErrEffectMismatch
 	}
 
@@ -317,7 +329,7 @@ func (validator *Validator) ValidateSettlement(
 	if !hasPermission(snapshot.EffectivePermissions, request.Permission) {
 		return ErrPermissionDenied
 	}
-	return validateEffect(snapshot, request)
+	return validateEffect(snapshot, binding, request)
 }
 
 func (validator *Validator) currentTime() time.Time {
@@ -387,6 +399,11 @@ func (validator *Validator) calculateMAC(claims authorityClaims) [sha256.Size]by
 	_, _ = mac.Write(integer[:])
 	writeString(claims.effectID)
 	writeString(claims.invocationID)
+	writeString(claims.requestDigest)
+	writeString(string(claims.effectService))
+	writeString(claims.effectOperation)
+	binary.BigEndian.PutUint64(integer[:], claims.dispatchAttempt)
+	_, _ = mac.Write(integer[:])
 	var result [sha256.Size]byte
 	copy(result[:], mac.Sum(nil))
 	return result
@@ -398,13 +415,6 @@ func validateSnapshot(snapshot Snapshot, now time.Time, admission bool) error {
 		snapshot.PlacementGeneration == 0 ||
 		snapshot.AuthorizationGeneration == 0 {
 		return ErrInvalidSnapshot
-	}
-	validDigest := func(value string) bool {
-		if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+sha256.Size*2 {
-			return false
-		}
-		decoded, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
-		return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 	}
 	if !validDigest(snapshot.PolicySnapshotDigest) || !validDigest(snapshot.EmergencyOverlayDigest) {
 		return ErrInvalidSnapshot
@@ -488,27 +498,73 @@ func validateSettlementRequest(request SettlementRequest) error {
 	if validateScope(request.Scope) != nil ||
 		!validPermission(request.Permission) ||
 		!validIdentifier(request.EffectID, false) ||
-		!validIdentifier(request.InvocationID, false) {
+		!validIdentifier(request.InvocationID, false) ||
+		!validDigest(request.RequestDigest) ||
+		!validEffectService(request.Service) ||
+		!validProtocolText(request.Operation, false) ||
+		request.DispatchAttempt == 0 {
 		return ErrInvalidRequest
 	}
 	return nil
 }
 
-func validateEffect(snapshot Snapshot, request SettlementRequest) error {
-	if snapshot.ActiveEffect == nil ||
-		snapshot.ActiveEffect.EffectID != request.EffectID ||
-		snapshot.ActiveEffect.InvocationID != request.InvocationID {
+func validateEffect(
+	snapshot Snapshot,
+	binding ServiceBinding,
+	request SettlementRequest,
+) error {
+	if snapshot.ActiveEffect == nil {
 		return ErrEffectMismatch
 	}
-	if !validIdentifier(snapshot.ActiveEffect.EffectID, false) ||
-		!validIdentifier(snapshot.ActiveEffect.InvocationID, false) {
+	effect := snapshot.ActiveEffect
+	if !validIdentifier(effect.EffectID, false) ||
+		!validIdentifier(effect.InvocationID, false) ||
+		!validDigest(effect.RequestDigest) ||
+		!validEffectService(effect.Service) ||
+		!validProtocolText(effect.Operation, false) ||
+		effect.DispatchAttempt == 0 {
 		return ErrInvalidSnapshot
 	}
-	if snapshot.ActiveEffect.Status != EffectDispatched &&
-		snapshot.ActiveEffect.Status != EffectExternallyCommitted {
+	if err := validateEffectBinding(binding, effect.Service); err != nil {
+		return err
+	}
+	if effect.EffectID != request.EffectID ||
+		effect.InvocationID != request.InvocationID ||
+		effect.RequestDigest != request.RequestDigest ||
+		effect.Service != request.Service ||
+		effect.Operation != request.Operation ||
+		effect.DispatchAttempt != request.DispatchAttempt {
+		return ErrEffectMismatch
+	}
+	if effect.Status != EffectDispatched && effect.Status != EffectExternallyCommitted {
 		return ErrEffectNotDispatched
 	}
 	return nil
+}
+
+func validateEffectBinding(binding ServiceBinding, service EffectService) error {
+	if binding == BindingWorkspace && service != EffectServiceWorkspace {
+		return ErrServiceBindingMismatch
+	}
+	return nil
+}
+
+func validDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
+}
+
+func validEffectService(service EffectService) bool {
+	switch service {
+	case EffectServiceModel, EffectServiceWorkspace, EffectServiceExecutor,
+		EffectServiceMCP, EffectServiceArtifact, EffectServiceExternalTool:
+		return true
+	default:
+		return false
+	}
 }
 
 func validIdentifier(value string, optional bool) bool {

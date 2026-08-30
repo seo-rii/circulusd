@@ -82,11 +82,28 @@ const (
 	EffectExternallyCommitted EffectStatus = "externally_committed"
 )
 
+// EffectService identifies the protocol service that owns one durable effect.
+// It is distinct from ServiceBinding because their wire vocabularies differ.
+type EffectService string
+
+const (
+	EffectServiceModel        EffectService = "model"
+	EffectServiceWorkspace    EffectService = "workspace"
+	EffectServiceExecutor     EffectService = "executor"
+	EffectServiceMCP          EffectService = "mcp"
+	EffectServiceArtifact     EffectService = "artifact"
+	EffectServiceExternalTool EffectService = "external-tool"
+)
+
 // EffectSnapshot is the Session DO's current durable effect identity.
 type EffectSnapshot struct {
-	EffectID     string
-	InvocationID string
-	Status       EffectStatus
+	EffectID        string
+	InvocationID    string
+	RequestDigest   string
+	Service         EffectService
+	Operation       string
+	DispatchAttempt uint64
+	Status          EffectStatus
 }
 
 // Snapshot is one authoritative, internally consistent Session DO view.
@@ -136,10 +153,14 @@ type AdmissionRequest struct {
 }
 
 type SettlementRequest struct {
-	Scope        Scope
-	Permission   Permission
-	EffectID     string
-	InvocationID string
+	Scope           Scope
+	Permission      Permission
+	EffectID        string
+	InvocationID    string
+	RequestDigest   string
+	Service         EffectService
+	Operation       string
+	DispatchAttempt uint64
 }
 
 type authorityPurpose uint8
@@ -165,6 +186,10 @@ type authorityClaims struct {
 	expiresAtUnixNano int64
 	effectID          string
 	invocationID      string
+	requestDigest     string
+	effectService     EffectService
+	effectOperation   string
+	dispatchAttempt   uint64
 }
 
 type signedAuthority struct {
