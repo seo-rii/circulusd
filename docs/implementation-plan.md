@@ -133,7 +133,7 @@ infrastructure as permitted by `SPEC.md` §51.1. Their evidence remains
 process/cgroup/Loader mechanics they directly observe; they do not turn those
 fixture dependencies into durable or production evidence.
 
-### Existing baseline
+### Current implemented baseline
 
 The implementation starts from these already-tested components:
 
@@ -147,18 +147,19 @@ The implementation starts from these already-tested components:
   writes and reads back CPU/memory/PID limits, attaches the child atomically,
   and performs identity-fenced `cgroup.kill` cleanup;
 - `internal/conformance/workerd` runs the real Pi adapter and Dynamic Worker
-  fixture, but its resource checks are still `NOT_RUN`, its external test takes
-  a caller-supplied expected executable digest, and its `workerd test` fixture
-  has no persistent socket;
-- the release manifest currently pins compressed workerd archives but does not
-  record the deterministically extracted executable digest;
+  fixture, but its resource checks are still `NOT_RUN`, its qualification path
+  has no trusted Manager/cgroup composition, and its `workerd test` fixture has
+  no persistent socket;
+- the release manifest pins both compressed workerd archives and their
+  deterministically extracted executable digests; the qualification resolver
+  verifies promotion policy and retains a sealed executable snapshot;
 - `cmd/agentd` is a diagnostic-only control shell and does not compose any of
   the preceding operational components.
 
-The current launcher calls its process-incarnation field
-`PlacementGeneration`, permits a stopped process to restart under that same
-value, and has no matching field in `Manager.ShardSpec`. Unit 10 must migrate
-that contract before joining the manager and launcher.
+The Manager and launcher now use a distinct typed `ShardGeneration`, and the
+fixed-argument adapter joins their start boundaries. The remaining identity
+work is to carry `AgentInstanceID` through ensure/readiness/cgroup/observation
+results and to reject stale tuple members before Manager state changes.
 
 ### Cut line
 
