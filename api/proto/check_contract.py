@@ -36,6 +36,7 @@ PROTO_FILES = (
 SCHEMA_FILES = (
     "public-error.schema.json",
     "capabilities-response.schema.json",
+    "development-status.schema.json",
     "rpc-envelope.schema.json",
     "release-manifest.schema.json",
 )
@@ -817,6 +818,25 @@ def validate_json_schemas() -> None:
                 "models": [],
                 "mcpServers": [],
             },
+            "development-status.schema.json": {
+                "apiVersion": "v1alpha",
+                "profile": "development-reference",
+                "mode": "diagnostic-only",
+                "productionEligible": False,
+                "admissionEnabled": False,
+                "state": {
+                    "availability": "unavailable",
+                    "reason": "NOT_WIRED",
+                    "implementation": "none",
+                    "durability": "none",
+                },
+                "execution": {
+                    "availability": "unavailable",
+                    "reason": "NOT_WIRED",
+                    "provider": "none",
+                    "isolationConformance": "NOT_RUN",
+                },
+            },
             "rpc-envelope.schema.json": {
                 "apiVersion": "v1alpha",
                 "kind": "request",
@@ -840,6 +860,25 @@ def validate_json_schemas() -> None:
             schemas["public-error.schema.json"]
         ).is_valid(unsafe_error):
             raise ContractError("public-error.schema.json accepted an unknown sensitive field")
+
+        development_validator = jsonschema.Draft202012Validator(
+            schemas["development-status.schema.json"]
+        )
+        dishonest_statuses = []
+        for field in ("productionEligible", "admissionEnabled"):
+            status = json.loads(json.dumps(examples["development-status.schema.json"]))
+            status[field] = True
+            dishonest_statuses.append(status)
+        wired_state = json.loads(
+            json.dumps(examples["development-status.schema.json"])
+        )
+        wired_state["state"]["implementation"] = "memory"
+        dishonest_statuses.append(wired_state)
+        for status in dishonest_statuses:
+            if development_validator.is_valid(status):
+                raise ContractError(
+                    "development-status.schema.json accepted a production or wired claim"
+                )
 
     release_manifest = REPOSITORY_ROOT / "deploy" / "airgap" / "release-manifest.json"
     if jsonschema is not None and release_manifest.is_file():

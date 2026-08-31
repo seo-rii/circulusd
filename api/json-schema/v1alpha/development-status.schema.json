@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://circulusd.local/schemas/v1alpha/development-status.schema.json",
+  "title": "Circulus Development Diagnostic Status v1alpha",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "profile",
+    "mode",
+    "productionEligible",
+    "admissionEnabled",
+    "state",
+    "execution"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "v1alpha"
+    },
+    "profile": {
+      "const": "development-reference"
+    },
+    "mode": {
+      "const": "diagnostic-only"
+    },
+    "productionEligible": {
+      "const": false
+    },
+    "admissionEnabled": {
+      "const": false
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "reason", "implementation", "durability"],
+      "properties": {
+        "availability": {
+          "const": "unavailable"
+        },
+        "reason": {
+          "const": "NOT_WIRED"
+        },
+        "implementation": {
+          "const": "none"
+        },
+        "durability": {
+          "const": "none"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "reason", "provider", "isolationConformance"],
+      "properties": {
+        "availability": {
+          "const": "unavailable"
+        },
+        "reason": {
+          "const": "NOT_WIRED"
+        },
+        "provider": {
+          "const": "none"
+        },
+        "isolationConformance": {
+          "const": "NOT_RUN"
+        }
+      }
+    }
+  }
+}
