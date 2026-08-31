@@ -3641,6 +3641,14 @@ fresh recovery actor가 보존된 subordinate fact로 settlement만 재개한다
 
 모델 호출도 같은 기본 구조를 따르되 partial stream은 자동 재실행에 특히 주의한다. provider가 durable request/result retrieval을 지원하지 않으면 partial-response crash는 일반적으로 uncertain effect다.
 
+development/reference model adapter는 `model.generate` Session command를 먼저
+subordinate ledger에 prepare하고, fresh sealed Session start claim을 소비한 뒤에만
+한 번의 provider dispatch를 수행한다. 별도의 model dispatch claim이나 provider
+start program counter를 만들지 않는다. provider acceptance는 terminal보다 먼저
+기록하고 normalized stream을 bounded하게 끝까지 소비한 뒤 committed, failed 또는
+unknown observation을 기록한다. 이 adapter의 process-local ledger 결과는 production
+durability나 provider result retrieval 증거로 취급하지 않는다.
+
 ## 36. Public API
 
 Public API는 resource identity, idempotency, durable event replay를 일관되게 지원해야 한다.

@@ -18,21 +18,12 @@ func (gateway *Gateway) ExecuteDispatch(ctx context.Context, authority OpaqueAut
 	if err := ctx.Err(); err != nil {
 		return DispatchExecution{}, err
 	}
-	if len(authority) == 0 || uint64(len(authority)) > gateway.bounds.MaxAuthorityBytes || transition.Dispatch == nil || transition.Cancel != nil {
+	if len(authority) == 0 || uint64(len(authority)) > gateway.bounds.MaxAuthorityBytes {
 		return DispatchExecution{}, ErrInvalidRequest
 	}
-	effect := transition.Effect
-	if err := gateway.validateEffect(effect); err != nil {
+	effect, command, err := gateway.validateDispatchTransition(transition)
+	if err != nil {
 		return DispatchExecution{}, err
-	}
-	command := *transition.Dispatch
-	if effect.State != StateDispatching || effect.Revision < 2 || command.Permit != (DispatchPermit{}) ||
-		command.ProviderID != effect.ProviderID || command.Scope != effect.Scope || command.EffectID != effect.Scope.EffectID ||
-		command.InvocationID != effect.Scope.InvocationID || command.RequestDigest != effect.RequestDigest || command.QuotaPermit != effect.QuotaPermit ||
-		command.Request.Model != effect.Request.Model || command.Request.MaxOutputTokens != effect.Request.MaxOutputTokens ||
-		command.Request.Reasoning != effect.Request.Reasoning ||
-		!slices.Equal(command.Request.Messages, effect.Request.Messages) || command.Attempt != effect.Attempt {
-		return DispatchExecution{}, ErrInvalidRequest
 	}
 
 	currentScope, err := gateway.authority.ValidateAdmission(ctx, append(OpaqueAuthority(nil), authority...), AdmissionAuthorityRequest{
@@ -67,7 +58,41 @@ func (gateway *Gateway) ExecuteDispatch(ctx context.Context, authority OpaqueAut
 	if err := gateway.dispatches.BeginProviderDispatch(ctx, permit); err != nil {
 		return DispatchExecution{Permit: permit, Effect: effect}, err
 	}
+	return gateway.executeProviderDispatch(ctx, effect, command, permit, gateway.dispatches.CommitProviderAccepted)
+}
 
+type providerAcceptedRecorder func(context.Context, ProviderAcceptedCommitRequest) error
+
+func (gateway *Gateway) validateDispatchTransition(transition Transition) (Effect, DispatchCommand, error) {
+	if gateway == nil || transition.Dispatch == nil || transition.Cancel != nil {
+		return Effect{}, DispatchCommand{}, ErrInvalidRequest
+	}
+	effect := transition.Effect
+	if err := gateway.validateEffect(effect); err != nil {
+		return Effect{}, DispatchCommand{}, err
+	}
+	command := *transition.Dispatch
+	if effect.State != StateDispatching || effect.Revision < 2 || command.Permit != (DispatchPermit{}) ||
+		command.ProviderID != effect.ProviderID || command.Scope != effect.Scope || command.EffectID != effect.Scope.EffectID ||
+		command.InvocationID != effect.Scope.InvocationID || command.RequestDigest != effect.RequestDigest || command.QuotaPermit != effect.QuotaPermit ||
+		command.Request.Model != effect.Request.Model || command.Request.MaxOutputTokens != effect.Request.MaxOutputTokens ||
+		command.Request.Reasoning != effect.Request.Reasoning ||
+		!slices.Equal(command.Request.Messages, effect.Request.Messages) || command.Attempt != effect.Attempt {
+		return Effect{}, DispatchCommand{}, ErrInvalidRequest
+	}
+	return effect, command, nil
+}
+
+func (gateway *Gateway) executeProviderDispatch(
+	ctx context.Context,
+	effect Effect,
+	command DispatchCommand,
+	permit DispatchPermit,
+	recordAccepted providerAcceptedRecorder,
+) (DispatchExecution, error) {
+	if gateway == nil || ctx == nil || recordAccepted == nil {
+		return DispatchExecution{}, ErrInvalidRequest
+	}
 	providerCommand := command
 	providerCommand.Request = cloneModelRequest(command.Request)
 	providerCommand.Permit = permit
@@ -96,7 +121,7 @@ func (gateway *Gateway) ExecuteDispatch(ctx context.Context, authority OpaqueAut
 		acceptedEffect := accepted.Effect
 		acceptedEffect.Request = cloneModelRequest(accepted.Effect.Request)
 		acceptedEffect.Response = cloneResponse(accepted.Effect.Response)
-		if commitErr := gateway.dispatches.CommitProviderAccepted(context.WithoutCancel(ctx), ProviderAcceptedCommitRequest{
+		if commitErr := recordAccepted(context.WithoutCancel(ctx), ProviderAcceptedCommitRequest{
 			ExpectedRevision: effect.Revision,
 			Permit:           permit,
 			Effect:           acceptedEffect,
