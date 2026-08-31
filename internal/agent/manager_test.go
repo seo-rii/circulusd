@@ -89,6 +89,25 @@ type delayedCancellationLauncher struct {
 	releaseOnce     sync.Once
 }
 
+type retryAfterCancellationLauncher struct {
+	mu      sync.Mutex
+	starts  int
+	started chan ShardSpec
+}
+
+func (launcher *retryAfterCancellationLauncher) Start(ctx context.Context, spec ShardSpec) (ShardProcess, error) {
+	launcher.mu.Lock()
+	launcher.starts++
+	call := launcher.starts
+	launcher.mu.Unlock()
+	launcher.started <- spec
+	if call == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return &fakeProcess{id: spec.ShardID, launcher: &fakeLauncher{}}, nil
+}
+
 func newDelayedCancellationLauncher() *delayedCancellationLauncher {
 	return &delayedCancellationLauncher{
 		contextCanceled: make(chan struct{}),
@@ -458,6 +477,77 @@ func TestManagerConcurrentSameSessionStartsAndAdmitsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestManagerSuccessfulLaunchStaysPendingUntilAtomicPlacementAdoption(t *testing.T) {
+	launcher := &fakeLauncher{}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 8, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "pending-result-tenant", "pending-result-session", 1, time.Unix(2_000_000_340, 0).UTC())
+	workerID, err := WorkerIdentity(request.SessionID, request.Runtime)
+	if err != nil {
+		t.Fatalf("WorkerIdentity() error = %v", err)
+	}
+	scopeKey := string(request.Profile.ProcessScope) + "/" + string(request.Profile.OuterIsolation)
+	spec := ShardSpec{
+		AgentInstanceID: manager.agentInstanceID,
+		ShardID:         "agent-shard-00000000000000000001",
+		ShardGeneration: 1,
+		ScopeKey:        scopeKey,
+		Profile:         request.Profile,
+		Limits:          manager.limits,
+		CreatedAt:       request.Now,
+	}
+	launchCtx, cancelLaunch := context.WithCancel(context.Background())
+	defer cancelLaunch()
+	pending := &launchPending{
+		ctx: launchCtx, cancel: cancelLaunch, done: make(chan struct{}), spec: spec,
+		sessions: map[identity.ID]struct{}{request.SessionID: {}}, waiters: 1,
+	}
+	fingerprint := requestIdentity{
+		tenantID: request.TenantID, workerID: workerID, profile: request.Profile,
+		estimatedMemoryBytes: request.EstimatedMemoryBytes,
+	}
+	manager.mu.Lock()
+	manager.latestGenerations[request.SessionID] = request.PlacementGeneration
+	manager.requestIdentities[request.SessionID] = fingerprint
+	manager.pendingScopes[scopeKey] = pending
+	manager.pendingSessions[request.SessionID] = pending
+	manager.mu.Unlock()
+
+	manager.runLaunch(pending)
+	manager.mu.Lock()
+	published := manager.shards[spec.ShardID] != nil
+	stillPending := manager.pendingScopes[scopeKey] == pending && manager.pendingSessions[request.SessionID] == pending
+	finished := pending.finished
+	manager.mu.Unlock()
+	if published || !stillPending || !finished {
+		t.Fatalf("completed launch state = published:%t pending:%t finished:%t, want false/true/true", published, stillPending, finished)
+	}
+	if snapshot := manager.Snapshot(); snapshot != (ManagerSnapshot{}) {
+		t.Fatalf("pre-adoption snapshot = %#v, want no live shard or session", snapshot)
+	}
+
+	claim := &launchClaim{
+		request: request, workerID: workerID,
+		fingerprint: fingerprint,
+	}
+	if err := manager.waitForLaunch(context.Background(), pending, claim); err != nil {
+		t.Fatalf("waitForLaunch(adopt pending result) error = %v", err)
+	}
+	placement := claim.placement
+	if placement.ShardID != spec.ShardID || placement.Replayed {
+		t.Fatalf("adopted placement = %#v, want fresh placement on %q", placement, spec.ShardID)
+	}
+	if snapshot := manager.Snapshot(); snapshot.Shards != 1 || snapshot.ResidentSessions != 1 {
+		t.Fatalf("post-adoption snapshot = %#v", snapshot)
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	starts, stops := launcher.counts()
+	if starts != 1 || len(stops) != 1 || stops[0] != spec.ShardID {
+		t.Fatalf("launch/stop ownership = %d/%#v, want one start and one stop", starts, stops)
+	}
+}
+
 func TestManagerInitiatorCancellationDoesNotCancelAttachedSameSessionFollower(t *testing.T) {
 	launcher := &fakeLauncher{startGate: make(chan struct{})}
 	var releaseGate sync.Once
@@ -647,6 +737,9 @@ func TestManagerLaunchSpecBindsOneAgentInstanceAndFreshShardGeneration(t *testin
 	if specs[0].ShardGeneration == 0 || specs[1].ShardGeneration != specs[0].ShardGeneration+1 {
 		t.Fatalf("ShardGenerations = %d and %d, want consecutive nonzero generations", specs[0].ShardGeneration, specs[1].ShardGeneration)
 	}
+	if specs[0].ShardID == specs[1].ShardID {
+		t.Fatalf("capacity launch ShardIDs = %q and %q, want distinct logical slots", specs[0].ShardID, specs[1].ShardID)
+	}
 }
 
 func TestManagerLaunchRetryConsumesFreshShardGeneration(t *testing.T) {
@@ -667,8 +760,59 @@ func TestManagerLaunchRetryConsumesFreshShardGeneration(t *testing.T) {
 	if specs[0].ShardGeneration == 0 || specs[1].ShardGeneration != specs[0].ShardGeneration+1 {
 		t.Fatalf("retry ShardGenerations = %d and %d, want fresh consecutive generations", specs[0].ShardGeneration, specs[1].ShardGeneration)
 	}
+	if specs[0].ShardID != specs[1].ShardID {
+		t.Fatalf("retry ShardIDs = %q and %q, want one logical slot", specs[0].ShardID, specs[1].ShardID)
+	}
 	if specs[0].AgentInstanceID != specs[1].AgentInstanceID {
 		t.Fatalf("retry AgentInstanceIDs = %q and %q", specs[0].AgentInstanceID, specs[1].AgentInstanceID)
+	}
+}
+
+func TestManagerCanceledLaunchRetryReusesShardIDWithFreshGeneration(t *testing.T) {
+	launcher := &retryAfterCancellationLauncher{started: make(chan ShardSpec, 2)}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 1, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "cancel-retry-tenant", "cancel-retry-session", 1, time.Unix(2_000_000_432, 0).UTC())
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		_, acquireErr := manager.Acquire(firstCtx, request)
+		firstResult <- acquireErr
+	}()
+	var firstSpec ShardSpec
+	select {
+	case firstSpec = <-launcher.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first launch did not start")
+	}
+	cancelFirst()
+	if acquireErr := receiveError(t, firstResult); !errors.Is(acquireErr, context.Canceled) {
+		t.Fatalf("first Acquire() error = %v, want context.Canceled", acquireErr)
+	}
+
+	type acquireResult struct {
+		placement Placement
+		err       error
+	}
+	retryResult := make(chan acquireResult, 1)
+	go func() {
+		placement, acquireErr := manager.Acquire(context.Background(), request)
+		retryResult <- acquireResult{placement: placement, err: acquireErr}
+	}()
+	var retrySpec ShardSpec
+	select {
+	case retrySpec = <-launcher.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retry launch did not start")
+	}
+	result := <-retryResult
+	if result.err != nil {
+		t.Fatalf("retry Acquire() error = %v", result.err)
+	}
+	if retrySpec.ShardID != firstSpec.ShardID || result.placement.ShardID != firstSpec.ShardID {
+		t.Fatalf("cancel retry IDs = first:%q retry:%q placement:%q, want one logical slot", firstSpec.ShardID, retrySpec.ShardID, result.placement.ShardID)
+	}
+	if firstSpec.ShardGeneration == 0 || retrySpec.ShardGeneration != firstSpec.ShardGeneration+1 {
+		t.Fatalf("cancel retry generations = %d and %d, want fresh generation", firstSpec.ShardGeneration, retrySpec.ShardGeneration)
 	}
 }
 

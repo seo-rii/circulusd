@@ -40,7 +40,22 @@ type launchPending struct {
 	waiters   int
 	abandoned bool
 	finished  bool
-	err       error
+	adopted   bool
+	result    launchResult
+	cleanup   *stopPending
+}
+
+type launchResult struct {
+	process ShardProcess
+	err     error
+}
+
+type launchClaim struct {
+	request     PlacementRequest
+	workerID    string
+	fingerprint requestIdentity
+	placement   Placement
+	adopted     bool
 }
 
 type shardProcessKey struct {
@@ -85,6 +100,7 @@ type Manager struct {
 	pendingSessions     map[identity.ID]*launchPending
 	pendingScopes       map[string]*launchPending
 	pendingStops        map[shardProcessKey]*stopPending
+	retryShardIDs       map[string]string
 	nextShardSequence   uint64
 	nextShardGeneration ShardGeneration
 	closed              bool
@@ -114,6 +130,7 @@ func NewManager(launcher Launcher, limits Limits) (*Manager, error) {
 		pendingSessions:     make(map[identity.ID]*launchPending),
 		pendingScopes:       make(map[string]*launchPending),
 		pendingStops:        make(map[shardProcessKey]*stopPending),
+		retryShardIDs:       make(map[string]string),
 		nextShardSequence:   1,
 		nextShardGeneration: 1,
 	}, nil
@@ -226,12 +243,19 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 			return Placement{}, ErrManagerClosed
 		}
 		if pending := manager.pendingSessions[request.SessionID]; pending != nil {
-			if !pending.abandoned && !pending.finished && pending.spec.ScopeKey == scopeKey {
+			if !pending.abandoned && pending.spec.ScopeKey == scopeKey &&
+				manager.latestGenerations[request.SessionID] == request.PlacementGeneration &&
+				manager.releasedGenerations[request.SessionID] != request.PlacementGeneration &&
+				manager.requestIdentities[request.SessionID] == fingerprint {
 				pending.waiters++
 				pending.sessions[request.SessionID] = struct{}{}
 				manager.mu.Unlock()
-				if err := manager.waitForLaunch(ctx, pending); err != nil {
+				claim := &launchClaim{request: request, workerID: workerID, fingerprint: fingerprint}
+				if err := manager.waitForLaunch(ctx, pending, claim); err != nil {
 					return Placement{}, err
+				}
+				if claim.adopted {
+					return claim.placement, nil
 				}
 				continue
 			}
@@ -382,13 +406,17 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 		}
 
 		if pending := manager.pendingScopes[scopeKey]; pending != nil {
-			if !pending.abandoned && !pending.finished {
+			if !pending.abandoned {
 				pending.waiters++
 				pending.sessions[request.SessionID] = struct{}{}
 				manager.pendingSessions[request.SessionID] = pending
 				manager.mu.Unlock()
-				if err := manager.waitForLaunch(ctx, pending); err != nil {
+				claim := &launchClaim{request: request, workerID: workerID, fingerprint: fingerprint}
+				if err := manager.waitForLaunch(ctx, pending, claim); err != nil {
 					return Placement{}, err
+				}
+				if claim.adopted {
+					return claim.placement, nil
 				}
 				continue
 			}
@@ -411,8 +439,11 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 		} else {
 			manager.nextShardGeneration++
 		}
-		shardID := fmt.Sprintf("agent-shard-%020d", manager.nextShardSequence)
-		manager.nextShardSequence++
+		shardID := manager.retryShardIDs[scopeKey]
+		if shardID == "" {
+			shardID = fmt.Sprintf("agent-shard-%020d", manager.nextShardSequence)
+			manager.nextShardSequence++
+		}
 		spec := ShardSpec{
 			AgentInstanceID: manager.agentInstanceID,
 			ShardID:         shardID,
@@ -435,43 +466,179 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 		manager.pendingSessions[request.SessionID] = pending
 		manager.mu.Unlock()
 		go manager.runLaunch(pending)
-		if err := manager.waitForLaunch(ctx, pending); err != nil {
+		claim := &launchClaim{request: request, workerID: workerID, fingerprint: fingerprint}
+		if err := manager.waitForLaunch(ctx, pending, claim); err != nil {
 			return Placement{}, err
+		}
+		if claim.adopted {
+			return claim.placement, nil
 		}
 	}
 }
 
-func (manager *Manager) waitForLaunch(ctx context.Context, pending *launchPending) error {
-	select {
-	case <-ctx.Done():
-		var cancel context.CancelFunc
-		manager.mu.Lock()
-		if pending.waiters > 0 {
-			pending.waiters--
+func (manager *Manager) waitForLaunch(ctx context.Context, pending *launchPending, claim *launchClaim) error {
+	if claim == nil {
+		return ErrInvalidConfig
+	}
+	ctxDone := ctx.Done()
+	waitErr := ctx.Err()
+	if waitErr == nil {
+		select {
+		case <-ctxDone:
+			waitErr = ctx.Err()
+			if waitErr == nil {
+				waitErr = context.Canceled
+			}
+		case <-pending.done:
 		}
-		if !pending.finished && pending.waiters == 0 && !pending.abandoned {
-			pending.abandoned = true
-			cancel = pending.cancel
+	}
+
+	var cancel context.CancelFunc
+	var cleanup *trackedStop
+	manager.mu.Lock()
+	canceled := waitErr != nil
+	if !canceled {
+		select {
+		case <-ctxDone:
+			canceled = true
+		default:
+		}
+	}
+	if pending.waiters <= 0 {
+		manager.mu.Unlock()
+		return ErrInvalidConfig
+	}
+	pending.waiters--
+	if canceled {
+		if pending.waiters == 0 && !pending.adopted {
+			manager.retryShardIDs[pending.spec.ScopeKey] = pending.spec.ShardID
+			if !pending.finished {
+				if !pending.abandoned {
+					pending.abandoned = true
+					cancel = pending.cancel
+				}
+			} else if pending.result.err == nil && pending.result.process != nil {
+				stop := manager.transferSuccessfulLaunchLocked(pending)
+				cleanup = &trackedStop{
+					key: shardProcessKeyFor(pending.spec), pending: stop,
+					reason: "stop unadopted workerd process after caller cancellation",
+				}
+			}
 		}
 		manager.mu.Unlock()
 		if cancel != nil {
 			cancel()
 		}
-		return ctx.Err()
-	case <-pending.done:
-		manager.mu.Lock()
-		if pending.waiters > 0 {
-			pending.waiters--
+		if cleanup != nil {
+			manager.startTrackedStop(*cleanup)
 		}
-		err := pending.err
-		manager.mu.Unlock()
-		return err
+		if waitErr == nil {
+			waitErr = ctx.Err()
+			if waitErr == nil {
+				waitErr = context.Canceled
+			}
+		}
+		return waitErr
 	}
+	if !pending.finished {
+		manager.mu.Unlock()
+		return ErrInvalidConfig
+	}
+	if pending.result.err != nil {
+		resultErr := pending.result.err
+		manager.mu.Unlock()
+		return resultErr
+	}
+	if manager.closed {
+		if !pending.adopted {
+			stop := manager.transferSuccessfulLaunchLocked(pending)
+			cleanup = &trackedStop{
+				key: shardProcessKeyFor(pending.spec), pending: stop,
+				reason: "stop unadopted workerd process after manager shutdown",
+			}
+		}
+		manager.mu.Unlock()
+		if cleanup != nil {
+			manager.startTrackedStop(*cleanup)
+		}
+		return ErrManagerClosed
+	}
+	if pending.adopted {
+		manager.mu.Unlock()
+		return nil
+	}
+	claimErr := error(nil)
+	if manager.latestGenerations[claim.request.SessionID] != claim.request.PlacementGeneration || manager.releasedGenerations[claim.request.SessionID] == claim.request.PlacementGeneration {
+		claimErr = ErrStalePlacement
+	} else if manager.requestIdentities[claim.request.SessionID] != claim.fingerprint {
+		claimErr = ErrPlacementConflict
+	} else if pending.spec.ScopeKey == "" || manager.shards[pending.spec.ShardID] != nil || manager.placements[claim.request.SessionID] != (Placement{}) {
+		claimErr = ErrInvalidConfig
+	}
+	if claimErr != nil {
+		if pending.waiters == 0 {
+			stop := manager.transferSuccessfulLaunchLocked(pending)
+			cleanup = &trackedStop{
+				key: shardProcessKeyFor(pending.spec), pending: stop,
+				reason: "stop workerd process without a valid launch claim",
+			}
+		}
+		manager.mu.Unlock()
+		if cleanup != nil {
+			manager.startTrackedStop(*cleanup)
+		}
+		return claimErr
+	}
+	placement := Placement{
+		TenantID: claim.request.TenantID, SessionID: claim.request.SessionID,
+		PlacementGeneration: claim.request.PlacementGeneration,
+		ShardID:             pending.spec.ShardID, WorkerID: claim.workerID,
+		Profile: claim.request.Profile, AdmittedAt: claim.request.Now,
+	}
+	manager.shards[pending.spec.ShardID] = &shard{
+		spec: pending.spec, process: pending.result.process,
+		sessions:               map[identity.ID]Placement{claim.request.SessionID: placement},
+		estimatedResidentBytes: claim.request.EstimatedMemoryBytes,
+	}
+	manager.placements[claim.request.SessionID] = placement
+	pending.adopted = true
+	if manager.retryShardIDs[pending.spec.ScopeKey] == pending.spec.ShardID {
+		delete(manager.retryShardIDs, pending.spec.ScopeKey)
+	}
+	manager.removeLaunchPendingLocked(pending)
+	claim.placement = placement
+	claim.adopted = true
+	manager.mu.Unlock()
+	return nil
+}
+
+// removeLaunchPendingLocked releases only the launch barrier; process
+// ownership must already be in either shards or pendingStops.
+func (manager *Manager) removeLaunchPendingLocked(pending *launchPending) {
+	if manager.pendingScopes[pending.spec.ScopeKey] == pending {
+		delete(manager.pendingScopes, pending.spec.ScopeKey)
+	}
+	for sessionID := range pending.sessions {
+		if manager.pendingSessions[sessionID] == pending {
+			delete(manager.pendingSessions, sessionID)
+		}
+	}
+}
+
+// transferSuccessfulLaunchLocked moves one finished, unadopted process into
+// the generation-keyed cleanup ledger. It does not invoke process callbacks.
+func (manager *Manager) transferSuccessfulLaunchLocked(pending *launchPending) *stopPending {
+	pending.abandoned = true
+	manager.retryShardIDs[pending.spec.ScopeKey] = pending.spec.ShardID
+	manager.removeLaunchPendingLocked(pending)
+	if pending.cleanup == nil {
+		pending.cleanup = manager.trackStopLocked(pending.spec, pending.result.process)
+	}
+	return pending.cleanup
 }
 
 func (manager *Manager) runLaunch(pending *launchPending) {
 	process, launchErr := manager.launcher.Start(pending.ctx, pending.spec)
-	var rejectedProcess ShardProcess
 	processIsNil := process == nil
 	if !processIsNil {
 		value := reflect.ValueOf(process)
@@ -485,40 +652,37 @@ func (manager *Manager) runLaunch(pending *launchPending) {
 		processID = process.ID()
 	}
 
+	outcomeErr := launchErr
+	var rejectedProcess ShardProcess
 	manager.mu.Lock()
-	if launchErr == nil {
+	if outcomeErr == nil {
 		if processIsNil || processID != pending.spec.ShardID {
-			launchErr = ErrInvalidConfig
+			outcomeErr = ErrInvalidConfig
 			if !processIsNil {
 				rejectedProcess = process
 			}
 		} else if manager.closed {
-			launchErr = ErrManagerClosed
+			outcomeErr = ErrManagerClosed
 			rejectedProcess = process
-		} else if pending.abandoned {
-			launchErr = context.Canceled
+		} else if pending.abandoned || pending.waiters == 0 {
+			outcomeErr = context.Canceled
 			rejectedProcess = process
 		} else {
-			manager.shards[pending.spec.ShardID] = &shard{
-				spec: pending.spec, process: process, sessions: make(map[identity.ID]Placement),
-			}
+			pending.result = launchResult{process: process}
+			pending.finished = true
+			close(pending.done)
+			manager.mu.Unlock()
+			pending.cancel()
+			return
 		}
 	} else if !processIsNil {
 		rejectedProcess = process
 	}
 	if rejectedProcess == nil {
-		if launchErr != nil {
-			pending.err = fmt.Errorf("launch workerd shard: %w", launchErr)
-		}
+		pending.result = launchResult{err: fmt.Errorf("launch workerd shard: %w", outcomeErr)}
 		pending.finished = true
-		if manager.pendingScopes[pending.spec.ScopeKey] == pending {
-			delete(manager.pendingScopes, pending.spec.ScopeKey)
-		}
-		for sessionID := range pending.sessions {
-			if manager.pendingSessions[sessionID] == pending {
-				delete(manager.pendingSessions, sessionID)
-			}
-		}
+		manager.retryShardIDs[pending.spec.ScopeKey] = pending.spec.ShardID
+		manager.removeLaunchPendingLocked(pending)
 		close(pending.done)
 		manager.mu.Unlock()
 		pending.cancel()
@@ -532,19 +696,13 @@ func (manager *Manager) runLaunch(pending *launchPending) {
 	manager.mu.Unlock()
 
 	if stopErr := manager.executeTrackedStop(context.Background(), rejectedStop); stopErr != nil {
-		launchErr = errors.Join(launchErr, stopErr)
+		outcomeErr = errors.Join(outcomeErr, stopErr)
 	}
 	manager.mu.Lock()
-	pending.err = fmt.Errorf("launch workerd shard: %w", launchErr)
+	pending.result = launchResult{err: fmt.Errorf("launch workerd shard: %w", outcomeErr)}
 	pending.finished = true
-	if manager.pendingScopes[pending.spec.ScopeKey] == pending {
-		delete(manager.pendingScopes, pending.spec.ScopeKey)
-	}
-	for sessionID := range pending.sessions {
-		if manager.pendingSessions[sessionID] == pending {
-			delete(manager.pendingSessions, sessionID)
-		}
-	}
+	manager.retryShardIDs[pending.spec.ScopeKey] = pending.spec.ShardID
+	manager.removeLaunchPendingLocked(pending)
 	close(pending.done)
 	manager.mu.Unlock()
 	pending.cancel()
@@ -675,6 +833,12 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 		manager.closed = true
 		launches := make([]<-chan struct{}, 0, len(manager.pendingScopes))
 		for _, pending := range manager.pendingScopes {
+			if pending.finished {
+				if !pending.adopted && pending.result.err == nil && pending.result.process != nil {
+					manager.transferSuccessfulLaunchLocked(pending)
+				}
+				continue
+			}
 			launches = append(launches, pending.done)
 		}
 		manager.mu.Unlock()

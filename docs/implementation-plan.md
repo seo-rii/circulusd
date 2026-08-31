@@ -109,6 +109,15 @@ not silently included in Unit 10.
   identity outcome. Parser, injected-reader concurrency, and live current-process
   tests pass repeatedly under the race detector. pidfd ownership, launcher
   attachment, serialized observation sequencing, and Manager delivery remain.
+- 2026-09-01: a successful Manager start now remains an immutable pending
+  result until a still-valid waiter atomically adopts both the process and its
+  first placement under the Manager lock. If the final claim is canceled, or
+  shutdown wins first, ownership moves to one cached generation-keyed stop
+  epoch; a late waiter joins that epoch instead of stopping the process twice.
+  Failed and canceled starts reserve their logical `ShardID` for retry while
+  consuming a fresh `ShardGeneration`; independent capacity slots still receive
+  distinct shard IDs. Deterministic post-completion cancellation, late-claim,
+  retry, shutdown, and repeated race/shuffle tests pass.
 
 ### Outcome
 
@@ -416,6 +425,10 @@ start. Canceling the initiating caller after another waiter attaches does not
 cancel the shared start. Canceling the last waiter requests cancellation, but
 the detached cleanup owner remains responsible for reaching a quiescent state.
 The immutable launch result/error is published to every remaining waiter.
+Successful launch completion alone does not insert a zero-session process into
+the live shard map. The first still-valid claim publishes the ready shard and
+its initial placement atomically; if no valid claim remains, the pending owner
+transfers that process to exactly one cleanup epoch.
 
 Stop and shutdown use shared cleanup epochs:
 

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hancomac/circulusd/internal/identity"
 )
 
 var errControlledStop = errors.New("test: controlled stop failure")
@@ -183,6 +185,100 @@ func TestManagerShutdownFencesAndDrainsAnInflightLaunch(t *testing.T) {
 	}
 	if snapshot := manager.Snapshot(); snapshot != (ManagerSnapshot{}) {
 		t.Fatalf("post-shutdown snapshot = %#v", snapshot)
+	}
+}
+
+func TestManagerCanceledLastClaimAfterCompletedLaunchTransfersOneStopEpoch(t *testing.T) {
+	stopGate := make(chan struct{})
+	process := &controlledStopProcess{stopEntered: make(chan struct{}), stopGate: stopGate}
+	launcher := &controlledStopLauncher{process: process}
+	manager := mustManager(t, launcher, Limits{
+		MaximumSessions: 4, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := baseRequest(t, "completed-cancel-tenant", "completed-cancel-session", 1, time.Unix(2_000_001_025, 0).UTC())
+	pending := registerUnadoptedLaunch(t, manager, request)
+	manager.runLaunch(pending)
+
+	// Cancellation is already observable when the completed result is resolved,
+	// so the claim must not adopt even though the result channel is also ready.
+	claimCtx, cancelClaim := context.WithCancel(context.Background())
+	cancelClaim()
+	if err := manager.waitForLaunch(claimCtx, pending, &launchClaim{request: request}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForLaunch(canceled completed claim) error = %v, want context.Canceled", err)
+	}
+	key := shardProcessKeyFor(pending.spec)
+	manager.mu.Lock()
+	liveShards := len(manager.shards)
+	livePlacements := len(manager.placements)
+	tracked := manager.pendingStops[key]
+	manager.mu.Unlock()
+	if liveShards != 0 || livePlacements != 0 || tracked == nil {
+		t.Fatalf("post-cancel ownership = shards:%d placements:%d stop:%v, want 0/0/tracked", liveShards, livePlacements, tracked != nil)
+	}
+	select {
+	case <-process.stopEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("manager-owned Stop epoch did not start")
+	}
+	close(stopGate)
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown(join cleanup) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls = %d, want exactly one epoch", calls)
+	}
+}
+
+func TestManagerShutdownClaimsFinishedUnadoptedLaunch(t *testing.T) {
+	process := &controlledStopProcess{}
+	launcher := &controlledStopLauncher{process: process}
+	manager := mustManager(t, launcher, Limits{
+		MaximumSessions: 4, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := baseRequest(t, "shutdown-pending-tenant", "shutdown-pending-session", 1, time.Unix(2_000_001_050, 0).UTC())
+	pending := registerUnadoptedLaunch(t, manager, request)
+	manager.runLaunch(pending)
+
+	shutdownResult := make(chan error, 1)
+	go func() { shutdownResult <- manager.Shutdown(context.Background()) }()
+	if err := receiveError(t, shutdownResult); err != nil {
+		t.Fatalf("Shutdown(finished unadopted launch) error = %v", err)
+	}
+	manager.mu.Lock()
+	pendingScopes := len(manager.pendingScopes)
+	pendingSessions := len(manager.pendingSessions)
+	manager.mu.Unlock()
+	if pendingScopes != 0 || pendingSessions != 0 || manager.Snapshot() != (ManagerSnapshot{}) {
+		t.Fatalf("shutdown pending state = scopes:%d sessions:%d snapshot:%#v", pendingScopes, pendingSessions, manager.Snapshot())
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls = %d, want one", calls)
+	}
+}
+
+func TestManagerLateLaunchClaimJoinsShutdownStopEpoch(t *testing.T) {
+	process := &controlledStopProcess{}
+	launcher := &controlledStopLauncher{process: process}
+	manager := mustManager(t, launcher, Limits{
+		MaximumSessions: 4, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := baseRequest(t, "late-claim-tenant", "late-claim-session", 1, time.Unix(2_000_001_075, 0).UTC())
+	pending := registerUnadoptedLaunch(t, manager, request)
+	manager.runLaunch(pending)
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown(claim result) error = %v", err)
+	}
+	if err := manager.waitForLaunch(context.Background(), pending, &launchClaim{request: request}); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("late waitForLaunch() error = %v, want ErrManagerClosed", err)
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown(join late claim) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls = %d, want late claim to join the first epoch", calls)
 	}
 }
 
@@ -587,6 +683,46 @@ func dedicatedRequest(t *testing.T, seed string, now time.Time) PlacementRequest
 	request.TrustClass = TrustUnreviewed
 	request.Profile = PlacementProfile{ProcessScope: ScopeSession, OuterIsolation: IsolationFirecracker}
 	return request
+}
+
+func registerUnadoptedLaunch(t *testing.T, manager *Manager, request PlacementRequest) *launchPending {
+	t.Helper()
+	workerID, err := WorkerIdentity(request.SessionID, request.Runtime)
+	if err != nil {
+		t.Fatalf("WorkerIdentity() error = %v", err)
+	}
+	scopeKey := string(request.Profile.ProcessScope) + "/" + string(request.Profile.OuterIsolation)
+	switch request.Profile.ProcessScope {
+	case ScopeTenant:
+		scopeKey += "/" + request.TenantID.String()
+	case ScopeSession:
+		scopeKey += "/" + request.SessionID.String()
+	}
+	launchCtx, cancelLaunch := context.WithCancel(context.Background())
+	pending := &launchPending{
+		ctx: launchCtx, cancel: cancelLaunch, done: make(chan struct{}),
+		spec: ShardSpec{
+			AgentInstanceID: manager.agentInstanceID,
+			ShardID:         "agent-shard-00000000000000000001",
+			ShardGeneration: 1,
+			ScopeKey:        scopeKey,
+			Profile:         request.Profile,
+			Limits:          manager.limits,
+			CreatedAt:       request.Now,
+		},
+		sessions: map[identity.ID]struct{}{request.SessionID: {}},
+		waiters:  1,
+	}
+	manager.mu.Lock()
+	manager.latestGenerations[request.SessionID] = request.PlacementGeneration
+	manager.requestIdentities[request.SessionID] = requestIdentity{
+		tenantID: request.TenantID, workerID: workerID, profile: request.Profile,
+		estimatedMemoryBytes: request.EstimatedMemoryBytes,
+	}
+	manager.pendingScopes[scopeKey] = pending
+	manager.pendingSessions[request.SessionID] = pending
+	manager.mu.Unlock()
+	return pending
 }
 
 func waitForLauncherStarts(t *testing.T, launcher *fakeLauncher, want int) {
