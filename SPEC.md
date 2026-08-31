@@ -3573,13 +3573,28 @@ manifest에서 side-effecting tool의 replay mode가 없으면 설치/Runtime Re
 interface InvocationResultRecord {
   invocationId: string;
   requestDigest: string;
-  status: "inflight" | "committed" | "failed";
+  service: string;
+  operation: string;
+  dispatchAttempt: number;
+  platformRequestId?: string;
+  providerRouteDigest: string;
+  status: "absent" | "inflight" | "committed" | "failed" | "unknown";
+  externalProviderRequestId?: string;
   externalCommitId?: string;
   resultRef?: string;
 }
 ```
 
 동일 invocation ID + 다른 request digest는 재사용 공격 또는 corruption으로 취급한다.
+provider command는 Session start claim 전에 subordinate ledger에 immutable하게
+prepare하고 canonical command digest로 결속한다. exact replay만 같은 record를
+사용할 수 있고 service, operation, attempt, platform request ID 또는 route를 바꾼
+relabel은 provider I/O 전에 거부한다. claim 후에는 `inflight` tombstone을 먼저
+기록하며 provider acceptance, terminal result 및 `unknown` fact는 그 뒤에만
+추가한다. provider 호출 중 ledger lock을 유지하거나 adapter 내부에서 동일
+attempt를 자동 재시도해서는 안 된다. Session이 발급한 opaque dispatch/start
+bearer는 subordinate command나 observation에 저장하거나 provider에 전달하지 않고,
+검증 직후 제거한다.
 
 ### 35.5 Workspace mutation
 
@@ -4329,6 +4344,8 @@ sudo ./install.sh --profile development
 - 낮은 resource limit
 - production secret 사용 금지
 - broad debug capability는 production profile에 승격 금지
+- process-local reference subordinate ledger와 deterministic fake effect 사용 가능
+- reference store 재구성 테스트는 process kill/durable restart 증거가 아니며 production capability/readiness로 승격 금지
 
 ## 42. Air-gap Bundle
 
