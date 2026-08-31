@@ -95,6 +95,14 @@ not silently included in Unit 10.
   caller. Repeated adapter and complete agent race/shuffle tests pass. The
   boot-scoped agent identity still must be carried through the low-level
   request/readiness/cgroup identity tuple before observation is wired.
+- 2026-09-01: Linux process observation now captures an immutable
+  `(pid, startTicks)` token from bounded canonical `/proc/<pid>/stat` input and
+  derives RSS bytes from bounded `statm` input with page-size and multiplication
+  overflow checks. Each sample reads `stat`, `statm`, then `stat` again through
+  one pinned proc directory descriptor and rejects PID reuse as a distinct stale
+  identity outcome. Parser, injected-reader concurrency, and live current-process
+  tests pass repeatedly under the race detector. pidfd ownership, launcher
+  attachment, serialized observation sequencing, and Manager delivery remain.
 
 ### Outcome
 
