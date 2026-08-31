@@ -627,10 +627,16 @@ func (client *Client) performHandshake(ctx context.Context, nonce []byte) (strin
 	}
 	if response == nil || response.Msg == nil || hasUnknownFields(response.Msg) ||
 		!isProtocolVersion(response.Msg.GetSelectedVersion()) || response.Msg.GetFeatureBitmap() != 0 ||
+		response.Msg.GetServerPeer() != v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD ||
 		response.Msg.GetMaximumFrameSize() != maximumMessageBytes || !isDescriptorDigest(response.Msg.GetDescriptorDigest()) ||
 		response.Msg.GetStatus().GetName() != "sandbox.process" ||
 		response.Msg.GetStatus().GetAvailability() != v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE ||
-		!bytes.Equal(response.Msg.GetNonceProof(), nonceProof(nonce, client.sandboxID, client.generation)) {
+		!bytes.Equal(response.Msg.GetNonceProof(), nonceProof(
+			nonce,
+			client.sandboxID,
+			client.generation,
+			v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD,
+		)) {
 		return "", connect.NewError(connect.CodeDataLoss, errors.New("handshake response failed protocol validation"))
 	}
 	session := response.Header().Get(sessionHeader)

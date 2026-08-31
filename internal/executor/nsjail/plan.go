@@ -85,6 +85,7 @@ type ResourceLimits struct {
 type Request struct {
 	SandboxID            identity.ID
 	Generation           uint64
+	EnvironmentDigest    string
 	RootfsDigest         string
 	SeccompProfileDigest string
 	SandboxdDigest       string
@@ -114,6 +115,7 @@ type LaunchPlan struct {
 	rootfsPath           string
 	seccompPath          string
 	sandboxdHostPath     string
+	environmentDigest    string
 	rootfsDigest         string
 	seccompProfileDigest string
 	sandboxdDigest       string
@@ -254,6 +256,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 		name  string
 		value string
 	}{
+		{name: "execution environment", value: request.EnvironmentDigest},
 		{name: "rootfs", value: request.RootfsDigest},
 		{name: "seccomp profile", value: request.SeccompProfileDigest},
 		{name: "sandboxd", value: request.SandboxdDigest},
@@ -362,6 +365,8 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--control-socket\"\n  arg: %s\n", strconv.Quote(sandboxControlSocketPath))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--sandbox-id\"\n  arg: %s\n", strconv.Quote(request.SandboxID.String()))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--generation\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(request.Generation, 10)))
+	_, _ = configuration.WriteString("  arg: \"--backend\"\n  arg: \"nsjail\"\n")
+	_, _ = fmt.Fprintf(&configuration, "  arg: \"--execution-environment-digest\"\n  arg: %s\n", strconv.Quote(request.EnvironmentDigest))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--protocol-version\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.ProtocolVersion), 10)))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--command-manifest-owner-uid\"\n  arg: %s\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.CommandManifestOwnerUID), 10)))
 	_, _ = fmt.Fprintf(&configuration, "  arg: \"--allow-client-uid\"\n  arg: %s\n}\n", strconv.Quote(strconv.FormatUint(uint64(planner.config.SandboxdClientUID), 10)))
@@ -379,6 +384,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 		rootfsPath:           rootfsPath,
 		seccompPath:          seccompPath,
 		sandboxdHostPath:     sandboxdHostPath,
+		environmentDigest:    request.EnvironmentDigest,
 		rootfsDigest:         request.RootfsDigest,
 		seccompProfileDigest: request.SeccompProfileDigest,
 		sandboxdDigest:       request.SandboxdDigest,
@@ -410,6 +416,7 @@ func digestLaunchPlan(plan LaunchPlan) string {
 		[]byte(plan.rootfsPath),
 		[]byte(plan.seccompPath),
 		[]byte(plan.sandboxdHostPath),
+		[]byte(plan.environmentDigest),
 		[]byte(plan.rootfsDigest),
 		[]byte(plan.seccompProfileDigest),
 		[]byte(plan.sandboxdDigest),

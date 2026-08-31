@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/sandboxd"
 	"github.com/hancomac/circulusd/internal/sandboxrpc"
@@ -122,6 +125,8 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	manifestOwnerUID := singleStringValue{name: "command manifest owner UID"}
 	sandboxID := singleStringValue{name: "sandbox ID"}
 	generationValue := singleStringValue{name: "generation"}
+	backendValue := singleStringValue{name: "backend"}
+	executionEnvironmentDigestValue := singleStringValue{name: "execution environment digest"}
 	protocolVersion := singleStringValue{name: "protocol version"}
 	var allowedClientUIDs uidValues
 	flags.Var(&socketPath, "control-socket", "canonical absolute private control socket path")
@@ -129,6 +134,8 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	flags.Var(&manifestOwnerUID, "command-manifest-owner-uid", "expected owner UID of the sealed command manifest")
 	flags.Var(&sandboxID, "sandbox-id", "launch-time sandbox identity")
 	flags.Var(&generationValue, "generation", "positive launch-time sandbox generation")
+	flags.Var(&backendValue, "backend", "launch-time execution backend: nsjail, docker, or firecracker")
+	flags.Var(&executionEnvironmentDigestValue, "execution-environment-digest", "canonical launch-time SHA-256 environment digest")
 	flags.Var(&protocolVersion, "protocol-version", "sandbox protocol major version")
 	flags.Var(&allowedClientUIDs, "allow-client-uid", "peer UID allowed to use the private socket; may be repeated")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
@@ -137,8 +144,27 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	parsedSandboxID, sandboxIDError := identity.Parse(identity.Sandbox, sandboxID.value)
 	generation, generationError := strconv.ParseUint(generationValue.value, 10, 64)
 	parsedManifestOwnerUID, manifestOwnerError := strconv.ParseUint(manifestOwnerUID.value, 10, 32)
+	backend := v1.ExecutionBackend_EXECUTION_BACKEND_UNSPECIFIED
+	switch backendValue.value {
+	case "nsjail":
+		backend = v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL
+	case "docker":
+		backend = v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER
+	case "firecracker":
+		backend = v1.ExecutionBackend_EXECUTION_BACKEND_FIRECRACKER
+	}
+	executionEnvironmentDigest, executionEnvironmentDigestError := hex.DecodeString(
+		strings.TrimPrefix(executionEnvironmentDigestValue.value, "sha256:"),
+	)
+	validExecutionEnvironmentDigest := executionEnvironmentDigestValue.set &&
+		len(executionEnvironmentDigestValue.value) == len("sha256:")+sha256.Size*2 &&
+		strings.HasPrefix(executionEnvironmentDigestValue.value, "sha256:") &&
+		executionEnvironmentDigestValue.value == strings.ToLower(executionEnvironmentDigestValue.value) &&
+		executionEnvironmentDigestError == nil && len(executionEnvironmentDigest) == sha256.Size
 	if sandboxIDError != nil || generationError != nil || generation == 0 ||
 		generation > maximumSharedGeneration || strconv.FormatUint(generation, 10) != generationValue.value ||
+		backend == v1.ExecutionBackend_EXECUTION_BACKEND_UNSPECIFIED || !backendValue.set ||
+		!validExecutionEnvironmentDigest ||
 		manifestOwnerError != nil || parsedManifestOwnerUID == 0 || parsedManifestOwnerUID == uint64(^uint32(0)) ||
 		strconv.FormatUint(parsedManifestOwnerUID, 10) != manifestOwnerUID.value || !manifestOwnerUID.set ||
 		protocolVersion.value != supportedProtocolVersion || !protocolVersion.set ||
@@ -195,21 +221,28 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 	defer supervisor.Fence(generation + 1) // generation is bounded below uint64 overflow.
 
 	server, err := dependencies.listen(sandboxrpc.ServerConfig{
-		SocketPath:        socketPath.value,
-		AllowedClientUIDs: append([]uint32(nil), allowedClientUIDs.values...),
-		SandboxID:         []byte(parsedSandboxID.String()),
-		SandboxGeneration: generation,
-		OneTimeNonce:      nonce,
-		Supervisor:        supervisor,
+		SocketPath:                 socketPath.value,
+		AllowedClientUIDs:          append([]uint32(nil), allowedClientUIDs.values...),
+		SandboxID:                  []byte(parsedSandboxID.String()),
+		SandboxGeneration:          generation,
+		Backend:                    backend,
+		ExecutionEnvironmentDigest: append([]byte(nil), executionEnvironmentDigest...),
+		OneTimeNonce:               nonce,
+		Supervisor:                 supervisor,
 	})
 	clearBytes(nonce)
 	if err != nil || server == nil {
 		fmt.Fprintf(dependencies.stderr, "sandboxd: listen on control socket: %v\n", err)
 		return 1
 	}
-	defer server.Close()
-	if err := server.Serve(ctx); err != nil {
-		fmt.Fprintf(dependencies.stderr, "sandboxd: serve control socket: %v\n", err)
+	serveError := server.Serve(ctx)
+	closeError := server.Close()
+	if serveError != nil {
+		fmt.Fprintf(dependencies.stderr, "sandboxd: serve control socket: %v\n", serveError)
+		return 1
+	}
+	if closeError != nil {
+		fmt.Fprintln(dependencies.stderr, "sandboxd: close control socket")
 		return 1
 	}
 	return 0

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/sandboxd"
 	"github.com/hancomac/circulusd/internal/sandboxrpc"
@@ -600,12 +601,14 @@ func (fixture *handshakeBrokerFixture) listen(
 		t.Fatalf("NewSupervisor() error = %v", err)
 	}
 	server, err := sandboxrpc.ListenServer(sandboxrpc.ServerConfig{
-		SocketPath:        socketPath,
-		AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
-		SandboxID:         []byte(fixture.sandboxID.String()),
-		SandboxGeneration: generation,
-		OneTimeNonce:      append([]byte(nil), nonce...),
-		Supervisor:        supervisor,
+		SocketPath:                 socketPath,
+		AllowedClientUIDs:          []uint32{uint32(os.Geteuid())},
+		SandboxID:                  []byte(fixture.sandboxID.String()),
+		SandboxGeneration:          generation,
+		Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+		ExecutionEnvironmentDigest: bytes.Repeat([]byte{0x42}, 32),
+		OneTimeNonce:               append([]byte(nil), nonce...),
+		Supervisor:                 supervisor,
 	})
 	if err != nil {
 		t.Fatalf("ListenServer() error = %v", err)

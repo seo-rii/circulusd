@@ -124,10 +124,13 @@ func digestProto(domain string, message proto.Message) (*v1.Digest, error) {
 	return sha256Digest(payload), nil
 }
 
-func nonceProof(nonce, sandboxID []byte, generation uint64) []byte {
+func nonceProof(nonce, sandboxID []byte, generation uint64, serverPeer v1.ProtocolPeer) []byte {
 	mac := hmac.New(sha256.New, nonce)
 	_, _ = mac.Write([]byte(nonceProofDomain))
 	_, _ = mac.Write(descriptorDigest().GetValue())
+	var encodedPeer [4]byte
+	binary.BigEndian.PutUint32(encodedPeer[:], uint32(serverPeer))
+	_, _ = mac.Write(encodedPeer[:])
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], uint32(len(sandboxID)))
 	_, _ = mac.Write(length[:])

@@ -402,6 +402,7 @@ func (provider *Provider) EnsureSandbox(
 		plan, buildErr := provider.dependencies.build(Request{
 			SandboxID:            sandboxID,
 			Generation:           generation,
+			EnvironmentDigest:    request.Spec.EnvironmentDigest,
 			RootfsDigest:         resolved.RootfsDigest,
 			SeccompProfileDigest: resolved.SeccompProfileDigest,
 			SandboxdDigest:       resolved.SandboxdDigest,

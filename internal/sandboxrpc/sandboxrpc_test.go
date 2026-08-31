@@ -3,11 +3,13 @@
 package sandboxrpc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"connectrpc.com/connect"
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
+	v1connect "github.com/hancomac/circulusd/api/generated/circulus/v1alpha/circulusv1alphaconnect"
 	"github.com/hancomac/circulusd/internal/sandboxd"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -55,6 +58,168 @@ func TestClientReadyAuthenticatesOneSessionConcurrently(t *testing.T) {
 	}
 }
 
+func TestSandboxServerBoundsWholeIOAndRejectsGeneralOptions(t *testing.T) {
+	server, client, _ := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	if server.httpServer.ReadTimeout != 5*time.Second {
+		t.Fatalf("ReadTimeout = %s, want 5s", server.httpServer.ReadTimeout)
+	}
+	if server.httpServer.WriteTimeout != maximumRPCDeadline+sandboxHTTPIOTimeout {
+		t.Fatalf("WriteTimeout = %s, want bounded long-lived RPC horizon", server.httpServer.WriteTimeout)
+	}
+	if !server.httpServer.DisableGeneralOptionsHandler {
+		t.Fatal("general OPTIONS handler is enabled outside the Connect RPC routes")
+	}
+
+	connection, err := net.DialTimeout("unix", server.SocketPath(), time.Second)
+	if err != nil {
+		t.Fatalf("dial sandbox socket: %v", err)
+	}
+	defer connection.Close()
+	if err := connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set connection deadline: %v", err)
+	}
+	if _, err := connection.Write([]byte(
+		"OPTIONS * HTTP/1.1\r\nHost: sandbox.invalid\r\nConnection: close\r\n\r\n",
+	)); err != nil {
+		t.Fatalf("write OPTIONS request: %v", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodOptions})
+	if err != nil {
+		t.Fatalf("read OPTIONS response: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 400 || response.StatusCode >= 500 {
+		t.Fatalf("OPTIONS * status = %d, want a 4xx rejection", response.StatusCode)
+	}
+}
+
+func TestServerCloseCachesCleanupError(t *testing.T) {
+	closeFailure := errors.New("sandbox listener cleanup failed")
+	listener := newFailingCloseListener(closeFailure)
+	server := &Server{
+		listener:   listener,
+		httpServer: &http.Server{},
+		handler:    &rpcHandler{},
+	}
+
+	if err := server.Close(); !errors.Is(err, closeFailure) {
+		t.Fatalf("first Close() error = %v, want cleanup failure", err)
+	}
+	if err := server.Close(); !errors.Is(err, closeFailure) {
+		t.Fatalf("second Close() error = %v, want cached cleanup failure", err)
+	}
+}
+
+func TestServerServeReturnsCancellationCleanupError(t *testing.T) {
+	closeFailure := errors.New("sandbox cancellation cleanup failed")
+	listener := newFailingCloseListener(closeFailure)
+	server := &Server{
+		listener:   listener,
+		httpServer: &http.Server{},
+		handler:    &rpcHandler{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx)
+	}()
+	select {
+	case <-listener.accepting:
+	case <-time.After(time.Second):
+		t.Fatal("Serve() did not begin accepting")
+	}
+	cancel()
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, closeFailure) {
+			t.Fatalf("Serve() error = %v, want cleanup failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve() did not return after cancellation")
+	}
+}
+
+func TestSandboxRPCRejectsWrongDaemonPeerAndBindsNonceProof(t *testing.T) {
+	server, client, _ := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	client.control = wrongPeerSandboxControlClient{}
+	err := client.Ready(context.Background())
+	if got := connect.CodeOf(err); got != connect.CodeDataLoss {
+		t.Fatalf("Ready(wrong daemon) code = %v error=%v, want data_loss", got, err)
+	}
+
+	nonce := bytes.Repeat([]byte{0xa5}, handshakeNonceBytes)
+	sandboxdProof := nonceProof(nonce, []byte("sandbox-alpha"), 7, v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD)
+	executordProof := nonceProof(nonce, []byte("sandbox-alpha"), 7, v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD)
+	if bytes.Equal(sandboxdProof, executordProof) {
+		t.Fatal("sandbox nonce proof is not bound to the authenticated server peer")
+	}
+}
+
+func TestSandboxServerRejectsDisallowedUDSPeerUID(t *testing.T) {
+	root, err := os.MkdirTemp("", "circulusd-srpc-uid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
+		Authority:         sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 7},
+		WorkspaceRoot:     workspace,
+		Commands:          map[string]string{"echo": "/bin/echo"},
+		Runner:            sandboxd.NewFakeRunner(),
+		ReplayLimitBytes:  1 << 20,
+		ReplayLimitEvents: 128,
+		SubscriberBuffer:  16,
+		ReadChunkBytes:    4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := bytes.Repeat([]byte{0x5a}, handshakeNonceBytes)
+	server, err := ListenServer(ServerConfig{
+		SocketPath:                 filepath.Join(root, "control.sock"),
+		AllowedClientUIDs:          []uint32{uint32(os.Getuid()) + 1},
+		SandboxID:                  []byte("sandbox-alpha"),
+		SandboxGeneration:          7,
+		Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+		ExecutionEnvironmentDigest: testExecutionEnvironmentDigest(),
+		OneTimeNonce:               nonce,
+		Supervisor:                 supervisor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go func() { _ = server.Serve(context.Background()) }()
+	client, err := NewClient(ClientConfig{
+		SocketPath:        server.SocketPath(),
+		ServerUID:         uint32(os.Geteuid()),
+		SandboxID:         []byte("sandbox-alpha"),
+		SandboxGeneration: 7,
+		OneTimeNonce:      nonce,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := client.Ready(ctx); err == nil {
+		t.Fatal("Ready() from disallowed UDS peer UID succeeded")
+	}
+}
+
 func TestClientPinnedEndpointFencesPathnameABA(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
@@ -85,12 +250,14 @@ func TestClientPinnedEndpointFencesPathnameABA(t *testing.T) {
 			t.Fatal(err)
 		}
 		server, err := ListenServer(ServerConfig{
-			SocketPath:        socketPath,
-			AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
-			SandboxID:         []byte("sandbox-alpha"),
-			SandboxGeneration: 7,
-			OneTimeNonce:      nonce,
-			Supervisor:        supervisor,
+			SocketPath:                 socketPath,
+			AllowedClientUIDs:          []uint32{uint32(os.Geteuid())},
+			SandboxID:                  []byte("sandbox-alpha"),
+			SandboxGeneration:          7,
+			Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+			ExecutionEnvironmentDigest: testExecutionEnvironmentDigest(),
+			OneTimeNonce:               nonce,
+			Supervisor:                 supervisor,
 		})
 		if err != nil {
 			t.Fatalf("ListenServer(%q) error = %v", socketPath, err)
@@ -629,6 +796,166 @@ func TestPrivateTransportFailsClosedAtWireBoundary(t *testing.T) {
 	}
 }
 
+func TestSpawnRejectsForgedServiceAuthorityBeforeExecution(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+
+	tests := []struct {
+		name   string
+		mutate func(*v1.SpawnProcessRequest)
+	}{
+		{name: "wrong service", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.Service = v1.EffectService_EFFECT_SERVICE_MODEL
+		}},
+		{name: "wrong operation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.Operation = "executor.retry"
+		}},
+		{name: "unspecified replay policy", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.ReplayPolicy = v1.ReplayPolicy_REPLAY_POLICY_UNSPECIFIED
+		}},
+		{name: "unknown replay policy", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.ReplayPolicy = v1.ReplayPolicy(99)
+		}},
+		{name: "malformed parent operation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.ParentOperationId.Value = nil
+		}},
+		{name: "orphan ordinal", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.ParentOperationId = nil
+			request.DispatchPermit.Ordinal = 1
+		}},
+		{name: "dispatch invocation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.InvocationId.Value = []byte("other-invocation")
+		}},
+		{name: "dispatch request digest", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.RequestDigest.Value[0] ^= 0xff
+		}},
+		{name: "workspace invocation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.InvocationId.Value = []byte("other-invocation")
+		}},
+		{name: "workspace request digest", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.RequestDigest.Value[0] ^= 0xff
+		}},
+		{name: "tenant", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.TenantId.Value = []byte("other-tenant")
+		}},
+		{name: "user", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.UserId.Value = []byte("other-user")
+		}},
+		{name: "session", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.SessionId.Value = []byte("other-session")
+		}},
+		{name: "effect", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.EffectId.Value = []byte("other-effect")
+		}},
+		{name: "dispatch attempt", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.DispatchAttempt++
+		}},
+		{name: "turn lease generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.TurnLeaseGeneration++
+		}},
+		{name: "placement generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.PlacementGeneration++
+		}},
+		{name: "authorization generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.AuthorizationGeneration++
+		}},
+		{name: "sandbox identity", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.SandboxId.Value = []byte("other-sandbox")
+		}},
+		{name: "sandbox generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.SandboxGeneration++
+		}},
+		{name: "dispatch sandbox generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.SandboxGeneration++
+		}},
+		{name: "backend", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.Backend = v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER
+		}},
+		{name: "launch backend", mutate: func(request *v1.SpawnProcessRequest) {
+			request.Sandbox.Backend = v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER
+			request.WorkspaceProtection.Backend = v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER
+		}},
+		{name: "execution environment", mutate: func(request *v1.SpawnProcessRequest) {
+			request.Sandbox.ExecutionEnvironmentDigest.Value[0] ^= 0xff
+		}},
+		{name: "read-write lease identity", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.LeaseId = nil
+		}},
+		{name: "read-write lease generation", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.LeaseGeneration = 0
+		}},
+		{name: "read-write enqueue sequence", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.EnqueueSequence = 0
+		}},
+		{name: "future workspace authority", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.IssuedAtUnixMs = uint64(time.Now().Add(time.Minute).UnixMilli())
+		}},
+		{name: "non-canonical dispatch deadline", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.DeadlineUnixMs = ^uint64(0)
+		}},
+		{name: "non-canonical workspace deadline", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.ExpiresAtUnixMs = ^uint64(0)
+			request.WorkspaceProtection.MaximumHoldDeadlineUnixMs = ^uint64(0)
+		}},
+		{name: "workspace expiry beyond maximum hold", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.MaximumHoldDeadlineUnixMs = uint64(time.Now().Add(time.Minute).UnixMilli())
+		}},
+		{name: "expired dispatch authority", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.DeadlineUnixMs = uint64(time.Now().Add(-time.Second).UnixMilli())
+		}},
+		{name: "expired workspace authority", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.ExpiresAtUnixMs = uint64(time.Now().Add(-time.Second).UnixMilli())
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := validSpawnRequest("forged-authority-"+string(rune('a'+index)), "authority-invoc")
+			test.mutate(request)
+			_, err := client.Spawn(context.Background(), request)
+			if got := connect.CodeOf(err); got != connect.CodeFailedPrecondition {
+				t.Fatalf("Spawn() code = %v error=%v, want failed_precondition", got, err)
+			}
+		})
+	}
+	if runner.StartCount() != 0 {
+		t.Fatalf("forged authorities started %d processes", runner.StartCount())
+	}
+
+	validCases := []struct {
+		name   string
+		mutate func(*v1.SpawnProcessRequest)
+	}{
+		{name: "top-level effect", mutate: func(request *v1.SpawnProcessRequest) {
+			request.DispatchPermit.ParentOperationId = nil
+			request.DispatchPermit.Ordinal = 0
+		}},
+		{name: "genesis revision and initial renewal", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.PinnedRevision = 0
+			request.WorkspaceProtection.RenewalSequence = 0
+		}},
+		{name: "read-only without write lease", mutate: func(request *v1.SpawnProcessRequest) {
+			request.WorkspaceProtection.AccessMode = v1.WorkspaceAccessMode_WORKSPACE_ACCESS_MODE_READ_ONLY
+			request.WorkspaceProtection.LeaseId = nil
+			request.WorkspaceProtection.LeaseGeneration = 0
+			request.WorkspaceProtection.RenewalSequence = 0
+			request.WorkspaceProtection.EnqueueSequence = 0
+		}},
+	}
+	for index, test := range validCases {
+		t.Run(test.name, func(t *testing.T) {
+			request := validSpawnRequest("valid-authority-"+string(rune('a'+index)), "valid-auth-invoc")
+			test.mutate(request)
+			if _, err := client.Spawn(context.Background(), request); err != nil {
+				t.Fatalf("Spawn() error = %v", err)
+			}
+			nextFakeProcess(t, runner).Complete(sandboxd.RunResult{ExitCode: 0})
+		})
+	}
+}
+
 func TestServerRequiresPrivateSocketDirectory(t *testing.T) {
 	t.Parallel()
 
@@ -650,12 +977,14 @@ func TestServerRequiresPrivateSocketDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = ListenServer(ServerConfig{
-		SocketPath:        filepath.Join(root, "control.sock"),
-		AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
-		SandboxID:         []byte("sandbox-alpha"),
-		SandboxGeneration: 7,
-		OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
-		Supervisor:        supervisor,
+		SocketPath:                 filepath.Join(root, "control.sock"),
+		AllowedClientUIDs:          []uint32{uint32(os.Geteuid())},
+		SandboxID:                  []byte("sandbox-alpha"),
+		SandboxGeneration:          7,
+		Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+		ExecutionEnvironmentDigest: testExecutionEnvironmentDigest(),
+		OneTimeNonce:               bytes.Repeat([]byte{0x5a}, 32),
+		Supervisor:                 supervisor,
 	})
 	if err == nil {
 		t.Fatal("ListenServer() succeeded with a non-private socket directory")
@@ -700,12 +1029,14 @@ func TestServerRejectsSupervisorLaunchAuthorityMismatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			server, err := ListenServer(ServerConfig{
-				SocketPath:        filepath.Join(root, "control.sock"),
-				AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
-				SandboxID:         []byte("sandbox-alpha"),
-				SandboxGeneration: 7,
-				OneTimeNonce:      bytes.Repeat([]byte{0x5a}, 32),
-				Supervisor:        supervisor,
+				SocketPath:                 filepath.Join(root, "control.sock"),
+				AllowedClientUIDs:          []uint32{uint32(os.Geteuid())},
+				SandboxID:                  []byte("sandbox-alpha"),
+				SandboxGeneration:          7,
+				Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+				ExecutionEnvironmentDigest: testExecutionEnvironmentDigest(),
+				OneTimeNonce:               bytes.Repeat([]byte{0x5a}, 32),
+				Supervisor:                 supervisor,
 			})
 			if server != nil {
 				_ = server.Close()
@@ -749,6 +1080,58 @@ func TestHandshakeRequiresFixedFrameWithoutConsumingNonce(t *testing.T) {
 	process.Complete(sandboxd.RunResult{ExitCode: 0})
 }
 
+func TestSandboxHandshakeRejectsWrongPeerAndVersionWithoutConsumingNonce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mutate   func(*v1.HandshakeRequest)
+		wantCode connect.Code
+	}{
+		{
+			name: "wrong peer",
+			mutate: func(request *v1.HandshakeRequest) {
+				request.Peer = v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD
+			},
+			wantCode: connect.CodePermissionDenied,
+		},
+		{
+			name: "wrong version",
+			mutate: func(request *v1.HandshakeRequest) {
+				request.MinimumVersion = &v1.ProtocolVersion{Major: 2}
+				request.MaximumVersion = &v1.ProtocolVersion{Major: 2}
+			},
+			wantCode: connect.CodeFailedPrecondition,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, client, runner := startTestTransport(t)
+			defer server.Close()
+			defer client.Close()
+			request := &v1.HandshakeRequest{
+				Peer:              v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD,
+				MinimumVersion:    protocolVersion(),
+				MaximumVersion:    protocolVersion(),
+				MaximumFrameSize:  maximumMessageBytes,
+				DescriptorDigest:  descriptorDigest(),
+				OneTimeNonce:      bytes.Repeat([]byte{0x5a}, handshakeNonceBytes),
+				SandboxId:         &v1.OpaqueId{Value: []byte("sandbox-alpha")},
+				SandboxGeneration: 7,
+			}
+			test.mutate(request)
+			_, err := client.control.Handshake(context.Background(), connect.NewRequest(request))
+			if got := connect.CodeOf(err); got != test.wantCode {
+				t.Fatalf("Handshake() code = %v error=%v, want %v", got, err, test.wantCode)
+			}
+			if _, err := client.Spawn(context.Background(), validSpawnRequest("post-reject-spawn", "post-reject-invoc")); err != nil {
+				t.Fatalf("Spawn() after rejected handshake error = %v", err)
+			}
+			nextFakeProcess(t, runner).Complete(sandboxd.RunResult{ExitCode: 0})
+		})
+	}
+}
+
 func TestRequestDigestAndIdempotencyConflictFailClosed(t *testing.T) {
 	t.Parallel()
 
@@ -790,6 +1173,200 @@ func TestRequestDigestAndIdempotencyConflictFailClosed(t *testing.T) {
 	process.Complete(sandboxd.RunResult{ExitCode: 0})
 }
 
+func TestSandboxWireRejectsWrongVersionMissingAndExpiredDeadline(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	session, err := client.ensureHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("ensureHandshake() error = %v", err)
+	}
+	tests := []struct {
+		name     string
+		mutate   func(*v1.RpcRequestMeta)
+		wantCode connect.Code
+	}{
+		{
+			name: "wrong version",
+			mutate: func(meta *v1.RpcRequestMeta) {
+				meta.ProtocolVersion = &v1.ProtocolVersion{Major: 2}
+			},
+			wantCode: connect.CodeFailedPrecondition,
+		},
+		{
+			name: "missing deadline",
+			mutate: func(meta *v1.RpcRequestMeta) {
+				meta.DeadlineUnixMs = 0
+			},
+			wantCode: connect.CodeFailedPrecondition,
+		},
+		{
+			name: "expired deadline",
+			mutate: func(meta *v1.RpcRequestMeta) {
+				meta.DeadlineUnixMs = uint64(time.Now().Add(-time.Second).UnixMilli())
+			},
+			wantCode: connect.CodeDeadlineExceeded,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prepared, _, err := prepareRequest(
+				context.Background(),
+				validSpawnRequest("wire-boundary-"+string(rune('a'+index)), "wire-invocation"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			message := prepared.(*v1.SpawnProcessRequest)
+			test.mutate(message.Meta)
+			message.Meta.RequestDigest = nil
+			message.Meta.RequestDigest, err = requestDigest(message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := connect.NewRequest(message)
+			request.Header().Set(sessionHeader, session)
+			_, err = client.process.Spawn(context.Background(), request)
+			if got := connect.CodeOf(err); got != test.wantCode {
+				t.Fatalf("Spawn() code = %v error=%v, want %v", got, err, test.wantCode)
+			}
+		})
+	}
+	if runner.StartCount() != 0 {
+		t.Fatalf("invalid wire requests started %d processes", runner.StartCount())
+	}
+}
+
+func TestSandboxWireRejectsOversizedRequest(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	session, err := client.ensureHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("ensureHandshake() error = %v", err)
+	}
+	prepared, _, err := prepareRequest(
+		context.Background(),
+		validSpawnRequest("oversized-wire-01", "oversized-invocat"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := prepared.(*v1.SpawnProcessRequest)
+	message.Arguments = []string{strings.Repeat("x", maximumMessageBytes)}
+	message.Meta.RequestDigest = nil
+	message.Meta.RequestDigest, err = requestDigest(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawProcess := v1connect.NewSandboxProcessServiceClient(
+		&http.Client{Transport: client.transport},
+		"http://sandbox.invalid",
+		connect.WithReadMaxBytes(maximumMessageBytes),
+	)
+	request := connect.NewRequest(message)
+	request.Header().Set(sessionHeader, session)
+	_, err = rawProcess.Spawn(context.Background(), request)
+	if got := connect.CodeOf(err); got != connect.CodeResourceExhausted {
+		t.Fatalf("oversized Spawn() code = %v error=%v, want resource_exhausted", got, err)
+	}
+	if runner.StartCount() != 0 {
+		t.Fatalf("oversized request started %d processes", runner.StartCount())
+	}
+}
+
+func TestSandboxWirePropagatesInFlightCancellation(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	spawned, err := client.Spawn(context.Background(), validSpawnRequest("cancel-wire-spawn", "cancel-wire-invoc"))
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	process := nextFakeProcess(t, runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, waitErr := client.Wait(ctx, &v1.WaitProcessRequest{
+			Meta:    idempotentMeta("cancel-wire-wait"),
+			Process: spawned.GetProcess(),
+		})
+		result <- waitErr
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		server.handler.mu.Lock()
+		waiting := false
+		for key := range server.handler.operations {
+			if strings.HasPrefix(key, "wait\x00") {
+				waiting = true
+				break
+			}
+		}
+		server.handler.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("Wait() did not reach the server")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if got := connect.CodeOf(err); got != connect.CodeCanceled {
+			t.Fatalf("Wait() code = %v error=%v, want canceled", got, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled Wait() did not return")
+	}
+	if signals := process.Signals(); len(signals) != 0 {
+		t.Fatalf("transport cancellation signaled the process: %v", signals)
+	}
+	process.Complete(sandboxd.RunResult{ExitCode: 0})
+}
+
+type wrongPeerSandboxControlClient struct{}
+
+func (wrongPeerSandboxControlClient) Handshake(
+	_ context.Context,
+	request *connect.Request[v1.HandshakeRequest],
+) (*connect.Response[v1.HandshakeResponse], error) {
+	response := connect.NewResponse(&v1.HandshakeResponse{
+		SelectedVersion:  protocolVersion(),
+		MaximumFrameSize: maximumMessageBytes,
+		DescriptorDigest: descriptorDigest(),
+		ServerPeer:       v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD,
+		Status: &v1.CapabilityStatus{
+			Name:         "sandbox.process",
+			Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+		},
+		NonceProof: nonceProof(
+			request.Msg.GetOneTimeNonce(),
+			request.Msg.GetSandboxId().GetValue(),
+			request.Msg.GetSandboxGeneration(),
+			v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD,
+		),
+	})
+	response.Header().Set(sessionHeader, "wrong-daemon-session")
+	return response, nil
+}
+
+func (wrongPeerSandboxControlClient) GetCapabilities(
+	context.Context,
+	*connect.Request[v1.GetCapabilitiesRequest],
+) (*connect.Response[v1.GetCapabilitiesResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("unused"))
+}
+
 func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	t.Helper()
 	root, err := os.MkdirTemp("", "circulusd-srpc-")
@@ -824,12 +1401,14 @@ func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	}
 	nonce := bytes.Repeat([]byte{0x5a}, 32)
 	server, err := ListenServer(ServerConfig{
-		SocketPath:        filepath.Join(root, "control.sock"),
-		AllowedClientUIDs: []uint32{uint32(os.Geteuid())},
-		SandboxID:         []byte("sandbox-alpha"),
-		SandboxGeneration: 7,
-		OneTimeNonce:      nonce,
-		Supervisor:        supervisor,
+		SocketPath:                 filepath.Join(root, "control.sock"),
+		AllowedClientUIDs:          []uint32{uint32(os.Geteuid())},
+		SandboxID:                  []byte("sandbox-alpha"),
+		SandboxGeneration:          7,
+		Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+		ExecutionEnvironmentDigest: testExecutionEnvironmentDigest(),
+		OneTimeNonce:               nonce,
+		Supervisor:                 supervisor,
 	})
 	if err != nil {
 		t.Fatalf("ListenServer() error = %v", err)
@@ -857,21 +1436,83 @@ func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 
 func validSpawnRequest(idempotencyKey, invocationID string) *v1.SpawnProcessRequest {
 	digest := sha256.Sum256([]byte("authorized execution request"))
+	environmentDigest := testExecutionEnvironmentDigest()
 	invocation := &v1.OpaqueId{Value: []byte(invocationID)}
+	tenant := &v1.OpaqueId{Value: []byte("tenant-alpha")}
+	user := &v1.OpaqueId{Value: []byte("user-alpha")}
+	session := &v1.OpaqueId{Value: []byte("session-alpha")}
+	effect := &v1.OpaqueId{Value: []byte("effect-alpha")}
+	now := time.Now()
 	return &v1.SpawnProcessRequest{
-		Meta:                idempotentMeta(idempotencyKey),
-		DispatchPermit:      &v1.DispatchPermit{Value: []byte("opaque-dispatch-permit")},
-		Sandbox:             &v1.SandboxHandle{SandboxId: &v1.OpaqueId{Value: []byte("sandbox-alpha")}, Generation: 7},
-		WorkspaceProtection: &v1.WorkspaceProtectionPermit{Value: []byte("opaque-workspace-permit")},
-		InvocationId:        invocation,
-		RequestDigest:       &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: digest[:]},
-		Executable:          "echo",
-		Arguments:           []string{"hello"},
-		WorkingDirectory:    "",
-		TimeoutMs:           5_000,
-		OutputLimitBytes:    1 << 20,
-		StdinMode:           v1.StdinMode_STDIN_MODE_STREAM,
+		Meta: idempotentMeta(idempotencyKey),
+		DispatchPermit: &v1.DispatchPermit{
+			Value:                   bytes.Repeat([]byte{0xd1}, 32),
+			TenantId:                proto.Clone(tenant).(*v1.OpaqueId),
+			UserId:                  proto.Clone(user).(*v1.OpaqueId),
+			SessionId:               proto.Clone(session).(*v1.OpaqueId),
+			TurnId:                  &v1.OpaqueId{Value: []byte("turn-alpha")},
+			EffectId:                proto.Clone(effect).(*v1.OpaqueId),
+			InvocationId:            proto.Clone(invocation).(*v1.OpaqueId),
+			RequestDigest:           &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: append([]byte(nil), digest[:]...)},
+			Service:                 v1.EffectService_EFFECT_SERVICE_EXECUTOR,
+			Operation:               "executor.run",
+			ReplayPolicy:            v1.ReplayPolicy_REPLAY_POLICY_IDEMPOTENCY_KEY,
+			ParentOperationId:       &v1.OpaqueId{Value: []byte("parent-operation")},
+			Ordinal:                 1,
+			DispatchAttempt:         2,
+			TurnLeaseGeneration:     3,
+			PlacementGeneration:     4,
+			SandboxGeneration:       7,
+			AuthorizationGeneration: 5,
+			DeadlineUnixMs:          uint64(now.Add(time.Hour).UnixMilli()),
+		},
+		Sandbox: &v1.SandboxHandle{
+			SandboxId:                  &v1.OpaqueId{Value: []byte("sandbox-alpha")},
+			Generation:                 7,
+			Backend:                    v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+			ExecutionEnvironmentDigest: &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: environmentDigest},
+		},
+		WorkspaceProtection: &v1.WorkspaceProtectionPermit{
+			Value:                     bytes.Repeat([]byte{0xe2}, 32),
+			TenantId:                  proto.Clone(tenant).(*v1.OpaqueId),
+			UserId:                    proto.Clone(user).(*v1.OpaqueId),
+			WorkspaceId:               &v1.OpaqueId{Value: []byte("workspace-alpha")},
+			LeaseId:                   &v1.OpaqueId{Value: []byte("lease-alpha")},
+			InvocationId:              proto.Clone(invocation).(*v1.OpaqueId),
+			RequestDigest:             &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: append([]byte(nil), digest[:]...)},
+			EffectId:                  proto.Clone(effect).(*v1.OpaqueId),
+			SessionId:                 proto.Clone(session).(*v1.OpaqueId),
+			SandboxId:                 &v1.OpaqueId{Value: []byte("sandbox-alpha")},
+			Backend:                   v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL,
+			AccessMode:                v1.WorkspaceAccessMode_WORKSPACE_ACCESS_MODE_READ_WRITE,
+			PinnedRevision:            11,
+			LeaseGeneration:           6,
+			DispatchAttempt:           2,
+			TurnLeaseGeneration:       3,
+			PlacementGeneration:       4,
+			SandboxGeneration:         7,
+			ProjectionGeneration:      8,
+			AuthorizationGeneration:   5,
+			IssuedAtUnixMs:            uint64(now.Add(-time.Minute).UnixMilli()),
+			ExpiresAtUnixMs:           uint64(now.Add(30 * time.Minute).UnixMilli()),
+			MaximumHoldDeadlineUnixMs: uint64(now.Add(time.Hour).UnixMilli()),
+			RenewalSequence:           1,
+			EnqueueSequence:           1,
+		},
+		InvocationId:     invocation,
+		RequestDigest:    &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: append([]byte(nil), digest[:]...)},
+		Executable:       "echo",
+		Arguments:        []string{"hello"},
+		WorkingDirectory: "",
+		TimeoutMs:        5_000,
+		OutputLimitBytes: 1 << 20,
+		StdinMode:        v1.StdinMode_STDIN_MODE_STREAM,
 	}
+}
+
+func testExecutionEnvironmentDigest() []byte {
+	digest := sha256.Sum256([]byte("authorized execution environment"))
+	return append([]byte(nil), digest[:]...)
 }
 
 func idempotentMeta(key string) *v1.RpcRequestMeta {
@@ -893,6 +1534,40 @@ func nextFakeProcess(t *testing.T, runner *sandboxd.FakeRunner) *sandboxd.FakePr
 func testWorkspaceRoot(t *testing.T, server *Server) string {
 	t.Helper()
 	return filepath.Join(filepath.Dir(server.SocketPath()), "workspace")
+}
+
+type failingCloseListener struct {
+	accepting chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+	err       error
+}
+
+func newFailingCloseListener(err error) *failingCloseListener {
+	return &failingCloseListener{
+		accepting: make(chan struct{}),
+		closed:    make(chan struct{}),
+		err:       err,
+	}
+}
+
+func (listener *failingCloseListener) Accept() (net.Conn, error) {
+	select {
+	case <-listener.accepting:
+	default:
+		close(listener.accepting)
+	}
+	<-listener.closed
+	return nil, net.ErrClosed
+}
+
+func (listener *failingCloseListener) Close() error {
+	listener.closeOnce.Do(func() { close(listener.closed) })
+	return listener.err
+}
+
+func (*failingCloseListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "sandbox-test", Net: "unix"}
 }
 
 func TestClientRejectsNilAndCancelledCalls(t *testing.T) {

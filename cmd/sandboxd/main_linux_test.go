@@ -9,14 +9,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/sandboxd"
 	"github.com/hancomac/circulusd/internal/sandboxrpc"
 	"golang.org/x/sys/unix"
 )
 
-const testSandboxID = "sandbox_AAAAAAAAAAAAAAAAAAAAAAAAAA"
+const (
+	testSandboxID                  = "sandbox_AAAAAAAAAAAAAAAAAAAAAAAAAA"
+	testExecutionEnvironmentDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
 
 func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 	t.Parallel()
@@ -60,6 +65,8 @@ func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 		"--control-socket", "/run/circulusd/control/control.sock",
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
+		"--backend", "nsjail",
+		"--execution-environment-digest", testExecutionEnvironmentDigest,
 		"--protocol-version", "1",
 		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
@@ -76,6 +83,8 @@ func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 	}
 	if transportConfig.SocketPath != "/run/circulusd/control/control.sock" ||
 		transportConfig.SandboxGeneration != 7 || string(transportConfig.SandboxID) != testSandboxID ||
+		transportConfig.Backend != v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL ||
+		!bytes.Equal(transportConfig.ExecutionEnvironmentDigest, bytes.Repeat([]byte{0xaa}, 32)) ||
 		len(transportConfig.AllowedClientUIDs) != 1 || transportConfig.AllowedClientUIDs[0] != 65534 ||
 		transportConfig.Supervisor != supervisor {
 		t.Fatalf("transport config = %#v", transportConfig)
@@ -101,6 +110,8 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 		"--control-socket", "/run/circulusd/control/control.sock",
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
+		"--backend", "nsjail",
+		"--execution-environment-digest", testExecutionEnvironmentDigest,
 		"--protocol-version", "1",
 		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
@@ -133,6 +144,10 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 		{name: "invalid sandbox ID", arguments: replaceFlag("--sandbox-id", "sandbox-alpha")},
 		{name: "zero generation", arguments: replaceFlag("--generation", "0")},
 		{name: "noncanonical generation", arguments: replaceFlag("--generation", "07")},
+		{name: "missing backend", arguments: withoutFlag("--backend")},
+		{name: "unsupported backend", arguments: replaceFlag("--backend", "mock")},
+		{name: "missing execution environment", arguments: withoutFlag("--execution-environment-digest")},
+		{name: "malformed execution environment", arguments: replaceFlag("--execution-environment-digest", "sha256:aa")},
 		{name: "unsupported protocol", arguments: replaceFlag("--protocol-version", "2")},
 		{name: "missing command manifest owner", arguments: withoutFlag("--command-manifest-owner-uid")},
 		{name: "zero command manifest owner", arguments: replaceFlag("--command-manifest-owner-uid", "0")},
@@ -174,6 +189,8 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 		"--control-socket", "/run/circulusd/control/control.sock",
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
+		"--backend", "nsjail",
+		"--execution-environment-digest", testExecutionEnvironmentDigest,
 		"--protocol-version", "1",
 		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
@@ -238,6 +255,28 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 			t.Fatalf("execute() = %d, nonce = %x, passed = %x", exitCode, nonce, passedNonce)
 		}
 	})
+
+	t.Run("server cleanup", func(t *testing.T) {
+		t.Parallel()
+		var stderr bytes.Buffer
+		server := &recordingServer{closeErr: errors.New("secret cleanup detail")}
+		exitCode := execute(context.Background(), arguments, daemonDependencies{
+			stderr: &stderr,
+			loadCommands: func(string, uint32) (map[string]string, error) {
+				return map[string]string{"echo": "/usr/bin/echo"}, nil
+			},
+			readNonce:     func() ([]byte, error) { return bytes.Repeat([]byte{0x5a}, launchNonceBytes), nil },
+			newSupervisor: sandboxd.NewSupervisor,
+			listen: func(sandboxrpc.ServerConfig) (daemonServer, error) {
+				return server, nil
+			},
+			runner: sandboxd.NewFakeRunner(),
+		})
+		if exitCode != 1 || server.closes != 1 || !strings.Contains(stderr.String(), "close control socket") ||
+			strings.Contains(stderr.String(), "secret cleanup detail") {
+			t.Fatalf("execute()=%d closes=%d stderr=%q", exitCode, server.closes, stderr.String())
+		}
+	})
 }
 
 func TestExecuteFailsClosedOnIncompleteDependencyAdapters(t *testing.T) {
@@ -250,6 +289,8 @@ func TestExecuteFailsClosedOnIncompleteDependencyAdapters(t *testing.T) {
 		"--control-socket", "/run/circulusd/control/control.sock",
 		"--sandbox-id", testSandboxID,
 		"--generation", "7",
+		"--backend", "nsjail",
+		"--execution-environment-digest", testExecutionEnvironmentDigest,
 		"--protocol-version", "1",
 		"--command-manifest-owner-uid", "65534",
 		"--allow-client-uid", "65534",
@@ -353,8 +394,9 @@ func TestReadLaunchNonceFDRequiresExactAnonymousPipe(t *testing.T) {
 }
 
 type recordingServer struct {
-	serves int
-	closes int
+	serves   int
+	closes   int
+	closeErr error
 }
 
 func (server *recordingServer) Serve(context.Context) error {
@@ -364,7 +406,7 @@ func (server *recordingServer) Serve(context.Context) error {
 
 func (server *recordingServer) Close() error {
 	server.closes++
-	return nil
+	return server.closeErr
 }
 
 func allZero(value []byte) bool {

@@ -29,17 +29,22 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const maximumUnixSocketPathBytes = 107
+const (
+	maximumUnixSocketPathBytes = 107
+	sandboxHTTPIOTimeout       = 5 * time.Second
+)
 
 // ServerConfig contains launch-time authority. None of these fields can be
 // supplied by a process RPC after the server begins listening.
 type ServerConfig struct {
-	SocketPath        string
-	AllowedClientUIDs []uint32
-	SandboxID         []byte
-	SandboxGeneration uint64
-	OneTimeNonce      []byte
-	Supervisor        *sandboxd.Supervisor
+	SocketPath                 string
+	AllowedClientUIDs          []uint32
+	SandboxID                  []byte
+	SandboxGeneration          uint64
+	Backend                    v1.ExecutionBackend
+	ExecutionEnvironmentDigest []byte
+	OneTimeNonce               []byte
+	Supervisor                 *sandboxd.Supervisor
 }
 
 // Server serves ControlService and SandboxProcessService on one private UDS.
@@ -49,19 +54,22 @@ type Server struct {
 	httpServer *http.Server
 	handler    *rpcHandler
 
-	serveMu sync.Mutex
-	served  bool
-	closed  atomic.Bool
-	close   sync.Once
+	serveMu  sync.Mutex
+	served   bool
+	closed   atomic.Bool
+	close    sync.Once
+	closeErr error
 }
 
 type rpcHandler struct {
 	v1connect.UnimplementedControlServiceHandler
 	v1connect.UnimplementedSandboxProcessServiceHandler
 
-	sandboxID  []byte
-	generation uint64
-	supervisor *sandboxd.Supervisor
+	sandboxID                  []byte
+	generation                 uint64
+	backend                    v1.ExecutionBackend
+	executionEnvironmentDigest [sha256.Size]byte
+	supervisor                 *sandboxd.Supervisor
 
 	handshakeMu sync.Mutex
 	nonce       [handshakeNonceBytes]byte
@@ -131,6 +139,14 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	if config.SandboxGeneration == 0 {
 		return nil, fmt.Errorf("sandboxrpc: sandbox generation must be positive")
 	}
+	if config.Backend != v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL &&
+		config.Backend != v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER &&
+		config.Backend != v1.ExecutionBackend_EXECUTION_BACKEND_FIRECRACKER {
+		return nil, fmt.Errorf("sandboxrpc: launch backend is invalid")
+	}
+	if len(config.ExecutionEnvironmentDigest) != sha256.Size {
+		return nil, fmt.Errorf("sandboxrpc: execution environment digest is invalid")
+	}
 	if len(config.OneTimeNonce) != handshakeNonceBytes {
 		return nil, fmt.Errorf("sandboxrpc: one-time nonce must be 32 bytes")
 	}
@@ -165,10 +181,12 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	handler := &rpcHandler{
 		sandboxID:  append([]byte(nil), config.SandboxID...),
 		generation: config.SandboxGeneration,
+		backend:    config.Backend,
 		supervisor: config.Supervisor,
 		processes:  make(map[string]*processBinding),
 		operations: make(map[string]*operationCall),
 	}
+	copy(handler.executionEnvironmentDigest[:], config.ExecutionEnvironmentDigest)
 	copy(handler.nonce[:], config.OneTimeNonce)
 	if _, err := rand.Read(handler.processKey[:]); err != nil {
 		cleanup()
@@ -192,9 +210,15 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	server := &Server{socketPath: config.SocketPath, listener: listener, handler: handler}
 	server.httpServer = &http.Server{
 		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+		ReadTimeout:       sandboxHTTPIOTimeout,
+		ReadHeaderTimeout: sandboxHTTPIOTimeout,
+		// WaitProcess and AttachProcess may legitimately outlive the request-body
+		// deadline. Keep the transport horizon beyond the maximum per-RPC
+		// metadata deadline while still bounding a client that stops reading.
+		WriteTimeout:                 maximumRPCDeadline + sandboxHTTPIOTimeout,
+		IdleTimeout:                  30 * time.Second,
+		MaxHeaderBytes:               16 << 10,
+		DisableGeneralOptionsHandler: true,
 		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
 			credentialed, ok := connection.(*credentialConn)
 			if !ok {
@@ -228,7 +252,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	server.served = true
 	server.serveMu.Unlock()
 	if server.closed.Load() {
-		return nil
+		return server.Close()
 	}
 	finished := make(chan struct{})
 	go func() {
@@ -241,7 +265,10 @@ func (server *Server) Serve(ctx context.Context) error {
 	err := server.httpServer.Serve(server.listener)
 	close(finished)
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-		return nil
+		return server.Close()
+	}
+	if ctx.Err() != nil {
+		return errors.Join(err, server.Close())
 	}
 	return err
 }
@@ -250,7 +277,6 @@ func (server *Server) Close() error {
 	if server == nil {
 		return nil
 	}
-	var closeError error
 	server.close.Do(func() {
 		server.closed.Store(true)
 		httpError := server.httpServer.Close()
@@ -260,13 +286,13 @@ func (server *Server) Close() error {
 		clear(server.handler.session[:])
 		server.handler.handshakeMu.Unlock()
 		if httpError != nil && !errors.Is(httpError, net.ErrClosed) {
-			closeError = httpError
+			server.closeErr = httpError
 		}
 		if listenerError != nil && !errors.Is(listenerError, net.ErrClosed) {
-			closeError = errors.Join(closeError, listenerError)
+			server.closeErr = errors.Join(server.closeErr, listenerError)
 		}
 	})
-	return closeError
+	return server.closeErr
 }
 
 func (listener *credentialListener) Accept() (net.Conn, error) {
@@ -339,7 +365,12 @@ func (handler *rpcHandler) Handshake(ctx context.Context, request *connect.Reque
 	if handler.nonceUsed || subtle.ConstantTimeCompare(message.GetOneTimeNonce(), handler.nonce[:]) != 1 {
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("launch nonce is unavailable"))
 	}
-	proof := nonceProof(handler.nonce[:], handler.sandboxID, handler.generation)
+	proof := nonceProof(
+		handler.nonce[:],
+		handler.sandboxID,
+		handler.generation,
+		v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD,
+	)
 	if _, err := rand.Read(handler.session[:]); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, errors.New("cannot establish protocol session"))
 	}
@@ -352,6 +383,7 @@ func (handler *rpcHandler) Handshake(ctx context.Context, request *connect.Reque
 		FeatureBitmap:    0,
 		MaximumFrameSize: maximumMessageBytes,
 		DescriptorDigest: descriptorDigest(),
+		ServerPeer:       v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD,
 		Status: &v1.CapabilityStatus{
 			Name:         "sandbox.process",
 			Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
@@ -401,6 +433,77 @@ func (handler *rpcHandler) Spawn(ctx context.Context, request *connect.Request[v
 	if message.GetDispatchPermit() == nil || len(message.GetDispatchPermit().GetValue()) < 16 || len(message.GetDispatchPermit().GetValue()) > 4096 ||
 		message.GetWorkspaceProtection() == nil || len(message.GetWorkspaceProtection().GetValue()) < 16 || len(message.GetWorkspaceProtection().GetValue()) > 4096 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("opaque execution permits are invalid"))
+	}
+	// executord authenticates the opaque permit signatures before opening this
+	// private channel. sandboxd still fail-closes on every explicit field binding
+	// so a valid permit cannot be confused across services, effects, invocations,
+	// sandboxes, backends, or generations.
+	dispatch := message.GetDispatchPermit()
+	workspace := message.GetWorkspaceProtection()
+	nowUnixMS := uint64(time.Now().UnixMilli())
+	validBackend := message.GetSandbox().GetBackend() == v1.ExecutionBackend_EXECUTION_BACKEND_NSJAIL ||
+		message.GetSandbox().GetBackend() == v1.ExecutionBackend_EXECUTION_BACKEND_DOCKER ||
+		message.GetSandbox().GetBackend() == v1.ExecutionBackend_EXECUTION_BACKEND_FIRECRACKER
+	validWorkspaceAccess := workspace.GetAccessMode() == v1.WorkspaceAccessMode_WORKSPACE_ACCESS_MODE_READ_ONLY ||
+		workspace.GetAccessMode() == v1.WorkspaceAccessMode_WORKSPACE_ACCESS_MODE_READ_WRITE
+	validReplayPolicy := dispatch.GetReplayPolicy() == v1.ReplayPolicy_REPLAY_POLICY_SAFE ||
+		dispatch.GetReplayPolicy() == v1.ReplayPolicy_REPLAY_POLICY_IDEMPOTENCY_KEY ||
+		dispatch.GetReplayPolicy() == v1.ReplayPolicy_REPLAY_POLICY_NEVER ||
+		dispatch.GetReplayPolicy() == v1.ReplayPolicy_REPLAY_POLICY_CONFIRM
+	parentOperation := dispatch.GetParentOperationId()
+	validOccurrence := (parentOperation == nil && dispatch.GetOrdinal() == 0) ||
+		(parentOperation != nil && validOpaqueID(parentOperation.GetValue(), 256))
+	validWorkspaceLease := workspace.GetAccessMode() == v1.WorkspaceAccessMode_WORKSPACE_ACCESS_MODE_READ_ONLY ||
+		(validOpaqueID(workspace.GetLeaseId().GetValue(), 256) &&
+			workspace.GetLeaseGeneration() > 0 && workspace.GetEnqueueSequence() > 0)
+	bindingsMatch := dispatch.GetService() == v1.EffectService_EFFECT_SERVICE_EXECUTOR &&
+		dispatch.GetOperation() == "executor.run" && validReplayPolicy && validOccurrence &&
+		validBackend && validWorkspaceAccess && validWorkspaceLease &&
+		validOpaqueID(dispatch.GetTenantId().GetValue(), 256) &&
+		validOpaqueID(dispatch.GetUserId().GetValue(), 256) &&
+		validOpaqueID(dispatch.GetSessionId().GetValue(), 256) &&
+		validOpaqueID(dispatch.GetTurnId().GetValue(), 256) &&
+		validOpaqueID(dispatch.GetEffectId().GetValue(), 256) &&
+		validOpaqueID(dispatch.GetInvocationId().GetValue(), 128) &&
+		isSHA256Digest(dispatch.GetRequestDigest()) &&
+		dispatch.GetDispatchAttempt() > 0 && dispatch.GetTurnLeaseGeneration() > 0 &&
+		dispatch.GetPlacementGeneration() > 0 && dispatch.GetSandboxGeneration() > 0 &&
+		dispatch.GetAuthorizationGeneration() > 0 && dispatch.GetDeadlineUnixMs() > nowUnixMS &&
+		dispatch.GetDeadlineUnixMs() <= math.MaxInt64 &&
+		validOpaqueID(workspace.GetTenantId().GetValue(), 256) &&
+		validOpaqueID(workspace.GetUserId().GetValue(), 256) &&
+		validOpaqueID(workspace.GetWorkspaceId().GetValue(), 256) &&
+		validOpaqueID(workspace.GetInvocationId().GetValue(), 128) &&
+		validOpaqueID(workspace.GetEffectId().GetValue(), 256) &&
+		validOpaqueID(workspace.GetSessionId().GetValue(), 256) &&
+		validOpaqueID(workspace.GetSandboxId().GetValue(), 256) &&
+		isSHA256Digest(workspace.GetRequestDigest()) &&
+		workspace.GetDispatchAttempt() > 0 && workspace.GetTurnLeaseGeneration() > 0 &&
+		workspace.GetPlacementGeneration() > 0 && workspace.GetSandboxGeneration() > 0 &&
+		workspace.GetProjectionGeneration() > 0 && workspace.GetAuthorizationGeneration() > 0 &&
+		workspace.GetIssuedAtUnixMs() > 0 && workspace.GetIssuedAtUnixMs() <= nowUnixMS &&
+		workspace.GetIssuedAtUnixMs() <= math.MaxInt64 && workspace.GetExpiresAtUnixMs() <= math.MaxInt64 &&
+		workspace.GetMaximumHoldDeadlineUnixMs() <= math.MaxInt64 &&
+		workspace.GetIssuedAtUnixMs() < workspace.GetExpiresAtUnixMs() &&
+		workspace.GetExpiresAtUnixMs() > nowUnixMS && workspace.GetExpiresAtUnixMs() <= workspace.GetMaximumHoldDeadlineUnixMs() &&
+		proto.Equal(dispatch.GetTenantId(), workspace.GetTenantId()) &&
+		proto.Equal(dispatch.GetUserId(), workspace.GetUserId()) &&
+		proto.Equal(dispatch.GetSessionId(), workspace.GetSessionId()) &&
+		proto.Equal(dispatch.GetEffectId(), workspace.GetEffectId()) &&
+		proto.Equal(dispatch.GetInvocationId(), message.GetInvocationId()) &&
+		proto.Equal(workspace.GetInvocationId(), message.GetInvocationId()) &&
+		proto.Equal(dispatch.GetRequestDigest(), message.GetRequestDigest()) &&
+		proto.Equal(workspace.GetRequestDigest(), message.GetRequestDigest()) &&
+		proto.Equal(workspace.GetSandboxId(), message.GetSandbox().GetSandboxId()) &&
+		workspace.GetBackend() == message.GetSandbox().GetBackend() &&
+		dispatch.GetDispatchAttempt() == workspace.GetDispatchAttempt() &&
+		dispatch.GetTurnLeaseGeneration() == workspace.GetTurnLeaseGeneration() &&
+		dispatch.GetPlacementGeneration() == workspace.GetPlacementGeneration() &&
+		dispatch.GetSandboxGeneration() == message.GetSandbox().GetGeneration() &&
+		workspace.GetSandboxGeneration() == message.GetSandbox().GetGeneration() &&
+		dispatch.GetAuthorizationGeneration() == workspace.GetAuthorizationGeneration()
+	if !bindingsMatch {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("execution authority bindings mismatch"))
 	}
 	if !validOpaqueID(message.GetInvocationId().GetValue(), 128) || !isSHA256Digest(message.GetRequestDigest()) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("invocation identity or request digest is invalid"))
@@ -840,8 +943,11 @@ func (handler *rpcHandler) verifySession(encoded string, uid uint32) bool {
 }
 
 func (handler *rpcHandler) validateSandbox(handle *v1.SandboxHandle) error {
-	if handle == nil || !bytes.Equal(handle.GetSandboxId().GetValue(), handler.sandboxID) || handle.GetGeneration() != handler.generation {
-		return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox identity or generation mismatch"))
+	if handle == nil || !bytes.Equal(handle.GetSandboxId().GetValue(), handler.sandboxID) ||
+		handle.GetGeneration() != handler.generation || handle.GetBackend() != handler.backend ||
+		!isSHA256Digest(handle.GetExecutionEnvironmentDigest()) ||
+		!bytes.Equal(handle.GetExecutionEnvironmentDigest().GetValue(), handler.executionEnvironmentDigest[:]) {
+		return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox launch authority mismatch"))
 	}
 	return nil
 }
