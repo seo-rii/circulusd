@@ -950,6 +950,10 @@ func validAuthorityRoute(authority ValidatedTurnFence) bool {
 
 func validateLedgerRoute(record LedgerRecord, lookup LedgerLookup) error {
 	if record.TenantID != lookup.TenantID || record.WorkspaceID != lookup.WorkspaceID ||
+		record.EffectID != lookup.EffectID || record.InvocationID != lookup.InvocationID ||
+		record.RequestDigest != lookup.RequestDigest || record.Service != lookup.Service ||
+		record.Operation != lookup.Operation || record.DispatchAttempt != lookup.DispatchAttempt ||
+		record.ProviderRequestID != lookup.ProviderRequestID ||
 		record.ProviderRouteDigest != lookup.ProviderRouteDigest {
 		return ErrLedgerMismatch
 	}

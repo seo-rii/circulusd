@@ -42,6 +42,15 @@ The permit binds:
 
 Every broker rejects a request without a current matching permit. The durable `dispatched` state means external I/O may or may not have occurred. A crash after permit issuance is therefore classified by the effect replay policy and any external ledger; it is never inferred from process state.
 
+The Session dispatch permit is not handed directly to a service adapter. The
+broker first consumes an atomic, durable, single-start claim and then wraps the
+exact receipt in a process-local sealed value whose zero value cannot authorize
+I/O. Model, MCP, and reference-effect adapters may open that value only to
+compare it with an immutable subordinate command. They cannot mint another
+start authority. A subordinate ledger is selected by the Session-bound service
+and every result, including `absent` and `unknown`, must repeat the complete
+effect, invocation, request, attempt, platform request, and route identity.
+
 ## ADR-003: Turn status and effect state are separate
 
 Turn status is one of `queued`, `active`, `needs_confirmation`, `completed`, `failed`, or `aborted`.

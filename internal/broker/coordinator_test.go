@@ -898,7 +898,12 @@ func committedRecord() LedgerRecord {
 }
 
 func routedRecord(status LedgerStatus) LedgerRecord {
-	return LedgerRecord{Status: status, TenantID: tenantID, WorkspaceID: workspaceID, ProviderRouteDigest: digest(152)}
+	return LedgerRecord{
+		Status: status, TenantID: tenantID, WorkspaceID: workspaceID,
+		EffectID: effectID, InvocationID: invocationID, RequestDigest: digest(2),
+		Service: ServiceExecutor, Operation: "run", DispatchAttempt: 1,
+		ProviderRequestID: mustID(identity.Request, "R"), ProviderRouteDigest: digest(152),
+	}
 }
 
 func digest(fill byte) Digest {

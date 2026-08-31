@@ -67,7 +67,9 @@ func TestDispatchAndRecoveryBindOpaqueAttemptProviderAndDeadline(t *testing.T) {
 	preparation := preparationPermit(snapshot, 1, now.Add(time.Minute))
 	snapshot.ActiveEffect.PreparationPermit = &preparation
 	store := newFakeStore(snapshot)
-	coordinator := mustCoordinator(t, store, &fakeLedger{record: routedRecord(LedgerAbsent)})
+	coordinator := mustCoordinator(t, store, &fakeLedger{lookup: func(_ context.Context, lookup LedgerLookup) (LedgerRecord, error) {
+		return exactLedgerRecord(lookup, LedgerAbsent), nil
+	}})
 
 	request := baseDispatchRequest(now)
 	request.PreparationPermit = *snapshot.ActiveEffect.PreparationPermit
@@ -600,8 +602,15 @@ func TestRecoveryRejectsMismatchedAbsentAndUnknownLedgerRoutes(t *testing.T) {
 			name   string
 			mutate func(*LedgerRecord)
 		}{
+			{name: "effect", mutate: func(record *LedgerRecord) { record.EffectID = mustID(identity.Effect, "wrong-effect") }},
+			{name: "invocation", mutate: func(record *LedgerRecord) { record.InvocationID = mustID(identity.Invocation, "wrong-invocation") }},
+			{name: "digest", mutate: func(record *LedgerRecord) { record.RequestDigest = digest(160) }},
 			{name: "tenant", mutate: func(record *LedgerRecord) { record.TenantID = mustID(identity.Tenant, "wrong-tenant") }},
 			{name: "workspace", mutate: func(record *LedgerRecord) { record.WorkspaceID = mustID(identity.Workspace, "wrong-workspace") }},
+			{name: "service", mutate: func(record *LedgerRecord) { record.Service = ServiceWorkspace }},
+			{name: "operation", mutate: func(record *LedgerRecord) { record.Operation = "write" }},
+			{name: "attempt", mutate: func(record *LedgerRecord) { record.DispatchAttempt++ }},
+			{name: "provider request", mutate: func(record *LedgerRecord) { record.ProviderRequestID = mustID(identity.Request, "wrong-provider") }},
 			{name: "provider route", mutate: func(record *LedgerRecord) { record.ProviderRouteDigest = digest(159) }},
 		} {
 			t.Run(string(status)+"/"+mismatch.name, func(t *testing.T) {

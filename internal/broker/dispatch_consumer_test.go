@@ -24,6 +24,21 @@ func TestNewDispatchConsumerRequiresVerifiedProductionClaimer(t *testing.T) {
 	}
 }
 
+func TestClaimedDispatchStartCannotBeForgedFromItsZeroValue(t *testing.T) {
+	t.Parallel()
+
+	claim := ClaimedDispatchStart{}
+	if permit, ok := claim.Open(); ok || permit != (DispatchStartPermit{}) {
+		t.Fatalf("zero ClaimedDispatchStart.Open() = %#v, %t; want zero/false", permit, ok)
+	}
+	claimType := reflect.TypeOf(claim)
+	for index := range claimType.NumField() {
+		if field := claimType.Field(index); field.PkgPath == "" {
+			t.Fatalf("ClaimedDispatchStart field %q is exported", field.Name)
+		}
+	}
+}
+
 func TestNewDispatchConsumerRejectsUnverifiedOrInsufficientAtomicDomainBeforeRawDependencies(t *testing.T) {
 	t.Parallel()
 
@@ -170,9 +185,11 @@ func TestDispatchConsumerAcceptsNarrowClaimerAndValidatesItsDurableReceipt(t *te
 	claimer.mu.Unlock()
 	starter.mu.Lock()
 	startCalls := starter.calls
+	openedPermit := starter.openedPermit
+	opened := starter.opened
 	starter.mu.Unlock()
-	if claimCalls != 1 || startCalls != 1 {
-		t.Fatalf("claim/start calls = %d/%d, want 1/1", claimCalls, startCalls)
+	if claimCalls != 1 || startCalls != 1 || !opened || openedPermit != claimer.claim.Permit {
+		t.Fatalf("claim/start/open = %d/%d/%t permit=%#v", claimCalls, startCalls, opened, openedPermit)
 	}
 
 	claimer.claim.Permit.Durable = false
@@ -999,18 +1016,20 @@ func (starter *boundaryDispatchStarter) RouteDigest() Digest {
 	return digest(152)
 }
 
-func (starter *boundaryDispatchStarter) Start(context.Context, DispatchStartPermit) error {
+func (starter *boundaryDispatchStarter) Start(context.Context, ClaimedDispatchStart) error {
 	starter.starts.Add(1)
 	return nil
 }
 
 type recordingDispatchStarter struct {
-	mu          sync.Mutex
-	calls       int
-	err         error
-	contextErr  error
-	hadDeadline bool
-	routeDigest Digest
+	mu           sync.Mutex
+	calls        int
+	err          error
+	contextErr   error
+	hadDeadline  bool
+	routeDigest  Digest
+	openedPermit DispatchStartPermit
+	opened       bool
 }
 
 type recordingDispatchClaimer struct {
@@ -1034,7 +1053,7 @@ type zeroRouteDispatchStarter struct{}
 
 func (*zeroRouteDispatchStarter) RouteDigest() Digest { return Digest{} }
 
-func (*zeroRouteDispatchStarter) Start(context.Context, DispatchStartPermit) error { return nil }
+func (*zeroRouteDispatchStarter) Start(context.Context, ClaimedDispatchStart) error { return nil }
 
 func (starter *recordingDispatchStarter) RouteDigest() Digest {
 	starter.mu.Lock()
@@ -1045,11 +1064,12 @@ func (starter *recordingDispatchStarter) RouteDigest() Digest {
 	return starter.routeDigest
 }
 
-func (starter *recordingDispatchStarter) Start(ctx context.Context, _ DispatchStartPermit) error {
+func (starter *recordingDispatchStarter) Start(ctx context.Context, claim ClaimedDispatchStart) error {
 	starter.mu.Lock()
 	starter.calls++
 	starter.contextErr = ctx.Err()
 	_, starter.hadDeadline = ctx.Deadline()
+	starter.openedPermit, starter.opened = claim.Open()
 	err := starter.err
 	starter.mu.Unlock()
 	return err

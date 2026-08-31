@@ -305,6 +305,27 @@ type DispatchStartClaim struct {
 	Fresh  bool
 }
 
+var dispatchStartClaimSeal = new(struct{})
+
+// ClaimedDispatchStart is minted only after the broker has verified a fresh,
+// durable Session start claim. Its zero value is invalid, and callers outside
+// this package cannot construct a value that Open accepts.
+type ClaimedDispatchStart struct {
+	permit DispatchStartPermit
+	seal   *struct{}
+}
+
+func (claim ClaimedDispatchStart) Open() (DispatchStartPermit, bool) {
+	if claim.seal != dispatchStartClaimSeal {
+		return DispatchStartPermit{}, false
+	}
+	return claim.permit, true
+}
+
+func (ClaimedDispatchStart) String() string { return "claimed-dispatch-start<redacted>" }
+
+func (ClaimedDispatchStart) GoString() string { return "claimed-dispatch-start<redacted>" }
+
 type DispatchStartOutcome string
 
 const (
@@ -324,7 +345,7 @@ type DispatchStartExecution struct {
 // returned error is classified unknown.
 type DispatchStarter interface {
 	RouteDigest() Digest
-	Start(context.Context, DispatchStartPermit) error
+	Start(context.Context, ClaimedDispatchStart) error
 }
 
 type SettlementRequest struct {

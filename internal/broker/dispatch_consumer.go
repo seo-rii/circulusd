@@ -117,7 +117,8 @@ func (consumer *DispatchConsumer) StartExactAttempt(
 	}
 	startContext, cancelStart := context.WithTimeout(context.WithoutCancel(ctx), consumer.timeout)
 	defer cancelStart()
-	if err := binding.starter.Start(startContext, claim.Permit); err != nil {
+	claimedStart := ClaimedDispatchStart{permit: claim.Permit, seal: dispatchStartClaimSeal}
+	if err := binding.starter.Start(startContext, claimedStart); err != nil {
 		return execution, fmt.Errorf("%w: starter returned without a proven outcome", ErrDispatchStartUnknown)
 	}
 	execution.Outcome = DispatchStartOutcomeStarted

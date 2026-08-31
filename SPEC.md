@@ -1454,6 +1454,15 @@ interface EffectRecord {
 
 Session DO transaction과 외부 서비스 transaction은 하나의 distributed transaction으로 가정하지 않는다. 복구는 effect state와 외부 invocation ledger를 조회하여 명시적으로 수행한다.
 
+Session DO의 durable single-start claim만 provider I/O를 시작할 수 있다. broker는
+fresh claim을 검증한 뒤에만 위조 불가능한 process-local claimed-start 값을 만들어
+service adapter에 전달한다. Model/MCP/reference adapter의 subordinate ledger는
+immutable provider command와 provider acceptance/terminal fact만 소유하며 Session의
+effect phase, generation, retry 또는 settlement를 전이하는 두 번째 program counter가
+되어서는 안 된다. `absent`와 `unknown`을 포함한 모든 ledger 응답은 tenant,
+workspace, effect, invocation, request digest, service, operation, dispatch attempt,
+platform request ID 및 provider route를 완전히 반복해야 한다.
+
 ### 15.5 Workspace DO
 
 Workspace DO는 authoritative VFS metadata와 revision state를 가진다.
