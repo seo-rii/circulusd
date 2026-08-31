@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/sys/unix"
 )
 
@@ -133,7 +134,8 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 
 func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 	config, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "shared-shard-a", 7)
+	agentInstanceID := workerdTestAgentInstanceID(0)
+	lease, err := controller.prepare(context.Background(), agentInstanceID, "shared-shard-a", 7)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -162,10 +164,10 @@ func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 		t.Fatalf("mkdir modes = %#v, want exclusive private 0700", modes)
 	}
 	firstName := backend.onlyChildName(t)
-	if firstName != workerdCgroupLeafName("shared-shard-a", 7) {
+	if firstName != workerdCgroupLeafName(agentInstanceID, "shared-shard-a", 7) {
 		t.Fatalf("leaf name = %q, want deterministic domain-separated identity", firstName)
 	}
-	if firstName == workerdCgroupLeafName("shared-shard-a", 8) {
+	if firstName == workerdCgroupLeafName(agentInstanceID, "shared-shard-a", 8) {
 		t.Fatal("leaf name does not bind shard generation")
 	}
 	evidence := controller.evidence()
@@ -174,6 +176,70 @@ func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 	}
 	if err := lease.destroy(context.Background()); err != nil {
 		t.Fatalf("destroy() error = %v", err)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupPrepareRejectsMissingOrWrongKindAgentIdentityBeforeAllocation(t *testing.T) {
+	_, backend, controller := newWorkerdCgroupFixture(t)
+	tenantID, err := identity.New(identity.Tenant)
+	if err != nil {
+		t.Fatalf("identity.New(tenant) error = %v", err)
+	}
+	for name, agentInstanceID := range map[string]identity.ID{
+		"empty":      {},
+		"wrong kind": tenantID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			lease, prepareErr := controller.prepare(context.Background(), agentInstanceID, "invalid-agent-identity", 1)
+			if lease != nil || !errors.Is(prepareErr, errInvalidWorkerdCgroupRequest) {
+				t.Fatalf("prepare() = %#v, %v, want nil/errInvalidWorkerdCgroupRequest", lease, prepareErr)
+			}
+		})
+	}
+	if children := backend.childCount(); children != 0 {
+		t.Fatalf("invalid agent identities allocated %d cgroup(s)", children)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupSeparatesAgentBootsForSameShardGeneration(t *testing.T) {
+	_, backend, controller := newWorkerdCgroupFixture(t)
+	oldAgentInstanceID := workerdTestAgentInstanceID(0)
+	newAgentInstanceID := workerdTestAgentInstanceID(1)
+	oldLease, err := controller.prepare(context.Background(), oldAgentInstanceID, "cross-boot-shard", 7)
+	if err != nil {
+		t.Fatalf("prepare(old boot) error = %v", err)
+	}
+	newLease, err := controller.prepare(context.Background(), newAgentInstanceID, "cross-boot-shard", 7)
+	if err != nil {
+		t.Fatalf("prepare(new boot) error = %v", err)
+	}
+	if oldLease.name == newLease.name {
+		t.Fatalf("cross-boot leaf names both = %q", oldLease.name)
+	}
+	if oldLease.agentInstanceID != oldAgentInstanceID || newLease.agentInstanceID != newAgentInstanceID {
+		t.Fatalf("lease agent identities = %q/%q, want %q/%q", oldLease.agentInstanceID, newLease.agentInstanceID, oldAgentInstanceID, newAgentInstanceID)
+	}
+	if err := oldLease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy(old boot) error = %v", err)
+	}
+	if children := backend.childCount(); children != 1 {
+		t.Fatalf("children after old boot destroy = %d, want new boot leaf retained", children)
+	}
+	sample, err := newLease.sampleResources(context.Background())
+	if err != nil {
+		t.Fatalf("sampleResources(new boot) error = %v", err)
+	}
+	if sample.AgentInstanceID != newAgentInstanceID || sample.ShardID != "cross-boot-shard" || sample.Generation != 7 {
+		t.Fatalf("new boot sample identity = %#v", sample)
+	}
+	if err := newLease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy(new boot) error = %v", err)
 	}
 	if err := controller.close(); err != nil {
 		t.Fatalf("close() error = %v", err)
@@ -196,7 +262,7 @@ func TestWorkerdCgroupPrepareRejectsNonCanonicalCPUMaxReadback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			_, backend, controller := newWorkerdCgroupFixture(t)
 			backend.corruptReadback["cpu.max"] = readback
-			lease, err := controller.prepare(context.Background(), "strict-cpu-max", 1)
+			lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "strict-cpu-max", 1)
 			if lease != nil || !errors.Is(err, errWorkerdCgroupContract) {
 				t.Fatalf("prepare(cpu.max=%q) = %#v, %v, want nil, contract error", readback, lease, err)
 			}
@@ -352,7 +418,7 @@ func TestWorkerdCgroupResourceSampleUsesPinnedGenerationBaselineAndBoundedReads(
 	if err != nil {
 		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "resource-baseline", 9)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "resource-baseline", 9)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -370,6 +436,7 @@ func TestWorkerdCgroupResourceSampleUsesPinnedGenerationBaselineAndBoundedReads(
 		t.Fatalf("sampleResources() error = %v", err)
 	}
 	want := workerdCgroupResourceSample{
+		AgentInstanceID:    workerdTestAgentInstanceID(0),
 		ShardID:            "resource-baseline",
 		Generation:         9,
 		Identity:           lease.identity,
@@ -439,7 +506,7 @@ func TestWorkerdCgroupResourceSampleRejectsCounterDecreaseFromGenerationBaseline
 			if err != nil {
 				t.Fatalf("new controller error = %v", err)
 			}
-			lease, err := controller.prepare(context.Background(), "counter-decrease", 1)
+			lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "counter-decrease", 1)
 			if err != nil {
 				t.Fatalf("prepare() error = %v", err)
 			}
@@ -460,7 +527,7 @@ func TestWorkerdCgroupResourceSampleRejectsCounterDecreaseFromGenerationBaseline
 
 func TestWorkerdCgroupResourceSampleRejectsOversizedControl(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "oversized-resource", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "oversized-resource", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -478,7 +545,7 @@ func TestWorkerdCgroupResourceSampleRejectsOversizedControl(t *testing.T) {
 
 func TestWorkerdCgroupResourceSampleRejectsPathReplacementDuringRead(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "resource-replacement", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "resource-replacement", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -486,7 +553,7 @@ func TestWorkerdCgroupResourceSampleRejectsPathReplacementDuringRead(t *testing.
 	if sample, sampleErr := lease.sampleResources(context.Background()); sample != (workerdCgroupResourceSample{}) || !errors.Is(sampleErr, errWorkerdCgroupPathReplaced) || !errors.Is(sampleErr, errWorkerdCgroupPoisoned) {
 		t.Fatalf("sampleResources(replacement) = %+v, %v, want zero, path replaced and poisoned", sample, sampleErr)
 	}
-	if next, prepareErr := controller.prepare(context.Background(), "must-not-observe-after-replacement", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+	if next, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "must-not-observe-after-replacement", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
 		if next != nil {
 			_ = next.destroy(context.Background())
 		}
@@ -502,7 +569,7 @@ func TestWorkerdCgroupResourceSampleRejectsPathReplacementDuringRead(t *testing.
 
 func TestWorkerdCgroupResourceSampleReleasesLocksAndExcludesDestroy(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "sample-destroy-race", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "sample-destroy-race", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -584,7 +651,7 @@ func TestWorkerdCgroupResourceSampleReleasesLocksAndExcludesDestroy(t *testing.T
 
 func TestWorkerdCgroupDirectoryFDBorrowExcludesDestroyAndCannotBeReused(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "borrowed-directory-fd", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "borrowed-directory-fd", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -644,7 +711,7 @@ func TestWorkerdCgroupPrepareRejectsNonLeafCgroupState(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			_, backend, controller := newWorkerdCgroupFixture(t)
 			backend.corruptReadback[test.control] = test.value
-			lease, err := controller.prepare(context.Background(), "invalid-leaf", 1)
+			lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "invalid-leaf", 1)
 			if lease != nil {
 				if destroyErr := lease.destroy(context.Background()); destroyErr != nil {
 					t.Fatalf("destroy(unexpected lease) error = %v", destroyErr)
@@ -666,7 +733,7 @@ func TestWorkerdCgroupPrepareRejectsNonLeafCgroupState(t *testing.T) {
 func TestWorkerdCgroupPrepareRollsBackPartialLimitFailure(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
 	backend.corruptReadback["cpu.max"] = "99999 100000\n"
-	lease, err := controller.prepare(context.Background(), "rollback-shard", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "rollback-shard", 1)
 	if lease != nil || !errors.Is(err, errWorkerdCgroupContract) {
 		t.Fatalf("prepare(corrupt readback) = %#v, %v, want nil, contract error", lease, err)
 	}
@@ -674,7 +741,7 @@ func TestWorkerdCgroupPrepareRollsBackPartialLimitFailure(t *testing.T) {
 		t.Fatalf("children after rollback = %d, want 0", children)
 	}
 	delete(backend.corruptReadback, "cpu.max")
-	lease, err = controller.prepare(context.Background(), "after-rollback", 1)
+	lease, err = controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "after-rollback", 1)
 	if err != nil {
 		t.Fatalf("prepare(after rollback) error = %v", err)
 	}
@@ -696,7 +763,7 @@ func TestWorkerdCgroupPrepareReturnsCleanupLeaseWhenRollbackUnlinkFails(t *testi
 	if err != nil {
 		t.Fatalf("new controller error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "retryable-rollback", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "retryable-rollback", 1)
 	if lease == nil || !errors.Is(err, errWorkerdCgroupContract) {
 		t.Fatalf("prepare(rollback unlink failure) = %#v, %v, want cleanup lease and contract error", lease, err)
 	}
@@ -718,7 +785,7 @@ func TestWorkerdCgroupPrepareReturnsCleanupLeaseWhenRollbackUnlinkFails(t *testi
 		t.Fatalf("cgroup.kill calls for never-attached cleanup lease = %d, want 0", calls)
 	}
 	delete(backend.writeFailures, "cgroup.kill")
-	replacement, err := controller.prepare(context.Background(), "after-retryable-rollback", 1)
+	replacement, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "after-retryable-rollback", 1)
 	if err != nil {
 		t.Fatalf("prepare(after cleanup retry) error = %v", err)
 	}
@@ -733,11 +800,11 @@ func TestWorkerdCgroupPrepareReturnsCleanupLeaseWhenRollbackUnlinkFails(t *testi
 func TestWorkerdCgroupPreparePoisonsControllerWhenCreatedChildCannotBeOpened(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
 	backend.openFailures = 1
-	lease, err := controller.prepare(context.Background(), "unidentified-child", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "unidentified-child", 1)
 	if lease != nil || !errors.Is(err, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(open failure) = %#v, %v, want nil and poisoned error", lease, err)
 	}
-	if next, prepareErr := controller.prepare(context.Background(), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+	if next, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(after poison) = %#v, %v, want poisoned error", next, prepareErr)
 	}
 	if calls := backend.mkdirCallCount(); calls != 1 {
@@ -759,12 +826,12 @@ func TestWorkerdCgroupPoisonRevokesBorrowFromExistingLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new controller error = %v", err)
 	}
-	existing, err := controller.prepare(context.Background(), "existing-before-poison", 1)
+	existing, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "existing-before-poison", 1)
 	if err != nil {
 		t.Fatalf("prepare(existing) error = %v", err)
 	}
 	backend.openFailures = 1
-	if unidentified, prepareErr := controller.prepare(context.Background(), "poisoning-child", 1); unidentified != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+	if unidentified, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "poisoning-child", 1); unidentified != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(poisoning child) = %#v, %v, want poisoned error", unidentified, prepareErr)
 	}
 	if err := existing.withDirectoryFD(func(int) error { return nil }); !errors.Is(err, errWorkerdCgroupLeaseUnavailable) {
@@ -785,14 +852,14 @@ func TestWorkerdCgroupPrepareRollbackNeverRemovesAReplacement(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
 	backend.corruptReadback["cpu.max"] = "99999 100000\n"
 	backend.replaceOnReadback = "cpu.max"
-	lease, err := controller.prepare(context.Background(), "rollback-replacement", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "rollback-replacement", 1)
 	if lease != nil || !errors.Is(err, errWorkerdCgroupPathReplaced) || !errors.Is(err, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(replaced during rollback) = %#v, %v, want nil, path replaced and poisoned", lease, err)
 	}
 	if calls := backend.removeCallCount(); calls != 0 {
 		t.Fatalf("remove calls for rollback replacement = %d, want 0", calls)
 	}
-	if next, prepareErr := controller.prepare(context.Background(), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+	if next, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(after replacement poison) = %#v, %v, want poisoned error", next, prepareErr)
 	}
 	if err := controller.close(); !errors.Is(err, errWorkerdCgroupPoisoned) {
@@ -816,11 +883,11 @@ func TestWorkerdCgroupPrepareReservesCapacityBeforeMkdir(t *testing.T) {
 	}
 	result := make(chan workerdCgroupPrepareResult, 1)
 	go func() {
-		lease, prepareErr := controller.prepare(context.Background(), "first", 1)
+		lease, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "first", 1)
 		result <- workerdCgroupPrepareResult{lease: lease, err: prepareErr}
 	}()
 	<-backend.mkdirEntered
-	if lease, prepareErr := controller.prepare(context.Background(), "second", 1); lease != nil || !errors.Is(prepareErr, errWorkerdCgroupCapacity) {
+	if lease, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "second", 1); lease != nil || !errors.Is(prepareErr, errWorkerdCgroupCapacity) {
 		t.Fatalf("prepare(over cap) = %#v, %v, want nil, capacity", lease, prepareErr)
 	}
 	close(mkdirGate)
@@ -854,7 +921,7 @@ func TestWorkerdCgroupPrepareRunsDistinctShardsConcurrently(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			lease, prepareErr := controller.prepare(context.Background(), fmt.Sprintf("concurrent-%d", index), 1)
+			lease, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), fmt.Sprintf("concurrent-%d", index), 1)
 			results <- workerdCgroupPrepareResult{lease: lease, err: prepareErr}
 		}()
 	}
@@ -879,7 +946,7 @@ func TestWorkerdCgroupPrepareRunsDistinctShardsConcurrently(t *testing.T) {
 
 func TestWorkerdCgroupDestroyCoalescesConcurrentCallers(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "coalesced-destroy", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "coalesced-destroy", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -921,7 +988,7 @@ func TestWorkerdCgroupDestroyCoalescesConcurrentCallers(t *testing.T) {
 
 func TestWorkerdCgroupDestroyCallerCancellationDoesNotCancelSharedCleanup(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "cancelled-destroy-waiter", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "cancelled-destroy-waiter", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -967,7 +1034,7 @@ func TestWorkerdCgroupDestroyCallerCancellationDoesNotCancelSharedCleanup(t *tes
 
 func TestWorkerdCgroupDestroyIsIdempotentAfterCallerCancellation(t *testing.T) {
 	_, _, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "idempotent-cancelled-destroy", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "idempotent-cancelled-destroy", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -992,7 +1059,7 @@ func TestWorkerdCgroupDestroyRetriesAndRetainsCapacityUntilUnlink(t *testing.T) 
 	if err != nil {
 		t.Fatalf("new controller error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "retry-destroy", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "retry-destroy", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1000,13 +1067,13 @@ func TestWorkerdCgroupDestroyRetriesAndRetainsCapacityUntilUnlink(t *testing.T) 
 	if err := lease.destroy(context.Background()); err == nil {
 		t.Fatal("destroy(first) error = nil, want retryable failure")
 	}
-	if extra, prepareErr := controller.prepare(context.Background(), "must-remain-reserved", 1); extra != nil || !errors.Is(prepareErr, errWorkerdCgroupCapacity) {
+	if extra, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "must-remain-reserved", 1); extra != nil || !errors.Is(prepareErr, errWorkerdCgroupCapacity) {
 		t.Fatalf("prepare(before successful unlink) = %#v, %v, want capacity", extra, prepareErr)
 	}
 	if err := lease.destroy(context.Background()); err != nil {
 		t.Fatalf("destroy(retry) error = %v", err)
 	}
-	replacement, err := controller.prepare(context.Background(), "after-unlink", 1)
+	replacement, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "after-unlink", 1)
 	if err != nil {
 		t.Fatalf("prepare(after unlink) error = %v", err)
 	}
@@ -1020,7 +1087,7 @@ func TestWorkerdCgroupDestroyRetriesAndRetainsCapacityUntilUnlink(t *testing.T) 
 
 func TestWorkerdCgroupDestroyNeverUnlinksAReplacement(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "replacement-attack", 4)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "replacement-attack", 4)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1035,7 +1102,7 @@ func TestWorkerdCgroupDestroyNeverUnlinksAReplacement(t *testing.T) {
 	if err := lease.destroy(context.Background()); !errors.Is(err, errWorkerdCgroupPoisoned) {
 		t.Fatalf("destroy(after terminal poison) error = %v, want poisoned error", err)
 	}
-	if next, prepareErr := controller.prepare(context.Background(), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+	if next, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "must-not-admit", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
 		t.Fatalf("prepare(after destroy poison) = %#v, %v, want poisoned error", next, prepareErr)
 	}
 	if err := controller.close(); !errors.Is(err, errWorkerdCgroupPoisoned) {
@@ -1048,7 +1115,7 @@ func TestWorkerdCgroupDestroyNeverUnlinksAReplacement(t *testing.T) {
 
 func TestWorkerdCgroupDestroyPollsUntilUnpopulated(t *testing.T) {
 	_, backend, controller := newWorkerdCgroupFixture(t)
-	lease, err := controller.prepare(context.Background(), "draining", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "draining", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1081,7 +1148,7 @@ func TestWorkerdCgroupDestroyDrainTimeoutIsRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new controller error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "drain-timeout", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "drain-timeout", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1119,7 +1186,7 @@ func TestWorkerdCgroupControllerAndLeasesDoNotLeakFileDescriptors(t *testing.T) 
 		t.Fatalf("new controller error = %v", err)
 	}
 	for generation := ShardGeneration(1); generation <= 100; generation++ {
-		lease, prepareErr := controller.prepare(context.Background(), "fd-cycle", generation)
+		lease, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "fd-cycle", generation)
 		if prepareErr != nil {
 			t.Fatalf("prepare(%d) error = %v", generation, prepareErr)
 		}
@@ -1144,7 +1211,7 @@ func TestWorkerdCgroupControllerCloseWaitsForTerminalLeaseFDClosure(t *testing.T
 	if err != nil {
 		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "close-waits-for-leaf-fd", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "close-waits-for-leaf-fd", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1178,7 +1245,7 @@ func TestWorkerdCgroupLeaseLeafCloseFailureIsTerminalAndReplayable(t *testing.T)
 	if err != nil {
 		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
 	}
-	lease, err := controller.prepare(context.Background(), "terminal-leaf-close", 1)
+	lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "terminal-leaf-close", 1)
 	if err != nil {
 		t.Fatalf("prepare() error = %v", err)
 	}
@@ -1211,15 +1278,15 @@ func TestWorkerdCgroupControllerPoisonWriterWaitsForActiveBorrow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
 	}
-	borrowedLease, err := controller.prepare(context.Background(), "active-borrow", 1)
+	borrowedLease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "active-borrow", 1)
 	if err != nil {
 		t.Fatalf("prepare(active borrow) error = %v", err)
 	}
-	poisonedLease, err := controller.prepare(context.Background(), "poison-writer", 1)
+	poisonedLease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "poison-writer", 1)
 	if err != nil {
 		t.Fatalf("prepare(poison writer) error = %v", err)
 	}
-	queuedLease, err := controller.prepare(context.Background(), "queued-after-writer", 1)
+	queuedLease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "queued-after-writer", 1)
 	if err != nil {
 		t.Fatalf("prepare(queued reader) error = %v", err)
 	}

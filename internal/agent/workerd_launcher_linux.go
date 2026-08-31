@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,6 +39,7 @@ var (
 	ErrWorkerdStopTimeout           = errors.New("agent: workerd process-group stop timeout")
 	ErrWorkerdLauncherClosed        = errors.New("agent: workerd process launcher is closed")
 	ErrWorkerdHistoryCapacity       = errors.New("agent: workerd launcher history capacity exhausted")
+	ErrWorkerdAgentInstanceMismatch = errors.New("agent: workerd launcher is bound to a different agent instance")
 )
 
 const (
@@ -88,9 +90,10 @@ type CPUMax struct {
 	PeriodMicros uint64
 }
 
-// WorkerdEnsureRequest is the immutable identity of one shard generation.
-// Reusing the same identity with different arguments is rejected.
+// WorkerdEnsureRequest is the immutable identity of one shard generation in
+// one agent boot. Reusing the same tuple with different arguments is rejected.
 type WorkerdEnsureRequest struct {
+	AgentInstanceID identity.ID
 	ShardID         string
 	ShardGeneration ShardGeneration
 	Arguments       []string
@@ -99,6 +102,7 @@ type WorkerdEnsureRequest struct {
 // WorkerdProcessInfo is the process identity made available to a readiness
 // probe. It is not an admission grant.
 type WorkerdProcessInfo struct {
+	AgentInstanceID identity.ID
 	ShardID         string
 	ShardGeneration ShardGeneration
 	PID             int
@@ -156,6 +160,7 @@ type workerdLaunchCommand struct {
 	CgroupFD        int
 	Stdout          io.Writer
 	Stderr          io.Writer
+	AgentInstanceID identity.ID
 	ShardID         string
 	ShardGeneration ShardGeneration
 }
@@ -174,8 +179,18 @@ type workerdStartedProcess interface {
 }
 
 type workerdLaunchKey struct {
-	shardID    string
-	generation ShardGeneration
+	agentInstanceID identity.ID
+	shardID         string
+	generation      ShardGeneration
+}
+
+type workerdShardKey struct {
+	agentInstanceID identity.ID
+	shardID         string
+}
+
+func (key workerdLaunchKey) shardKey() workerdShardKey {
+	return workerdShardKey{agentInstanceID: key.agentInstanceID, shardID: key.shardID}
 }
 
 type workerdLaunchIdentity [sha256.Size]byte
@@ -226,34 +241,35 @@ type workerdInstance struct {
 }
 
 // WorkerdProcessLauncher owns the verified sealed executable snapshot and
-// coordinates starts independently per immutable shard generation. This is a
-// low-level launcher, not a Launcher implementation: its bounded static
+// coordinates starts independently per boot-scoped immutable shard generation.
+// This is a low-level launcher, not a Launcher implementation: its bounded static
 // arguments and release-bound executable/environment still need to be sealed
 // by a narrow Manager adapter.
 type WorkerdProcessLauncher struct {
-	mu                 sync.Mutex
-	executable         *os.File
-	executableProcPath string
-	executableDigest   string
-	environment        []string
-	readinessTimeout   time.Duration
-	stopGracePeriod    time.Duration
-	outputLimitBytes   int
-	historyCapacity    int
-	readinessProbe     WorkerdReadinessProbe
-	starter            workerdProcessStarter
-	cgroups            *workerdCgroupController
-	pending            map[workerdLaunchKey]*workerdPendingLaunch
-	allocations        map[*workerdCgroupLease]workerdCgroupAllocation
-	current            map[string]*workerdInstance
-	latestGenerations  map[string]ShardGeneration
-	retiredGenerations map[string]ShardGeneration
-	launchIdentities   map[workerdLaunchKey]workerdLaunchIdentity
-	instances          map[*workerdInstance]struct{}
-	closed             bool
-	closeOperation     *workerdCloseOperation
-	cgroupsClosed      bool
-	terminalCloseErr   error
+	mu                   sync.Mutex
+	executable           *os.File
+	executableProcPath   string
+	executableDigest     string
+	environment          []string
+	readinessTimeout     time.Duration
+	stopGracePeriod      time.Duration
+	outputLimitBytes     int
+	historyCapacity      int
+	readinessProbe       WorkerdReadinessProbe
+	starter              workerdProcessStarter
+	cgroups              *workerdCgroupController
+	boundAgentInstanceID identity.ID
+	pending              map[workerdLaunchKey]*workerdPendingLaunch
+	allocations          map[*workerdCgroupLease]workerdCgroupAllocation
+	current              map[workerdShardKey]*workerdInstance
+	latestGenerations    map[workerdShardKey]ShardGeneration
+	retiredGenerations   map[workerdShardKey]ShardGeneration
+	launchIdentities     map[workerdLaunchKey]workerdLaunchIdentity
+	instances            map[*workerdInstance]struct{}
+	closed               bool
+	closeOperation       *workerdCloseOperation
+	cgroupsClosed        bool
+	terminalCloseErr     error
 }
 
 // WorkerdShardHandle is returned only after the configured readiness probe
@@ -442,9 +458,9 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		cgroups:            cgroups,
 		pending:            make(map[workerdLaunchKey]*workerdPendingLaunch),
 		allocations:        make(map[*workerdCgroupLease]workerdCgroupAllocation),
-		current:            make(map[string]*workerdInstance),
-		latestGenerations:  make(map[string]ShardGeneration),
-		retiredGenerations: make(map[string]ShardGeneration),
+		current:            make(map[workerdShardKey]*workerdInstance),
+		latestGenerations:  make(map[workerdShardKey]ShardGeneration),
+		retiredGenerations: make(map[workerdShardKey]ShardGeneration),
 		launchIdentities:   make(map[workerdLaunchKey]workerdLaunchIdentity),
 		instances:          make(map[*workerdInstance]struct{}),
 	}, nil
@@ -459,6 +475,7 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 	}
 	arguments := slices.Clone(request.Arguments)
 	if ctx == nil || launcher == nil || launcher.starter == nil || launcher.readinessProbe == nil ||
+		request.AgentInstanceID.Kind() != identity.Process ||
 		request.ShardID == "" || request.ShardID != strings.TrimSpace(request.ShardID) ||
 		len(request.ShardID) > 256 || strings.ContainsRune(request.ShardID, '\x00') ||
 		request.ShardGeneration == 0 {
@@ -479,12 +496,17 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 		_, _ = identityHash.Write(encodedLength[:])
 		_, _ = io.WriteString(identityHash, argument)
 	}
-	var identity workerdLaunchIdentity
-	copy(identity[:], identityHash.Sum(nil))
+	var launchIdentity workerdLaunchIdentity
+	copy(launchIdentity[:], identityHash.Sum(nil))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	key := workerdLaunchKey{shardID: request.ShardID, generation: request.ShardGeneration}
+	key := workerdLaunchKey{
+		agentInstanceID: request.AgentInstanceID,
+		shardID:         request.ShardID,
+		generation:      request.ShardGeneration,
+	}
+	shardKey := key.shardKey()
 
 	for {
 		launcher.mu.Lock()
@@ -492,16 +514,22 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdLauncherClosed
 		}
-		if _, known := launcher.latestGenerations[request.ShardID]; !known && len(launcher.latestGenerations) >= launcher.historyCapacity {
+		if launcher.boundAgentInstanceID == (identity.ID{}) {
+			launcher.boundAgentInstanceID = request.AgentInstanceID
+		} else if launcher.boundAgentInstanceID != request.AgentInstanceID {
+			launcher.mu.Unlock()
+			return nil, ErrWorkerdAgentInstanceMismatch
+		}
+		if _, known := launcher.latestGenerations[shardKey]; !known && len(launcher.latestGenerations) >= launcher.historyCapacity {
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdHistoryCapacity
 		}
-		if retired := launcher.retiredGenerations[request.ShardID]; retired >= request.ShardGeneration ||
-			launcher.latestGenerations[request.ShardID] > request.ShardGeneration {
+		if retired := launcher.retiredGenerations[shardKey]; retired >= request.ShardGeneration ||
+			launcher.latestGenerations[shardKey] > request.ShardGeneration {
 			launcher.mu.Unlock()
 			return nil, ErrStaleWorkerdGeneration
 		}
-		if existingIdentity, found := launcher.launchIdentities[key]; found && existingIdentity != identity {
+		if existingIdentity, found := launcher.launchIdentities[key]; found && existingIdentity != launchIdentity {
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdLaunchConflict
 		}
@@ -539,8 +567,8 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 				return nil, ctx.Err()
 			}
 		}
-		if current := launcher.current[request.ShardID]; current != nil && current.key == key {
-			if current.identity != identity {
+		if current := launcher.current[shardKey]; current != nil && current.key == key {
+			if current.identity != launchIdentity {
 				launcher.mu.Unlock()
 				return nil, ErrWorkerdLaunchConflict
 			}
@@ -555,7 +583,7 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 		}
 		var earlierPending *workerdPendingLaunch
 		for pendingKey, candidate := range launcher.pending {
-			if pendingKey.shardID == request.ShardID {
+			if pendingKey.shardKey() == shardKey {
 				earlierPending = candidate
 				break
 			}
@@ -572,14 +600,14 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 		}
 		unresolved := make([]*workerdInstance, 0, 1)
 		for instance := range launcher.instances {
-			if instance.key.shardID != request.ShardID {
+			if instance.key.shardKey() != shardKey {
 				continue
 			}
 			instance.mu.Lock()
 			if !instance.groupGone {
 				instance.handleStopRequested = true
-				if launcher.retiredGenerations[request.ShardID] < instance.key.generation {
-					launcher.retiredGenerations[request.ShardID] = instance.key.generation
+				if launcher.retiredGenerations[shardKey] < instance.key.generation {
+					launcher.retiredGenerations[shardKey] = instance.key.generation
 				}
 				unresolved = append(unresolved, instance)
 			}
@@ -606,18 +634,18 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdHistoryCapacity
 		}
-		if request.ShardGeneration > launcher.latestGenerations[request.ShardID] {
+		if request.ShardGeneration > launcher.latestGenerations[shardKey] {
 			for existingKey := range launcher.launchIdentities {
-				if existingKey.shardID == request.ShardID && existingKey.generation < request.ShardGeneration {
+				if existingKey.shardKey() == shardKey && existingKey.generation < request.ShardGeneration {
 					delete(launcher.launchIdentities, existingKey)
 				}
 			}
-			launcher.latestGenerations[request.ShardID] = request.ShardGeneration
+			launcher.latestGenerations[shardKey] = request.ShardGeneration
 		}
-		launcher.launchIdentities[key] = identity
+		launcher.launchIdentities[key] = launchIdentity
 		launchContext, cancel := context.WithTimeout(context.Background(), launcher.readinessTimeout)
 		pending := &workerdPendingLaunch{
-			key: key, identity: identity, arguments: arguments, done: make(chan struct{}),
+			key: key, identity: launchIdentity, arguments: arguments, done: make(chan struct{}),
 			cancel: cancel, ctx: launchContext, waiters: 1,
 		}
 		launcher.pending[key] = pending
@@ -679,7 +707,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		launcher.mu.Lock()
 		residuals := make([]residualCgroupAllocation, 0)
 		for lease, allocation := range launcher.allocations {
-			if allocation.key.shardID == pending.key.shardID {
+			if allocation.key.shardKey() == pending.key.shardKey() {
 				residuals = append(residuals, residualCgroupAllocation{lease: lease, key: allocation.key})
 			}
 		}
@@ -701,7 +729,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 				return
 			}
 		}
-		lease, prepareErr := launcher.cgroups.prepare(pending.ctx, pending.key.shardID, pending.key.generation)
+		lease, prepareErr := launcher.cgroups.prepare(pending.ctx, pending.key.agentInstanceID, pending.key.shardID, pending.key.generation)
 		cgroupLease = lease
 		if cgroupLease != nil {
 			launcher.mu.Lock()
@@ -749,6 +777,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		CgroupFD:        -1,
 		Stdout:          stdout,
 		Stderr:          stderr,
+		AgentInstanceID: pending.key.agentInstanceID,
 		ShardID:         pending.key.shardID,
 		ShardGeneration: pending.key.generation,
 	}
@@ -793,9 +822,10 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		instance.exited = true
 		instance.exitErr = exitErr
 		close(instance.exitDone)
-		if launcher.current[instance.key.shardID] == instance {
-			if launcher.retiredGenerations[instance.key.shardID] < instance.key.generation {
-				launcher.retiredGenerations[instance.key.shardID] = instance.key.generation
+		shardKey := instance.key.shardKey()
+		if launcher.current[shardKey] == instance {
+			if launcher.retiredGenerations[shardKey] < instance.key.generation {
+				launcher.retiredGenerations[shardKey] = instance.key.generation
 			}
 		}
 		instance.mu.Unlock()
@@ -807,7 +837,10 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	probeResult := make(chan error, 1)
 	go func() {
 		probeResult <- launcher.readinessProbe.WaitReady(pending.ctx, WorkerdProcessInfo{
-			ShardID: pending.key.shardID, ShardGeneration: pending.key.generation, PID: process.PID(),
+			AgentInstanceID: pending.key.agentInstanceID,
+			ShardID:         pending.key.shardID,
+			ShardGeneration: pending.key.generation,
+			PID:             process.PID(),
 		})
 	}()
 	readinessSucceeded := false
@@ -868,10 +901,11 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	}
 
 	launcher.mu.Lock()
+	shardKey := pending.key.shardKey()
 	abandoned := pending.abandoned
-	stale := launcher.latestGenerations[pending.key.shardID] != pending.key.generation
+	stale := launcher.latestGenerations[shardKey] != pending.key.generation
 	closing := launcher.closed
-	oldInstance := launcher.current[pending.key.shardID]
+	oldInstance := launcher.current[shardKey]
 	launcher.mu.Unlock()
 	if abandoned || stale || closing {
 		stop := launcher.beginWorkerdStop(instance, false)
@@ -904,7 +938,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	launcher.mu.Lock()
 	instance.mu.Lock()
 	finalAbandoned := pending.abandoned
-	finalStale := launcher.latestGenerations[pending.key.shardID] != pending.key.generation
+	finalStale := launcher.latestGenerations[shardKey] != pending.key.generation
 	finalClosed := launcher.closed
 	finalExited := instance.exited
 	finalExitErr := instance.exitErr
@@ -931,7 +965,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		return
 	}
 	resultHandle = &WorkerdShardHandle{launcher: launcher, instance: instance}
-	launcher.current[pending.key.shardID] = instance
+	launcher.current[shardKey] = instance
 	instance.mu.Unlock()
 	launcher.mu.Unlock()
 }
@@ -978,8 +1012,9 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 				instance.mu.Lock()
 				instance.groupGone = true
 				delete(launcher.instances, instance)
-				if launcher.current[instance.key.shardID] == instance {
-					delete(launcher.current, instance.key.shardID)
+				shardKey := instance.key.shardKey()
+				if launcher.current[shardKey] == instance {
+					delete(launcher.current, shardKey)
 				}
 				if cleanupErr != nil {
 					launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, cleanupErr)
@@ -1055,8 +1090,9 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 			instance.mu.Lock()
 			instance.groupGone = true
 			delete(launcher.instances, instance)
-			if launcher.current[instance.key.shardID] == instance {
-				delete(launcher.current, instance.key.shardID)
+			shardKey := instance.key.shardKey()
+			if launcher.current[shardKey] == instance {
+				delete(launcher.current, shardKey)
 			}
 			instance.mu.Unlock()
 			launcher.mu.Unlock()
@@ -1114,6 +1150,11 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 		launcher.mu.Unlock()
 
 		sort.Slice(pendingLaunches, func(first, second int) bool {
+			firstAgent := pendingLaunches[first].key.agentInstanceID.String()
+			secondAgent := pendingLaunches[second].key.agentInstanceID.String()
+			if firstAgent != secondAgent {
+				return firstAgent < secondAgent
+			}
 			if pendingLaunches[first].key.shardID != pendingLaunches[second].key.shardID {
 				return pendingLaunches[first].key.shardID < pendingLaunches[second].key.shardID
 			}
@@ -1131,6 +1172,11 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 			}
 			launcher.mu.Unlock()
 			sort.Slice(instances, func(first, second int) bool {
+				firstAgent := instances[first].key.agentInstanceID.String()
+				secondAgent := instances[second].key.agentInstanceID.String()
+				if firstAgent != secondAgent {
+					return firstAgent < secondAgent
+				}
 				if instances[first].key.shardID != instances[second].key.shardID {
 					return instances[first].key.shardID < instances[second].key.shardID
 				}
@@ -1161,6 +1207,11 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 			}
 			launcher.mu.Unlock()
 			sort.Slice(residuals, func(first, second int) bool {
+				firstAgent := residuals[first].key.agentInstanceID.String()
+				secondAgent := residuals[second].key.agentInstanceID.String()
+				if firstAgent != secondAgent {
+					return firstAgent < secondAgent
+				}
 				if residuals[first].key.shardID != residuals[second].key.shardID {
 					return residuals[first].key.shardID < residuals[second].key.shardID
 				}
@@ -1244,6 +1295,7 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	}
 	launcher := handle.launcher
 	instance := handle.instance
+	shardKey := instance.key.shardKey()
 	launcher.mu.Lock()
 	instance.mu.Lock()
 	if instance.groupGone {
@@ -1260,9 +1312,9 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 		launcher.mu.Unlock()
 		return ErrStaleWorkerdGeneration
 	}
-	if launcher.current[instance.key.shardID] == instance {
-		if launcher.retiredGenerations[instance.key.shardID] < instance.key.generation {
-			launcher.retiredGenerations[instance.key.shardID] = instance.key.generation
+	if launcher.current[shardKey] == instance {
+		if launcher.retiredGenerations[shardKey] < instance.key.generation {
+			launcher.retiredGenerations[shardKey] = instance.key.generation
 		}
 		instance.handleStopRequested = true
 		instance.mu.Unlock()
@@ -1281,6 +1333,14 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	launcher.mu.Unlock()
 	stop := launcher.beginWorkerdStop(instance, false)
 	return launcher.waitWorkerdStop(ctx, stop)
+}
+
+// AgentInstanceID returns the immutable boot-scoped agent process identity.
+func (handle *WorkerdShardHandle) AgentInstanceID() identity.ID {
+	if handle == nil || handle.instance == nil {
+		return identity.ID{}
+	}
+	return handle.instance.key.agentInstanceID
 }
 
 // ShardID returns the immutable shard identity.
@@ -1394,6 +1454,9 @@ type osWorkerdProcessStarter struct {
 }
 
 func (starter osWorkerdProcessStarter) Start(command workerdLaunchCommand) (workerdStartedProcess, error) {
+	if command.AgentInstanceID.Kind() != identity.Process {
+		return nil, ErrInvalidWorkerdEnsureRequest
+	}
 	process := exec.Command(command.Executable, command.Arguments...)
 	process.Env = make([]string, len(command.Environment))
 	copy(process.Env, command.Environment)

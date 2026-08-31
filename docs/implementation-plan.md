@@ -90,17 +90,18 @@ not silently included in Unit 10.
   reads and poisons admission on replacement. A borrow/quiescence gate keeps
   mutexes out of cgroup I/O while preventing destruction or a queued integrity
   writer from racing an active descriptor borrower. Focused and complete
-  repeated race tests pass. The fixed-configuration Manager adapter, process
-  token/RSS, serialized observation sequence, and Manager delivery remain.
+  repeated race tests pass. The fixed-configuration adapter and process-RSS
+  primitive are recorded below; serialized observation sequence and Manager
+  delivery remain.
 - 2026-09-01: the Linux Manager adapter now binds every start to one
   construction-time snapshot of the release-derived workerd argument vector,
   validates the Manager-owned process/shard generation boundary, and gives
   each concurrent low-level `Ensure` call an unaliased copy. It forwards no
   placement generation or caller process arguments, rejects nil launchers and
   handles, and does not enter the low-level launcher for an already-canceled
-  caller. Repeated adapter and complete agent race/shuffle tests pass. The
-  boot-scoped agent identity still must be carried through the low-level
-  request/readiness/cgroup identity tuple before observation is wired.
+  caller. Repeated adapter and complete agent race/shuffle tests pass. Full
+  tuple validation is recorded by the later identity-boundary item; serialized
+  observation and Manager delivery remain.
 - 2026-09-01: Linux process observation now captures an immutable
   `(pid, startTicks)` token from bounded canonical `/proc/<pid>/stat` input and
   derives RSS bytes from bounded `statm` input with page-size and multiplication
@@ -118,6 +119,16 @@ not silently included in Unit 10.
   consuming a fresh `ShardGeneration`; independent capacity slots still receive
   distinct shard IDs. Deterministic post-completion cancellation, late-claim,
   retry, shutdown, and repeated race/shuffle tests pass.
+- 2026-09-01: the complete process identity tuple now survives the static
+  `ShardProcess` boundary and is checked by the adapter and Manager before a
+  placement can publish. Mismatched non-nil processes transfer to cleanup.
+  Ensure, readiness, starter commands, handles, cgroup leases/leaves/samples,
+  current/history keys, and stop ownership carry the same boot-scoped agent ID.
+  A low-level launcher binds atomically to its first valid agent instance for
+  its entire lifetime; another boot fails before readiness, process, or cgroup
+  callbacks, so history cannot accumulate across boots. Exact mismatch,
+  lock-free callback, first-bind race, and cgroup integration tests pass under
+  full repository race and vet gates.
 
 ### Outcome
 
@@ -172,9 +183,11 @@ The implementation starts from these already-tested components:
   the preceding operational components.
 
 The Manager and launcher now use a distinct typed `ShardGeneration`, and the
-fixed-argument adapter joins their start boundaries. The remaining identity
-work is to carry `AgentInstanceID` through ensure/readiness/cgroup/observation
-results and to reject stale tuple members before Manager state changes.
+fixed-argument adapter joins their start boundaries. `AgentInstanceID` travels
+through ensure, readiness, process, and cgroup values, and the Manager checks
+the exact process tuple before publication. The remaining identity work is to
+attach that tuple and a serialized sequence to observation results, then reject
+stale tuple members before Manager state changes.
 
 ### Cut line
 
@@ -225,6 +238,13 @@ placement values cannot flow into those fields. Neither `agentInstanceID` nor
 `shardGeneration` is accepted in a placement request or qualification-input
 document: `ShardSpec` is the outbound Manager-to-Launcher value, and Manager
 fills both identities before calling `Launcher.Start`.
+
+One `WorkerdProcessLauncher` lifetime belongs to exactly one
+`agentInstanceID`, bound by its first valid non-canceled ensure request. A new
+Manager boot must construct a new launcher/adapter lifetime and close the old
+one; reusing the old launcher with another agent identity fails before
+allocation or callbacks. Per-shard generation history therefore cannot grow
+across boots.
 
 Every readiness response, exit callback, resource sample, and stop completion
 carries `(agentInstanceID, shardID, shardGeneration)` plus a non-reusable

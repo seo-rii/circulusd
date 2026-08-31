@@ -27,7 +27,9 @@ func (launcher *controlledStopLauncher) Start(_ context.Context, spec ShardSpec)
 	launcher.specs = append(launcher.specs, spec)
 	launcher.mu.Unlock()
 	launcher.process.mu.Lock()
+	launcher.process.agentInstanceID = spec.AgentInstanceID
 	launcher.process.id = spec.ShardID
+	launcher.process.shardGeneration = spec.ShardGeneration
 	launcher.process.mu.Unlock()
 	return launcher.process, nil
 }
@@ -40,7 +42,9 @@ func (launcher *controlledStopLauncher) launchState() (int, []ShardSpec) {
 
 type controlledStopProcess struct {
 	mu              sync.Mutex
+	agentInstanceID identity.ID
 	id              string
+	shardGeneration ShardGeneration
 	calls           int
 	failures        int
 	stopEntered     chan struct{}
@@ -52,6 +56,18 @@ func (process *controlledStopProcess) ID() string {
 	process.mu.Lock()
 	defer process.mu.Unlock()
 	return process.id
+}
+
+func (process *controlledStopProcess) AgentInstanceID() identity.ID {
+	process.mu.Lock()
+	defer process.mu.Unlock()
+	return process.agentInstanceID
+}
+
+func (process *controlledStopProcess) ShardGeneration() ShardGeneration {
+	process.mu.Lock()
+	defer process.mu.Unlock()
+	return process.shardGeneration
 }
 
 func (process *controlledStopProcess) Stop(ctx context.Context) error {
@@ -94,7 +110,12 @@ func newParallelStopLauncher() *parallelStopLauncher {
 }
 
 func (launcher *parallelStopLauncher) Start(_ context.Context, spec ShardSpec) (ShardProcess, error) {
-	return &parallelStopProcess{id: spec.ShardID, launcher: launcher}, nil
+	return &parallelStopProcess{
+		agentInstanceID: spec.AgentInstanceID,
+		id:              spec.ShardID,
+		shardGeneration: spec.ShardGeneration,
+		launcher:        launcher,
+	}, nil
 }
 
 func (launcher *parallelStopLauncher) releaseStops() {
@@ -102,11 +123,17 @@ func (launcher *parallelStopLauncher) releaseStops() {
 }
 
 type parallelStopProcess struct {
-	id       string
-	launcher *parallelStopLauncher
+	agentInstanceID identity.ID
+	id              string
+	shardGeneration ShardGeneration
+	launcher        *parallelStopLauncher
 }
 
 func (process *parallelStopProcess) ID() string { return process.id }
+
+func (process *parallelStopProcess) AgentInstanceID() identity.ID { return process.agentInstanceID }
+
+func (process *parallelStopProcess) ShardGeneration() ShardGeneration { return process.shardGeneration }
 
 func (process *parallelStopProcess) Stop(ctx context.Context) error {
 	process.launcher.entered <- process.id
@@ -136,7 +163,9 @@ func newAbandonedLaunchLauncher(process *controlledStopProcess) *abandonedLaunch
 
 func (launcher *abandonedLaunchLauncher) Start(ctx context.Context, spec ShardSpec) (ShardProcess, error) {
 	launcher.process.mu.Lock()
+	launcher.process.agentInstanceID = spec.AgentInstanceID
 	launcher.process.id = spec.ShardID
+	launcher.process.shardGeneration = spec.ShardGeneration
 	launcher.process.mu.Unlock()
 	close(launcher.startEntered)
 	<-ctx.Done()

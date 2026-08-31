@@ -647,21 +647,29 @@ func (manager *Manager) runLaunch(pending *launchPending) {
 			processIsNil = value.IsNil()
 		}
 	}
-	processID := ""
-	if launchErr == nil && !processIsNil {
-		processID = process.ID()
-	}
-
 	outcomeErr := launchErr
+	if processIsNil {
+		if outcomeErr == nil {
+			outcomeErr = ErrInvalidConfig
+		}
+	} else {
+		processID := process.ID()
+		processAgentInstanceID := process.AgentInstanceID()
+		processShardGeneration := process.ShardGeneration()
+		if processID != pending.spec.ShardID ||
+			processAgentInstanceID != pending.spec.AgentInstanceID ||
+			processShardGeneration != pending.spec.ShardGeneration {
+			if outcomeErr == nil {
+				outcomeErr = ErrInvalidConfig
+			} else if !errors.Is(outcomeErr, ErrInvalidConfig) {
+				outcomeErr = errors.Join(outcomeErr, ErrInvalidConfig)
+			}
+		}
+	}
 	var rejectedProcess ShardProcess
 	manager.mu.Lock()
 	if outcomeErr == nil {
-		if processIsNil || processID != pending.spec.ShardID {
-			outcomeErr = ErrInvalidConfig
-			if !processIsNil {
-				rejectedProcess = process
-			}
-		} else if manager.closed {
+		if manager.closed {
 			outcomeErr = ErrManagerClosed
 			rejectedProcess = process
 		} else if pending.abandoned || pending.waiters == 0 {

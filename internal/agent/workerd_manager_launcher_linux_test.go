@@ -48,15 +48,20 @@ func (ensurer *managerAdapterGatedEnsurer) Ensure(ctx context.Context, request W
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-ensurer.gate:
-		return &WorkerdShardHandle{}, nil
+		return newManagerAdapterHandle(request.AgentInstanceID, request.ShardID, request.ShardGeneration), nil
 	}
 }
 
 func TestWorkerdManagerLauncherSnapshotsAndForwardsOnlyFixedArguments(t *testing.T) {
 	processID := newManagerAdapterIdentity(t, identity.Process)
-	handle := &WorkerdShardHandle{}
-	lowLevel := &managerAdapterRecordingEnsurer{handle: handle}
 	arguments := []string{"serve", "--config=/release/workerd.capnp"}
+	spec := ShardSpec{
+		AgentInstanceID: processID,
+		ShardID:         "manager-adapter-shard",
+		ShardGeneration: 17,
+	}
+	handle := newManagerAdapterHandle(spec.AgentInstanceID, spec.ShardID, spec.ShardGeneration)
+	lowLevel := &managerAdapterRecordingEnsurer{handle: handle}
 	launcher, err := newWorkerdManagerLauncher(lowLevel, arguments)
 	if err != nil {
 		t.Fatalf("newWorkerdManagerLauncher() error = %v", err)
@@ -64,11 +69,6 @@ func TestWorkerdManagerLauncherSnapshotsAndForwardsOnlyFixedArguments(t *testing
 	arguments[0] = "caller-mutated"
 	arguments = append(arguments, "--caller-argument")
 	ctx := context.WithValue(context.Background(), managerAdapterContextKey{}, "fixed-context")
-	spec := ShardSpec{
-		AgentInstanceID: processID,
-		ShardID:         "manager-adapter-shard",
-		ShardGeneration: 17,
-	}
 
 	process, err := launcher.Start(ctx, spec)
 	if err != nil {
@@ -81,7 +81,7 @@ func TestWorkerdManagerLauncherSnapshotsAndForwardsOnlyFixedArguments(t *testing
 	if len(requests) != 1 {
 		t.Fatalf("Ensure requests = %#v, want one", requests)
 	}
-	if requests[0].ShardID != spec.ShardID || requests[0].ShardGeneration != spec.ShardGeneration ||
+	if requests[0].AgentInstanceID != spec.AgentInstanceID || requests[0].ShardID != spec.ShardID || requests[0].ShardGeneration != spec.ShardGeneration ||
 		len(requests[0].Arguments) != 2 || requests[0].Arguments[0] != "serve" || requests[0].Arguments[1] != "--config=/release/workerd.capnp" {
 		t.Fatalf("first Ensure request = %#v", requests[0])
 	}
@@ -100,9 +100,34 @@ func TestWorkerdManagerLauncherSnapshotsAndForwardsOnlyFixedArguments(t *testing
 	if len(requests) != 2 {
 		t.Fatalf("Ensure requests = %#v, want two", requests)
 	}
-	if requests[1].ShardID != spec.ShardID || requests[1].ShardGeneration != spec.ShardGeneration ||
+	if requests[1].AgentInstanceID != spec.AgentInstanceID || requests[1].ShardID != spec.ShardID || requests[1].ShardGeneration != spec.ShardGeneration ||
 		len(requests[1].Arguments) != 2 || requests[1].Arguments[0] != "serve" || requests[1].Arguments[1] != "--config=/release/workerd.capnp" {
 		t.Fatalf("second Ensure request = %#v", requests[1])
+	}
+}
+
+func TestWorkerdManagerLauncherReturnsMismatchedHandleForManagerCleanup(t *testing.T) {
+	spec := ShardSpec{
+		AgentInstanceID: newManagerAdapterIdentity(t, identity.Process),
+		ShardID:         "adapter-mismatch",
+		ShardGeneration: 23,
+	}
+	for name, handle := range map[string]*WorkerdShardHandle{
+		"agent instance": newManagerAdapterHandle(newManagerAdapterIdentity(t, identity.Process), spec.ShardID, spec.ShardGeneration),
+		"shard ID":       newManagerAdapterHandle(spec.AgentInstanceID, "wrong-shard", spec.ShardGeneration),
+		"generation":     newManagerAdapterHandle(spec.AgentInstanceID, spec.ShardID, spec.ShardGeneration+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			lowLevel := &managerAdapterRecordingEnsurer{handle: handle}
+			launcher, err := newWorkerdManagerLauncher(lowLevel, []string{"serve"})
+			if err != nil {
+				t.Fatalf("newWorkerdManagerLauncher() error = %v", err)
+			}
+			process, startErr := launcher.Start(context.Background(), spec)
+			if process != handle || !errors.Is(startErr, ErrInvalidConfig) {
+				t.Fatalf("Start() = %#v, %v, want exact handle/ErrInvalidConfig", process, startErr)
+			}
+		})
 	}
 }
 
@@ -215,6 +240,9 @@ func TestWorkerdManagerLauncherConcurrentStartsUseUnaliasedArgumentsAndDoNotSeri
 	for range callers {
 		select {
 		case request := <-lowLevel.entered:
+			if request.AgentInstanceID != processID {
+				t.Fatalf("concurrent Ensure AgentInstanceID = %q, want %q", request.AgentInstanceID, processID)
+			}
 			if len(request.Arguments) != 2 || request.Arguments[0] != "serve" || request.Arguments[1] != "--fixed" {
 				t.Fatalf("concurrent Ensure arguments = %#v", request.Arguments)
 			}
@@ -249,4 +277,12 @@ func newManagerAdapterIdentity(t *testing.T, kind identity.Kind) identity.ID {
 		t.Fatalf("identity.New(%q) error = %v", kind, err)
 	}
 	return id
+}
+
+func newManagerAdapterHandle(agentInstanceID identity.ID, shardID string, shardGeneration ShardGeneration) *WorkerdShardHandle {
+	return &WorkerdShardHandle{instance: &workerdInstance{key: workerdLaunchKey{
+		agentInstanceID: agentInstanceID,
+		shardID:         shardID,
+		generation:      shardGeneration,
+	}}}
 }

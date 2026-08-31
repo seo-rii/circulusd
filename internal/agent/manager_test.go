@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,14 +18,33 @@ import (
 
 var errLaunch = errors.New("test: launch failed")
 
+func TestShardProcessRequiresManagerOwnedIdentityTuple(t *testing.T) {
+	processType := reflect.TypeOf((*ShardProcess)(nil)).Elem()
+	for _, contract := range []struct {
+		name       string
+		resultType reflect.Type
+	}{
+		{name: "ID", resultType: reflect.TypeOf("")},
+		{name: "AgentInstanceID", resultType: reflect.TypeOf(identity.ID{})},
+		{name: "ShardGeneration", resultType: reflect.TypeOf(ShardGeneration(0))},
+	} {
+		method, found := processType.MethodByName(contract.name)
+		if !found || method.Type.NumIn() != 0 || method.Type.NumOut() != 1 || method.Type.Out(0) != contract.resultType {
+			t.Errorf("ShardProcess.%s = %#v, want no inputs and %v result", contract.name, method, contract.resultType)
+		}
+	}
+}
+
 type fakeLauncher struct {
-	mu         sync.Mutex
-	starts     int
-	specs      []ShardSpec
-	stops      []string
-	failNext   bool
-	startGate  chan struct{}
-	returnedID string
+	mu                      sync.Mutex
+	starts                  int
+	specs                   []ShardSpec
+	stops                   []string
+	failNext                bool
+	startGate               chan struct{}
+	returnedAgentInstanceID identity.ID
+	returnedID              string
+	returnedShardGeneration ShardGeneration
 }
 
 func (launcher *fakeLauncher) Start(ctx context.Context, spec ShardSpec) (ShardProcess, error) {
@@ -38,6 +58,14 @@ func (launcher *fakeLauncher) Start(ctx context.Context, spec ShardSpec) (ShardP
 	if launcher.returnedID != "" {
 		id = launcher.returnedID
 	}
+	agentInstanceID := spec.AgentInstanceID
+	if launcher.returnedAgentInstanceID != (identity.ID{}) {
+		agentInstanceID = launcher.returnedAgentInstanceID
+	}
+	shardGeneration := spec.ShardGeneration
+	if launcher.returnedShardGeneration != 0 {
+		shardGeneration = launcher.returnedShardGeneration
+	}
 	launcher.mu.Unlock()
 	if gate != nil {
 		select {
@@ -49,7 +77,12 @@ func (launcher *fakeLauncher) Start(ctx context.Context, spec ShardSpec) (ShardP
 	if fail {
 		return nil, errLaunch
 	}
-	return &fakeProcess{id: id, launcher: launcher}, nil
+	return &fakeProcess{
+		agentInstanceID: agentInstanceID,
+		id:              id,
+		shardGeneration: shardGeneration,
+		launcher:        launcher,
+	}, nil
 }
 
 func (launcher *fakeLauncher) counts() (int, []string) {
@@ -65,12 +98,18 @@ func (launcher *fakeLauncher) launchSpecs() []ShardSpec {
 }
 
 type fakeProcess struct {
-	id       string
-	launcher *fakeLauncher
-	once     sync.Once
+	agentInstanceID identity.ID
+	id              string
+	shardGeneration ShardGeneration
+	launcher        *fakeLauncher
+	once            sync.Once
 }
 
 func (process *fakeProcess) ID() string { return process.id }
+
+func (process *fakeProcess) AgentInstanceID() identity.ID { return process.agentInstanceID }
+
+func (process *fakeProcess) ShardGeneration() ShardGeneration { return process.shardGeneration }
 
 func (process *fakeProcess) Stop(context.Context) error {
 	process.once.Do(func() {
@@ -105,7 +144,12 @@ func (launcher *retryAfterCancellationLauncher) Start(ctx context.Context, spec 
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	return &fakeProcess{id: spec.ShardID, launcher: &fakeLauncher{}}, nil
+	return &fakeProcess{
+		agentInstanceID: spec.AgentInstanceID,
+		id:              spec.ShardID,
+		shardGeneration: spec.ShardGeneration,
+		launcher:        &fakeLauncher{},
+	}, nil
 }
 
 func newDelayedCancellationLauncher() *delayedCancellationLauncher {
@@ -126,7 +170,12 @@ func (launcher *delayedCancellationLauncher) Start(ctx context.Context, spec Sha
 		<-launcher.returnGate
 		return nil, ctx.Err()
 	}
-	return &fakeProcess{id: spec.ShardID, launcher: &fakeLauncher{}}, nil
+	return &fakeProcess{
+		agentInstanceID: spec.AgentInstanceID,
+		id:              spec.ShardID,
+		shardGeneration: spec.ShardGeneration,
+		launcher:        &fakeLauncher{},
+	}, nil
 }
 
 func (launcher *delayedCancellationLauncher) releaseFirstStart() {
@@ -140,32 +189,46 @@ func (launcher *delayedCancellationLauncher) launchSpecs() []ShardSpec {
 }
 
 type blockingIDLauncher struct {
-	idEntered   chan struct{}
-	idGate      chan struct{}
-	releaseOnce sync.Once
-}
-
-func newBlockingIDLauncher() *blockingIDLauncher {
-	return &blockingIDLauncher{idEntered: make(chan struct{}), idGate: make(chan struct{})}
+	identityEntered     [3]chan struct{}
+	identityGates       [3]chan struct{}
+	identityEnteredOnce [3]sync.Once
+	identityReleaseOnce [3]sync.Once
 }
 
 func (launcher *blockingIDLauncher) Start(_ context.Context, spec ShardSpec) (ShardProcess, error) {
-	return &blockingIDProcess{id: spec.ShardID, launcher: launcher}, nil
-}
-
-func (launcher *blockingIDLauncher) releaseID() {
-	launcher.releaseOnce.Do(func() { close(launcher.idGate) })
+	return &blockingIDProcess{
+		agentInstanceID: spec.AgentInstanceID,
+		id:              spec.ShardID,
+		shardGeneration: spec.ShardGeneration,
+		launcher:        launcher,
+	}, nil
 }
 
 type blockingIDProcess struct {
-	id       string
-	launcher *blockingIDLauncher
+	agentInstanceID identity.ID
+	id              string
+	shardGeneration ShardGeneration
+	launcher        *blockingIDLauncher
 }
 
 func (process *blockingIDProcess) ID() string {
-	close(process.launcher.idEntered)
-	<-process.launcher.idGate
+	process.blockIdentityCallback(0)
 	return process.id
+}
+
+func (process *blockingIDProcess) AgentInstanceID() identity.ID {
+	process.blockIdentityCallback(1)
+	return process.agentInstanceID
+}
+
+func (process *blockingIDProcess) ShardGeneration() ShardGeneration {
+	process.blockIdentityCallback(2)
+	return process.shardGeneration
+}
+
+func (process *blockingIDProcess) blockIdentityCallback(index int) {
+	process.launcher.identityEnteredOnce[index].Do(func() { close(process.launcher.identityEntered[index]) })
+	<-process.launcher.identityGates[index]
 }
 
 func (*blockingIDProcess) Stop(context.Context) error { return nil }
@@ -180,6 +243,14 @@ func (typedNilLauncher) Start(context.Context, ShardSpec) (ShardProcess, error) 
 type typedNilProcess struct{}
 
 func (*typedNilProcess) ID() string { panic("typed-nil process ID callback") }
+
+func (*typedNilProcess) AgentInstanceID() identity.ID {
+	panic("typed-nil process AgentInstanceID callback")
+}
+
+func (*typedNilProcess) ShardGeneration() ShardGeneration {
+	panic("typed-nil process ShardGeneration callback")
+}
 
 func (*typedNilProcess) Stop(context.Context) error { panic("typed-nil process Stop callback") }
 
@@ -837,21 +908,38 @@ func TestManagerShardGenerationOverflowFailsClosedBeforeAnotherStart(t *testing.
 
 func TestManagerStopsAProcessThatViolatesTheLauncherIdentityContract(t *testing.T) {
 	t.Parallel()
-	launcher := &fakeLauncher{returnedID: "wrong-shard"}
-	manager := mustManager(t, launcher, Limits{MaximumSessions: 2, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
-	request := baseRequest(t, "tenant-a", "session-bad-launcher", 1, time.Unix(2_000_000_450, 0).UTC())
-	if placement, err := manager.Acquire(context.Background(), request); !errors.Is(err, ErrInvalidConfig) || placement != (Placement{}) {
-		t.Fatalf("Acquire() = %#v, %v; want ErrInvalidConfig", placement, err)
-	}
-	_, stops := launcher.counts()
-	if len(stops) != 1 || stops[0] != "wrong-shard" {
-		t.Fatalf("invalid launcher process stops = %#v", stops)
+	for name, launcher := range map[string]*fakeLauncher{
+		"agent instance": {returnedAgentInstanceID: mustID(t, identity.Process, "wrong-agent-instance")},
+		"shard ID":       {returnedID: "wrong-shard"},
+		"generation":     {returnedShardGeneration: 999},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			manager := mustManager(t, launcher, Limits{MaximumSessions: 2, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+			request := baseRequest(t, "tenant-a-"+name, "session-bad-launcher-"+name, 1, time.Unix(2_000_000_450, 0).UTC())
+			if placement, err := manager.Acquire(context.Background(), request); !errors.Is(err, ErrInvalidConfig) || placement != (Placement{}) {
+				t.Fatalf("Acquire() = %#v, %v; want ErrInvalidConfig", placement, err)
+			}
+			_, stops := launcher.counts()
+			if len(stops) != 1 {
+				t.Fatalf("invalid launcher process stops = %#v, want one", stops)
+			}
+		})
 	}
 }
 
-func TestManagerProcessIDCallbackRunsWithoutManagerMutex(t *testing.T) {
-	launcher := newBlockingIDLauncher()
-	defer launcher.releaseID()
+func TestManagerProcessIdentityCallbacksRunWithoutManagerMutex(t *testing.T) {
+	launcher := &blockingIDLauncher{}
+	for index := range launcher.identityEntered {
+		launcher.identityEntered[index] = make(chan struct{})
+		launcher.identityGates[index] = make(chan struct{})
+	}
+	defer func() {
+		for index := range launcher.identityGates {
+			index := index
+			launcher.identityReleaseOnce[index].Do(func() { close(launcher.identityGates[index]) })
+		}
+	}()
 	manager := mustManager(t, launcher, Limits{MaximumSessions: 2, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
 	request := baseRequest(t, "callback-tenant", "callback-session", 1, time.Unix(2_000_000_460, 0).UTC())
 	acquireResult := make(chan error, 1)
@@ -859,23 +947,26 @@ func TestManagerProcessIDCallbackRunsWithoutManagerMutex(t *testing.T) {
 		_, err := manager.Acquire(context.Background(), request)
 		acquireResult <- err
 	}()
-	select {
-	case <-launcher.idEntered:
-	case <-time.After(3 * time.Second):
-		t.Fatal("process ID callback was not entered")
-	}
-
-	snapshotResult := make(chan ManagerSnapshot, 1)
-	go func() { snapshotResult <- manager.Snapshot() }()
-	select {
-	case snapshot := <-snapshotResult:
-		if snapshot != (ManagerSnapshot{}) {
-			t.Fatalf("Snapshot() while identity callback blocked = %#v", snapshot)
+	for index, callbackName := range []string{"ID", "AgentInstanceID", "ShardGeneration"} {
+		select {
+		case <-launcher.identityEntered[index]:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("process %s callback was not entered", callbackName)
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("Snapshot() blocked behind process ID callback")
+
+		snapshotResult := make(chan ManagerSnapshot, 1)
+		go func() { snapshotResult <- manager.Snapshot() }()
+		select {
+		case snapshot := <-snapshotResult:
+			if snapshot != (ManagerSnapshot{}) {
+				t.Fatalf("Snapshot() while %s callback blocked = %#v", callbackName, snapshot)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Snapshot() blocked behind process %s callback", callbackName)
+		}
+		index := index
+		launcher.identityReleaseOnce[index].Do(func() { close(launcher.identityGates[index]) })
 	}
-	launcher.releaseID()
 	if err := receiveError(t, acquireResult); err != nil {
 		t.Fatalf("Acquire() error = %v", err)
 	}

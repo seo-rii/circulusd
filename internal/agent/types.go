@@ -111,6 +111,8 @@ type ShardSpec struct {
 
 type ShardProcess interface {
 	ID() string
+	AgentInstanceID() identity.ID
+	ShardGeneration() ShardGeneration
 	// Stop is idempotent and returns nil only after the shard can no longer
 	// execute requests. A daemon shutdown retries uncertain failures.
 	Stop(context.Context) error

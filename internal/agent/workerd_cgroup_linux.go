@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/sys/unix"
 )
 
@@ -89,6 +90,7 @@ type workerdCgroupCounterBaseline struct {
 }
 
 type workerdCgroupResourceSample struct {
+	AgentInstanceID    identity.ID
 	ShardID            string
 	Generation         ShardGeneration
 	Identity           workerdCgroupIdentity
@@ -182,13 +184,14 @@ type workerdCgroupDestroyOperation struct {
 }
 
 type workerdCgroupLease struct {
-	controller *workerdCgroupController
-	name       string
-	shardID    string
-	generation ShardGeneration
-	fd         int
-	identity   workerdCgroupIdentity
-	baseline   workerdCgroupCounterBaseline
+	controller      *workerdCgroupController
+	name            string
+	agentInstanceID identity.ID
+	shardID         string
+	generation      ShardGeneration
+	fd              int
+	identity        workerdCgroupIdentity
+	baseline        workerdCgroupCounterBaseline
 
 	mu               sync.Mutex
 	attachable       bool
@@ -351,8 +354,8 @@ func (controller *workerdCgroupController) endAuthorityWrite() {
 	controller.authority.Unlock()
 }
 
-func (controller *workerdCgroupController) prepare(ctx context.Context, shardID string, generation ShardGeneration) (resultLease *workerdCgroupLease, resultErr error) {
-	if ctx == nil || shardID == "" || len(shardID) > maximumWorkerdCgroupShardIDBytes || strings.IndexByte(shardID, 0) >= 0 || generation == 0 {
+func (controller *workerdCgroupController) prepare(ctx context.Context, agentInstanceID identity.ID, shardID string, generation ShardGeneration) (resultLease *workerdCgroupLease, resultErr error) {
+	if ctx == nil || agentInstanceID.Kind() != identity.Process || shardID == "" || len(shardID) > maximumWorkerdCgroupShardIDBytes || strings.IndexByte(shardID, 0) >= 0 || generation == 0 {
 		return nil, errInvalidWorkerdCgroupRequest
 	}
 	if err := ctx.Err(); err != nil {
@@ -374,7 +377,7 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 	controller.reserved++
 	controller.mu.Unlock()
 
-	name := workerdCgroupLeafName(shardID, generation)
+	name := workerdCgroupLeafName(agentInstanceID, shardID, generation)
 	if err := controller.backend.mkdirExclusive(controller.rootFD, name, 0o700); err != nil {
 		controller.mu.Lock()
 		controller.reserved--
@@ -390,7 +393,10 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 		controller.mu.Unlock()
 		return nil, errors.Join(classifyWorkerdCgroupError("open shard cgroup", err), errWorkerdCgroupPoisoned)
 	}
-	lease := &workerdCgroupLease{controller: controller, name: name, shardID: shardID, generation: generation, fd: fd, identity: identity}
+	lease := &workerdCgroupLease{
+		controller: controller, name: name, agentInstanceID: agentInstanceID,
+		shardID: shardID, generation: generation, fd: fd, identity: identity,
+	}
 	rollbackRequired := true
 	defer func() {
 		if !rollbackRequired || resultErr == nil {
@@ -539,10 +545,14 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 	return lease, nil
 }
 
-func workerdCgroupLeafName(shardID string, generation ShardGeneration) string {
+func workerdCgroupLeafName(agentInstanceID identity.ID, shardID string, generation ShardGeneration) string {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(workerdCgroupLeafDomain))
 	var encoded [8]byte
+	agentIdentity := agentInstanceID.String()
+	binary.BigEndian.PutUint64(encoded[:], uint64(len(agentIdentity)))
+	_, _ = hash.Write(encoded[:])
+	_, _ = hash.Write([]byte(agentIdentity))
 	binary.BigEndian.PutUint64(encoded[:], uint64(len(shardID)))
 	_, _ = hash.Write(encoded[:])
 	_, _ = hash.Write([]byte(shardID))
@@ -782,6 +792,7 @@ func (lease *workerdCgroupLease) sampleResources(ctx context.Context) (workerdCg
 			return err
 		}
 		sample = workerdCgroupResourceSample{
+			AgentInstanceID:    lease.agentInstanceID,
 			ShardID:            lease.shardID,
 			Generation:         lease.generation,
 			Identity:           lease.identity,

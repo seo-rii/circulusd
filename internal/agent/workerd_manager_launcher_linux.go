@@ -60,6 +60,7 @@ func (launcher *WorkerdManagerLauncher) Start(ctx context.Context, spec ShardSpe
 		return nil, ErrInvalidRequest
 	}
 	handle, err := launcher.launcher.Ensure(ctx, WorkerdEnsureRequest{
+		AgentInstanceID: spec.AgentInstanceID,
 		ShardID:         spec.ShardID,
 		ShardGeneration: spec.ShardGeneration,
 		Arguments:       slices.Clone(launcher.arguments),
@@ -69,6 +70,11 @@ func (launcher *WorkerdManagerLauncher) Start(ctx context.Context, spec ShardSpe
 	}
 	if handle == nil {
 		return nil, ErrInvalidConfig
+	}
+	if handle.AgentInstanceID() != spec.AgentInstanceID ||
+		handle.ShardID() != spec.ShardID ||
+		handle.ShardGeneration() != spec.ShardGeneration {
+		return handle, ErrInvalidConfig
 	}
 	return handle, nil
 }
