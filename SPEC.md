@@ -539,6 +539,15 @@ shared/tenant workerd는 다음 제한을 MUST 가진다.
 
 per-isolate heap limit만으로 전체 shard RSS를 제어할 수 있다고 가정해서는 안 된다.
 
+Manager가 shard resource observation을 적용할 때는 RSS, pressure, drain,
+shard 제거 또는 stop scheduling을 변경하기 전에 정확한
+`(agentInstanceID, shardID, shardGeneration)`과 그 generation 안에서 엄격히
+증가하는 `observationSequence`를 MUST 검증해야 한다. stale identity와 중복 또는
+감소한 sequence는 어떤 Manager 상태도 변경해서는 안 된다. `ObservedAt`은 비어
+있지 않은 진단 메타데이터여야 하지만 ordering, freshness, maximum lifetime 또는
+drain 판단의 권위로 사용해서는 안 된다. Maximum lifetime은 observation의 벽시계가
+아니라 Manager가 신뢰한 admission 시각을 기준으로 계속 강제한다.
+
 ## 9. Pi 세션 실행 모델
 
 ### 9.1 세션과 Worker의 대응

@@ -23,12 +23,13 @@ type requestIdentity struct {
 }
 
 type shard struct {
-	spec                   ShardSpec
-	process                ShardProcess
-	sessions               map[identity.ID]Placement
-	estimatedResidentBytes uint64
-	rssBytes               uint64
-	draining               bool
+	spec                    ShardSpec
+	process                 ShardProcess
+	sessions                map[identity.ID]Placement
+	estimatedResidentBytes  uint64
+	rssBytes                uint64
+	lastObservationSequence uint64
+	draining                bool
 }
 
 type launchPending struct {
@@ -788,7 +789,8 @@ func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) err
 }
 
 func (manager *Manager) Observe(observation ShardObservation) error {
-	if manager == nil || observation.ShardID == "" || observation.ObservedAt.IsZero() {
+	if manager == nil || observation.AgentInstanceID.Kind() != identity.Process || observation.ShardID == "" ||
+		observation.ShardGeneration == 0 || observation.ObservationSequence == 0 || observation.ObservedAt.IsZero() {
 		return ErrInvalidRequest
 	}
 	manager.mu.Lock()
@@ -801,8 +803,19 @@ func (manager *Manager) Observe(observation ShardObservation) error {
 		manager.mu.Unlock()
 		return ErrShardNotFound
 	}
+	if observation.AgentInstanceID != manager.agentInstanceID ||
+		observation.AgentInstanceID != current.spec.AgentInstanceID ||
+		observation.ShardGeneration != current.spec.ShardGeneration {
+		manager.mu.Unlock()
+		return ErrStaleObservation
+	}
+	if observation.ObservationSequence <= current.lastObservationSequence {
+		manager.mu.Unlock()
+		return ErrStaleObservationSequence
+	}
+	current.lastObservationSequence = observation.ObservationSequence
 	current.rssBytes = observation.RSSBytes
-	if observation.OOMObserved || observation.HeapPressure || observation.RSSBytes >= manager.limits.AdmissionMemoryWatermarkBytes || observation.ObservedAt.Sub(current.spec.CreatedAt) >= manager.limits.MaximumLifetime {
+	if observation.OOMObserved || observation.HeapPressure || observation.RSSBytes >= manager.limits.AdmissionMemoryWatermarkBytes {
 		current.draining = true
 	}
 	var stop *trackedStop

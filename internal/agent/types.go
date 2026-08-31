@@ -12,15 +12,17 @@ import (
 )
 
 var (
-	ErrInvalidConfig      = errors.New("agent: invalid manager configuration")
-	ErrInvalidRequest     = errors.New("agent: invalid placement request")
-	ErrIsolationDowngrade = errors.New("agent: placement weakens trust-class isolation")
-	ErrCapacity           = errors.New("agent: shard admission capacity unavailable")
-	ErrStalePlacement     = errors.New("agent: stale placement generation")
-	ErrPlacementConflict  = errors.New("agent: placement generation reused with different inputs")
-	ErrPlacementNotFound  = errors.New("agent: placement not found")
-	ErrShardNotFound      = errors.New("agent: shard not found")
-	ErrManagerClosed      = errors.New("agent: manager is shut down")
+	ErrInvalidConfig            = errors.New("agent: invalid manager configuration")
+	ErrInvalidRequest           = errors.New("agent: invalid placement request")
+	ErrIsolationDowngrade       = errors.New("agent: placement weakens trust-class isolation")
+	ErrCapacity                 = errors.New("agent: shard admission capacity unavailable")
+	ErrStalePlacement           = errors.New("agent: stale placement generation")
+	ErrPlacementConflict        = errors.New("agent: placement generation reused with different inputs")
+	ErrPlacementNotFound        = errors.New("agent: placement not found")
+	ErrShardNotFound            = errors.New("agent: shard not found")
+	ErrStaleObservation         = errors.New("agent: stale shard observation identity")
+	ErrStaleObservationSequence = errors.New("agent: stale shard observation sequence")
+	ErrManagerClosed            = errors.New("agent: manager is shut down")
 )
 
 // ErrTerminalShardCleanup marks a cleanup result whose process ownership has
@@ -129,12 +131,18 @@ type Launcher interface {
 	Start(context.Context, ShardSpec) (ShardProcess, error)
 }
 
+// ShardObservation is one immutable, generation-bound resource sample.
+// ObservationSequence must increase within that generation. ObservedAt is
+// required diagnostic metadata and is never an ordering or lifetime authority.
 type ShardObservation struct {
-	ShardID      string
-	RSSBytes     uint64
-	OOMObserved  bool
-	HeapPressure bool
-	ObservedAt   time.Time
+	AgentInstanceID     identity.ID
+	ShardID             string
+	ShardGeneration     ShardGeneration
+	ObservationSequence uint64
+	RSSBytes            uint64
+	OOMObserved         bool
+	HeapPressure        bool
+	ObservedAt          time.Time
 }
 
 type ManagerSnapshot struct {

@@ -161,6 +161,18 @@ not silently included in Unit 10.
   timeouts and pre-removal cgroup failures remain retryable. Retry sharing,
   cancellation, reentrant classification, mixed parallel shutdown, stale-
   handle, removal, poison, and terminal-close race tests pass.
+- 2026-09-01: the Manager observation endpoint now validates the exact
+  `(agentInstanceID, shardID, shardGeneration)` before a generation-local,
+  strictly increasing `observationSequence`, and performs neither state
+  mutation nor stop scheduling for invalid, missing, stale, duplicate, or
+  decreasing input. A new generation resets sequence ownership. `ObservedAt`
+  remains required diagnostic metadata but no longer drives lifetime or drain;
+  admission-time lifetime enforcement remains separate. Simultaneous equal-
+  sequence delivery linearizes to one winner without loser-payload mutation,
+  draining is irreversible, and observation-triggered Stop callbacks may
+  reenter Manager without its mutex held. Focused 50-pass and complete agent
+  10-pass race/shuffle gates, repository tests, and vet pass. The serialized
+  producer, process-token attachment, and lifecycle delivery remain.
 
 ### Outcome
 
@@ -217,9 +229,10 @@ The implementation starts from these already-tested components:
 The Manager and launcher now use a distinct typed `ShardGeneration`, and the
 fixed-argument adapter joins their start boundaries. `AgentInstanceID` travels
 through ensure, readiness, process, and cgroup values, and the Manager checks
-the exact process tuple before publication. The remaining identity work is to
-attach that tuple and a serialized sequence to observation results, then reject
-stale tuple members before Manager state changes.
+the exact process tuple before publication. The Manager observation endpoint
+also requires that tuple plus a generation-scoped increasing sequence and
+rejects stale inputs before state changes. The remaining observation identity
+work is the serialized producer and its lifecycle-owned delivery wiring.
 
 ### Cut line
 
@@ -279,18 +292,23 @@ one; reusing the old launcher with another agent identity fails before
 allocation or callbacks. Per-shard generation history therefore cannot grow
 across boots.
 
-At U10.2 completion, every readiness response, exit callback, resource sample,
-and stop completion MUST carry `(agentInstanceID, shardID, shardGeneration)`
-plus a non-reusable process-instance token and the pinned cgroup device/inode
-identity. On Linux, the completed process token MUST use a pidfd when available
-and verify PID start identity; a numeric PID alone is insufficient. A late
-callback from a prior start must not publish, drain, account, or remove its
-replacement.
+Manager-facing `ShardObservation` values now carry
+`(agentInstanceID, shardID, shardGeneration, observationSequence)`. Manager
+checks the exact tuple and a generation-scoped increasing sequence before any
+state mutation or stop scheduling. It requires a nonzero `ObservedAt` for the
+diagnostic record shape, but does not use that wall clock for ordering,
+freshness, lifetime, or drain decisions.
+
+At U10.2 completion, every readiness response, exit callback, resource-sample
+producer, and stop completion MUST carry the identity tuple plus a non-reusable
+process-instance token and the pinned cgroup device/inode identity. On Linux,
+the completed process token MUST use a pidfd when available and verify PID start
+identity; a numeric PID alone is insufficient. A late callback from a prior
+start must not publish, drain, account, or remove its replacement.
 
 One observer loop will own each shard generation. It will serialize samples and
-assign a monotonic `observationSequence` after a complete read. `ObservedAt`
-will remain diagnostic only; Manager will reject duplicate or decreasing
-sequences rather than using wall-clock order. Cumulative `memory.events` and
+assign a monotonic `observationSequence` after a complete read before delivery
+to the already-fenced Manager endpoint. Cumulative `memory.events` and
 `cpu.stat` values will be compared with the baseline captured for that exact
 generation.
 
@@ -518,7 +536,8 @@ require resources to disappear before an individually canceled caller returns.
 - Replacement waits for uncertain cleanup of the prior process instance;
   timeout or cancellation cannot silently transfer ownership.
 - Drain admission closes before stop begins. Generation and observation
-  sequence checks reject late, duplicate, and out-of-order samples.
+  sequence checks reject late, duplicate, and out-of-order samples before any
+  state mutation or stop scheduling.
 - Shutdown fences new admission first, joins every in-flight start/stop owner,
   and preserves caller-local cancellation separately from shared cleanup
   results.
@@ -567,10 +586,11 @@ remains in U10.4.
 
 Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
 generation baselines, `(pid,startTicks)` RSS reads, permission/read-only
-dominance, operation-scoped host absence versus post-provision path loss, and
-controller availability versus enablement are implemented. pidfd ownership,
-launcher attachment, serialized sequences, Manager delivery, and
-evidence-artifact status mapping remain.
+dominance, operation-scoped host absence versus post-provision path loss,
+controller availability versus enablement, and the Manager observation
+identity/sequence endpoint are implemented. pidfd ownership, launcher
+attachment, serialized producer delivery, and evidence-artifact status mapping
+remain.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include
