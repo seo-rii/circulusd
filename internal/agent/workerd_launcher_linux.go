@@ -77,8 +77,15 @@ type WorkerdCgroupConfig struct {
 	DrainTimeout   time.Duration
 	MemoryMaxBytes uint64
 	SwapMaxBytes   uint64
-	CPUCores       uint64
+	CPUMax         CPUMax
 	PIDsMax        uint64
+}
+
+// CPUMax is a finite cgroup-v2 cpu.max quota and period, expressed in
+// microseconds. Unlimited CPU is intentionally not representable.
+type CPUMax struct {
+	QuotaMicros  uint64
+	PeriodMicros uint64
 }
 
 // WorkerdEnsureRequest is the immutable identity of one shard generation.
@@ -276,7 +283,7 @@ func NewWorkerdProcessLauncher(config WorkerdLauncherConfig) (*WorkerdProcessLau
 		DrainTimeout:   config.Cgroup.DrainTimeout,
 		MemoryMaxBytes: config.Cgroup.MemoryMaxBytes,
 		SwapMaxBytes:   config.Cgroup.SwapMaxBytes,
-		CPUCores:       config.Cgroup.CPUCores,
+		CPUMax:         config.Cgroup.CPUMax,
 		PIDsMax:        config.Cgroup.PIDsMax,
 	})
 	if err != nil {

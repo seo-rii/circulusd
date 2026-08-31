@@ -38,12 +38,14 @@ const (
 	maximumWorkerdCgroupShards       = 4096
 	maximumWorkerdCgroupDrainTimeout = 30 * time.Second
 	maximumWorkerdCgroupMemoryBytes  = uint64(1 << 50)
-	maximumWorkerdCgroupCPUCores     = uint64(1024)
+	minimumWorkerdCgroupCPUQuota     = uint64(1_000)
+	maximumWorkerdCgroupCPUQuota     = uint64(1_000_000_000)
+	minimumWorkerdCgroupCPUPeriod    = uint64(1_000)
+	maximumWorkerdCgroupCPUPeriod    = uint64(1_000_000)
 	maximumWorkerdCgroupPIDs         = uint64(1 << 20)
 	maximumWorkerdCgroupPathBytes    = 4096
 	maximumWorkerdCgroupShardIDBytes = 1024
 	maximumWorkerdCgroupControlBytes = 4096
-	workerdCgroupCPUPeriodMicros     = uint64(100_000)
 	workerdCgroupDrainPollInterval   = 10 * time.Millisecond
 	workerdCgroupLeafDomain          = "circulusd/workerd-cgroup/v1\x00"
 )
@@ -56,7 +58,7 @@ type workerdCgroupConfig struct {
 	DrainTimeout   time.Duration
 	MemoryMaxBytes uint64
 	SwapMaxBytes   uint64
-	CPUCores       uint64
+	CPUMax         CPUMax
 	PIDsMax        uint64
 }
 
@@ -158,7 +160,8 @@ func newWorkerdCgroupControllerWithBackend(config workerdCgroupConfig, backend w
 		config.MaximumShards < 1 || config.MaximumShards > maximumWorkerdCgroupShards ||
 		config.DrainTimeout <= 0 || config.DrainTimeout > maximumWorkerdCgroupDrainTimeout ||
 		config.MemoryMaxBytes < 1 || config.MemoryMaxBytes > maximumWorkerdCgroupMemoryBytes || config.SwapMaxBytes != 0 ||
-		config.CPUCores < 1 || config.CPUCores > maximumWorkerdCgroupCPUCores ||
+		config.CPUMax.QuotaMicros < minimumWorkerdCgroupCPUQuota || config.CPUMax.QuotaMicros > maximumWorkerdCgroupCPUQuota ||
+		config.CPUMax.PeriodMicros < minimumWorkerdCgroupCPUPeriod || config.CPUMax.PeriodMicros > maximumWorkerdCgroupCPUPeriod ||
 		config.PIDsMax < 1 || config.PIDsMax > maximumWorkerdCgroupPIDs {
 		return nil, errInvalidWorkerdCgroupConfig
 	}
@@ -395,7 +398,7 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 		{name: "cgroup.max.descendants", value: "0"},
 		{name: "memory.max", value: fmt.Sprint(controller.config.MemoryMaxBytes)},
 		{name: "memory.swap.max", value: "0"},
-		{name: "cpu.max", value: fmt.Sprintf("%d %d", controller.config.CPUCores*workerdCgroupCPUPeriodMicros, workerdCgroupCPUPeriodMicros)},
+		{name: "cpu.max", value: strconv.FormatUint(controller.config.CPUMax.QuotaMicros, 10) + " " + strconv.FormatUint(controller.config.CPUMax.PeriodMicros, 10)},
 		{name: "pids.max", value: fmt.Sprint(controller.config.PIDsMax)},
 	}
 	for _, limit := range limits {

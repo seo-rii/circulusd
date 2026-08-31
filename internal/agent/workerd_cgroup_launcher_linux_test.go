@@ -73,7 +73,7 @@ func TestWorkerdCgroupLauncherPreparesExactControlsBeforeStart(t *testing.T) {
 		{Name: "cgroup.max.descendants", Value: "0"},
 		{Name: "memory.max", Value: fmt.Sprint(cgroupConfig.MemoryMaxBytes)},
 		{Name: "memory.swap.max", Value: "0"},
-		{Name: "cpu.max", Value: fmt.Sprintf("%d 100000", cgroupConfig.CPUCores*100_000)},
+		{Name: "cpu.max", Value: "50000 100000"},
 		{Name: "pids.max", Value: fmt.Sprint(cgroupConfig.PIDsMax)},
 	}
 	if observation.calls != 1 || observation.cgroupFD < 0 || !observation.cgroupFDOpen || !observation.cgroupFDNamesChild {

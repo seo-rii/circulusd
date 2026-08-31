@@ -22,7 +22,7 @@ func TestNewWorkerdCgroupControllerRejectsConfigurationOutsideClosedBounds(t *te
 		DrainTimeout:   time.Nanosecond,
 		MemoryMaxBytes: 1,
 		SwapMaxBytes:   0,
-		CPUCores:       1,
+		CPUMax:         CPUMax{QuotaMicros: 1_000, PeriodMicros: 1_000},
 		PIDsMax:        1,
 	}
 	tests := []struct {
@@ -39,8 +39,12 @@ func TestNewWorkerdCgroupControllerRejectsConfigurationOutsideClosedBounds(t *te
 		{name: "zero memory", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = 0 }},
 		{name: "excessive memory", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = (1 << 50) + 1 }},
 		{name: "nonzero swap", mutate: func(config *workerdCgroupConfig) { config.SwapMaxBytes = 1 }},
-		{name: "zero cpu", mutate: func(config *workerdCgroupConfig) { config.CPUCores = 0 }},
-		{name: "excessive cpu", mutate: func(config *workerdCgroupConfig) { config.CPUCores = 1025 }},
+		{name: "zero cpu quota", mutate: func(config *workerdCgroupConfig) { config.CPUMax.QuotaMicros = 0 }},
+		{name: "cpu quota below minimum", mutate: func(config *workerdCgroupConfig) { config.CPUMax.QuotaMicros = 999 }},
+		{name: "cpu quota above maximum", mutate: func(config *workerdCgroupConfig) { config.CPUMax.QuotaMicros = 1_000_000_001 }},
+		{name: "zero cpu period", mutate: func(config *workerdCgroupConfig) { config.CPUMax.PeriodMicros = 0 }},
+		{name: "cpu period below minimum", mutate: func(config *workerdCgroupConfig) { config.CPUMax.PeriodMicros = 999 }},
+		{name: "cpu period above maximum", mutate: func(config *workerdCgroupConfig) { config.CPUMax.PeriodMicros = 1_000_001 }},
 		{name: "zero pids", mutate: func(config *workerdCgroupConfig) { config.PIDsMax = 0 }},
 		{name: "excessive pids", mutate: func(config *workerdCgroupConfig) { config.PIDsMax = (1 << 20) + 1 }},
 	}
@@ -61,13 +65,13 @@ func TestNewWorkerdCgroupControllerAcceptsClosedConfigurationBounds(t *testing.T
 	minimum.MaximumShards = 1
 	minimum.DrainTimeout = time.Nanosecond
 	minimum.MemoryMaxBytes = 1
-	minimum.CPUCores = 1
+	minimum.CPUMax = CPUMax{QuotaMicros: 1_000, PeriodMicros: 1_000}
 	minimum.PIDsMax = 1
 	maximum := validWorkerdCgroupConfig()
 	maximum.MaximumShards = 4096
 	maximum.DrainTimeout = 30 * time.Second
 	maximum.MemoryMaxBytes = 1 << 50
-	maximum.CPUCores = 1024
+	maximum.CPUMax = CPUMax{QuotaMicros: 1_000_000_000, PeriodMicros: 1_000_000}
 	maximum.PIDsMax = 1 << 20
 	for name, config := range map[string]workerdCgroupConfig{"minimum": minimum, "maximum": maximum} {
 		t.Run(name, func(t *testing.T) {
@@ -146,7 +150,7 @@ func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 		{Name: "cgroup.max.descendants", Value: "0"},
 		{Name: "memory.max", Value: fmt.Sprint(config.MemoryMaxBytes)},
 		{Name: "memory.swap.max", Value: "0"},
-		{Name: "cpu.max", Value: fmt.Sprintf("%d 100000", config.CPUCores*100_000)},
+		{Name: "cpu.max", Value: "50000 100000"},
 		{Name: "pids.max", Value: fmt.Sprint(config.PIDsMax)},
 	}
 	if writes := backend.limitWrites(); !reflect.DeepEqual(writes, wantWrites) {
@@ -171,6 +175,36 @@ func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 	}
 	if err := controller.close(); err != nil {
 		t.Fatalf("close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupPrepareRejectsNonCanonicalCPUMaxReadback(t *testing.T) {
+	for name, readback := range map[string]string{
+		"unlimited quota":      "max 100000\n",
+		"zero quota":           "0 100000\n",
+		"quota below minimum":  "999 100000\n",
+		"quota above maximum":  "1000000001 100000\n",
+		"zero period":          "50000 0\n",
+		"period below minimum": "50000 999\n",
+		"period above maximum": "50000 1000001\n",
+		"missing period":       "50000\n",
+		"extra token":          "50000 100000 extra\n",
+		"noncanonical decimal": "050000 100000\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, backend, controller := newWorkerdCgroupFixture(t)
+			backend.corruptReadback["cpu.max"] = readback
+			lease, err := controller.prepare(context.Background(), "strict-cpu-max", 1)
+			if lease != nil || !errors.Is(err, errWorkerdCgroupContract) {
+				t.Fatalf("prepare(cpu.max=%q) = %#v, %v, want nil, contract error", readback, lease, err)
+			}
+			if children := backend.childCount(); children != 0 {
+				t.Fatalf("children after rejected cpu.max = %d, want 0", children)
+			}
+			if err := controller.close(); err != nil {
+				t.Fatalf("close() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -907,7 +941,7 @@ func validWorkerdCgroupConfig() workerdCgroupConfig {
 		DrainTimeout:   time.Second,
 		MemoryMaxBytes: 4 << 30,
 		SwapMaxBytes:   0,
-		CPUCores:       4,
+		CPUMax:         CPUMax{QuotaMicros: 50_000, PeriodMicros: 100_000},
 		PIDsMax:        512,
 	}
 }

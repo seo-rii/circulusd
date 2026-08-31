@@ -1,6 +1,7 @@
 # Implementation plan
 
-Status: Unit 10 accepted after independent architecture and concurrency review
+Status: Unit 10 implementation in progress after independent architecture and
+concurrency review
 
 Updated: 2026-08-31
 
@@ -17,7 +18,7 @@ required external evidence.
 | 7 | complete | Reference Session dispatch claims, subordinate effect ledgers, model/MCP consumers, and in-process recovery fault tests |
 | 8 | complete | Fail-closed production bootstrap boundary and separate diagnostic-only development daemon |
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
-| 10 | planned | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
+| 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
 | 11 | queued | Phase 0B real-process celld Session/effect/placement authority and kill/restart fault matrix |
 | 12 | queued | Durable public idempotency and API/SSE disconnect/replay recovery |
 
@@ -27,6 +28,14 @@ Their exact cut lines must use the evidence produced by Units 10–12; they are
 not silently included in Unit 10.
 
 ## Unit 10: Phase 0A workerd resource qualification
+
+### Implementation progress
+
+- 2026-08-31: the finite cgroup-v2 CPU contract migrated from integer
+  `CPUCores` multiplication to bounded `CPUMax{QuotaMicros, PeriodMicros}` with
+  direct decimal serialization and exact readback rejection tests. Focused and
+  full `internal/agent` race tests pass. This is a host-independent contract
+  result only and does not promote an external qualification status.
 
 ### Outcome
 
