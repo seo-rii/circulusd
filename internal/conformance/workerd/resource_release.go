@@ -366,23 +366,40 @@ func (resolved *resourceQualificationRelease) identitySnapshot() resourceQualifi
 }
 
 func (resolved *resourceQualificationRelease) openExecutableSnapshot() (*os.File, error) {
+	return resolved.openExecutableSnapshotWithOpen(unix.Open)
+}
+
+func (resolved *resourceQualificationRelease) openExecutableSnapshotWithOpen(
+	open func(string, int, uint32) (int, error),
+) (*os.File, error) {
 	if resolved == nil {
 		return nil, errResourceQualificationReleaseClosed
+	}
+	if open == nil {
+		return nil, fmt.Errorf("%w: snapshot opener is nil", errResourceQualificationReleaseInvalid)
 	}
 	resolved.mu.Lock()
 	defer resolved.mu.Unlock()
 	if resolved.executable == nil {
 		return nil, errResourceQualificationReleaseClosed
 	}
-	path := fmt.Sprintf("/proc/self/fd/%d", resolved.executable.Fd())
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	ownerFD := resolved.executable.Fd()
+	if ownerFD == ^uintptr(0) {
+		return nil, errResourceQualificationReleaseClosed
+	}
+	path := fmt.Sprintf("/proc/self/fd/%d", ownerFD)
+	fd, err := open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("%w: duplicate executable snapshot: %v", errResourceQualificationReleaseClosed, err)
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) ||
+			errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
+			return nil, fmt.Errorf("%w: duplicate executable snapshot: %v", errResourceQualificationReleaseUnavailable, err)
+		}
+		return nil, fmt.Errorf("%w: duplicate executable snapshot: %v", errResourceQualificationReleaseInvalid, err)
 	}
 	duplicate := os.NewFile(uintptr(fd), "qualified-workerd-snapshot")
 	if duplicate == nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("%w: wrap duplicated executable snapshot", errResourceQualificationReleaseClosed)
+		return nil, fmt.Errorf("%w: wrap duplicated executable snapshot", errResourceQualificationReleaseInvalid)
 	}
 	return duplicate, nil
 }

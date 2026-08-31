@@ -74,6 +74,12 @@ not silently included in Unit 10.
   host features remain distinct from malformed, permission, and identity
   failures. Focused race tests, the complete conformance package, and vet pass;
   runner launch composition and evidence serialization remain unimplemented.
+- 2026-09-01: release-owned executable snapshots now reopen independent,
+  read-only, close-on-exec descriptors while holding the owner lifetime lock.
+  Only a genuinely closed owner reports `ReleaseClosed`; missing or unsupported
+  proc descriptor access reports host unavailability, while permission and
+  other syscall failures remain invalid qualification state. Concurrent clone,
+  independent offset/lifetime, seal, and error-classification race tests pass.
 - 2026-09-01: every low-level workerd launch, readiness identity, cgroup leaf,
   and returned handle now carries the named `ShardGeneration`; the launcher no
   longer exposes or accepts a placement generation. Each cgroup lease captures

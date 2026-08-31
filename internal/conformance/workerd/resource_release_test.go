@@ -517,6 +517,128 @@ func TestResourceQualificationReleaseSupportsConcurrentSnapshotReaders(t *testin
 	}
 }
 
+func TestResourceQualificationReleaseSnapshotCloneErrorClassification(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		errno error
+		want  error
+	}{
+		{name: "proc fd missing", errno: unix.ENOENT, want: errResourceQualificationReleaseUnavailable},
+		{name: "proc fd parent missing", errno: unix.ENOTDIR, want: errResourceQualificationReleaseUnavailable},
+		{name: "syscall unavailable", errno: unix.ENOSYS, want: errResourceQualificationReleaseUnavailable},
+		{name: "operation unsupported", errno: unix.EOPNOTSUPP, want: errResourceQualificationReleaseUnavailable},
+		{name: "permission denied", errno: unix.EACCES, want: errResourceQualificationReleaseInvalid},
+		{name: "operation not permitted", errno: unix.EPERM, want: errResourceQualificationReleaseInvalid},
+		{name: "unexpected io failure", errno: unix.EIO, want: errResourceQualificationReleaseInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture := newResourceReleaseTestFixture(t, "development", []byte("clone-error-workerd"))
+			resolved, err := resolveResourceQualificationRelease(fixture.config)
+			if err != nil {
+				t.Fatalf("resolveResourceQualificationRelease() error = %v", err)
+			}
+			defer resolved.close()
+
+			_, err = resolved.openExecutableSnapshotWithOpen(func(string, int, uint32) (int, error) {
+				return -1, test.errno
+			})
+			assertResourceReleaseError(t, err, test.want)
+			if errors.Is(err, errResourceQualificationReleaseClosed) {
+				t.Fatalf("clone error = %v also matches closed snapshot", err)
+			}
+		})
+	}
+}
+
+func TestResourceQualificationReleaseSnapshotCloneOwnsIndependentDescriptor(t *testing.T) {
+	t.Parallel()
+
+	executable := []byte("independent-snapshot-workerd")
+	fixture := newResourceReleaseTestFixture(t, "development", executable)
+	resolved, err := resolveResourceQualificationRelease(fixture.config)
+	if err != nil {
+		t.Fatalf("resolveResourceQualificationRelease() error = %v", err)
+	}
+
+	if _, err := resolved.executable.Seek(7, io.SeekStart); err != nil {
+		t.Fatalf("seek owner snapshot: %v", err)
+	}
+	discardedClone, err := resolved.openExecutableSnapshot()
+	if err != nil {
+		t.Fatalf("open disposable executable snapshot: %v", err)
+	}
+	if err := discardedClone.Close(); err != nil {
+		t.Fatalf("close disposable executable snapshot: %v", err)
+	}
+	clone, err := resolved.openExecutableSnapshot()
+	if err != nil {
+		t.Fatalf("openExecutableSnapshot() error = %v", err)
+	}
+	defer clone.Close()
+
+	cloneOffset, err := clone.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatalf("inspect clone offset: %v", err)
+	}
+	if cloneOffset != 0 {
+		t.Fatalf("clone offset = %d, want independent offset 0", cloneOffset)
+	}
+	if _, err := clone.Seek(5, io.SeekStart); err != nil {
+		t.Fatalf("seek clone snapshot: %v", err)
+	}
+	ownerOffset, err := resolved.executable.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatalf("inspect owner offset: %v", err)
+	}
+	if ownerOffset != 7 {
+		t.Fatalf("owner offset after clone seek = %d, want 7", ownerOffset)
+	}
+
+	fdFlags, err := unix.FcntlInt(clone.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("F_GETFD clone: %v", err)
+	}
+	if fdFlags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("clone descriptor flags = %#x, want FD_CLOEXEC", fdFlags)
+	}
+	statusFlags, err := unix.FcntlInt(clone.Fd(), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatalf("F_GETFL clone: %v", err)
+	}
+	if statusFlags&unix.O_ACCMODE != unix.O_RDONLY {
+		t.Fatalf("clone status flags = %#x, want read-only", statusFlags)
+	}
+	wantedSeals := unix.F_SEAL_WRITE | unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
+	seals, err := unix.FcntlInt(clone.Fd(), unix.F_GET_SEALS, 0)
+	if err != nil {
+		t.Fatalf("F_GET_SEALS clone: %v", err)
+	}
+	if seals&wantedSeals != wantedSeals {
+		t.Fatalf("clone seals = %#x, want at least %#x", seals, wantedSeals)
+	}
+
+	if err := resolved.close(); err != nil {
+		t.Fatalf("close owner snapshot: %v", err)
+	}
+	if _, err := clone.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("rewind clone after owner close: %v", err)
+	}
+	got, err := io.ReadAll(clone)
+	if err != nil {
+		t.Fatalf("read clone after owner close: %v", err)
+	}
+	if string(got) != string(executable) {
+		t.Fatalf("clone after owner close = %q, want %q", got, executable)
+	}
+	if _, err := resolved.openExecutableSnapshot(); !errors.Is(err, errResourceQualificationReleaseClosed) {
+		t.Fatalf("open after owner close error = %v, want closed snapshot", err)
+	}
+}
+
 type resourceReleaseTestFixture struct {
 	config   resourceQualificationConfig
 	manifest release.Manifest
