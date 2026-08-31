@@ -63,6 +63,167 @@ func TestProductionProfileRejectsMock(t *testing.T) {
 	}
 }
 
+func TestProductionProfileRejectsExplicitReferenceEvidenceClasses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		component string
+		evidence  Evidence
+		wantError bool
+	}{
+		{
+			name:      "external conformance",
+			component: "state.kill-durability",
+			evidence:  Evidence{Class: EvidenceClassExternal},
+		},
+		{
+			name:      "host observation for host gate",
+			component: "host.kernel",
+			evidence:  Evidence{Class: EvidenceClassHostObservation},
+		},
+		{
+			name:      "legacy unclassified evidence remains compatible",
+			component: "state.kill-durability",
+		},
+		{
+			name:      "reference only",
+			component: "state.kill-durability",
+			evidence:  Evidence{Class: EvidenceClassReferenceOnly},
+			wantError: true,
+		},
+		{
+			name:      "legacy mock",
+			component: "state.kill-durability",
+			evidence:  Evidence{Mock: true},
+			wantError: true,
+		},
+		{
+			name:      "host observation cannot qualify a service gate",
+			component: "state.kill-durability",
+			evidence:  Evidence{Class: EvidenceClassHostObservation},
+			wantError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			collector := NewCollector()
+			if err := collector.Add(Result{
+				Component: test.component,
+				Status:    Pass,
+				Evidence:  test.evidence,
+			}); err != nil {
+				t.Fatalf("Add() error = %v", err)
+			}
+			err := collector.Evaluate(Profile{
+				Name:       "production",
+				Production: true,
+				Required:   []string{test.component},
+			})
+			if test.wantError && err == nil {
+				t.Fatal("Evaluate() error = nil, want fail-closed evidence rejection")
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("Evaluate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCollectorValidatesEvidenceClassAndArtifactReferences(t *testing.T) {
+	t.Parallel()
+
+	valid := Result{
+		Component: "workerd.dynamic-worker",
+		Status:    Pass,
+		Evidence: Evidence{
+			Class: EvidenceClassExternal,
+			ArtifactReferences: []ArtifactReference{{
+				Name:   "workerd-linux-x86_64.gz",
+				Digest: validDigest("a"),
+			}},
+		},
+	}
+	if err := NewCollector().Add(valid); err != nil {
+		t.Fatalf("Add(valid) error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Result)
+	}{
+		{name: "unknown class", mutate: func(result *Result) { result.Evidence.Class = EvidenceClass("guessed") }},
+		{name: "invalid artifact name", mutate: func(result *Result) { result.Evidence.ArtifactReferences[0].Name = "../workerd" }},
+		{name: "invalid artifact digest", mutate: func(result *Result) { result.Evidence.ArtifactReferences[0].Digest = "sha256:no" }},
+		{name: "duplicate artifact", mutate: func(result *Result) {
+			result.Evidence.ArtifactReferences = append(result.Evidence.ArtifactReferences, result.Evidence.ArtifactReferences[0])
+		}},
+		{name: "duplicate artifact name with another digest", mutate: func(result *Result) {
+			result.Evidence.ArtifactReferences = append(result.Evidence.ArtifactReferences, ArtifactReference{
+				Name:   result.Evidence.ArtifactReferences[0].Name,
+				Digest: validDigest("b"),
+			})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.Evidence.ArtifactReferences = append([]ArtifactReference(nil), valid.Evidence.ArtifactReferences...)
+			test.mutate(&candidate)
+			if err := NewCollector().Add(candidate); err == nil {
+				t.Fatal("Add() error = nil, want invalid evidence rejection")
+			}
+		})
+	}
+}
+
+func TestCollectorOwnsArtifactReferenceSlices(t *testing.T) {
+	t.Parallel()
+
+	digest := validDigest("a")
+	result := Result{
+		Component: "workerd.dynamic-worker",
+		Status:    Pass,
+		Evidence: Evidence{
+			Class: EvidenceClassExternal,
+			ArtifactReferences: []ArtifactReference{{
+				Name:   "worker.mjs",
+				Digest: digest,
+			}},
+		},
+	}
+	collector := NewCollector()
+	if err := collector.Add(result); err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	result.Evidence.ArtifactReferences[0].Digest = validDigest("b")
+	first := collector.Report()
+	if got := first.Results[0].Evidence.ArtifactReferences[0].Digest; got != digest {
+		t.Fatalf("Report() digest after Add input mutation = %q, want %q", got, digest)
+	}
+	first.Results[0].Evidence.ArtifactReferences[0].Digest = validDigest("c")
+	if got := collector.Report().Results[0].Evidence.ArtifactReferences[0].Digest; got != digest {
+		t.Fatalf("Report() digest after output mutation = %q, want %q", got, digest)
+	}
+
+	mergedResult := result
+	mergedResult.Evidence.ArtifactReferences = []ArtifactReference{{
+		Name:   "worker.mjs",
+		Digest: digest,
+	}}
+	merged := NewCollector()
+	input := Report{SchemaVersion: 1, Results: []Result{mergedResult}}
+	if err := merged.Merge(input); err != nil {
+		t.Fatalf("Merge() error = %v", err)
+	}
+	input.Results[0].Evidence.ArtifactReferences[0].Digest = validDigest("d")
+	if got := merged.Report().Results[0].Evidence.ArtifactReferences[0].Digest; got != digest {
+		t.Fatalf("Report() digest after Merge input mutation = %q, want %q", got, digest)
+	}
+}
+
 func TestCollectorRejectsConflictingDuplicateEvidence(t *testing.T) {
 	t.Parallel()
 

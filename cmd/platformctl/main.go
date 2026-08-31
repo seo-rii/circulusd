@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/hancomac/circulusd/internal/conformance"
 	"github.com/hancomac/circulusd/internal/controlrpc"
 	"github.com/hancomac/circulusd/internal/doctor"
+	"github.com/hancomac/circulusd/internal/doctoruds"
 	"github.com/hancomac/circulusd/internal/release"
 )
 
@@ -36,10 +38,13 @@ const (
 	defaultReleasePath       = "/usr/lib/pi-platform/release-manifest.json"
 	defaultReleaseRootsPath  = "/etc/pi-platform/release-trust-roots.json"
 	defaultPlatformdSocket   = "/run/pi-platform/platformd.sock"
+	defaultAgentdSocket      = "/run/pi-platform/agentd.sock"
+	defaultExecutordSocket   = "/run/pi-platform/executord.sock"
 	minimumDoctorFreeBytes   = 5 << 30
 	minimumDoctorFreeInodes  = 100_000
 	defaultControlTimeout    = 30 * time.Second
 	maximumControlTimeout    = 5 * time.Minute
+	maximumControlPathBytes  = 107
 )
 
 type configurationSnapshot struct {
@@ -48,16 +53,19 @@ type configurationSnapshot struct {
 }
 
 type commandDependencies struct {
-	stdout            io.Writer
-	stderr            io.Writer
-	clock             func() time.Time
-	loadConfiguration func(string, config.InstallProfile) (configurationSnapshot, string, error)
-	loadRelease       func(string, string, bool) (doctor.Probe, string, error)
-	hostSources       doctor.HostSources
-	additionalProbes  []doctor.Probe
-	runID             func() (string, error)
-	hostID            func() (string, error)
-	getCapabilities   func(context.Context, string) (*v1.GetCapabilitiesResponse, error)
+	stdout             io.Writer
+	stderr             io.Writer
+	clock              func() time.Time
+	loadConfiguration  func(string, config.InstallProfile) (configurationSnapshot, string, error)
+	loadRelease        func(string, string, bool) (doctor.Probe, string, error)
+	hostSources        doctor.HostSources
+	additionalProbes   []doctor.Probe
+	runID              func() (string, error)
+	hostID             func() (string, error)
+	runnerBinaryDigest func() (string, error)
+	targetInstanceID   func() (string, error)
+	buildUDSProbe      func(doctoruds.Config) (doctor.Probe, error)
+	getCapabilities    func(context.Context, string) (*v1.GetCapabilitiesResponse, error)
 }
 
 type capabilitiesOutput struct {
@@ -96,6 +104,24 @@ func main() {
 }
 
 func execute(ctx context.Context, arguments []string, dependencies commandDependencies) int {
+	if dependencies.stdout != nil {
+		reflected := reflect.ValueOf(dependencies.stdout)
+		switch reflected.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if reflected.IsNil() {
+				dependencies.stdout = nil
+			}
+		}
+	}
+	if dependencies.stderr != nil {
+		reflected := reflect.ValueOf(dependencies.stderr)
+		switch reflected.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if reflected.IsNil() {
+				dependencies.stderr = nil
+			}
+		}
+	}
 	if len(arguments) == 0 {
 		if dependencies.stderr != nil {
 			fmt.Fprintln(dependencies.stderr, "usage: platformctl <doctor|capabilities> [options]")
@@ -178,7 +204,8 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 				v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_DEGRADED,
 				v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_FORBIDDEN:
 				reason := capability.GetUnavailableReason()
-				if reason == nil || reason.GetCode() == v1.ErrorCode_ERROR_CODE_UNSPECIFIED ||
+				if reason == nil || reason.GetCode() <= v1.ErrorCode_ERROR_CODE_UNSPECIFIED ||
+					reason.GetCode() > v1.ErrorCode_ERROR_CODE_NEEDS_CONFIRMATION ||
 					reason.GetReason() == "" || reason.GetReason() != strings.TrimSpace(reason.GetReason()) ||
 					reason.GetMessage() == "" || !utf8.ValidString(reason.GetReason()) || !utf8.ValidString(reason.GetMessage()) ||
 					len(reason.GetReason()) > 256 || len(reason.GetMessage()) > 1_024 ||
@@ -252,8 +279,26 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	releasePath := flags.String("release-manifest", defaultReleasePath, "absolute release manifest path")
 	releaseRootsPath := flags.String("release-trust-roots", defaultReleaseRootsPath, "absolute offline release trust-root path")
 	profileName := flags.String("profile", string(config.InstallProfileFull), "install profile")
+	platformdSocket := flags.String("platformd-socket", defaultPlatformdSocket, "canonical absolute platformd control socket path")
+	agentdSocket := flags.String("agentd-socket", defaultAgentdSocket, "canonical absolute agentd control socket path")
+	executordSocket := flags.String("executord-socket", defaultExecutordSocket, "canonical absolute executord control socket path")
+	udsTimeout := flags.Duration("uds-timeout", defaultControlTimeout, "total daemon control protocol probe timeout")
 	if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
 		return 2
+	}
+	invalidControlSocket := false
+	controlSockets := []string{*platformdSocket, *agentdSocket, *executordSocket}
+	seenControlSockets := make(map[string]struct{}, len(controlSockets))
+	for _, path := range controlSockets {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path ||
+			path == string(filepath.Separator) || len(path) > maximumControlPathBytes ||
+			!utf8.ValidString(path) || strings.IndexFunc(path, unicode.IsControl) >= 0 {
+			invalidControlSocket = true
+		}
+		if _, duplicate := seenControlSockets[path]; duplicate {
+			invalidControlSocket = true
+		}
+		seenControlSockets[path] = struct{}{}
 	}
 	if !filepath.IsAbs(*configurationPath) ||
 		filepath.Clean(*configurationPath) != *configurationPath ||
@@ -263,9 +308,10 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 		*releasePath == string(filepath.Separator) ||
 		!filepath.IsAbs(*releaseRootsPath) ||
 		filepath.Clean(*releaseRootsPath) != *releaseRootsPath ||
-		*releaseRootsPath == string(filepath.Separator) {
+		*releaseRootsPath == string(filepath.Separator) || invalidControlSocket ||
+		*udsTimeout <= 0 || *udsTimeout > doctoruds.MaximumProbeTimeout {
 		if dependencies.stderr != nil {
-			fmt.Fprintln(dependencies.stderr, "platformctl: configuration, release, and trust-root paths must be canonical absolute files")
+			fmt.Fprintln(dependencies.stderr, "platformctl: file and daemon socket paths or UDS timeout are invalid")
 		}
 		return 2
 	}
@@ -284,7 +330,8 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	}
 	if ctx == nil || dependencies.stdout == nil || dependencies.stderr == nil ||
 		dependencies.clock == nil || dependencies.loadConfiguration == nil ||
-		dependencies.loadRelease == nil || dependencies.runID == nil || dependencies.hostID == nil {
+		dependencies.loadRelease == nil || dependencies.runID == nil || dependencies.hostID == nil ||
+		dependencies.runnerBinaryDigest == nil || dependencies.targetInstanceID == nil || dependencies.buildUDSProbe == nil {
 		return 1
 	}
 
@@ -299,6 +346,18 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	conformanceProfile, err := doctor.ConformanceProfile(profile, configuration.backends)
 	if err != nil {
 		fmt.Fprintf(dependencies.stderr, "platformctl: select conformance profile: %v\n", err)
+		return 1
+	}
+	udsProbe, err := dependencies.buildUDSProbe(doctoruds.Config{
+		Endpoints: []doctoruds.Endpoint{
+			{Name: doctoruds.Platformd, SocketPath: *platformdSocket, ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD},
+			{Name: doctoruds.Agentd, SocketPath: *agentdSocket, ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD},
+			{Name: doctoruds.Executord, SocketPath: *executordSocket, ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD},
+		},
+		Timeout: *udsTimeout,
+	})
+	if err != nil {
+		fmt.Fprintln(dependencies.stderr, "platformctl: configure daemon protocol probe")
 		return 1
 	}
 	releaseProbe, releaseDigest, err := dependencies.loadRelease(
@@ -329,22 +388,35 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 		fmt.Fprintln(dependencies.stderr, "platformctl: read host identity")
 		return 1
 	}
+	runnerBinaryDigest, err := dependencies.runnerBinaryDigest()
+	if err != nil {
+		fmt.Fprintln(dependencies.stderr, "platformctl: read doctor runner identity")
+		return 1
+	}
+	targetInstanceID, err := dependencies.targetInstanceID()
+	if err != nil {
+		fmt.Fprintln(dependencies.stderr, "platformctl: read target instance identity")
+		return 1
+	}
 	probes := make(
 		[]doctor.Probe,
 		0,
-		len(hostProbes)+1+len(dependencies.additionalProbes),
+		len(hostProbes)+2+len(dependencies.additionalProbes),
 	)
 	probes = append(probes, hostProbes...)
 	probes = append(probes, releaseProbe)
+	probes = append(probes, udsProbe)
 	probes = append(probes, dependencies.additionalProbes...)
 	report, err := doctor.Run(ctx, doctor.Plan{
-		RunID:         runID,
-		Profile:       conformanceProfile,
-		ConfigDigest:  configurationDigest,
-		ReleaseDigest: releaseDigest,
-		HostID:        hostID,
-		Clock:         dependencies.clock,
-		Probes:        probes,
+		RunID:              runID,
+		Profile:            conformanceProfile,
+		ConfigDigest:       configurationDigest,
+		ReleaseDigest:      releaseDigest,
+		HostID:             hostID,
+		RunnerBinaryDigest: runnerBinaryDigest,
+		TargetInstanceID:   targetInstanceID,
+		Clock:              dependencies.clock,
+		Probes:             probes,
 	})
 	if err != nil {
 		fmt.Fprintf(dependencies.stderr, "platformctl: run doctor: %v\n", err)
@@ -409,8 +481,13 @@ func defaultDependencies() commandDependencies {
 				Status:    conformance.NotRun,
 				Reason:    "offline release signature trust roots are not configured",
 				Evidence: conformance.Evidence{
+					Class:        conformance.EvidenceClassExternal,
 					BinaryDigest: digest,
 					Version:      manifest.Release.Version,
+					ArtifactReferences: []conformance.ArtifactReference{{
+						Name:   "release-manifest.json",
+						Digest: digest,
+					}},
 				},
 			}
 			if manifest.Release.Status == "development" {
@@ -419,7 +496,8 @@ func defaultDependencies() commandDependencies {
 					result.Reason = "development release manifest cannot qualify a production profile"
 				} else {
 					result.Status = conformance.Pass
-					result.Reason = "unsigned development manifest is reference-only"
+					result.Reason = ""
+					result.Evidence.Class = conformance.EvidenceClassReferenceOnly
 					result.Evidence.Mock = true
 				}
 			} else {
@@ -434,7 +512,7 @@ func defaultDependencies() commandDependencies {
 					result.Reason = "release manifest or artifact signature verification failed"
 				default:
 					result.Status = conformance.Pass
-					result.Reason = "release manifest and artifacts match a configured offline trust root"
+					result.Reason = ""
 				}
 			}
 			return doctor.Probe{
@@ -470,6 +548,44 @@ func defaultDependencies() commandDependencies {
 			digest := sha256.Sum256([]byte(machineID))
 			return "host-" + hex.EncodeToString(digest[:]), nil
 		},
+		runnerBinaryDigest: func() (string, error) {
+			file, err := os.Open("/proc/self/exe")
+			if err != nil {
+				return "", err
+			}
+			hasher := sha256.New()
+			_, readErr := io.Copy(hasher, file)
+			closeErr := file.Close()
+			if readErr != nil {
+				return "", readErr
+			}
+			if closeErr != nil {
+				return "", closeErr
+			}
+			return "sha256:" + hex.EncodeToString(hasher.Sum(nil)), nil
+		},
+		targetInstanceID: func() (string, error) {
+			file, err := os.Open("/proc/sys/kernel/random/boot_id")
+			if err != nil {
+				return "", err
+			}
+			encoded, readErr := io.ReadAll(io.LimitReader(file, 129))
+			closeErr := file.Close()
+			if readErr != nil {
+				return "", readErr
+			}
+			if closeErr != nil {
+				return "", closeErr
+			}
+			bootID := strings.TrimSpace(string(encoded))
+			if bootID == "" || len(encoded) > 128 || !utf8.ValidString(bootID) ||
+				strings.IndexFunc(bootID, unicode.IsControl) >= 0 {
+				return "", fmt.Errorf("boot identity is invalid")
+			}
+			digest := sha256.Sum256([]byte(bootID))
+			return "boot-" + hex.EncodeToString(digest[:]), nil
+		},
+		buildUDSProbe: doctoruds.BuildProbe,
 		getCapabilities: func(ctx context.Context, socketPath string) (*v1.GetCapabilitiesResponse, error) {
 			client, err := controlrpc.NewClient(controlrpc.ClientConfig{
 				SocketPath: socketPath,

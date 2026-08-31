@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://circulus.example/schemas/v1alpha/doctor-report.schema.json",
+  "title": "Circulus Doctor Report",
+  "description": "Structural schema for a doctor evidence snapshot. Acceptance requires the supplemental semantic validator declared below; schema validity alone never establishes qualification or startup authority.",
+  "x-circulus-semantic-validator": {
+    "required": true,
+    "reference": "internal/doctor.ValidateCurrent",
+    "rules": [
+      "strictly ordered unique required-component and result keys",
+      "unique artifact names within each result",
+      "ordered bounded timestamps and current-identity freshness",
+      "required-component status and evidence qualification",
+      "recomputed profileQualified, productionEligible, and failureReason"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "apiVersion",
+    "probeRunId",
+    "profile",
+    "configDigest",
+    "releaseDigest",
+    "hostId",
+    "runnerBinaryDigest",
+    "targetInstanceId",
+    "productionProfile",
+    "requiredComponents",
+    "startedAt",
+    "finishedAt",
+    "observedAt",
+    "profileQualified",
+    "productionEligible",
+    "results"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "maximum": 1
+    },
+    "apiVersion": {
+      "const": "v1alpha"
+    },
+    "probeRunId": {
+      "$ref": "#/$defs/identifier"
+    },
+    "profile": {
+      "$ref": "#/$defs/identifier"
+    },
+    "configDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "releaseDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "hostId": {
+      "$ref": "#/$defs/identifier"
+    },
+    "runnerBinaryDigest": {
+      "$ref": "#/$defs/digest"
+    },
+    "targetInstanceId": {
+      "$ref": "#/$defs/identifier"
+    },
+    "productionProfile": {
+      "type": "boolean"
+    },
+    "requiredComponents": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    },
+    "startedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "finishedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "observedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "profileQualified": {
+      "type": "boolean"
+    },
+    "productionEligible": {
+      "type": "boolean"
+    },
+    "failureReason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/result"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "profileQualified": {
+            "const": false
+          }
+        },
+        "required": [
+          "profileQualified"
+        ]
+      },
+      "then": {
+        "required": [
+          "failureReason"
+        ],
+        "properties": {
+          "productionEligible": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "not": {
+          "required": [
+            "failureReason"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "productionProfile": {
+            "const": false
+          }
+        },
+        "required": [
+          "productionProfile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "productionEligible": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "productionProfile": {
+            "const": true
+          },
+          "profileQualified": {
+            "const": true
+          }
+        },
+        "required": [
+          "productionProfile",
+          "profileQualified"
+        ]
+      },
+      "then": {
+        "properties": {
+          "productionEligible": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "productionEligible": {
+            "const": true
+          }
+        },
+        "required": [
+          "productionEligible"
+        ]
+      },
+      "then": {
+        "properties": {
+          "productionProfile": {
+            "const": true
+          },
+          "profileQualified": {
+            "const": true
+          },
+          "results": {
+            "items": {
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "PASS"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "evidence": {
+                    "properties": {
+                      "evidenceClass": {
+                        "enum": [
+                          "external",
+                          "host-observation"
+                        ]
+                      },
+                      "mock": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+    },
+    "component": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "maxLength": 64
+    },
+    "artifactReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidenceClass",
+        "artifactReferences"
+      ],
+      "properties": {
+        "evidenceClass": {
+          "enum": [
+            "external",
+            "host-observation",
+            "reference-only"
+          ]
+        },
+        "binaryDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "environmentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "kernel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "architecture": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+        },
+        "artifactReferences": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/artifactReference"
+          }
+        },
+        "mock": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mock": {
+                "const": true
+              }
+            },
+            "required": [
+              "mock"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidenceClass": {
+                "const": "reference-only"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "status",
+        "evidence"
+      ],
+      "properties": {
+        "component": {
+          "$ref": "#/$defs/component"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "UNAVAILABLE",
+            "NOT_RUN"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "\\S"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PASS"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evidence": {
+                "properties": {
+                  "evidenceClass": {
+                    "const": "host-observation"
+                  }
+                },
+                "required": [
+                  "evidenceClass"
+                ]
+              }
+            },
+            "required": [
+              "evidence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "component": {
+                "pattern": "^host\\."
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

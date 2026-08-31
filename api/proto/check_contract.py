@@ -37,6 +37,7 @@ SCHEMA_FILES = (
     "public-error.schema.json",
     "capabilities-response.schema.json",
     "development-status.schema.json",
+    "doctor-report.schema.json",
     "rpc-envelope.schema.json",
     "release-manifest.schema.json",
 )
@@ -890,6 +891,54 @@ def validate_json_schemas() -> None:
                     "isolationConformance": "NOT_RUN",
                 },
             },
+            "doctor-report.schema.json": {
+                "schemaVersion": 1,
+                "apiVersion": "v1alpha",
+                "probeRunId": "doctor-run-example",
+                "profile": "lightweight",
+                "configDigest": digest,
+                "releaseDigest": digest,
+                "hostId": "host-example",
+                "runnerBinaryDigest": digest,
+                "targetInstanceId": "single-node-example",
+                "productionProfile": True,
+                "requiredComponents": [
+                    "host.kernel",
+                    "state.kill-durability",
+                ],
+                "startedAt": "2026-08-27T01:02:03Z",
+                "finishedAt": "2026-08-27T01:02:04Z",
+                "observedAt": "2026-08-27T01:02:04Z",
+                "profileQualified": True,
+                "productionEligible": True,
+                "results": [
+                    {
+                        "component": "host.kernel",
+                        "status": "PASS",
+                        "evidence": {
+                            "evidenceClass": "host-observation",
+                            "kernel": "6.12.4-reference",
+                            "architecture": "x86_64",
+                            "artifactReferences": [],
+                        },
+                    },
+                    {
+                        "component": "state.kill-durability",
+                        "status": "PASS",
+                        "evidence": {
+                            "evidenceClass": "external",
+                            "binaryDigest": digest,
+                            "version": "0.3.0",
+                            "artifactReferences": [
+                                {
+                                    "name": "state-app.wasm",
+                                    "digest": digest,
+                                }
+                            ],
+                        },
+                    },
+                ],
+            },
             "rpc-envelope.schema.json": {
                 "apiVersion": "v1alpha",
                 "kind": "request",
@@ -931,6 +980,33 @@ def validate_json_schemas() -> None:
             if development_validator.is_valid(status):
                 raise ContractError(
                     "development-status.schema.json accepted a production or wired claim"
+                )
+
+        doctor_example = examples["doctor-report.schema.json"]
+        doctor_validator = jsonschema.Draft202012Validator(
+            schemas["doctor-report.schema.json"],
+            format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+        )
+        dishonest_reports = []
+        missing_identity = json.loads(json.dumps(doctor_example))
+        del missing_identity["runnerBinaryDigest"]
+        dishonest_reports.append(missing_identity)
+        reference_pass = json.loads(json.dumps(doctor_example))
+        reference_pass["results"][1]["evidence"]["evidenceClass"] = (
+            "reference-only"
+        )
+        reference_pass["results"][1]["evidence"]["mock"] = True
+        dishonest_reports.append(reference_pass)
+        forged_eligibility = json.loads(json.dumps(doctor_example))
+        forged_eligibility["productionProfile"] = False
+        dishonest_reports.append(forged_eligibility)
+        unknown_evidence = json.loads(json.dumps(doctor_example))
+        unknown_evidence["results"][0]["evidence"]["capturedSecret"] = True
+        dishonest_reports.append(unknown_evidence)
+        for report in dishonest_reports:
+            if doctor_validator.is_valid(report):
+                raise ContractError(
+                    "doctor-report.schema.json accepted ambiguous or dishonest evidence"
                 )
 
     release_manifest = REPOSITORY_ROOT / "deploy" / "airgap" / "release-manifest.json"

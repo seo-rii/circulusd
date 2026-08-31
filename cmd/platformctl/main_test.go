@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/hancomac/circulusd/internal/conformance"
 	"github.com/hancomac/circulusd/internal/controlrpc"
 	"github.com/hancomac/circulusd/internal/doctor"
+	"github.com/hancomac/circulusd/internal/doctoruds"
 	"github.com/hancomac/circulusd/internal/release"
 )
 
@@ -34,6 +37,10 @@ func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T
 		"--release-manifest", "/usr/lib/pi-platform/release-manifest.json",
 		"--release-trust-roots", "/etc/pi-platform/release-trust-roots.json",
 		"--profile", "lightweight",
+		"--platformd-socket", "/run/pi-platform/custom-platformd.sock",
+		"--agentd-socket", "/run/pi-platform/custom-agentd.sock",
+		"--executord-socket", "/run/pi-platform/custom-executord.sock",
+		"--uds-timeout", "2s",
 	}, commandDependencies{
 		stdout: &stdout,
 		stderr: &stderr,
@@ -55,13 +62,39 @@ func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T
 			return doctor.Probe{
 				Component: "release.signature",
 				Run: func(context.Context) conformance.Result {
-					return conformance.Result{Component: "release.signature", Status: conformance.Pass}
+					return conformance.Result{
+						Component: "release.signature",
+						Status:    conformance.Pass,
+						Evidence:  conformance.Evidence{Class: conformance.EvidenceClassExternal},
+					}
 				},
 			}, digest, nil
 		},
-		hostSources: passingHostSources(),
-		runID:       func() (string, error) { return "doctor-cli-run-1", nil },
-		hostID:      func() (string, error) { return "host-cli-1", nil },
+		hostSources:        passingHostSources(),
+		runID:              func() (string, error) { return "doctor-cli-run-1", nil },
+		hostID:             func() (string, error) { return "host-cli-1", nil },
+		runnerBinaryDigest: func() (string, error) { return digest, nil },
+		targetInstanceID:   func() (string, error) { return "boot-cli-1", nil },
+		buildUDSProbe: func(config doctoruds.Config) (doctor.Probe, error) {
+			want := []doctoruds.Endpoint{
+				{Name: doctoruds.Platformd, SocketPath: "/run/pi-platform/custom-platformd.sock", ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD},
+				{Name: doctoruds.Agentd, SocketPath: "/run/pi-platform/custom-agentd.sock", ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD},
+				{Name: doctoruds.Executord, SocketPath: "/run/pi-platform/custom-executord.sock", ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD},
+			}
+			if !reflect.DeepEqual(config.Endpoints, want) || config.Timeout != 2*time.Second || config.Query != nil {
+				return doctor.Probe{}, errors.New("unexpected daemon probe configuration")
+			}
+			return doctor.Probe{
+				Component: doctoruds.Component,
+				Run: func(context.Context) conformance.Result {
+					return conformance.Result{
+						Component: doctoruds.Component,
+						Status:    conformance.Pass,
+						Evidence:  conformance.Evidence{Class: conformance.EvidenceClassExternal},
+					}
+				},
+			}, nil
+		},
 	})
 	if exitCode != 1 {
 		t.Fatalf("execute() = %d, want 1 for missing required gates; stderr=%q", exitCode, stderr.String())
@@ -70,7 +103,9 @@ func TestDoctorCommandEmitsIdentityBoundJSONAndFailsForMissingGates(t *testing.T
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatalf("doctor JSON: %v; output=%q", err, stdout.String())
 	}
-	if report.RunID != "doctor-cli-run-1" || report.ConfigDigest != digest ||
+	if report.APIVersion != "v1alpha" || report.RunID != "doctor-cli-run-1" ||
+		report.ConfigDigest != digest || report.RunnerBinaryDigest != digest ||
+		report.TargetInstanceID != "boot-cli-1" ||
 		report.ReleaseDigest != digest || report.ProfileQualified || report.ProductionEligible {
 		t.Fatalf("doctor report = %+v", report)
 	}
@@ -100,6 +135,7 @@ func TestDoctorCommandExitsZeroOnlyWhenEverySelectedProductionGatePasses(t *test
 		"host.scratch-quota":     {},
 		"host.kvm-access":        {},
 		"release.signature":      {},
+		"uds.protocol":           {},
 	}
 	additional := make([]doctor.Probe, 0, len(profile.Required))
 	for _, component := range profile.Required {
@@ -109,7 +145,11 @@ func TestDoctorCommandExitsZeroOnlyWhenEverySelectedProductionGatePasses(t *test
 		additional = append(additional, doctor.Probe{
 			Component: component,
 			Run: func(context.Context) conformance.Result {
-				return conformance.Result{Component: component, Status: conformance.Pass}
+				return conformance.Result{
+					Component: component,
+					Status:    conformance.Pass,
+					Evidence:  conformance.Evidence{Class: conformance.EvidenceClassExternal},
+				}
 			},
 		})
 	}
@@ -130,14 +170,32 @@ func TestDoctorCommandExitsZeroOnlyWhenEverySelectedProductionGatePasses(t *test
 			return doctor.Probe{
 				Component: "release.signature",
 				Run: func(context.Context) conformance.Result {
-					return conformance.Result{Component: "release.signature", Status: conformance.Pass}
+					return conformance.Result{
+						Component: "release.signature",
+						Status:    conformance.Pass,
+						Evidence:  conformance.Evidence{Class: conformance.EvidenceClassExternal},
+					}
 				},
 			}, digest, nil
 		},
-		hostSources:      passingHostSources(),
-		additionalProbes: additional,
-		runID:            func() (string, error) { return "doctor-cli-run-2", nil },
-		hostID:           func() (string, error) { return "host-cli-2", nil },
+		hostSources:        passingHostSources(),
+		additionalProbes:   additional,
+		runID:              func() (string, error) { return "doctor-cli-run-2", nil },
+		hostID:             func() (string, error) { return "host-cli-2", nil },
+		runnerBinaryDigest: func() (string, error) { return digest, nil },
+		targetInstanceID:   func() (string, error) { return "boot-cli-2", nil },
+		buildUDSProbe: func(doctoruds.Config) (doctor.Probe, error) {
+			return doctor.Probe{
+				Component: doctoruds.Component,
+				Run: func(context.Context) conformance.Result {
+					return conformance.Result{
+						Component: doctoruds.Component,
+						Status:    conformance.Pass,
+						Evidence:  conformance.Evidence{Class: conformance.EvidenceClassExternal},
+					}
+				},
+			}, nil
+		},
 	})
 	if exitCode != 0 {
 		t.Fatalf("execute() = %d, want 0; output=%q", exitCode, stdout.String())
@@ -148,6 +206,10 @@ func TestDoctorCommandExitsZeroOnlyWhenEverySelectedProductionGatePasses(t *test
 	}
 	if !report.ProfileQualified || !report.ProductionEligible {
 		t.Fatalf("doctor report = %+v", report)
+	}
+	if !report.ProductionProfile || len(report.RequiredComponents) == 0 ||
+		report.RunnerBinaryDigest != digest || report.TargetInstanceID != "boot-cli-2" {
+		t.Fatalf("doctor report identity = %+v", report)
 	}
 }
 
@@ -183,6 +245,10 @@ func TestDoctorCommandRejectsInvalidInputBeforeRunningHostProbes(t *testing.T) {
 		{"doctor", "--profile", "future"},
 		{"doctor", "--config", "relative", "--profile", "lightweight"},
 		{"doctor", "--release-trust-roots", "relative", "--profile", "lightweight"},
+		{"doctor", "--platformd-socket", "relative", "--profile", "lightweight"},
+		{"doctor", "--agentd-socket", "/run/pi-platform/shared.sock", "--executord-socket", "/run/pi-platform/shared.sock", "--profile", "lightweight"},
+		{"doctor", "--uds-timeout", "0s", "--profile", "lightweight"},
+		{"doctor", "--uds-timeout", "31s", "--profile", "lightweight"},
 		{"doctor", "unexpected"},
 	}
 	for index, arguments := range invalidArguments {
@@ -215,7 +281,8 @@ func TestDefaultReleaseProbeKeepsDevelopmentEvidenceReferenceOnly(t *testing.T) 
 		t.Fatalf("loadRelease() digest = %q", digest)
 	}
 	reference := referenceProbe.Run(t.Context())
-	if reference.Status != conformance.Pass || !reference.Evidence.Mock {
+	if reference.Status != conformance.Pass || reference.Reason != "" || !reference.Evidence.Mock ||
+		reference.Evidence.Class != conformance.EvidenceClassReferenceOnly {
 		t.Fatalf("reference release result = %+v", reference)
 	}
 	productionProbe, _, err := dependencies.loadRelease(
@@ -227,7 +294,8 @@ func TestDefaultReleaseProbeKeepsDevelopmentEvidenceReferenceOnly(t *testing.T) 
 		t.Fatalf("loadRelease(production) error = %v", err)
 	}
 	production := productionProbe.Run(t.Context())
-	if production.Status != conformance.Fail || production.Evidence.Mock {
+	if production.Status != conformance.Fail || production.Evidence.Mock ||
+		production.Evidence.Class != conformance.EvidenceClassExternal {
 		t.Fatalf("production release result = %+v", production)
 	}
 }
@@ -352,7 +420,8 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 		t.Fatalf("loadRelease() error = %v", err)
 	}
 	result := probe.Run(t.Context())
-	if result.Status != conformance.Pass || result.Evidence.Mock ||
+	if result.Status != conformance.Pass || result.Reason != "" || result.Evidence.Mock ||
+		result.Evidence.Class != conformance.EvidenceClassExternal ||
 		result.Evidence.BinaryDigest != digest {
 		t.Fatalf("production release result = %+v, digest = %q", result, digest)
 	}
@@ -377,6 +446,29 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 	}
 	if invalid := invalidProbe.Run(t.Context()); invalid.Status != conformance.Fail {
 		t.Fatalf("invalid root result = %+v", invalid)
+	}
+}
+
+func TestDefaultDoctorRuntimeIdentityBindsTheRunningBinaryAndBoot(t *testing.T) {
+	dependencies := defaultDependencies()
+	runnerDigest, err := dependencies.runnerBinaryDigest()
+	if err != nil {
+		t.Fatalf("runnerBinaryDigest() error = %v", err)
+	}
+	targetInstanceID, err := dependencies.targetInstanceID()
+	if err != nil {
+		t.Fatalf("targetInstanceID() error = %v", err)
+	}
+	if len(runnerDigest) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(runnerDigest, "sha256:") {
+		t.Fatalf("runnerBinaryDigest() = %q", runnerDigest)
+	}
+	if len(targetInstanceID) != len("boot-")+sha256.Size*2 || !strings.HasPrefix(targetInstanceID, "boot-") {
+		t.Fatalf("targetInstanceID() = %q", targetInstanceID)
+	}
+	againRunner, runnerErr := dependencies.runnerBinaryDigest()
+	againTarget, targetErr := dependencies.targetInstanceID()
+	if runnerErr != nil || targetErr != nil || againRunner != runnerDigest || againTarget != targetInstanceID {
+		t.Fatalf("runtime identity changed: runner=%q/%q target=%q/%q errors=%v/%v", runnerDigest, againRunner, targetInstanceID, againTarget, runnerErr, targetErr)
 	}
 }
 
@@ -450,7 +542,7 @@ func TestCapabilitiesCommandQueriesPlatformdAndEmitsStableJSON(t *testing.T) {
 		t.Fatalf("capabilities JSON: %v; output=%q", err, stdout.String())
 	}
 	if document.APIVersion != "v1alpha" || document.Protocol.Major != 1 || document.Protocol.Minor != 0 ||
-		document.Protocol.DescriptorDigest != "sha256:ff942ae0643b6fa2a8b8ccee97e1593e0d4b56cd414ee771ad0b731ff5854f63" ||
+		document.Protocol.DescriptorDigest != "sha256:693b865cbe6eadb0e6d43910707f8bd0cde0bd892642487e514416e8c0ebc1e0" ||
 		document.ServerSequence != "1" {
 		t.Fatalf("capabilities envelope = %+v", document)
 	}
@@ -498,6 +590,38 @@ func TestCapabilitiesCommandRejectsInvalidInputBeforeDialing(t *testing.T) {
 	}
 }
 
+func TestExecuteRejectsTypedNilWritersWithoutPanicking(t *testing.T) {
+	var typedNil *bytes.Buffer
+
+	for _, arguments := range [][]string{
+		{"unknown"},
+		{"capabilities", "--unknown"},
+		{"doctor", "--unknown"},
+	} {
+		if exitCode := execute(context.Background(), arguments, commandDependencies{
+			stderr: typedNil,
+		}); exitCode != 2 {
+			t.Fatalf("execute(%v) = %d, want 2", arguments, exitCode)
+		}
+	}
+
+	var stderr bytes.Buffer
+	exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
+		stdout: typedNil,
+		stderr: &stderr,
+		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+			return &v1.GetCapabilitiesResponse{
+				Meta:             &v1.RpcResponseMeta{ServerSequence: 1},
+				ProtocolVersion:  &v1.ProtocolVersion{Major: 1},
+				DescriptorDigest: &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: make([]byte, sha256.Size)},
+			}, nil
+		},
+	})
+	if exitCode != 1 {
+		t.Fatalf("execute(capabilities) = %d, want 1", exitCode)
+	}
+}
+
 func TestCapabilitiesCommandFailsClosedOnContradictoryOrDuplicateStatus(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -516,6 +640,18 @@ func TestCapabilitiesCommandFailsClosedOnContradictoryOrDuplicateStatus(t *testi
 			capabilities: []*v1.CapabilityStatus{{
 				Name:         "state.celld",
 				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE,
+			}},
+		},
+		{
+			name: "unavailable with unknown error code",
+			capabilities: []*v1.CapabilityStatus{{
+				Name:         "state.celld",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE,
+				UnavailableReason: &v1.PublicError{
+					Code:    v1.ErrorCode(99),
+					Reason:  "UNKNOWN_CODE",
+					Message: "provider returned an unknown code",
+				},
 			}},
 		},
 		{

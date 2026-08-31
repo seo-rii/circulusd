@@ -239,15 +239,7 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 					stats.FreeInodes < requirements.MinimumFreeInodes {
 					return conformance.Result{Component: "host.disk", Status: conformance.Fail, Reason: "data filesystem free space or inodes are below policy"}
 				}
-				return conformance.Result{
-					Component: "host.disk",
-					Status:    conformance.Pass,
-					Reason: fmt.Sprintf(
-						"freeBytes=%d freeInodes=%d",
-						stats.FreeBytes,
-						stats.FreeInodes,
-					),
-				}
+				return conformance.Result{Component: "host.disk", Status: conformance.Pass}
 			},
 		},
 		{
@@ -308,7 +300,7 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 				if !quotaEnabled {
 					return conformance.Result{Component: "host.scratch-quota", Status: conformance.Unavailable, Reason: "project quota is not enabled on the data filesystem"}
 				}
-				return conformance.Result{Component: "host.scratch-quota", Status: conformance.Pass, Reason: "project quota is enabled for scratch isolation"}
+				return conformance.Result{Component: "host.scratch-quota", Status: conformance.Pass}
 			},
 		},
 		{
