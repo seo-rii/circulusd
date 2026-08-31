@@ -1,7 +1,7 @@
 # Implementation plan
 
-Status: Unit 10 implementation in progress after independent architecture and
-concurrency review
+Status: Unit 10 paused for machine transfer after the Manager observation fence
+and unattached pidfd process-identity owner
 
 Updated: 2026-09-01
 
@@ -10,6 +10,9 @@ reviewable repository work units. `SPEC.md` remains the product contract;
 `docs/acceptance.md` records evidence that has actually run. A completed work
 unit is not a conformance `PASS` unless the acceptance ledger records the exact
 required external evidence.
+
+The machine-transfer resume checkpoint for the current unit is
+[`docs/unit10-handoff.md`](unit10-handoff.md).
 
 ## Current sequence
 
