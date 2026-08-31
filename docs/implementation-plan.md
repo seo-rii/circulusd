@@ -1,6 +1,6 @@
 # Implementation plan
 
-Status: Unit 10 planned and accepted as the next implementation unit
+Status: Unit 10 accepted after independent architecture and concurrency review
 
 Updated: 2026-08-31
 
@@ -18,53 +18,71 @@ required external evidence.
 | 8 | complete | Fail-closed production bootstrap boundary and separate diagnostic-only development daemon |
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | planned | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
+| 11 | queued | Phase 0B real-process celld Session/effect/placement authority and kill/restart fault matrix |
+| 12 | queued | Durable public idempotency and API/SSE disconnect/replay recovery |
 
-Unit 11 follows Unit 10 with the remaining Phase 0B real-process celld
-durability and API/SSE recovery boundary. Phase 1A is then split into additional
-units for the private workload composition and the NsJail single-node vertical
-slice. Those later units are ordered but are not yet detailed here; their exact
-cut lines must use the evidence produced by Units 10 and 11.
+After Unit 12, the private `platformd`-to-`agentd` workload composition and the
+Phase 1A NsJail single-node vertical slice receive separate work-unit plans.
+Their exact cut lines must use the evidence produced by Units 10–12; they are
+not silently included in Unit 10.
 
 ## Unit 10: Phase 0A workerd resource qualification
 
 ### Outcome
 
-Complete the still-`NOT_RUN` Phase 0A resource checks against the release-pinned
-stock workerd process:
+Complete the Phase 0A process, cgroup, and Worker Loader gates against the
+release-pinned stock workerd process. Unit 10 introduces five distinct required
+external results:
 
-- bounded CPU execution and worker-failure handling;
-- cgroup-backed RSS observation and a cold-start benchmark;
-- pressure/OOM-driven shard drain and recycle;
-- Dynamic Worker eviction and reconstruction from the same committed
-  checkpoint and content-addressed runtime identity;
-- whole-shard kill/restart with stale placement activity rejected.
+- `workerd.cpu-limit`: both Loader `cpuMs` failure semantics and shard-level
+  cgroup CPU throttling;
+- `workerd.rss-cold-start`: process RSS, cgroup memory attribution, and repeated
+  cold-start measurements;
+- `workerd.dynamic-worker-reconstruction`: destructive Dynamic Worker failure
+  followed by a demonstrably new initialization for the same content-addressed
+  Worker ID;
+- `workerd.shard-pressure-recycle`: real cgroup pressure/OOM, drain, cleanup,
+  and reconstruction;
+- `workerd.shard-kill-reconstruction`: explicit whole-shard `SIGKILL`, cleanup,
+  and reconstruction.
+
+The old ambiguous `workerd.shard-recycle` result is replaced by the last two
+results when the profile and probe inventory migrate. Neither one may
+substitute for the other.
 
 This is a Phase 0A Go/No-Go result, not production admission. The Phase 0A
-model and tool services remain deterministic mocks as permitted by `SPEC.md`
-§51.1, and their evidence remains `reference-only`/`mock`.
+model, tool, checkpoint store, and placement source remain deterministic test
+infrastructure as permitted by `SPEC.md` §51.1. Their evidence remains
+`reference-only`/`mock`. The five named results claim only the real
+process/cgroup/Loader mechanics they directly observe; they do not turn those
+fixture dependencies into durable or production evidence.
 
 ### Existing baseline
 
 The implementation starts from these already-tested components:
 
 - `internal/agent.Manager` serializes placement metadata, coalesces compatible
-  cold starts, fences placement generations, drains pressure/expired shards,
-  and coordinates concurrent shutdown;
+  cold starts, fences caller-supplied placement generations, drains
+  pressure/expired shards, and coordinates concurrent shutdown;
 - `internal/agent.WorkerdProcessLauncher` pins a verified executable snapshot,
-  gates readiness, bounds output, and coordinates generation replacement and
+  gates readiness, bounds output, and coordinates process replacement and
   cleanup;
-- the Linux cgroup controller creates one leaf per shard generation, writes and
-  reads back CPU/memory/PID limits, attaches the child atomically, and performs
-  generation-fenced `cgroup.kill` cleanup;
+- the Linux cgroup controller creates one leaf per current launcher generation,
+  writes and reads back CPU/memory/PID limits, attaches the child atomically,
+  and performs identity-fenced `cgroup.kill` cleanup;
 - `internal/conformance/workerd` runs the real Pi adapter and Dynamic Worker
-  fixture but still reports `workerd.cpu-limit`, `workerd.rss-cold-start`, and
-  `workerd.shard-recycle` as `NOT_RUN`;
-- `cmd/agentd` is still a diagnostic-only control shell and does not compose
-  any of the preceding operational components.
+  fixture, but its resource checks are still `NOT_RUN`, its external test takes
+  a caller-supplied expected executable digest, and its `workerd test` fixture
+  has no persistent socket;
+- the release manifest currently pins compressed workerd archives but does not
+  record the deterministically extracted executable digest;
+- `cmd/agentd` is a diagnostic-only control shell and does not compose any of
+  the preceding operational components.
 
-The manager and low-level process launcher are not yet one production
-composition. Their distinct generation domains and readiness contracts must be
-made explicit before they are joined.
+The current launcher calls its process-incarnation field
+`PlacementGeneration`, permits a stopped process to restart under that same
+value, and has no matching field in `Manager.ShardSpec`. Unit 10 must migrate
+that contract before joining the manager and launcher.
 
 ### Cut line
 
@@ -76,9 +94,11 @@ qualification harness. It does not:
 - change `cmd/agentd` from its diagnostic-only capability claims;
 - claim a real model, MCP broker, celld durability, or production state
   authority;
+- prove the downstream model/tool/workspace/turn/SSE stale-request rejection
+  required by `SPEC.md` §34.3 and §53.4;
 - add NsJail, Docker, Firecracker, native command execution, or outer workerd
   isolation;
-- mark any production install profile qualified;
+- mark §53.1, §53.4, or any production install profile qualified;
 - choose permanent resident-session, RSS, or latency defaults from one host's
   measurements.
 
@@ -86,161 +106,407 @@ The current same-identity delegated cgroup mechanism proves mechanical limit
 application, observation, and cleanup. It is not a security boundary against a
 fully compromised same-UID workerd process. A production workload composition
 must separately close cgroup-control authority isolation or place workerd in a
-stronger outer boundary. Unit 10 must keep `AdmissionReady=false` while that
-gap, the private workload authority, or any required production dependency is
-open.
+stronger outer boundary. Unit 10 keeps `AdmissionReady=false` while that gap,
+the private workload authority, or any required production dependency is open.
 
-### Lifecycle and generation model
+### Identity and generation model
 
-The manager's Session `placementGeneration` and the process launcher's shard
-generation are different values and must never be substituted for one another:
+Four identity domains remain distinct:
 
-- `placementGeneration` comes from the authoritative Session state and fences
-  late Worker requests after placement changes;
-- `shardGeneration` identifies one OS process/cgroup incarnation owned by the
-  current agent runtime;
-- an observation or exit callback carries the shard ID, shard generation, and
-  pinned cgroup identity; it cannot drain or stop a replacement generation;
-- a reconstructed Dynamic Worker keeps its content-addressed Worker ID but
-  receives only the current placement authority.
+- Session `placementGeneration` is issued by authoritative Session state. It is
+  used only by the reference fixture in Unit 10 and is never passed to the
+  process launcher or used in a cgroup leaf name. Real rotation and downstream
+  broker rejection belong to Unit 11 and later composition work.
+- `agentInstanceID` is a fresh, non-secret 128-bit identifier created for one
+  qualification-runtime boot by Manager construction after the host boot
+  identity is loaded. Restarting that runtime creates a new value.
+- `shardID` names one manager-owned logical shard slot inside an agent instance.
+- `shardGeneration` is allocated monotonically by `Manager`, scoped to
+  `(agentInstanceID, shardID)`. Every OS start attempt consumes a new
+  generation, including a retry after failed, canceled, timed-out, or uncertain
+  cleanup. A generation is never reused for a second PID.
+
+Unit 10 adds `AgentInstanceID` and `ShardGeneration` to `ShardSpec` and renames
+the launcher's `PlacementGeneration` fields in ensure requests, process info,
+launch keys, cgroup names, and handles. Contract tests prove that Session
+placement values cannot flow into those fields. Neither `agentInstanceID` nor
+`shardGeneration` is accepted in a placement request or qualification-input
+document: `ShardSpec` is the outbound Manager-to-Launcher value, and Manager
+fills both identities before calling `Launcher.Start`.
+
+Every readiness response, exit callback, resource sample, and stop completion
+carries `(agentInstanceID, shardID, shardGeneration)` plus a non-reusable
+process-instance token and the pinned cgroup device/inode identity. On Linux,
+the process token uses a pidfd when available and verifies PID start identity;
+a numeric PID alone is insufficient. A late callback from a prior start cannot
+publish, drain, account, or remove its replacement.
+
+One observer loop owns each shard generation. It serializes samples and assigns
+a monotonic `observationSequence` after a complete read. `ObservedAt` is
+diagnostic only; Manager rejects duplicate or decreasing sequences rather than
+using wall-clock order. Cumulative `memory.events` and `cpu.stat` values are
+compared with the baseline captured for that exact generation.
+
+### Readiness boundary
+
+Shard readiness and Dynamic Worker admission bind different identities.
+
+Shard readiness proves only:
+
+- agent instance, shard ID, and shard generation;
+- workerd executable digest/version;
+- static SessionHost artifact and configuration digest;
+- Worker Loader ABI and release identity;
+- the private readiness endpoint nonce and pinned cgroup identity.
+
+It does not bind a per-session Runtime Revision. At Loader admission, the
+trusted SessionHost separately verifies the session ID, Runtime Revision
+digest, Pi adapter ABI, compatibility date/flags, module graph, stable binding
+set, and content-addressed Worker ID. A shared/tenant shard can therefore host
+Dynamic Workers with different Runtime Revisions without weakening either
+identity check.
+
+### External qualification contract
+
+#### Release provenance
+
+Unit 10 first extends the release artifact contract so a workerd entry records
+the archive digest, compression/extraction recipe, and extracted executable
+digest for each architecture. Those fields are covered by the release-manifest
+signing digest. The resource runner loads and validates the manifest and trust
+policy, selects the exact architecture entry, verifies deterministic
+extraction provenance, and hashes the opened executable snapshot.
+
+The runner does not accept an expected workerd digest, version, SessionHost
+digest, or fixture digest from an environment variable or command-line flag.
+Those values come only from the validated release and the compiled probe
+inventory. A development-status manifest can support Phase 0A evidence, but it
+cannot qualify a production profile and remains subject to the release-status
+rules in `docs/acceptance.md`.
+
+#### Input and invocation
+
+The new external test consumes one canonical absolute path:
+
+```text
+CIRCULUSD_WORKERD_QUALIFICATION_CONFIG=/private/path/workerd-qualification-v1.json
+```
+
+The versioned, exact-field JSON document is bounded at 64 KiB and supplies only
+operator/host inputs:
+
+- release manifest and trust-root paths;
+- installed workerd path and architecture;
+- a pre-provisioned cgroup-v2 root and private evidence-output directory;
+- exact CPU quota/period, memory/swap/PID limits, readiness/probe/drain/total
+  timeouts, and cold-start sample count.
+
+It supplies no raw workerd arguments, child environment, expected digest, or
+capability claim. Reference qualification uses `cpu.max=50000 100000`,
+`memory.max=1073741824`, `memory.swap.max=0`, `pids.max=128`, and at least five
+cold starts. A different valid measurement profile changes the configuration
+and environment digests and cannot be merged with the reference run.
+
+The launcher and cgroup controller replace the integer `CPUCores` input with a
+finite canonical `CPUMax{QuotaMicros, PeriodMicros}` value. Both members are
+decimal `uint64` values; quota is in `[1_000, 1_000_000_000]` and period is in
+`[1_000, 1_000_000]`. Zero, an unlimited `max` quota, out-of-range values,
+extra tokens, and any value that cannot round-trip through the exact kernel
+readback are rejected. The controller formats each member directly and does
+not derive quota by multiplication, so no core-to-quota arithmetic can
+overflow. Unit 10 qualification is finite-limit only.
+
+The explicit gate command is:
+
+```bash
+env CIRCULUSD_WORKERD_QUALIFICATION_CONFIG=/private/path/workerd-qualification-v1.json \
+  go test -race -count=1 \
+  -run '^TestStockWorkerdResourceQualification$' \
+  ./internal/conformance/workerd
+```
+
+The harness materializes a private fixture directory and a persistent workerd
+configuration with a private Unix socket. The production launcher receives one
+fixed, golden-tested argument vector rendered by the harness:
+
+```text
+serve --experimental
+-I<fixture-directory> <fixture-directory>/phase0-resource.capnp
+```
+
+The golden-argv preflight executes this exact `serve` contract against the
+pinned workerd binary. Flags accepted only by `workerd test` are not part of
+the qualification launcher contract.
+
+SessionHost readiness uses a bounded nonce challenge over that socket and
+returns the shard-level identity defined above. The total run has a configured
+deadline no greater than 15 minutes; every individual probe and cleanup round
+has a smaller explicit bound.
+
+The operator provisions the cgroup root before the test. Its ancestors are
+root-owned and non-writable, the target is an empty cgroup-v2 domain owned by
+the runner's effective UID/GID with mode `0700`, and `cpu`, `memory`, and `pids`
+are available and enabled. The harness never creates or relaxes that root. It
+creates only generation-derived child leaves and requires the root to be empty
+again after the final cleanup join.
+
+#### Status classification
+
+The runner uses this fixed classification; callers cannot choose a weaker
+status:
+
+| Situation | Result |
+|---|---|
+| The resource runner is not implemented, the explicit gate was not selected, or the qualification config is absent | `NOT_RUN` |
+| The validated release artifact, required kernel feature, cgroup-v2 mount, or controller delegation is genuinely absent on the target host | `UNAVAILABLE` |
+| The supplied document is malformed, the release/binary identity mismatches, or a provisioned path/root violates its ownership, mode, emptiness, controller, or identity contract | `FAIL` |
+| A probe assertion, readiness check, internal deadline, cleanup join, evidence write/read-back, or leak check fails | `FAIL` |
+| The enclosing caller cancels before completion and cleanup succeeds without another observed failure | `NOT_RUN` |
+| Cancellation also exposes cleanup, identity, assertion, or evidence failure | `FAIL` |
+| Every predicate for one named component passes in the same fresh run | `PASS` |
+
+An explicit gate invocation exits unsuccessfully unless all five Unit 10
+resource results are `PASS`. A test skip, timeout, whole-shard kill, or cgroup
+limit readback alone can never be interpreted as a component `PASS`.
+
+#### Evidence envelope and retention
+
+Every run emits a versioned deterministic-CBOR qualification envelope before a
+JSON view is produced. Its schema contains:
+
+- run ID and start/finish timestamps;
+- runner binary digest, embedded source/fixture digest, and probe-inventory
+  digest;
+- release manifest digest/status, architecture-specific archive digest,
+  extraction recipe, executable digest/version, static SessionHost artifact
+  digest, and compatibility inputs;
+- configuration/environment digests and the exact limits/timeouts/sample
+  bounds;
+- host and boot identity, kernel, architecture, cgroup namespace/mount identity,
+  root and leaf device/inode identities, and enabled controllers;
+- per-probe start/finish times, raw bounded sample counts, result status, and
+  final cleanup outcome;
+- separately named process RSS, cgroup memory charge/event, CPU throttling, PID,
+  readiness, initialization, checkpoint, and reconstruction observations.
+
+Process RSS is read only for the pinned process instance and is not inferred
+from `memory.current`; cgroup memory charge is recorded separately. Artifact
+references and results are canonical-name sorted. All five Unit 10 `PASS`
+results require `EvidenceClassExternal`, `Mock=false`, the same run ID and
+identity envelope, and a digest reference to
+`workerd-resource-observation-v1.cbor`.
+
+The output directory must be canonical, private, owned by the caller, and not
+group/other writable. Files are created through a same-directory exclusive
+temporary file with mode `0600`, followed by file sync, a no-clobber atomic
+rename (`renameat2(RENAME_NOREPLACE)` or an equivalent operation) relative to a
+pinned output-directory FD, directory sync, read-back digest verification, and
+semantic validation. A run never replaces, relabels, or appends to an existing
+artifact. The runner performs no automatic deletion; release evidence is
+retained for the support lifetime of the bound release and removed only by the
+later release-retention policy.
+
+This retained envelope is historical qualification evidence, not startup
+authority. It is never reused to manufacture a fresh result. Any later doctor
+or startup consumer must independently authenticate the current host, boot,
+release, executable, config, and target and apply its own freshness policy.
+
+### Lifecycle, ownership, and cancellation
 
 The required process lifecycle is:
 
 ```text
-allocated -> starting -> ready -> draining -> stopping -> stopped
+allocated -> starting -> ready -> draining -> stopping -> quiescent
                 |          |          |
-                +----------+----------+-> failed cleanup -> retry cleanup
+                +----------+----------+-> cleanup pending -> cleanup retry
 ```
 
-`ready` is published only after the cgroup limits are read back, the process is
-atomically attached, and the SessionHost readiness identity matches the
-expected release/runtime inputs. Entering `draining` closes admission
-immediately. Ownership is retained until the process is gone, the cgroup is
-unpopulated and removed, and every borrowed descriptor is closed.
+Every transition to a new `starting` process consumes a fresh shard generation.
+`ready` is published only after limit readback, atomic cgroup attachment, and
+the shard-level readiness challenge. Entering `draining` closes admission
+immediately. Resource ownership remains with the shared lifecycle operation
+until the process is gone, the cgroup is unpopulated and removed, and every
+borrowed descriptor is closed.
 
-### Work packages and TDD order
+Manager owns the launch context and a waiter/result record for each pending
+start. Canceling the initiating caller after another waiter attaches does not
+cancel the shared start. Canceling the last waiter requests cancellation, but
+the detached cleanup owner remains responsible for reaching a quiescent state.
+The immutable launch result/error is published to every remaining waiter.
 
-Every behavioral slice follows strict RED → GREEN → race/shuffle verification.
-Tests that need a real binary or cgroup are external conformance tests and must
-not be replaced with a fake to obtain `PASS`.
+Stop and shutdown use shared cleanup epochs:
 
-#### U10.1 — Join manager and launcher contracts
+- caller cancellation stops only that caller's wait and returns its local
+  context error;
+- all uncanceled waiters on one cleanup epoch observe its same terminal result;
+- a retryable cleanup error retains resource ownership and an explicit retry
+  starts a new shared epoch;
+- a terminal integrity/identity error poisons the owner and is cached for every
+  later caller;
+- successful ownership release is terminal and idempotent;
+- qualification report finalization joins every detached start/cleanup owner;
+  no `PASS` is emitted while cleanup is pending or uncertain.
 
-1. Add failing contract tests for distinct placement/shard generations,
-   immutable launch arguments, readiness identity mismatch, and cleanup of a
-   process that becomes invalid before publication.
-2. Add the narrow adapter that translates a manager-owned `ShardSpec` into one
-   fixed launcher request. Callers cannot supply raw workerd arguments,
-   environment, executable path, or cgroup controls.
-3. Keep construction release-bound: the opened workerd binary, SessionHost
-   artifact, compatibility inputs, limits, and explicit child environment are
-   frozen before any shard starts.
-4. Verify that a stale readiness, exit, or stop completion cannot publish or
-   remove a newer shard generation.
-
-#### U10.2 — Add generation-bound resource observation
-
-1. Add failing parser and race tests for bounded reads of `memory.current`,
-   `memory.events`, `cpu.stat`, `pids.current`, and the pinned cgroup identity.
-2. Return immutable observations that distinguish ordinary RSS, CPU throttling,
-   OOM/oom-kill counters, and unavailable/malformed kernel evidence.
-3. Reject stale/replaced cgroup observations and never read an unbounded control
-   file.
-4. Feed observations into `Manager.Observe` without holding manager or cgroup
-   locks across filesystem I/O or callbacks.
-
-#### U10.3 — Make recycle and reconstruction deterministic
-
-1. Add failing tests for concurrent pressure reports, natural process exit,
-   explicit release, generation replacement, and daemon shutdown selecting one
-   cleanup owner.
-2. A pressure/OOM transition marks the shard draining once, excludes it from
-   admission, and coalesces stop/cgroup cleanup. Independent shards continue to
-   make progress.
-3. Exercise Dynamic Worker eviction in the pinned Loader fixture and prove that
-   initialization reconstructs from the committed checkpoint without shared
-   global or lifecycle state.
-4. Kill the complete workerd shard, rotate placement authority, reconstruct the
-   same content-addressed Worker identity, and prove that late activity carrying
-   the previous placement generation is rejected.
-
-#### U10.4 — Replace the three resource `NOT_RUN` probes
-
-1. Extend the explicit external workerd fixture with a provisioned, empty,
-   delegated cgroup-v2 root. Absence of the pinned binary or usable delegation
-   yields `UNAVAILABLE`/`NOT_RUN` with a stable reason, never a skip interpreted
-   as success.
-2. `workerd.cpu-limit` must observe both the configured shard quota and bounded
-   handling of an infinite-JS/worker failure in stock workerd.
-3. `workerd.rss-cold-start` must record repeated cold-start latency and cgroup
-   memory observations in a versioned canonical artifact. `PASS` means the
-   measurement completed with valid identity and bounds; it does not freeze a
-   product performance threshold.
-4. `workerd.shard-recycle` must cause real pressure or a real process kill,
-   observe drain/cleanup, and reconstruct before it can pass.
-5. Bind every result to the workerd binary/version, compatibility environment,
-   host/kernel/architecture, probe inventory, and a digest reference to the
-   resource-observation artifact. Synthetic model/tool evidence stays marked
-   mock and cannot qualify a production profile.
-
-#### U10.5 — Close the unit without widening readiness
-
-1. Run focused race/shuffle tests for `internal/agent`, the workerd conformance
-   harness, and `cmd/agentd`.
-2. Run the complete Go race/vet and TypeScript check/lint/unit gates.
-3. Run the real external fixture on a provisioned host and retain its report;
-   if the host boundary is unavailable, Unit 10 remains incomplete.
-4. Update `docs/acceptance.md` from the retained evidence. Do not infer an
-   aggregate §53 `PASS` or change daemon capabilities from unit tests.
+The quiescent-boundary leak assertion runs only after the enclosing
+qualification run or shutdown has joined those owners. It does not incorrectly
+require resources to disappear before an individually canceled caller returns.
 
 ### Concurrency invariants
 
-- One shard generation has at most one start operation and one cleanup owner.
-- Same-generation waiters share a result; canceling one waiter does not cancel
-  work still owned by other waiters.
-- Independent shard starts, observations, and cleanup operations can progress
+- One `(agentInstanceID, shardID, shardGeneration)` has at most one OS start and
+  one active cleanup epoch; a second OS start always has a new generation.
+- Same-operation waiters share an immutable result. Initiator cancellation
+  cannot cancel work still owned by another waiter.
+- Independent shard starts, observation loops, and cleanup epochs progress
   concurrently.
-- No manager mutex is held while launching, probing readiness, reading cgroup
-  files, waiting for process exit, or draining a cgroup.
-- Replacement waits for uncertain cleanup of the prior generation; timeout or
-  cancellation cannot silently transfer ownership.
-- Drain admission closes before the stop begins, and no observation from the
-  drained generation can affect its replacement.
-- Shutdown fences new admission first, joins every in-flight start/stop, and
-  returns reproducible cleanup errors to concurrent/repeated callers.
+- No manager mutex is held while calling any interface method, including
+  `Launcher.Start`, `ShardProcess.ID`, readiness, observation sinks, or
+  `ShardProcess.Stop`, or while doing process/cgroup I/O.
+- Reentrant/blocking callbacks cannot deadlock `Acquire`, `Observe`, `Snapshot`,
+  or `Shutdown`.
+- Replacement waits for uncertain cleanup of the prior process instance;
+  timeout or cancellation cannot silently transfer ownership.
+- Drain admission closes before stop begins. Generation and observation
+  sequence checks reject late, duplicate, and out-of-order samples.
+- Shutdown fences new admission first, joins every in-flight start/stop owner,
+  and preserves caller-local cancellation separately from shared cleanup
+  results.
 - Test callbacks reached from product goroutines report through channels or
   returned errors; they never call `FailNow` methods.
+
+### Work packages and strict TDD order
+
+Every behavioral slice follows RED → GREEN → focused race/shuffle verification.
+Fakes specify host-independent contracts only; they can never replace a real
+binary/cgroup external `PASS`.
+
+#### U10.1 — Release pin, generation, and composition contracts
+
+1. Add failing release-manifest/schema tests for extraction provenance and the
+   installed executable digest, plus failing qualification-input tests that
+   reject caller-supplied expected identities or raw launch inputs.
+2. Add failing launcher/controller API tests that replace `CPUCores` with the
+   bounded finite `CPUMax` value; reject zero, `max`, range violations, extra
+   tokens, and legacy multiplication/overflow behavior.
+3. Add failing agent tests for the generation allocator/API rename, one fresh
+   generation per OS attempt, placement-generation non-flow, stale callback
+   rejection, and readiness identity separation.
+4. Add cross-contract RED tests for “initiator cancels after a second waiter
+   attaches → one OS start and remaining waiter succeeds” and for blocking or
+   reentrant `ID`/readiness callbacks under Manager operations.
+5. Implement the narrow manager/launcher adapter, canonical CPU-max migration,
+   manager-owned launch context, immutable waiter result, and release-bound
+   fixed launch configuration.
+
+#### U10.2 — Generation-bound resource observation
+
+1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
+   `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include
+   controller write/readback tests for the canonical quota/period and
+   process-RSS tests pinned to the process token/PID start identity.
+2. Add failing race tests for stale cgroup identity, duplicate/decreasing
+   observation sequence, delayed old low-memory samples, and cumulative-counter
+   baseline replacement.
+3. Implement one serialized observer loop per shard generation. Feed immutable
+   observations into Manager without holding manager/cgroup locks across I/O or
+   callbacks.
+4. Keep cgroup memory charge, process RSS, CPU throttling, OOM/oom-kill counters,
+   and unavailable/malformed evidence distinct in code and artifacts.
+
+#### U10.3 — Distinct reconstruction and recycle contracts
+
+1. Add failing host-independent contract tests for all three new reconstruction
+   result names, their non-substitutability, checkpoint commit/ack ordering,
+   initialization-instance change, pressure drain, explicit `SIGKILL`, and
+   quiescent cleanup.
+2. Move the deterministic checkpoint store outside the workerd process. It
+   records canonical checkpoint bytes/digest and acknowledges the commit before
+   any destructive fault is injected.
+3. For Dynamic Worker reconstruction, trigger a pinned Loader/CPU-limit fault
+   that must destroy the isolate, then require a new initialization-instance ID
+   for the same content-addressed Worker ID and reload the acknowledged
+   checkpoint. If the pinned workerd behavior cannot prove a destroyed isolate,
+   this result fails and the whole-shard probe cannot substitute for it.
+   The ID is created inside the Dynamic Worker module during actual module
+   initialization, retained in module-local state, and returned by the
+   initialization hook. It must remain identical across two pre-fault calls and
+   differ on the first successful post-fault initialization; the harness cannot
+   inject, rotate, or synthesize it.
+4. Separately induce real pressure/OOM for the pressure-recycle result and send
+   `SIGKILL` to the pinned process instance for the shard-kill result. Each path
+   must drain, clean the exact cgroup generation, start a new generation, and
+   reload the acknowledged checkpoint.
+5. A deterministic mock placement source rotates the fixture placement value
+   and proves only Manager/fixture fencing shape. Label that evidence reference
+   only; do not claim downstream broker rejection or §53.1/§53.4 `PASS`.
+
+#### U10.4 — External runner, status, and evidence
+
+1. Add failing host-independent tests for the exact input schema, fixed argv,
+   provisioning preflight, status table, component PASS predicates, evidence
+   class/identity agreement, canonical artifact validator, atomic retention,
+   and cleanup-leak finalizer.
+2. Add an external RED run showing that the existing `workerd test` fixture and
+   three caller-supplied binary environment variables cannot satisfy the new
+   resource gate; retain the command and result.
+3. Implement the persistent private-socket fixture and run every real probe
+   under the manager/launcher/cgroup composition.
+4. `workerd.cpu-limit` passes only when exact `cpu.max` readback and an increase
+   in `cpu.stat` throttling are observed **and** an infinite Worker invocation
+   reaches the pinned Loader `cpuMs` failure within its own deadline while the
+   shard remains usable or is deterministically recycled.
+5. `workerd.rss-cold-start` passes only with at least five fresh-cgroup samples,
+   separate process RSS/cgroup charge, bounded start/ready timestamps, exact
+   identity, and a valid artifact; it records measurements rather than freezing
+   a product performance threshold.
+6. Run the three reconstruction probes independently and refuse aggregate PASS
+   when any one is missing, substituted, canceled, timed out, or not quiescent.
+
+#### U10.5 — Close the unit without widening readiness
+
+1. Run focused race/shuffle/repetition tests for `internal/agent`, the workerd
+   conformance harness, and `cmd/agentd`.
+2. Run the complete Go race/vet and TypeScript check/lint/unit gates.
+3. Run the explicit external gate on a provisioned host and retain the fresh
+   envelope and JSON view. If the boundary is unavailable, Unit 10 remains
+   incomplete.
+4. Update profiles, operator instructions, and `docs/acceptance.md` from that
+   retained evidence. Do not infer aggregate §53 `PASS` or change daemon
+   capabilities from unit/reference tests.
 
 ### Required evidence and exit criteria
 
 Unit 10 is complete only when all of the following are true:
 
-- host-independent tests pass under `go test -race` with shuffled/repeated
-  lifecycle cases;
-- the pinned stock workerd external fixture reports non-mock `PASS` for
-  `workerd.cpu-limit`, `workerd.rss-cold-start`, and
-  `workerd.shard-recycle`;
-- Dynamic Worker and whole-shard reconstruction both preserve durable identity
-  and reject stale placement authority;
-- no child process, process group, cgroup, goroutine, or file descriptor is
-  left owned after success, failure, cancellation, or concurrent shutdown;
-- the benchmark artifact and conformance report are canonical, bounded, and
-  digest-linked;
+- host-independent contract tests pass under `go test -race` with
+  shuffled/repeated lifecycle cases;
+- all five named Unit 10 results are non-mock external `PASS` from the same
+  release-, config-, host-, boot-, cgroup-, runner-, and run-bound envelope;
+- Dynamic Worker failure, pressure recycle, and explicit whole-shard kill each
+  reconstruct independently from an externally acknowledged checkpoint;
+- the reference placement-fencing shape is labeled mock/reference-only and
+  §53.1/§53.4 remain unpromoted;
+- after the enclosing final cleanup join, no child process, process group,
+  cgroup child, goroutine, or file descriptor remains owned;
+- the qualification envelope, resource artifact, and JSON view are canonical,
+  bounded, atomically retained, digest-linked, and semantically revalidated;
 - `cmd/agentd` still reports operational capabilities as `NOT_WIRED`, and
   production admission/readiness remains false;
-- `docs/acceptance.md` records exactly what ran, including any environment
-  limitation, without promoting mock/reference evidence.
+- `docs/acceptance.md` records exactly what ran, including environment limits,
+  without promoting mock/reference evidence.
 
 ## Commit boundaries
 
 Implementation commits remain independently reviewable and revertible:
 
-1. manager/launcher generation and readiness contract;
-2. cgroup observation and accounting;
-3. recycle/reconstruction lifecycle;
-4. external conformance and canonical evidence artifact;
-5. acceptance and operator documentation.
+1. release extraction pin and qualification input/evidence schemas;
+2. manager/launcher generation, waiter, and readiness contracts;
+3. cgroup/process observation and accounting;
+4. Dynamic Worker, pressure recycle, and shard-kill reconstruction contracts;
+5. persistent external runner and retained evidence;
+6. acceptance and operator documentation.
 
 Each implementation commit includes its preceding failing tests and the green
 result for that one work package. Cross-package changes are combined only when
-splitting them would leave an invalid protocol or lifecycle contract.
+splitting them would leave an invalid protocol, identity, or lifecycle
+contract.

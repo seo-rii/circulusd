@@ -33,10 +33,13 @@ Only `PASS` satisfies a required release profile. Development fakes and unit lau
 ## Planned qualification work
 
 Unit 10 is fixed in `docs/implementation-plan.md` as the Phase 0A workerd
-resource-qualification unit. It targets the remaining CPU-limit,
-RSS/cold-start, pressure/recycle, and Worker/shard reconstruction evidence while
-keeping `cmd/agentd` diagnostic-only. This is a plan, not executed evidence; it
-does not change any status in the table above.
+resource-qualification unit. It separates CPU enforcement, RSS/cold-start,
+Dynamic Worker reconstruction, pressure-driven shard recycle, and explicit
+shard-kill reconstruction into independently required results while keeping
+`cmd/agentd` diagnostic-only. Its Session/checkpoint/placement fixtures remain
+reference-only, so even a completed Unit 10 does not by itself satisfy §53.1 or
+§53.4. This is a plan, not executed evidence; it does not change any status in
+the table above.
 
 ## External qualification notes
 

@@ -276,6 +276,8 @@ context-free path metadata validation. The local `/run` convention assumes
 responsive local metadata, while a custom FUSE/NFS-backed path may block beyond
 the deadline and must not be treated as a bounded startup check.
 
+## ADR-014: Phase 0A resource qualification is not workload authority
+
 The Unit 10 Phase 0A qualification harness may compose the existing internal
 agent manager, workerd launcher, and cgroup controller to obtain real external
 resource evidence. That harness is not an `agentd` workload graph and creates no
@@ -288,3 +290,21 @@ Phase 0A mechanical cgroup evidence also does not claim that a same-UID workerd
 process cannot reopen delegated cgroup controls after a full process
 compromise. Production composition must isolate that authority or place the
 process inside a stronger outer boundary before it can become admission-ready.
+
+Session placement generation and a workerd process incarnation are separate
+domains. The former comes from Session state and fences workload requests; the
+manager owns a distinct monotonic shard generation for every OS start attempt.
+Phase 0A may exercise placement shape with a deterministic mock source, but
+only real Session authority and downstream broker checks can satisfy the stale
+model/tool/workspace/turn/SSE rejection contract.
+
+Shard readiness binds the workerd executable, static SessionHost/config,
+Loader ABI, release identity, and cgroup/process incarnation. Per-session
+Runtime Revision, Pi ABI, compatibility settings, module graph, stable
+bindings, and Worker ID are checked later at Dynamic Worker Loader admission.
+A shared shard therefore does not claim one per-session runtime identity.
+
+Retained Unit 10 resource evidence is run-, host-, boot-, release-, config-,
+cgroup-, and runner-bound historical evidence. It is not daemon startup
+authority and cannot be relabeled as a current result without a fresh run and
+semantic identity validation.
