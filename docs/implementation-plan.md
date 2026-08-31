@@ -48,6 +48,11 @@ not silently included in Unit 10.
   Release/package race tests, the API schema contract, and the complete Go test
   suite pass. Runtime extraction/opened-executable verification remains in the
   external-runner slice.
+- 2026-08-31: the resource fixture now renders only the pinned
+  `serve --experimental -I<fixture> <fixture>/phase0-resource.capnp` argument
+  vector from a short canonical absolute directory. Golden tests reject unsafe
+  paths and prove each call returns an unaliased fixed vector. Pinned-binary CLI
+  preflight and persistent socket materialization remain to be implemented.
 
 ### Outcome
 
