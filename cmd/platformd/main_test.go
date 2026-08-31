@@ -74,15 +74,19 @@ func blockingRecordingServer() *recordingServer {
 	return &recordingServer{closed: make(chan struct{})}
 }
 
-func TestPlatformdProductionDependenciesExcludeReferenceMemoryAPI(t *testing.T) {
+func TestPlatformdProductionDependenciesExcludeReferenceProviders(t *testing.T) {
 	command := exec.Command("go", "list", "-deps", ".")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list -deps: %v\n%s", err, output)
 	}
+	forbidden := map[string]struct{}{
+		"github.com/hancomac/circulusd/internal/fakeeffect":  {},
+		"github.com/hancomac/circulusd/internal/platformapi": {},
+	}
 	for _, dependency := range strings.Fields(string(output)) {
-		if dependency == "github.com/hancomac/circulusd/internal/platformapi" {
-			t.Fatalf("production dependency graph contains reference-memory package %q", dependency)
+		if _, denied := forbidden[dependency]; denied {
+			t.Fatalf("production dependency graph contains reference provider package %q", dependency)
 		}
 	}
 }
