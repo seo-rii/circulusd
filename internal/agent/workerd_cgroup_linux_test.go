@@ -96,10 +96,18 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 		wantErr error
 	}{
 		{name: "missing", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.ENOENT }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "missing device", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.ENODEV }, wantErr: errWorkerdCgroupUnavailable},
 		{name: "permission denied", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EACCES }, wantErr: errWorkerdCgroupContract},
 		{name: "operation not permitted", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EPERM }, wantErr: errWorkerdCgroupContract},
 		{name: "readonly", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EROFS }, wantErr: errWorkerdCgroupContract},
 		{name: "unsupported syscall", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.ENOSYS }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "unsupported operation", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EOPNOTSUPP }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "permission dominates missing", mutate: func(backend *fakeWorkerdCgroupBackend) {
+			backend.inspectErr = errors.Join(unix.ENOENT, unix.EACCES)
+		}, wantErr: errWorkerdCgroupContract},
+		{name: "integrity failure dominates missing", mutate: func(backend *fakeWorkerdCgroupBackend) {
+			backend.inspectErr = errors.Join(unix.ENOENT, unix.EIO)
+		}, wantErr: errWorkerdCgroupContract},
 		{name: "symlink escape", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EXDEV }, wantErr: errWorkerdCgroupContract},
 		{name: "foreign intermediate", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.Components[1].UID = 2001 }, wantErr: errWorkerdCgroupContract},
 		{name: "daemon-owned replaceable intermediate", mutate: func(backend *fakeWorkerdCgroupBackend) {
@@ -114,8 +122,15 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 		{name: "nonprivate mode", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.Components[3].Mode = unix.S_IFDIR | 0o750 }, wantErr: errWorkerdCgroupContract},
 		{name: "threaded root", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.CgroupType = "threaded\n" }, wantErr: errWorkerdCgroupContract},
 		{name: "root process", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.Processes = "123\n" }, wantErr: errWorkerdCgroupContract},
-		{name: "missing cpu controller", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.Controllers = "memory pids\n" }, wantErr: errWorkerdCgroupContract},
+		{name: "missing cpu controller", mutate: func(backend *fakeWorkerdCgroupBackend) {
+			backend.inspection.Controllers = "memory pids\n"
+			backend.inspection.SubtreeControl = "memory pids\n"
+		}, wantErr: errWorkerdCgroupUnavailable},
 		{name: "missing delegated pids controller", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.SubtreeControl = "cpu memory\n" }, wantErr: errWorkerdCgroupContract},
+		{name: "missing controller plus disabled available controller", mutate: func(backend *fakeWorkerdCgroupBackend) {
+			backend.inspection.Controllers = "memory pids\n"
+			backend.inspection.SubtreeControl = "memory\n"
+		}, wantErr: errWorkerdCgroupContract},
 		{name: "existing child cgroup", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.ChildDirectories = 1 }, wantErr: errWorkerdCgroupContract},
 	}
 	for _, test := range tests {
@@ -133,7 +148,39 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 	}
 }
 
-func TestClassifyWorkerdCgroupErrorSeparatesUnavailableHostFeaturesFromProvisioningFailures(t *testing.T) {
+func TestWorkerdCgroupProvisionedOpenFailuresNeverBecomeUnavailable(t *testing.T) {
+	for name, operationErr := range map[string]error{
+		"missing path":          unix.ENOENT,
+		"missing device":        unix.ENODEV,
+		"unsupported syscall":   unix.ENOSYS,
+		"unsupported operation": unix.EOPNOTSUPP,
+		"mixed missing integrity": errors.Join(
+			unix.ENOENT,
+			unix.EIO,
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			backend := newFakeWorkerdCgroupBackend()
+			controller, err := newWorkerdCgroupControllerWithBackend(validWorkerdCgroupConfig(), backend)
+			if err != nil {
+				t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
+			}
+			backend.openErr = operationErr
+			lease, prepareErr := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "post-provision-open", 1)
+			if lease != nil || !errors.Is(prepareErr, errWorkerdCgroupContract) || errors.Is(prepareErr, errWorkerdCgroupUnavailable) {
+				t.Fatalf("prepare() = %#v, %v, want nil, contract-only failure", lease, prepareErr)
+			}
+			if !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+				t.Fatalf("prepare() error = %v, want poisoned replacement fence", prepareErr)
+			}
+			if closeErr := controller.close(); !errors.Is(closeErr, errWorkerdCgroupPoisoned) {
+				t.Fatalf("close() error = %v, want cached poison", closeErr)
+			}
+		})
+	}
+}
+
+func TestClassifyWorkerdCgroupDiscoveryErrorSeparatesUnavailableHostFeaturesFromProvisioningFailures(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		errno   error
@@ -143,14 +190,17 @@ func TestClassifyWorkerdCgroupErrorSeparatesUnavailableHostFeaturesFromProvision
 		{name: "missing device", errno: unix.ENODEV, wantErr: errWorkerdCgroupUnavailable},
 		{name: "unsupported syscall", errno: unix.ENOSYS, wantErr: errWorkerdCgroupUnavailable},
 		{name: "unsupported operation", errno: unix.EOPNOTSUPP, wantErr: errWorkerdCgroupUnavailable},
+		{name: "wrapped missing path", errno: fmt.Errorf("wrapped: %w", unix.ENOENT), wantErr: errWorkerdCgroupUnavailable},
+		{name: "multiple unavailable leaves", errno: errors.Join(unix.ENOENT, unix.ENOSYS), wantErr: errWorkerdCgroupUnavailable},
 		{name: "permission denied", errno: unix.EACCES, wantErr: errWorkerdCgroupContract},
 		{name: "operation not permitted", errno: unix.EPERM, wantErr: errWorkerdCgroupContract},
 		{name: "readonly provisioned root", errno: unix.EROFS, wantErr: errWorkerdCgroupContract},
 		{name: "permission dominates missing path", errno: errors.Join(unix.ENOENT, unix.EACCES), wantErr: errWorkerdCgroupContract},
 		{name: "readonly dominates unsupported syscall", errno: errors.Join(unix.ENOSYS, unix.EROFS), wantErr: errWorkerdCgroupContract},
+		{name: "integrity dominates missing path", errno: errors.Join(unix.ENOENT, unix.EIO), wantErr: errWorkerdCgroupContract},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := classifyWorkerdCgroupError("test cgroup operation", test.errno)
+			err := classifyWorkerdCgroupError(workerdCgroupErrorScopeDiscovery, "test cgroup discovery", test.errno)
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("classifyWorkerdCgroupError(%v) = %v, want %v", test.errno, err, test.wantErr)
 			}
@@ -162,6 +212,39 @@ func TestClassifyWorkerdCgroupErrorSeparatesUnavailableHostFeaturesFromProvision
 				t.Fatalf("classifyWorkerdCgroupError(%v) also matches %v", test.errno, other)
 			}
 		})
+	}
+}
+
+func TestClassifyWorkerdCgroupProvisionedErrorRejectsRawUnavailableErrnos(t *testing.T) {
+	for name, operationErr := range map[string]error{
+		"missing path":          unix.ENOENT,
+		"missing device":        unix.ENODEV,
+		"unsupported syscall":   unix.ENOSYS,
+		"unsupported operation": unix.EOPNOTSUPP,
+		"wrapped missing path":  fmt.Errorf("wrapped: %w", unix.ENOENT),
+		"joined unavailable":    errors.Join(unix.ENOENT, unix.ENOSYS),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := classifyWorkerdCgroupError(workerdCgroupErrorScopeProvisioned, "test provisioned cgroup operation", operationErr)
+			if !errors.Is(err, errWorkerdCgroupContract) || errors.Is(err, errWorkerdCgroupUnavailable) {
+				t.Fatalf("classifyWorkerdCgroupError(%v) = %v, want contract-only failure", operationErr, err)
+			}
+		})
+	}
+}
+
+func TestClassifyWorkerdCgroupErrorPreservesKnownContractDominance(t *testing.T) {
+	classified := classifyWorkerdCgroupError(
+		workerdCgroupErrorScopeDiscovery,
+		"test joined sentinels",
+		errors.Join(errWorkerdCgroupUnavailable, errWorkerdCgroupContract),
+	)
+	if !errors.Is(classified, errWorkerdCgroupUnavailable) || !errors.Is(classified, errWorkerdCgroupContract) {
+		t.Fatalf("classifyWorkerdCgroupError(joined sentinels) = %v, want both sentinels preserved", classified)
+	}
+	availability := workerdCgroupAvailabilityForError(classified, workerdCgroupEvidence{ReferenceOnly: true})
+	if availability.Status != "FAILED" || availability.Available {
+		t.Fatalf("availability = %+v, want FAILED contract dominance", availability)
 	}
 }
 
@@ -1411,9 +1494,9 @@ func TestWorkerdCgroupAvailabilityIsNotRunWithoutMutatingHost(t *testing.T) {
 func TestWorkerdCgroupAvailabilityDoesNotLaunderProvisioningFailuresAsNotRun(t *testing.T) {
 	evidence := workerdCgroupEvidence{ReferenceOnly: true}
 	for name, classified := range map[string]error{
-		"permission denied":           classifyWorkerdCgroupError("inspect delegated root", unix.EACCES),
-		"operation not permitted":     classifyWorkerdCgroupError("inspect delegated root", unix.EPERM),
-		"readonly root":               classifyWorkerdCgroupError("inspect delegated root", unix.EROFS),
+		"permission denied":           classifyWorkerdCgroupError(workerdCgroupErrorScopeDiscovery, "inspect delegated root", unix.EACCES),
+		"operation not permitted":     classifyWorkerdCgroupError(workerdCgroupErrorScopeDiscovery, "inspect delegated root", unix.EPERM),
+		"readonly root":               classifyWorkerdCgroupError(workerdCgroupErrorScopeDiscovery, "inspect delegated root", unix.EROFS),
 		"joined contract unavailable": errors.Join(errWorkerdCgroupContract, errWorkerdCgroupUnavailable),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1505,6 +1588,7 @@ type fakeWorkerdCgroupBackend struct {
 	replaceOnReadback    string
 	writeFailures        map[string]int
 	openFailures         int
+	openErr              error
 	removeFailures       int
 	mkdirCalls           int
 	mkdirModes           []uint32
@@ -1648,6 +1732,9 @@ func (backend *fakeWorkerdCgroupBackend) mkdirExclusive(_ int, name string, mode
 func (backend *fakeWorkerdCgroupBackend) openChild(_ int, name string) (int, workerdCgroupIdentity, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
+	if backend.openErr != nil {
+		return -1, workerdCgroupIdentity{}, backend.openErr
+	}
 	if backend.openFailures > 0 {
 		backend.openFailures--
 		return -1, workerdCgroupIdentity{}, unix.EIO

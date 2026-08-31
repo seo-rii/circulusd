@@ -141,6 +141,15 @@ not silently included in Unit 10.
   loss and U10.4 external status mapping remain. Constructor,
   direct-classifier, mixed-error, availability, agent, and conformance race
   tests pass.
+- 2026-09-01: every cgroup syscall classification now names either delegated-
+  root discovery or an operation on an already provisioned boundary. Only a
+  discovery error tree made entirely of genuine absence/unsupported errno
+  leaves is unavailable; mkdir, open, read, write, sample, destroy, and close
+  failures after construction fail the contract. A missing required controller
+  is distinct from an available controller the operator failed to enable, and
+  provisioning or contradictory states dominate absence. Scoped classifier,
+  controller matrix, real prepare-path, complete agent race, repository test,
+  and vet gates pass. U10.4 external result mapping remains.
 
 ### Outcome
 
@@ -546,11 +555,11 @@ fences.
 #### U10.2 — Generation-bound resource observation
 
 Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
-generation baselines, `(pid,startTicks)` RSS reads, and permission/read-only
-dominance in the low-level classifier are implemented. Operation-scoped host
-absence versus post-provision path loss, controller availability versus
-enablement, pidfd ownership, launcher attachment, serialized sequences, Manager
-delivery, and evidence-artifact status mapping remain.
+generation baselines, `(pid,startTicks)` RSS reads, permission/read-only
+dominance, operation-scoped host absence versus post-provision path loss, and
+controller availability versus enablement are implemented. pidfd ownership,
+launcher attachment, serialized sequences, Manager delivery, and
+evidence-artifact status mapping remain.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include
