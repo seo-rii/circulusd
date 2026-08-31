@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/text/unicode/norm"
 )
@@ -16,25 +17,11 @@ const (
 	maximumSessionIdentifierBytes = 256
 )
 
-// SessionEventReaderEvidence is a fail-closed production capability claim.
-// A reader may set AuthoritativeSessionJournal only when it reads the
-// crash-durable Session aggregate journal whose transaction enforces the
-// journal's global ordering invariants. That includes validating any migrated
-// aggregate and the complete journal before selecting a partial page, so a
-// page does not need an attacker-controlled prefix summary.
-// AtomicAuthorizationGenerationFence means the permit generation is compared
-// with authoritative Session state in the same transaction as the page read.
-type SessionEventReaderEvidence struct {
-	CrashDurable                       bool
-	AuthoritativeSessionJournal        bool
-	AtomicAuthorizationGenerationFence bool
-	ReferenceOnly                      bool
-}
-
 // SessionEventPageReader is deliberately read-only. Implementations must not
-// expose an append or mutation operation through this authority boundary.
+// expose an append or mutation operation through this authority boundary. The
+// live probe must be served by the same concrete reader that handles requests.
 type SessionEventPageReader interface {
-	SessionEventReaderEvidence() SessionEventReaderEvidence
+	dependency.ProductionProbe
 	ReadSessionEventPage(context.Context, AuthorizedSessionEventPageRequest) (SessionPublicEventPage, error)
 }
 
@@ -108,7 +95,7 @@ type SessionPublicEventPage struct {
 }
 
 type SessionEventServiceConfig struct {
-	Reader            SessionEventPageReader
+	Reader            dependency.Verified[SessionEventPageReader]
 	Authorizer        Authorizer
 	MaximumPageEvents int
 }
@@ -120,26 +107,29 @@ type SessionEventService struct {
 }
 
 func NewSessionEventService(config SessionEventServiceConfig) (*SessionEventService, error) {
-	if config.Reader == nil || config.Authorizer == nil ||
-		config.MaximumPageEvents < 1 || config.MaximumPageEvents > maximumSessionEventPageEvents {
+	if config.Authorizer == nil || config.MaximumPageEvents < 1 ||
+		config.MaximumPageEvents > maximumSessionEventPageEvents {
 		return nil, ErrInvalidConfig
 	}
-	for _, dependency := range []any{config.Reader, config.Authorizer} {
-		value := reflect.ValueOf(dependency)
-		switch value.Kind() {
-		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-			if value.IsNil() {
-				return nil, ErrInvalidConfig
-			}
+	value := reflect.ValueOf(config.Authorizer)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return nil, ErrInvalidConfig
 		}
 	}
-	evidence := config.Reader.SessionEventReaderEvidence()
-	if !evidence.CrashDurable || !evidence.AuthoritativeSessionJournal ||
-		!evidence.AtomicAuthorizationGenerationFence || evidence.ReferenceOnly {
+	reader, _, err := config.Reader.Open()
+	if err != nil {
+		return nil, ErrRepositoryNotDurable
+	}
+	if _, err := dependency.RequireAtomicDomain([]dependency.AtomicGroup{
+		dependency.AtomicCommandReceipt,
+		dependency.AtomicEffectLifecycle,
+	}, config.Reader); err != nil {
 		return nil, ErrRepositoryNotDurable
 	}
 	return &SessionEventService{
-		reader: config.Reader, authorizer: config.Authorizer,
+		reader: reader, authorizer: config.Authorizer,
 		maximumPageEvents: config.MaximumPageEvents,
 	}, nil
 }

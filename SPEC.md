@@ -4909,6 +4909,26 @@ response descriptor를 evidence와 exact-equal 비교한 뒤 runtime root로 sig
 검증한다. 한 verifier는 최대 4096개의 burned challenge만 발급하고, canceled probe가
 return한 뒤에는 verified seal을 만들지 않는다.
 
+production graph는 이 proof를 raw client와 별도로 전달하거나 durability boolean으로
+재서술하지 않는다. Session event reader와 dispatch-start claimer는 각각 자신의 좁은
+operational interface에 `ProductionProbe`를 함께 구현하고, private immutable
+`stateappclient.Client` 하나로 operation과 probe를 모두 forward한다. probe 뒤에 client,
+origin, route 또는 backend를 교체하는 setter/wrapper는 production adapter가 될 수 없다.
+verifier는 이 exact adapter object를 seal하고, public Session/broker consumer constructor는
+각각 `Verified[SessionEventPageReader]`와 `Verified[DispatchStartClaimer]`만 받는다.
+self-reported crash durability, authoritative journal 또는 atomic fence boolean은 production
+admission 근거가 아니다.
+
+각 consumer는 caller가 verification 때 선택한 최소 요구사항을 그대로 신뢰하지 않고,
+seal을 `Open`한 뒤 `command-receipt`와 `effect-lifecycle`을 자신의 고정 policy로 다시
+`RequireAtomicDomain`한다. 두 adapter를 하나의 platform graph에 함께 넣을 때도 두 seal을
+한 번에 검사해 transaction domain과 conformance identity가 같은지 확인하고, bootstrap
+factory는 두 adapter를 동일한 exact client에서만 만든다. zero/invalid seal, group 부족
+또는 domain mismatch는 authorization, state read,
+claim이나 provider start 전에 실패해야 한다. reference-memory helper는 production
+constructor와 같은 exported raw 경로를 제공하지 않는다. process restart나 celld/state-app
+교체는 기존 adapter, seal과 consumer graph 전체를 폐기하고 새 challenge로 다시 구성한다.
+
 repository의 client/contract 구현만으로 celld 지원을 가정하지 않는다. pinned celld가
 이 native signer와 immutable provenance를 실제 제공하고 process restart 때 기존 graph를
 폐기하는 통합 conformance가 통과하기 전까지 `state.celld`는 `NOT_WIRED`를 유지한다.

@@ -3,12 +3,80 @@ package broker
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/dependency"
+	dependencycontract "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/identity"
 )
+
+func TestNewDispatchConsumerRequiresVerifiedProductionClaimer(t *testing.T) {
+	t.Parallel()
+
+	constructor := reflect.TypeOf(NewDispatchConsumer)
+	want := reflect.TypeOf(dependency.Verified[DispatchStartClaimer]{})
+	if first := constructor.In(0); first != want {
+		t.Fatalf("NewDispatchConsumer first parameter = %v, want %v", first, want)
+	}
+}
+
+func TestNewDispatchConsumerRejectsUnverifiedOrInsufficientAtomicDomainBeforeRawDependencies(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		verified func(*testing.T, *productionDispatchStartClaimer) dependency.Verified[DispatchStartClaimer]
+	}{
+		{
+			name: "zero verified claimer",
+			verified: func(*testing.T, *productionDispatchStartClaimer) dependency.Verified[DispatchStartClaimer] {
+				return dependency.Verified[DispatchStartClaimer]{}
+			},
+		},
+		{
+			name: "command receipt without effect lifecycle",
+			verified: func(t *testing.T, claimer *productionDispatchStartClaimer) dependency.Verified[DispatchStartClaimer] {
+				proofs := dependencycontract.NewProductionProofs(t, []dependency.AtomicGroup{
+					dependency.AtomicCommandReceipt,
+				})
+				claimer.ProductionProofs = proofs
+				return dependencycontract.Verify(
+					t,
+					proofs,
+					DispatchStartClaimer(claimer),
+					[]dependency.AtomicGroup{dependency.AtomicCommandReceipt},
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			claimer := &productionDispatchStartClaimer{}
+			starter := &boundaryDispatchStarter{}
+			verified := test.verified(t, claimer)
+			consumer, err := NewDispatchConsumer(
+				verified,
+				map[EffectService]DispatchStarter{ServiceExecutor: starter},
+				time.Second,
+			)
+			if consumer != nil || !errors.Is(err, ErrDurabilityBarrier) {
+				t.Fatalf("NewDispatchConsumer() = %#v, %v; want nil/ErrDurabilityBarrier", consumer, err)
+			}
+			if claimer.claims.Load() != 0 || starter.routes.Load() != 0 || starter.starts.Load() != 0 {
+				t.Fatalf(
+					"raw dependency calls = claim:%d route:%d start:%d, want all zero",
+					claimer.claims.Load(), starter.routes.Load(), starter.starts.Load(),
+				)
+			}
+		})
+	}
+}
 
 func TestConcurrentStartExactAttemptClaimsAndStartsOnce(t *testing.T) {
 	t.Parallel()
@@ -23,7 +91,7 @@ func TestConcurrentStartExactAttemptClaimsAndStartsOnce(t *testing.T) {
 		t.Fatalf("AdmitDispatch() error = %v", err)
 	}
 	starter := &recordingDispatchStarter{}
-	consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{
+	consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{
 		ServiceExecutor: starter,
 	}, time.Second)
 	if err != nil {
@@ -85,7 +153,7 @@ func TestDispatchConsumerAcceptsNarrowClaimerAndValidatesItsDurableReceipt(t *te
 	}}
 	starter := &recordingDispatchStarter{routeDigest: routeDigest}
 	consumer, err := NewDispatchConsumer(
-		claimer,
+		verifiedDispatchStartClaimer(t, claimer),
 		map[EffectService]DispatchStarter{ServiceExecutor: starter},
 		time.Second,
 	)
@@ -109,7 +177,7 @@ func TestDispatchConsumerAcceptsNarrowClaimerAndValidatesItsDurableReceipt(t *te
 
 	claimer.claim.Permit.Durable = false
 	consumer, err = NewDispatchConsumer(
-		claimer,
+		verifiedDispatchStartClaimer(t, claimer),
 		map[EffectService]DispatchStarter{ServiceExecutor: starter},
 		time.Second,
 	)
@@ -148,7 +216,7 @@ func TestDispatchConsumerRejectsInvalidConfigurationBeforeClaim(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if consumer, err := NewDispatchConsumer(coordinator, test.starters, test.timeout); err == nil || consumer != nil {
+			if consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), test.starters, test.timeout); err == nil || consumer != nil {
 				t.Fatalf("NewDispatchConsumer() = %#v, %v; want rejection", consumer, err)
 			}
 		})
@@ -175,7 +243,7 @@ func TestDispatchConsumerCopiesStarterRegistryBeforeUse(t *testing.T) {
 	selected := &recordingDispatchStarter{}
 	replacement := &recordingDispatchStarter{}
 	starters := map[EffectService]DispatchStarter{ServiceExecutor: selected}
-	consumer, err := NewDispatchConsumer(coordinator, starters, time.Second)
+	consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), starters, time.Second)
 	if err != nil {
 		t.Fatalf("NewDispatchConsumer() error = %v", err)
 	}
@@ -209,7 +277,7 @@ func TestDispatchConsumerRejectsRewiredStarterRouteBeforeClaim(t *testing.T) {
 	}
 	starter := &recordingDispatchStarter{routeDigest: digest(153)}
 	consumer, err := NewDispatchConsumer(
-		coordinator,
+		verifiedDispatchStartClaimer(t, coordinator),
 		map[EffectService]DispatchStarter{ServiceExecutor: starter},
 		time.Second,
 	)
@@ -248,7 +316,7 @@ func TestDispatchStartClaimResponseLossAndRestartNeverReachStarter(t *testing.T)
 	store.loseDispatchStartResponseOnce = true
 	store.mu.Unlock()
 	starter := &recordingDispatchStarter{}
-	consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+	consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 	if err != nil {
 		t.Fatalf("NewDispatchConsumer() error = %v", err)
 	}
@@ -258,7 +326,7 @@ func TestDispatchStartClaimResponseLossAndRestartNeverReachStarter(t *testing.T)
 		t.Fatalf("first StartExactAttempt() = %#v, %v; want lost durable response", execution, startErr)
 	}
 	restarted := mustCoordinator(t, store, nil)
-	restartedConsumer, err := NewDispatchConsumer(restarted, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+	restartedConsumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, restarted), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 	if err != nil {
 		t.Fatalf("NewDispatchConsumer(restart) error = %v", err)
 	}
@@ -289,7 +357,7 @@ func TestStarterErrorIsUnknownAndNeverRetried(t *testing.T) {
 		t.Fatalf("AdmitDispatch() error = %v", err)
 	}
 	starter := &recordingDispatchStarter{err: errors.New("response lost after possible send")}
-	consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+	consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 	if err != nil {
 		t.Fatalf("NewDispatchConsumer() error = %v", err)
 	}
@@ -327,7 +395,7 @@ func TestFreshClaimDecouplesBoundedStarterContextFromCallerCancellation(t *testi
 	store.afterFreshDispatchStartClaim = cancel
 	store.mu.Unlock()
 	starter := &recordingDispatchStarter{}
-	consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+	consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 	if err != nil {
 		t.Fatalf("NewDispatchConsumer() error = %v", err)
 	}
@@ -423,7 +491,7 @@ func TestMalformedDispatchStartReceiptNeverReachesStarter(t *testing.T) {
 			store.corruptDispatchStartReceipt = test.mutate
 			store.mu.Unlock()
 			starter := &recordingDispatchStarter{}
-			consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+			consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 			if err != nil {
 				t.Fatalf("NewDispatchConsumer() error = %v", err)
 			}
@@ -554,7 +622,7 @@ func TestAbortAndElapsedDeadlinePreventClaimAndStarter(t *testing.T) {
 				t.Fatalf("AdmitDispatch() error = %v", err)
 			}
 			starter := &recordingDispatchStarter{}
-			consumer, err := NewDispatchConsumer(coordinator, map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
+			consumer, err := NewDispatchConsumer(verifiedDispatchStartClaimer(t, coordinator), map[EffectService]DispatchStarter{ServiceExecutor: starter}, time.Second)
 			if err != nil {
 				t.Fatalf("NewDispatchConsumer() error = %v", err)
 			}
@@ -881,6 +949,59 @@ func TestReadTurnDeepCopiesDispatchStartMetadata(t *testing.T) {
 		second.ActiveEffect.LastDispatch.Start.Dispatch.Operation != dispatch.Operation {
 		t.Fatalf("stored dispatch metadata was mutated through a read snapshot: %#v", second.ActiveEffect.LastDispatch)
 	}
+}
+
+func verifiedDispatchStartClaimer(
+	t testing.TB,
+	claimer rawDispatchStartClaimer,
+) dependency.Verified[DispatchStartClaimer] {
+	t.Helper()
+	atomicGroups := []dependency.AtomicGroup{
+		dependency.AtomicCommandReceipt,
+		dependency.AtomicEffectLifecycle,
+	}
+	proofs := dependencycontract.NewProductionProofs(t, atomicGroups)
+	productionClaimer := DispatchStartClaimer(&productionDispatchStartClaimer{
+		ProductionProofs: proofs,
+		claimer:          claimer,
+	})
+	return dependencycontract.Verify(t, proofs, productionClaimer, atomicGroups)
+}
+
+type productionDispatchStartClaimer struct {
+	*dependencycontract.ProductionProofs
+	claimer rawDispatchStartClaimer
+	claims  atomic.Int64
+}
+
+type rawDispatchStartClaimer interface {
+	ClaimDispatchStart(context.Context, DispatchStartRequest) (DispatchStartClaim, error)
+}
+
+func (claimer *productionDispatchStartClaimer) ClaimDispatchStart(
+	ctx context.Context,
+	request DispatchStartRequest,
+) (DispatchStartClaim, error) {
+	claimer.claims.Add(1)
+	if claimer.claimer == nil {
+		return DispatchStartClaim{}, ErrDurabilityBarrier
+	}
+	return claimer.claimer.ClaimDispatchStart(ctx, request)
+}
+
+type boundaryDispatchStarter struct {
+	routes atomic.Int64
+	starts atomic.Int64
+}
+
+func (starter *boundaryDispatchStarter) RouteDigest() Digest {
+	starter.routes.Add(1)
+	return digest(152)
+}
+
+func (starter *boundaryDispatchStarter) Start(context.Context, DispatchStartPermit) error {
+	starter.starts.Add(1)
+	return nil
 }
 
 type recordingDispatchStarter struct {

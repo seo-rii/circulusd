@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/hancomac/circulusd/internal/dependency"
+	dependencycontract "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/platformapi"
 )
 
@@ -45,16 +48,30 @@ func (authorizer *stateEventAuthorizer) Authorize(
 }
 
 type stateEventReader struct {
-	mu       sync.Mutex
-	evidence platformapi.SessionEventReaderEvidence
-	page     platformapi.SessionPublicEventPage
-	err      error
-	request  platformapi.AuthorizedSessionEventPageRequest
-	calls    int
+	mu      sync.Mutex
+	page    platformapi.SessionPublicEventPage
+	err     error
+	request platformapi.AuthorizedSessionEventPageRequest
+	calls   int
 }
 
-func (reader *stateEventReader) SessionEventReaderEvidence() platformapi.SessionEventReaderEvidence {
-	return reader.evidence
+type stateEventPageReader interface {
+	ReadSessionEventPage(
+		context.Context,
+		platformapi.AuthorizedSessionEventPageRequest,
+	) (platformapi.SessionPublicEventPage, error)
+}
+
+type productionStateEventPageReader struct {
+	*dependencycontract.ProductionProofs
+	reader stateEventPageReader
+}
+
+func (reader *productionStateEventPageReader) ReadSessionEventPage(
+	ctx context.Context,
+	request platformapi.AuthorizedSessionEventPageRequest,
+) (platformapi.SessionPublicEventPage, error) {
+	return reader.reader.ReadSessionEventPage(ctx, request)
 }
 
 func (reader *stateEventReader) ReadSessionEventPage(
@@ -66,14 +83,6 @@ func (reader *stateEventReader) ReadSessionEventPage(
 	reader.request = request
 	reader.calls++
 	return reader.page, reader.err
-}
-
-func productionStateEventEvidence() platformapi.SessionEventReaderEvidence {
-	return platformapi.SessionEventReaderEvidence{
-		CrashDurable:                       true,
-		AuthoritativeSessionJournal:        true,
-		AtomicAuthorizationGenerationFence: true,
-	}
 }
 
 func stateEventPermit(generation uint64) platformapi.AuthorizationPermit {
@@ -105,12 +114,23 @@ func stateEventRequest(after uint64, limit int) platformapi.ReadSessionEventPage
 
 func newStateEventService(
 	t *testing.T,
-	reader platformapi.SessionEventPageReader,
+	reader stateEventPageReader,
 	authorizer platformapi.Authorizer,
 ) *platformapi.SessionEventService {
 	t.Helper()
+	groups := []dependency.AtomicGroup{
+		dependency.AtomicCommandReceipt,
+		dependency.AtomicEffectLifecycle,
+	}
+	proofs := dependencycontract.NewProductionProofs(t, groups)
+	verified := dependencycontract.Verify[platformapi.SessionEventPageReader](
+		t,
+		proofs,
+		&productionStateEventPageReader{ProductionProofs: proofs, reader: reader},
+		groups,
+	)
 	service, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-		Reader: reader, Authorizer: authorizer, MaximumPageEvents: 16,
+		Reader: verified, Authorizer: authorizer, MaximumPageEvents: 16,
 	})
 	if err != nil {
 		t.Fatalf("NewSessionEventService() error = %v", err)
@@ -118,46 +138,70 @@ func newStateEventService(
 	return service
 }
 
-func TestSessionEventServiceRejectsNilReferenceAndIncompleteReaders(t *testing.T) {
+func TestSessionEventServiceConfigRequiresVerifiedProductionReader(t *testing.T) {
 	t.Parallel()
-	authorizer := &stateEventAuthorizer{}
 
-	for name, reader := range map[string]platformapi.SessionEventPageReader{
-		"crash durability": &stateEventReader{evidence: platformapi.SessionEventReaderEvidence{
-			AuthoritativeSessionJournal: true, AtomicAuthorizationGenerationFence: true,
-		}},
-		"authoritative journal": &stateEventReader{evidence: platformapi.SessionEventReaderEvidence{
-			CrashDurable: true, AtomicAuthorizationGenerationFence: true,
-		}},
-		"atomic generation fence": &stateEventReader{evidence: platformapi.SessionEventReaderEvidence{
-			CrashDurable: true, AuthoritativeSessionJournal: true,
-		}},
-		"reference only": &stateEventReader{evidence: platformapi.SessionEventReaderEvidence{
-			CrashDurable: true, AuthoritativeSessionJournal: true,
-			AtomicAuthorizationGenerationFence: true, ReferenceOnly: true,
-		}},
-	} {
-		t.Run(name, func(t *testing.T) {
+	field, ok := reflect.TypeOf(platformapi.SessionEventServiceConfig{}).FieldByName("Reader")
+	want := reflect.TypeOf(dependency.Verified[platformapi.SessionEventPageReader]{})
+	if !ok || field.Type != want {
+		t.Fatalf("SessionEventServiceConfig.Reader = %v, want %v", field.Type, want)
+	}
+}
+
+func TestSessionEventServiceRejectsUnverifiedOrInsufficientAtomicDomainBeforeCalls(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		verified func(*testing.T, stateEventPageReader) dependency.Verified[platformapi.SessionEventPageReader]
+	}{
+		{
+			name: "zero seal",
+			verified: func(*testing.T, stateEventPageReader) dependency.Verified[platformapi.SessionEventPageReader] {
+				return dependency.Verified[platformapi.SessionEventPageReader]{}
+			},
+		},
+		{
+			name: "command receipt without effect lifecycle",
+			verified: func(t *testing.T, reader stateEventPageReader) dependency.Verified[platformapi.SessionEventPageReader] {
+				groups := []dependency.AtomicGroup{dependency.AtomicCommandReceipt}
+				proofs := dependencycontract.NewProductionProofs(t, groups)
+				return dependencycontract.Verify[platformapi.SessionEventPageReader](
+					t,
+					proofs,
+					&productionStateEventPageReader{ProductionProofs: proofs, reader: reader},
+					groups,
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-				Reader: reader, Authorizer: authorizer, MaximumPageEvents: 16,
+
+			reader := &stateEventReader{}
+			authorizer := &stateEventAuthorizer{}
+			service, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
+				Reader: test.verified(t, reader), Authorizer: authorizer, MaximumPageEvents: 16,
 			})
-			if !errors.Is(err, platformapi.ErrRepositoryNotDurable) {
-				t.Fatalf("NewSessionEventService() error = %v, want ErrRepositoryNotDurable", err)
+			if service != nil || !errors.Is(err, platformapi.ErrRepositoryNotDurable) {
+				t.Fatalf("NewSessionEventService() = (%#v, %v), want nil/ErrRepositoryNotDurable", service, err)
+			}
+			if authorizer.calls != 0 || reader.calls != 0 {
+				t.Fatalf("constructor dependency calls = authorize:%d read:%d, want zero", authorizer.calls, reader.calls)
 			}
 		})
 	}
+}
 
-	var nilReader *stateEventReader
-	_, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-		Reader: nilReader, Authorizer: authorizer, MaximumPageEvents: 16,
-	})
-	if !errors.Is(err, platformapi.ErrInvalidConfig) {
-		t.Fatalf("NewSessionEventService(typed nil reader) error = %v, want ErrInvalidConfig", err)
-	}
+func TestSessionEventServiceRejectsInvalidConfigBeforeOpeningReader(t *testing.T) {
+	t.Parallel()
+
+	var zero dependency.Verified[platformapi.SessionEventPageReader]
+
 	var nilAuthorizer *stateEventAuthorizer
-	_, err = platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-		Reader:     &stateEventReader{evidence: productionStateEventEvidence()},
+	_, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
+		Reader:     zero,
 		Authorizer: nilAuthorizer, MaximumPageEvents: 16,
 	})
 	if !errors.Is(err, platformapi.ErrInvalidConfig) {
@@ -165,8 +209,7 @@ func TestSessionEventServiceRejectsNilReferenceAndIncompleteReaders(t *testing.T
 	}
 	for _, maximum := range []int{0, 257} {
 		_, err = platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-			Reader:     &stateEventReader{evidence: productionStateEventEvidence()},
-			Authorizer: authorizer, MaximumPageEvents: maximum,
+			Reader: zero, Authorizer: &stateEventAuthorizer{}, MaximumPageEvents: maximum,
 		})
 		if !errors.Is(err, platformapi.ErrInvalidConfig) {
 			t.Fatalf("NewSessionEventService(maximum %d) error = %v, want ErrInvalidConfig", maximum, err)
@@ -179,8 +222,7 @@ func TestSessionEventPageAuthorizationIsExactAndRefencedAgainByReader(t *testing
 	permit := stateEventPermit(41)
 	authorizer := &stateEventAuthorizer{permit: permit}
 	reader := &stateEventReader{
-		evidence: productionStateEventEvidence(),
-		page:     emptyStateEventPage(),
+		page: emptyStateEventPage(),
 	}
 	service := newStateEventService(t, reader, authorizer)
 
@@ -230,7 +272,7 @@ func TestSessionPublicEventPageJSONShapeMatchesStateApp(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			reader := &stateEventReader{evidence: productionStateEventEvidence(), page: test.page}
+			reader := &stateEventReader{page: test.page}
 			service := newStateEventService(t, reader, &stateEventAuthorizer{})
 			result, err := service.ReadSessionEventPage(context.Background(), test.request)
 			if err != nil {
@@ -274,9 +316,7 @@ func TestSessionEventPageRejectsForgedAuthorizationBeforeReader(t *testing.T) {
 			t.Parallel()
 			forged := valid
 			mutate(&forged)
-			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(), page: emptyStateEventPage(),
-			}
+			reader := &stateEventReader{page: emptyStateEventPage()}
 			service := newStateEventService(t, reader, &stateEventAuthorizer{permit: forged})
 			_, err := service.ReadSessionEventPage(context.Background(), stateEventRequest(0, 1))
 			if !errors.Is(err, platformapi.ErrAccessDenied) {
@@ -306,9 +346,7 @@ func TestSessionEventPageMapsReaderErrorsWithoutLeakingInternals(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(), err: test.readerError,
-			}
+			reader := &stateEventReader{err: test.readerError}
 			service := newStateEventService(t, reader, &stateEventAuthorizer{})
 			_, err := service.ReadSessionEventPage(context.Background(), stateEventRequest(0, 1))
 			if !errors.Is(err, test.want) {
@@ -324,9 +362,7 @@ func TestSessionEventPageMapsReaderErrorsWithoutLeakingInternals(t *testing.T) {
 func TestSessionEventPageValidatesInputAndResponseBounds(t *testing.T) {
 	t.Parallel()
 	validReader := func() *stateEventReader {
-		return &stateEventReader{
-			evidence: productionStateEventEvidence(), page: emptyStateEventPage(),
-		}
+		return &stateEventReader{page: emptyStateEventPage()}
 	}
 	for name, request := range map[string]platformapi.ReadSessionEventPageRequest{
 		"invalid principal": {
@@ -412,7 +448,7 @@ func TestSessionEventPageValidatesInputAndResponseBounds(t *testing.T) {
 			case "sequence overlap":
 				request.AfterSequence = 1
 			}
-			reader := &stateEventReader{evidence: productionStateEventEvidence(), page: page}
+			reader := &stateEventReader{page: page}
 			service := newStateEventService(t, reader, &stateEventAuthorizer{})
 			_, err := service.ReadSessionEventPage(context.Background(), request)
 			if !errors.Is(err, platformapi.ErrRepositoryFailure) {
@@ -443,7 +479,7 @@ func TestSessionEventPageValidatesSnapshotAndEveryEventFamily(t *testing.T) {
 			{Sequence: 7, Type: platformapi.EventTurnCompleted, TurnID: "turn-one", TurnSequence: 0},
 		},
 	}
-	reader := &stateEventReader{evidence: productionStateEventEvidence(), page: page}
+	reader := &stateEventReader{page: page}
 	service := newStateEventService(t, reader, &stateEventAuthorizer{})
 	got, err := service.ReadSessionEventPage(context.Background(), stateEventRequest(0, 16))
 	if err != nil {
@@ -547,7 +583,6 @@ func TestSessionEventPageRejectsMalformedFamilyMetadataAndCausality(t *testing.T
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(),
 				page: platformapi.SessionPublicEventPage{
 					Snapshot: platformapi.SessionPublicEventSnapshot{
 						SessionID: stateEventSessionID, LastEventSequence: uint64(len(events)),
@@ -576,8 +611,7 @@ func TestSessionEventPageRejectsMalformedFamilyMetadataAndCausality(t *testing.T
 		t.Run("snapshot "+name, func(t *testing.T) {
 			t.Parallel()
 			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(),
-				page:     platformapi.SessionPublicEventPage{Snapshot: snapshot},
+				page: platformapi.SessionPublicEventPage{Snapshot: snapshot},
 			}
 			service := newStateEventService(t, reader, &stateEventAuthorizer{})
 			_, err := service.ReadSessionEventPage(context.Background(), stateEventRequest(0, 1))
@@ -591,7 +625,6 @@ func TestSessionEventPageRejectsMalformedFamilyMetadataAndCausality(t *testing.T
 func TestSessionEventPageAllowsPartialPageWhoseAcceptancePrecedesCursor(t *testing.T) {
 	t.Parallel()
 	reader := &stateEventReader{
-		evidence: productionStateEventEvidence(),
 		page: platformapi.SessionPublicEventPage{
 			Snapshot: platformapi.SessionPublicEventSnapshot{
 				SessionID: stateEventSessionID, LastEventSequence: 3,
@@ -664,7 +697,6 @@ func TestSessionEventPagePreservesSchemaV2EffectTransitionMigration(t *testing.T
 				snapshot.TurnStatus = stateEventTurnStatus(platformapi.TurnActive)
 			}
 			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(),
 				page: platformapi.SessionPublicEventPage{
 					Snapshot: snapshot,
 					Events:   test.events,
@@ -706,7 +738,6 @@ func TestSessionEventPageRejectsImpossiblePartialPrefixCausality(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			reader := &stateEventReader{
-				evidence: productionStateEventEvidence(),
 				page: platformapi.SessionPublicEventPage{
 					Snapshot: platformapi.SessionPublicEventSnapshot{
 						SessionID: stateEventSessionID, LastEventSequence: 3,
@@ -726,7 +757,6 @@ func TestSessionEventPageRejectsImpossiblePartialPrefixCausality(t *testing.T) {
 func TestSessionEventPageReturnDoesNotAliasReaderMemory(t *testing.T) {
 	t.Parallel()
 	reader := &stateEventReader{
-		evidence: productionStateEventEvidence(),
 		page: platformapi.SessionPublicEventPage{
 			Snapshot: platformapi.SessionPublicEventSnapshot{
 				SessionID: stateEventSessionID, ActiveTurnID: stateEventString("turn-one"),
@@ -761,10 +791,6 @@ type rotatingStateEventBoundary struct {
 	goodReads            int
 	authorizationReached chan<- struct{}
 	releaseAuthorization <-chan struct{}
-}
-
-func (boundary *rotatingStateEventBoundary) SessionEventReaderEvidence() platformapi.SessionEventReaderEvidence {
-	return productionStateEventEvidence()
 }
 
 func (boundary *rotatingStateEventBoundary) Authorize(

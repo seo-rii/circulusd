@@ -21,13 +21,6 @@ type authoritativeHTTPReader struct {
 	requests []platformapi.AuthorizedSessionEventPageRequest
 }
 
-func (*authoritativeHTTPReader) SessionEventReaderEvidence() platformapi.SessionEventReaderEvidence {
-	return platformapi.SessionEventReaderEvidence{
-		CrashDurable: true, AuthoritativeSessionJournal: true,
-		AtomicAuthorizationGenerationFence: true,
-	}
-}
-
 func (reader *authoritativeHTTPReader) ReadSessionEventPage(
 	_ context.Context,
 	request platformapi.AuthorizedSessionEventPageRequest,
@@ -120,16 +113,10 @@ func newAuthoritativeHTTPHandler(
 
 func newAuthoritativeHTTPEventService(
 	t *testing.T,
-	reader platformapi.SessionEventPageReader,
+	reader stateEventPageReader,
 ) *platformapi.SessionEventService {
 	t.Helper()
-	service, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-		Reader: reader, Authorizer: &stateEventAuthorizer{}, MaximumPageEvents: 16,
-	})
-	if err != nil {
-		t.Fatalf("NewSessionEventService() error = %v", err)
-	}
-	return service
+	return newStateEventService(t, reader, &stateEventAuthorizer{})
 }
 
 func legacyHTTPService(t *testing.T) *platformapi.Service {
@@ -354,13 +341,6 @@ type appendAfterReadHTTPJournal struct {
 	events   []platformapi.SessionPublicEvent
 	appended bool
 	requests []platformapi.AuthorizedSessionEventPageRequest
-}
-
-func (*appendAfterReadHTTPJournal) SessionEventReaderEvidence() platformapi.SessionEventReaderEvidence {
-	return platformapi.SessionEventReaderEvidence{
-		CrashDurable: true, AuthoritativeSessionJournal: true,
-		AtomicAuthorizationGenerationFence: true,
-	}
 }
 
 func (journal *appendAfterReadHTTPJournal) ReadSessionEventPage(

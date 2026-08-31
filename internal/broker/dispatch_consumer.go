@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	"github.com/hancomac/circulusd/internal/dependency"
 )
 
 const maximumDispatchStartTimeout = 5 * time.Minute
@@ -18,10 +20,11 @@ type DispatchConsumer struct {
 	timeout  time.Duration
 }
 
-// DispatchStartClaimer is the narrow durability boundary required before any
-// provider start. Coordinator and external authoritative adapters both satisfy
-// it without granting the consumer access to unrelated state mutations.
+// DispatchStartClaimer binds the narrow durable-claim operation to the live
+// production identity that serves it. Production callers must verify that
+// exact adapter before it can enter the consumer graph.
 type DispatchStartClaimer interface {
+	dependency.ProductionProbe
 	ClaimDispatchStart(context.Context, DispatchStartRequest) (DispatchStartClaim, error)
 }
 
@@ -31,10 +34,20 @@ type dispatchStarterBinding struct {
 }
 
 func NewDispatchConsumer(
-	claimer DispatchStartClaimer,
+	verified dependency.Verified[DispatchStartClaimer],
 	starters map[EffectService]DispatchStarter,
 	timeout time.Duration,
 ) (*DispatchConsumer, error) {
+	claimer, _, err := verified.Open()
+	if err != nil {
+		return nil, ErrDurabilityBarrier
+	}
+	if _, err := dependency.RequireAtomicDomain(
+		[]dependency.AtomicGroup{dependency.AtomicCommandReceipt, dependency.AtomicEffectLifecycle},
+		verified,
+	); err != nil {
+		return nil, ErrDurabilityBarrier
+	}
 	claimerIsNil := claimer == nil
 	if !claimerIsNil {
 		value := reflect.ValueOf(claimer)

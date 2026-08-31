@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/platformapi"
 	"github.com/hancomac/circulusd/internal/stateappclient"
@@ -21,38 +23,42 @@ const (
 
 type sessionEventClient interface {
 	ReadSessionEvents(context.Context, stateappclient.Request) (canonical.Value, error)
+	dependency.ProductionProbe
 }
 
-// Reader is a fail-closed state-app-backed Session event reader. The concrete
-// authenticated client establishes the wire boundary, but cannot by itself
-// prove celld crash durability, authoritative journal conformance, or an
-// atomic authorization-generation fence.
+// Reader is a state-app-backed Session event reader and production-probe
+// candidate. Production consumers must accept it only through a
+// dependency.Verified wrapper.
 type Reader struct {
 	client sessionEventClient
 }
 
-// New builds the structural adapter. Accepting the concrete client keeps
-// arbitrary in-process implementations out of the exported construction path,
-// while the reader remains reference-only until externally verified evidence
-// can be wired without self-assertion.
+// New builds a candidate around the exact concrete client that serves both
+// operational reads and the production challenge.
 func New(client *stateappclient.Client) (*Reader, error) {
-	if client == nil {
+	if adapterClientIsNil(client) {
 		return nil, platformapi.ErrInvalidConfig
 	}
 	return &Reader{client: client}, nil
 }
 
-// newReferenceReaderForTest is deliberately unexported and always fails the
-// production evidence check, even when its client behaves correctly.
-func newReferenceReaderForTest(client sessionEventClient) (*Reader, error) {
-	if client == nil {
+// newCandidateReaderForTest preserves the same single-client invariant while
+// allowing deterministic contract tests without a network listener.
+func newCandidateReaderForTest(client sessionEventClient) (*Reader, error) {
+	if adapterClientIsNil(client) {
 		return nil, platformapi.ErrInvalidConfig
 	}
 	return &Reader{client: client}, nil
 }
 
-func (reader *Reader) SessionEventReaderEvidence() platformapi.SessionEventReaderEvidence {
-	return platformapi.SessionEventReaderEvidence{ReferenceOnly: true}
+func (reader *Reader) ProbeProduction(
+	ctx context.Context,
+	challenge dependency.ProbeChallenge,
+) (dependency.ProbeResponse, error) {
+	if reader == nil || adapterClientIsNil(reader.client) {
+		return dependency.ProbeResponse{}, dependency.ErrInvalidConfiguration
+	}
+	return reader.client.ProbeProduction(ctx, challenge)
 }
 
 func (reader *Reader) ReadSessionEventPage(
@@ -65,7 +71,7 @@ func (reader *Reader) ReadSessionEventPage(
 	if err := ctx.Err(); err != nil {
 		return platformapi.SessionPublicEventPage{}, err
 	}
-	if reader == nil || reader.client == nil {
+	if reader == nil || adapterClientIsNil(reader.client) {
 		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
 	}
 	permit := request.Authorization
@@ -270,6 +276,19 @@ func (reader *Reader) ReadSessionEventPage(
 		},
 		Events: events,
 	}, nil
+}
+
+func adapterClientIsNil(client any) bool {
+	if client == nil {
+		return true
+	}
+	value := reflect.ValueOf(client)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 var _ platformapi.SessionEventPageReader = (*Reader)(nil)

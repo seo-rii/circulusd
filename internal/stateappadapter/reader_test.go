@@ -5,11 +5,14 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/dependency"
+	dependencycontract "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/platformapi"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
@@ -20,15 +23,18 @@ type recordingClient struct {
 	mu       sync.Mutex
 	requests []stateappclient.Request
 	read     func(context.Context, stateappclient.Request) (canonical.Value, error)
+	probe    func(context.Context, dependency.ProbeChallenge) (dependency.ProbeResponse, error)
 }
 
-type unusedAuthorizer struct{}
+type readerTestAuthorizer struct {
+	permit platformapi.AuthorizationPermit
+}
 
-func (*unusedAuthorizer) Authorize(
-	context.Context,
-	platformapi.AuthorizationRequest,
+func (authorizer *readerTestAuthorizer) Authorize(
+	_ context.Context,
+	_ platformapi.AuthorizationRequest,
 ) (platformapi.AuthorizationPermit, error) {
-	panic("reference-only reader must be rejected before authorization")
+	return authorizer.permit, nil
 }
 
 func (client *recordingClient) ReadSessionEvents(
@@ -41,13 +47,84 @@ func (client *recordingClient) ReadSessionEvents(
 	return client.read(ctx, request)
 }
 
+func (client *recordingClient) ProbeProduction(
+	ctx context.Context,
+	challenge dependency.ProbeChallenge,
+) (dependency.ProbeResponse, error) {
+	return client.probe(ctx, challenge)
+}
+
 func (client *recordingClient) callCount() int {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return len(client.requests)
 }
 
-func TestNewRequiresConcreteConfiguredClientButRemainsReferenceOnly(t *testing.T) {
+func TestReaderForwardsProductionProbeToItsOperationalClient(t *testing.T) {
+	t.Parallel()
+
+	var _ dependency.ProductionProbe = (*Reader)(nil)
+	challenge := dependency.ProbeChallenge{Nonce: make([]byte, dependency.ChallengeBytes)}
+	challenge.Nonce[0] = 0x71
+	want := dependency.ProbeResponse{
+		Descriptor: dependency.Descriptor{
+			InstanceID: "reader-state-instance",
+			AtomicGroups: []dependency.AtomicGroup{
+				dependency.AtomicCommandReceipt,
+				dependency.AtomicEffectLifecycle,
+			},
+		},
+		KeyID:     "reader-runtime-key",
+		Signature: []byte{0x11, 0x22, 0x33},
+	}
+	ctx := context.WithValue(context.Background(), struct{ name string }{"reader-probe"}, "exact-context")
+	probeErr := errors.New("probe sentinel")
+	probeCalls := 0
+	client := &recordingClient{
+		read: func(context.Context, stateappclient.Request) (canonical.Value, error) {
+			return nil, nil
+		},
+		probe: func(gotContext context.Context, gotChallenge dependency.ProbeChallenge) (dependency.ProbeResponse, error) {
+			probeCalls++
+			if gotContext != ctx || !reflect.DeepEqual(gotChallenge, challenge) {
+				t.Fatalf("forwarded probe context/challenge = (%v, %#v), want exact inputs", gotContext, gotChallenge)
+			}
+			return want, probeErr
+		},
+	}
+	reader := mustCandidateReader(t, client)
+
+	got, err := reader.ProbeProduction(ctx, challenge)
+	if probeCalls != 1 || !reflect.DeepEqual(got, want) || !errors.Is(err, probeErr) {
+		t.Fatalf("ProbeProduction() calls/response/error = %d/%#v/%v, want 1/%#v/%v", probeCalls, got, err, want, probeErr)
+	}
+}
+
+func TestReaderProductionProbeRejectsNilReceiverAndClient(t *testing.T) {
+	t.Parallel()
+
+	challenge := dependency.ProbeChallenge{Nonce: make([]byte, dependency.ChallengeBytes)}
+	var nilReader *Reader
+	if response, err := nilReader.ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("nil reader ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
+	if response, err := (&Reader{}).ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("nil client ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
+	var nilClient *recordingClient
+	if reader, err := newCandidateReaderForTest(nilClient); reader != nil || !errors.Is(err, platformapi.ErrInvalidConfig) {
+		t.Fatalf("newCandidateReaderForTest(typed nil) = (%#v, %v), want nil/ErrInvalidConfig", reader, err)
+	}
+	reader := &Reader{client: nilClient}
+	if response, err := reader.ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("typed nil client ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
+}
+
+func TestNewRequiresConcreteConfiguredClient(t *testing.T) {
 	t.Parallel()
 	var constructor func(*stateappclient.Client) (*Reader, error) = New
 	_ = constructor
@@ -69,30 +146,56 @@ func TestNewRequiresConcreteConfiguredClientButRemainsReferenceOnly(t *testing.T
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if evidence := reader.SessionEventReaderEvidence(); evidence != (platformapi.SessionEventReaderEvidence{
-		ReferenceOnly: true,
-	}) {
-		t.Fatalf("unverified concrete-client evidence = %#v", evidence)
+	if reader.client != client {
+		t.Fatal("New() did not retain the exact concrete client")
+	}
+}
+
+func TestVerifiedReaderOpensExactAdapterAndServesSessionEvents(t *testing.T) {
+	t.Parallel()
+
+	groups := []dependency.AtomicGroup{
+		dependency.AtomicCommandReceipt,
+		dependency.AtomicEffectLifecycle,
+	}
+	proofs := dependencycontract.NewProductionProofs(t, groups)
+	tenantID := validTestID("tenant", 90)
+	subjectID := validTestID("subject", 90)
+	sessionID := validTestID("sess", 90)
+	permit := validTestPermit(tenantID, subjectID, sessionID, 9)
+	client := &recordingClient{
+		read: func(context.Context, stateappclient.Request) (canonical.Value, error) {
+			return canonical.Map{
+				"snapshot": canonical.Map{
+					"sessionId": sessionID, "activeTurnId": nil,
+					"turnStatus": nil, "lastEventSequence": int64(0),
+				},
+				"events": canonical.Array{},
+			}, nil
+		},
+		probe: proofs.ProbeProduction,
+	}
+	reader := mustCandidateReader(t, client)
+	candidate := platformapi.SessionEventPageReader(reader)
+	verified := dependencycontract.Verify(t, proofs, candidate, groups)
+	opened, _, err := verified.Open()
+	if err != nil || opened != reader {
+		t.Fatalf("verified.Open() = (%#v, %v), want exact reader %p", opened, err, reader)
 	}
 	service, err := platformapi.NewSessionEventService(platformapi.SessionEventServiceConfig{
-		Reader: reader, Authorizer: &unusedAuthorizer{}, MaximumPageEvents: 16,
-	})
-	if service != nil || !errors.Is(err, platformapi.ErrRepositoryNotDurable) {
-		t.Fatalf("NewSessionEventService() = (%#v, %v), want nil ErrRepositoryNotDurable", service, err)
-	}
-
-	reference, err := newReferenceReaderForTest(&recordingClient{
-		read: func(context.Context, stateappclient.Request) (canonical.Value, error) {
-			return nil, nil
-		},
+		Reader: verified, Authorizer: &readerTestAuthorizer{permit: permit}, MaximumPageEvents: 16,
 	})
 	if err != nil {
-		t.Fatalf("newReferenceReaderForTest() error = %v", err)
+		t.Fatalf("NewSessionEventService() error = %v", err)
 	}
-	if evidence := reference.SessionEventReaderEvidence(); !evidence.ReferenceOnly ||
-		evidence.CrashDurable || evidence.AuthoritativeSessionJournal ||
-		evidence.AtomicAuthorizationGenerationFence {
-		t.Fatalf("reference evidence = %#v", evidence)
+	page, err := service.ReadSessionEventPage(context.Background(), platformapi.ReadSessionEventPageRequest{
+		Principal: permit.Principal, SessionID: sessionID, Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("ReadSessionEventPage() error = %v", err)
+	}
+	if page.Snapshot.SessionID != sessionID || len(page.Events) != 0 || client.callCount() != 1 {
+		t.Fatalf("ReadSessionEventPage() = %#v, ingress calls = %d", page, client.callCount())
 	}
 }
 
@@ -124,7 +227,7 @@ func TestReaderRefencesPermitAndConvertsEveryPublicEventFamily(t *testing.T) {
 			},
 		}, nil
 	}}
-	reader := mustReferenceReader(t, client)
+	reader := mustCandidateReader(t, client)
 	permit := validTestPermit(tenantID, subjectID, sessionID, 41)
 
 	page, err := reader.ReadSessionEventPage(context.Background(), platformapi.AuthorizedSessionEventPageRequest{
@@ -221,7 +324,7 @@ func TestReaderRejectsInvalidPermitCursorAndLimitBeforeIngress(t *testing.T) {
 			}}
 			request := base
 			test.edit(&request)
-			_, err := mustReferenceReader(t, client).ReadSessionEventPage(context.Background(), request)
+			_, err := mustCandidateReader(t, client).ReadSessionEventPage(context.Background(), request)
 			if !errors.Is(err, test.want) || client.callCount() != 0 {
 				t.Fatalf("ReadSessionEventPage() error/calls = %v/%d, want %v/0", err, client.callCount(), test.want)
 			}
@@ -285,7 +388,7 @@ func TestReaderRejectsMalformedCanonicalPageAndEventFamilies(t *testing.T) {
 			client := &recordingClient{read: func(context.Context, stateappclient.Request) (canonical.Value, error) {
 				return result, nil
 			}}
-			_, err := mustReferenceReader(t, client).ReadSessionEventPage(
+			_, err := mustCandidateReader(t, client).ReadSessionEventPage(
 				context.Background(),
 				platformapi.AuthorizedSessionEventPageRequest{
 					Authorization: validTestPermit(tenantID, subjectID, sessionID, 7),
@@ -331,7 +434,7 @@ func TestReaderMapsOnlyAllowlistedRemoteAndContextErrors(t *testing.T) {
 			client := &recordingClient{read: func(context.Context, stateappclient.Request) (canonical.Value, error) {
 				return nil, test.err
 			}}
-			_, err := mustReferenceReader(t, client).ReadSessionEventPage(context.Background(), request)
+			_, err := mustCandidateReader(t, client).ReadSessionEventPage(context.Background(), request)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("ReadSessionEventPage() error = %v, want %v", err, test.want)
 			}
@@ -347,7 +450,7 @@ func TestReaderMapsOnlyAllowlistedRemoteAndContextErrors(t *testing.T) {
 		t.Fatal("pre-canceled context reached client")
 		return nil, nil
 	}}
-	if _, err := mustReferenceReader(t, client).ReadSessionEventPage(canceled, request); !errors.Is(err, context.Canceled) || client.callCount() != 0 {
+	if _, err := mustCandidateReader(t, client).ReadSessionEventPage(canceled, request); !errors.Is(err, context.Canceled) || client.callCount() != 0 {
 		t.Fatalf("pre-canceled read error/calls = %v/%d", err, client.callCount())
 	}
 }
@@ -363,7 +466,7 @@ func TestReaderKeepsSixtyFourConcurrentRequestsIsolated(t *testing.T) {
 			"events": canonical.Array{},
 		}, nil
 	}}
-	reader := mustReferenceReader(t, client)
+	reader := mustCandidateReader(t, client)
 	var wait sync.WaitGroup
 	errorsByRequest := make(chan error, 64)
 	for index := uint64(0); index < 64; index++ {
@@ -396,11 +499,11 @@ func TestReaderKeepsSixtyFourConcurrentRequestsIsolated(t *testing.T) {
 	}
 }
 
-func mustReferenceReader(t *testing.T, client sessionEventClient) *Reader {
+func mustCandidateReader(t *testing.T, client sessionEventClient) *Reader {
 	t.Helper()
-	reader, err := newReferenceReaderForTest(client)
+	reader, err := newCandidateReaderForTest(client)
 	if err != nil {
-		t.Fatalf("newReferenceReaderForTest() error = %v", err)
+		t.Fatalf("newCandidateReaderForTest() error = %v", err)
 	}
 	return reader
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/broker"
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
@@ -20,6 +21,7 @@ type dispatchStartClient interface {
 		context.Context,
 		stateappclient.ClaimDispatchStartRequest,
 	) (stateappclient.ClaimDispatchStartResult, error)
+	dependency.ProductionProbe
 }
 
 // DispatchStartClaimer is the narrow state-app-backed durability boundary
@@ -30,10 +32,20 @@ type DispatchStartClaimer struct {
 }
 
 func NewDispatchStartClaimer(client *stateappclient.Client) (*DispatchStartClaimer, error) {
-	if client == nil {
+	if adapterClientIsNil(client) {
 		return nil, broker.ErrInvalidRequest
 	}
 	return &DispatchStartClaimer{client: client}, nil
+}
+
+func (claimer *DispatchStartClaimer) ProbeProduction(
+	ctx context.Context,
+	challenge dependency.ProbeChallenge,
+) (dependency.ProbeResponse, error) {
+	if claimer == nil || adapterClientIsNil(claimer.client) {
+		return dependency.ProbeResponse{}, dependency.ErrInvalidConfiguration
+	}
+	return claimer.client.ProbeProduction(ctx, challenge)
 }
 
 func (claimer *DispatchStartClaimer) ClaimDispatchStart(
@@ -46,7 +58,7 @@ func (claimer *DispatchStartClaimer) ClaimDispatchStart(
 	if err := ctx.Err(); err != nil {
 		return broker.DispatchStartClaim{}, err
 	}
-	if claimer == nil || claimer.client == nil {
+	if claimer == nil || adapterClientIsNil(claimer.client) {
 		return broker.DispatchStartClaim{}, broker.ErrInvalidRequest
 	}
 

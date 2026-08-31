@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hancomac/circulusd/internal/broker"
+	"github.com/hancomac/circulusd/internal/dependency"
+	dependencycontract "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
@@ -17,6 +20,7 @@ type recordingDispatchStartClient struct {
 	mu       sync.Mutex
 	requests []stateappclient.ClaimDispatchStartRequest
 	claim    func(context.Context, stateappclient.ClaimDispatchStartRequest) (stateappclient.ClaimDispatchStartResult, error)
+	probe    func(context.Context, dependency.ProbeChallenge) (dependency.ProbeResponse, error)
 }
 
 func (client *recordingDispatchStartClient) ClaimDispatchStart(
@@ -29,10 +33,81 @@ func (client *recordingDispatchStartClient) ClaimDispatchStart(
 	return client.claim(ctx, request)
 }
 
+func (client *recordingDispatchStartClient) ProbeProduction(
+	ctx context.Context,
+	challenge dependency.ProbeChallenge,
+) (dependency.ProbeResponse, error) {
+	return client.probe(ctx, challenge)
+}
+
 func (client *recordingDispatchStartClient) requestsSnapshot() []stateappclient.ClaimDispatchStartRequest {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return append([]stateappclient.ClaimDispatchStartRequest(nil), client.requests...)
+}
+
+func TestDispatchStartClaimerForwardsProductionProbeToItsOperationalClient(t *testing.T) {
+	t.Parallel()
+
+	var _ dependency.ProductionProbe = (*DispatchStartClaimer)(nil)
+	challenge := dependency.ProbeChallenge{Nonce: make([]byte, dependency.ChallengeBytes)}
+	challenge.Nonce[0] = 0x72
+	want := dependency.ProbeResponse{
+		Descriptor: dependency.Descriptor{
+			InstanceID: "dispatch-state-instance",
+			AtomicGroups: []dependency.AtomicGroup{
+				dependency.AtomicCommandReceipt,
+				dependency.AtomicEffectLifecycle,
+			},
+		},
+		KeyID:     "dispatch-runtime-key",
+		Signature: []byte{0x44, 0x55, 0x66},
+	}
+	ctx := context.WithValue(context.Background(), struct{ name string }{"dispatch-probe"}, "exact-context")
+	probeErr := errors.New("probe sentinel")
+	probeCalls := 0
+	client := &recordingDispatchStartClient{
+		claim: func(
+			context.Context,
+			stateappclient.ClaimDispatchStartRequest,
+		) (stateappclient.ClaimDispatchStartResult, error) {
+			return stateappclient.ClaimDispatchStartResult{}, nil
+		},
+		probe: func(gotContext context.Context, gotChallenge dependency.ProbeChallenge) (dependency.ProbeResponse, error) {
+			probeCalls++
+			if gotContext != ctx || !reflect.DeepEqual(gotChallenge, challenge) {
+				t.Fatalf("forwarded probe context/challenge = (%v, %#v), want exact inputs", gotContext, gotChallenge)
+			}
+			return want, probeErr
+		},
+	}
+	claimer := &DispatchStartClaimer{client: client}
+
+	got, err := claimer.ProbeProduction(ctx, challenge)
+	if probeCalls != 1 || !reflect.DeepEqual(got, want) || !errors.Is(err, probeErr) {
+		t.Fatalf("ProbeProduction() calls/response/error = %d/%#v/%v, want 1/%#v/%v", probeCalls, got, err, want, probeErr)
+	}
+}
+
+func TestDispatchStartClaimerProductionProbeRejectsNilReceiverAndClient(t *testing.T) {
+	t.Parallel()
+
+	challenge := dependency.ProbeChallenge{Nonce: make([]byte, dependency.ChallengeBytes)}
+	var nilClaimer *DispatchStartClaimer
+	if response, err := nilClaimer.ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("nil claimer ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
+	if response, err := (&DispatchStartClaimer{}).ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("nil client ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
+	var nilClient *recordingDispatchStartClient
+	claimer := &DispatchStartClaimer{client: nilClient}
+	if response, err := claimer.ProbeProduction(context.Background(), challenge); !reflect.DeepEqual(response, dependency.ProbeResponse{}) ||
+		!errors.Is(err, dependency.ErrInvalidConfiguration) {
+		t.Fatalf("typed nil client ProbeProduction() = (%#v, %v), want zero/ErrInvalidConfiguration", response, err)
+	}
 }
 
 type adapterTestDispatchStarter struct {
@@ -106,31 +181,45 @@ func TestDispatchStartClaimerMapsExactFreshAndReplayReceipts(t *testing.T) {
 func TestDispatchStartClaimerResponseLossAndReplayNeverStartProvider(t *testing.T) {
 	t.Parallel()
 	request := validBrokerDispatchStartRequest(t, 2)
+	groups := []dependency.AtomicGroup{
+		dependency.AtomicCommandReceipt,
+		dependency.AtomicEffectLifecycle,
+	}
+	proofs := dependencycontract.NewProductionProofs(t, groups)
 	var mu sync.Mutex
 	calls := 0
 	commandID := ""
-	client := &recordingDispatchStartClient{claim: func(
-		_ context.Context,
-		wire stateappclient.ClaimDispatchStartRequest,
-	) (stateappclient.ClaimDispatchStartResult, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		calls++
-		if commandID == "" {
-			commandID = wire.CommandID
-		}
-		if wire.CommandID != commandID {
-			return stateappclient.ClaimDispatchStartResult{}, errors.New("command identity changed after response loss")
-		}
-		if calls == 1 {
-			return stateappclient.ClaimDispatchStartResult{}, stateappclient.ErrTransport
-		}
-		return validClientDispatchStartResult(wire, false, true), nil
-	}}
+	client := &recordingDispatchStartClient{
+		claim: func(
+			_ context.Context,
+			wire stateappclient.ClaimDispatchStartRequest,
+		) (stateappclient.ClaimDispatchStartResult, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if commandID == "" {
+				commandID = wire.CommandID
+			}
+			if wire.CommandID != commandID {
+				return stateappclient.ClaimDispatchStartResult{}, errors.New("command identity changed after response loss")
+			}
+			if calls == 1 {
+				return stateappclient.ClaimDispatchStartResult{}, stateappclient.ErrTransport
+			}
+			return validClientDispatchStartResult(wire, false, true), nil
+		},
+		probe: proofs.ProbeProduction,
+	}
 	claimer := &DispatchStartClaimer{client: client}
+	candidate := broker.DispatchStartClaimer(claimer)
+	verified := dependencycontract.Verify(t, proofs, candidate, groups)
+	opened, _, err := verified.Open()
+	if err != nil || opened != claimer {
+		t.Fatalf("verified.Open() = (%#v, %v), want exact claimer %p", opened, err, claimer)
+	}
 	starter := &adapterTestDispatchStarter{routeDigest: request.Dispatch.ProviderRouteDigest}
 	consumer, err := broker.NewDispatchConsumer(
-		claimer,
+		verified,
 		map[broker.EffectService]broker.DispatchStarter{request.Dispatch.Service: starter},
 		time.Second,
 	)
