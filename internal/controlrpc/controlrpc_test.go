@@ -182,6 +182,24 @@ func TestListenServerValidatesSocketPathPermissionsAndUIDPolicy(t *testing.T) {
 	})
 }
 
+func TestControlServerBoundsWholeRequestAndResponseIO(t *testing.T) {
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	if server.httpServer.ReadTimeout != 5*time.Second {
+		t.Fatalf("ReadTimeout = %s, want 5s", server.httpServer.ReadTimeout)
+	}
+	if server.httpServer.WriteTimeout != 5*time.Second {
+		t.Fatalf("WriteTimeout = %s, want 5s", server.httpServer.WriteTimeout)
+	}
+}
+
 func TestServerRejectsDisallowedPeerUID(t *testing.T) {
 	otherUID := uint32(os.Getuid()) + 1
 	server := startTestServer(t, ServerConfig{

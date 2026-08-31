@@ -34,6 +34,7 @@ const (
 	sessionLifetime            = 5 * time.Minute
 	sessionRandomBytes         = 16
 	sessionPayloadBytes        = 1 + 4 + 4 + 8 + sessionRandomBytes
+	controlHTTPIOTimeout       = 5 * time.Second
 )
 
 type CapabilityProvider func(context.Context) ([]*v1.CapabilityStatus, error)
@@ -161,7 +162,9 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	}
 	server.httpServer = &http.Server{
 		Handler:           rpcHandler,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       controlHTTPIOTimeout,
+		ReadHeaderTimeout: controlHTTPIOTimeout,
+		WriteTimeout:      controlHTTPIOTimeout,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
