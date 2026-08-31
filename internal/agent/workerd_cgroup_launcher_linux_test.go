@@ -13,10 +13,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/identity"
 	"golang.org/x/sys/unix"
 )
 
 var errWorkerdCgroupIntegrationStart = errors.New("test: workerd cgroup start failure")
+
+type firstWorkerdContextErrObserver struct {
+	context.Context
+	once     sync.Once
+	checked  chan struct{}
+	release  chan struct{}
+	returned chan struct{}
+}
+
+func (observed *firstWorkerdContextErrObserver) Err() error {
+	err := observed.Context.Err()
+	observed.once.Do(func() {
+		close(observed.checked)
+		<-observed.release
+		close(observed.returned)
+	})
+	return err
+}
 
 func TestWorkerdCgroupLauncherConstructorFailureClosesController(t *testing.T) {
 	_, backend, cgroups := newWorkerdCgroupLauncherController(t)
@@ -129,6 +148,111 @@ func TestWorkerdCgroupLauncherRejectsDifferentAgentBeforeCgroupAndStartCallbacks
 		t.Fatalf("mismatched boot process Start calls = %d -> %d", beforeStarts, afterStarts)
 	}
 	closeWorkerdCgroupIntegratedLauncher(t, launcher, nil)
+}
+
+func TestWorkerdCgroupLauncherCanceledFirstRequestDoesNotBindLifetime(t *testing.T) {
+	_, backend, cgroups := newWorkerdCgroupLauncherController(t)
+	process := newFakeWorkerdProcess(20_003, true)
+	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	backend.killHook = func() { process.finishGroup(nil) }
+	starter := &cgroupObservingWorkerdStarter{backend: backend, inner: inner}
+	var readinessMu sync.Mutex
+	readinessCalls := 0
+	probe := WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error {
+		readinessMu.Lock()
+		readinessCalls++
+		readinessMu.Unlock()
+		return nil
+	})
+	launcher := newWorkerdCgroupLauncherWithProbeForTest(t, starter, cgroups, probe)
+	t.Cleanup(func() { closeWorkerdCgroupIntegratedLauncher(t, launcher, nil) })
+
+	baseContext, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	observedContext := &firstWorkerdContextErrObserver{
+		Context: baseContext, checked: make(chan struct{}), release: make(chan struct{}), returned: make(chan struct{}),
+	}
+	releasedContextCheck := false
+	defer func() {
+		if !releasedContextCheck {
+			close(observedContext.release)
+		}
+	}()
+	firstAgentInstanceID := workerdTestAgentInstanceID(6)
+	request := WorkerdEnsureRequest{
+		AgentInstanceID: firstAgentInstanceID,
+		ShardID:         "cgroup-canceled-first-bind",
+		ShardGeneration: 1,
+	}
+	launcher.mu.Lock()
+	mutexHeld := true
+	defer func() {
+		if mutexHeld {
+			launcher.mu.Unlock()
+		}
+	}()
+	firstResult := make(chan workerdEnsureResult, 1)
+	go func() {
+		handle, err := launcher.Ensure(observedContext, request)
+		firstResult <- workerdEnsureResult{handle: handle, err: err}
+	}()
+	select {
+	case <-observedContext.checked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ensure did not complete its first context check")
+	}
+	close(observedContext.release)
+	releasedContextCheck = true
+	select {
+	case <-observedContext.returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Ensure did not return from its first context check")
+	}
+	cancelFirst()
+	launcher.mu.Unlock()
+	mutexHeld = false
+
+	var canceledResult workerdEnsureResult
+	select {
+	case canceledResult = <-firstResult:
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled Ensure did not return")
+	}
+	if canceledResult.handle != nil || !errors.Is(canceledResult.err, context.Canceled) {
+		t.Fatalf("canceled first Ensure = %#v, %v, want nil/context.Canceled", canceledResult.handle, canceledResult.err)
+	}
+	launcher.mu.Lock()
+	boundAgentInstanceID := launcher.boundAgentInstanceID
+	pendingLaunches := len(launcher.pending)
+	launcher.mu.Unlock()
+	readinessMu.Lock()
+	observedReadinessCalls := readinessCalls
+	readinessMu.Unlock()
+	if boundAgentInstanceID != (identity.ID{}) || pendingLaunches != 0 || backend.mkdirCallCount() != 0 || starter.snapshot().calls != 0 || observedReadinessCalls != 0 {
+		t.Fatalf("canceled first request effects = bound:%q pending:%d mkdir:%d starts:%d readiness:%d, want none",
+			boundAgentInstanceID, pendingLaunches, backend.mkdirCallCount(), starter.snapshot().calls, observedReadinessCalls)
+	}
+
+	secondAgentInstanceID := workerdTestAgentInstanceID(7)
+	request.AgentInstanceID = secondAgentInstanceID
+	handle, err := launcher.Ensure(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Ensure(second boot) error = %v", err)
+	}
+	launcher.mu.Lock()
+	boundAgentInstanceID = launcher.boundAgentInstanceID
+	launcher.mu.Unlock()
+	readinessMu.Lock()
+	observedReadinessCalls = readinessCalls
+	readinessMu.Unlock()
+	commands := inner.commandSnapshot()
+	if boundAgentInstanceID != secondAgentInstanceID || backend.mkdirCallCount() != 1 || starter.snapshot().calls != 1 || observedReadinessCalls != 1 || len(commands) != 1 || commands[0].AgentInstanceID != secondAgentInstanceID {
+		t.Fatalf("second request effects = bound:%q mkdir:%d starts:%d readiness:%d commands:%#v",
+			boundAgentInstanceID, backend.mkdirCallCount(), starter.snapshot().calls, observedReadinessCalls, commands)
+	}
+	if err := handle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(second boot) error = %v", err)
+	}
 }
 
 func TestWorkerdCgroupLauncherStartFailureCleansLeaseBeforeReturning(t *testing.T) {
@@ -856,6 +980,11 @@ func newWorkerdCgroupLauncherController(t *testing.T) (workerdCgroupConfig, *fak
 
 func newWorkerdCgroupLauncherForTest(t *testing.T, starter workerdProcessStarter, cgroups *workerdCgroupController) *WorkerdProcessLauncher {
 	t.Helper()
+	return newWorkerdCgroupLauncherWithProbeForTest(t, starter, cgroups, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+}
+
+func newWorkerdCgroupLauncherWithProbeForTest(t *testing.T, starter workerdProcessStarter, cgroups *workerdCgroupController, probe WorkerdReadinessProbe) *WorkerdProcessLauncher {
+	t.Helper()
 	content := []byte("verified-cgroup-workerd-inode")
 	executablePath := t.TempDir() + "/workerd"
 	if err := os.WriteFile(executablePath, content, 0o500); err != nil {
@@ -866,7 +995,7 @@ func newWorkerdCgroupLauncherForTest(t *testing.T, starter workerdProcessStarter
 		ExecutablePath: executablePath, ExecutableDigest: fmt.Sprintf("sha256:%x", digest),
 		ReadinessTimeout: time.Second, StopGracePeriod: 20 * time.Millisecond,
 		OutputLimitBytes: 1024, HistoryCapacity: 128,
-		ReadinessProbe: WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }),
+		ReadinessProbe: probe,
 	}
 	launcher, err := newWorkerdProcessLauncherWithCgroup(config, starter, unix.MemfdCreate, cgroups)
 	if err != nil {

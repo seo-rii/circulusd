@@ -498,6 +498,7 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 	}
 	var launchIdentity workerdLaunchIdentity
 	copy(launchIdentity[:], identityHash.Sum(nil))
+	ctxDone := ctx.Done()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -510,6 +511,15 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 
 	for {
 		launcher.mu.Lock()
+		select {
+		case <-ctxDone:
+			launcher.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.Canceled
+		default:
+		}
 		if launcher.closed {
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdLauncherClosed
