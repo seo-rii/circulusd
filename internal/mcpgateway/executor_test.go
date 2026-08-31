@@ -13,16 +13,16 @@ import (
 
 type functionCall struct {
 	next  func(context.Context) (ProviderEvent, error)
-	close func() error
+	close func(context.Context) error
 }
 
 func (call *functionCall) Next(ctx context.Context) (ProviderEvent, error) {
 	return call.next(ctx)
 }
 
-func (call *functionCall) Close() error {
+func (call *functionCall) Close(ctx context.Context) error {
 	if call.close != nil {
-		return call.close()
+		return call.close(ctx)
 	}
 	return nil
 }

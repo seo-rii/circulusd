@@ -144,6 +144,8 @@ func (ClaimedCommand) GoString() string { return "claimed-effect-command<redacte
 // effect starters. Implementations must not infer provider-start authority from
 // an Observation.
 type Ledger interface {
+	// Limits returns immutable byte caps that remain fixed for the ledger's lifetime.
+	Limits() ReferenceLimits
 	Prepare(context.Context, Command) error
 	ClaimStart(context.Context, broker.ClaimedDispatchStart) (ClaimedCommand, error)
 	RecordAccepted(context.Context, Observation, string) error
@@ -220,6 +222,13 @@ func (ledger *ReferenceLedger) RouteDigest() broker.Digest {
 		return broker.Digest{}
 	}
 	return ledger.routeDigest
+}
+
+func (ledger *ReferenceLedger) Limits() ReferenceLimits {
+	if ledger == nil {
+		return ReferenceLimits{}
+	}
+	return ledger.limits
 }
 
 func (*ReferenceLedger) String() string   { return "reference-effect-ledger<redacted>" }

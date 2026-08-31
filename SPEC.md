@@ -3040,6 +3040,20 @@ stdio MCP server가 workspace/session scope로 장기 실행되는 경우 해당
 - resources/prompts capability는 기본 미노출한다. read-only resource는 admin allowlist로 MAY 노출한다.
 - Gateway는 미지원/거부 method에 JSON-RPC 표준 오류로 응답하고 audit에 기록한다.
 
+### 27.7 Session claimed dispatch
+
+development/reference MCP adapter는 bounded canonical call command를 provider I/O
+없이 subordinate ledger에 먼저 prepare한다. fresh sealed Session start claim을
+소비한 뒤에만 tool authorization, availability, credential authorization,
+protocol negotiation, 단 한 번의 provider start 순서로 진행한다. 기존 MCP
+repository의 독립 dispatch/start claim이나 effect commit을 이 경로의 두 번째
+program counter로 사용하지 않는다. provider에는 raw Session bearer 대신 package가
+seal한 non-secret exact dispatch binding만 전달한다. acceptance와 committed,
+failed 또는 unknown terminal observation은 bounded cleanup deadline 안에 기록하고,
+terminal payload는 provider external commit ID와 output을 함께 보존한다.
+구성된 input/output과 canonical envelope을 모두 수용하지 못하는 subordinate
+ledger limit은 adapter 생성 시 거부한다.
+
 ## 28. Model Gateway
 
 Pi Worker는 model API key나 local inference endpoint credential을 직접 받지 않는다.

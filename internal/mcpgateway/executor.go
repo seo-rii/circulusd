@@ -128,7 +128,7 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 	startClaimActive := true
 	start, startErr := provider.Start(ctx, command)
 	if contextErr := ctx.Err(); contextErr != nil {
-		closeProviderCall(start.Call)
+		gateway.closeProviderCall(ctx, start.Call)
 		cancelled, cancelErr := gateway.Cancel(ctx, authority, current)
 		return cancelled, errors.Join(contextErr, cancelErr)
 	}
@@ -143,18 +143,18 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 			ExpectedRevision: current.Revision, Kind: EventProviderAccepted, ProviderRequestID: providerRequestID,
 		})
 		if applyErr != nil {
-			closeProviderCall(start.Call)
+			gateway.closeProviderCall(ctx, start.Call)
 			return current, applyErr
 		}
 		current, err = gateway.persistAfterProviderStart(ctx, currentScope, current, accepted.Effect, startPermit)
 		if err != nil {
-			closeProviderCall(start.Call)
+			gateway.closeProviderCall(ctx, start.Call)
 			return accepted.Effect, err
 		}
 		startClaimActive = false
 	}
 	if startErr != nil || isNilInterface(start.Call) || !validProviderID {
-		closeProviderCall(start.Call)
+		gateway.closeProviderCall(ctx, start.Call)
 		class := FailureUnknown
 		var classified *ProviderDispatchError
 		if errors.As(startErr, &classified) && classified.Classification() == DispatchDefinitelyNotSent && !validProviderID {
@@ -179,7 +179,7 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 	}
 
 	call := start.Call
-	defer closeProviderCall(call)
+	defer gateway.closeProviderCall(ctx, call)
 	for {
 		if ctx.Err() != nil {
 			cancelled, cancelErr := gateway.Cancel(ctx, authority, current)
@@ -1245,9 +1245,11 @@ func (gateway *Gateway) cleanupContext(ctx context.Context) (context.Context, co
 	return context.WithTimeout(context.WithoutCancel(ctx), gateway.bounds.CancelTimeout)
 }
 
-func closeProviderCall(call ProviderCall) {
+func (gateway *Gateway) closeProviderCall(ctx context.Context, call ProviderCall) {
 	if !isNilInterface(call) {
-		_ = call.Close()
+		cleanupContext, cancelCleanup := gateway.cleanupContext(ctx)
+		defer cancelCleanup()
+		_ = call.Close(cleanupContext)
 	}
 }
 

@@ -50,6 +50,9 @@ compare it with an immutable subordinate command. They cannot mint another
 start authority. A subordinate ledger is selected by the Session-bound service
 and every result, including `absent` and `unknown`, must repeat the complete
 effect, invocation, request, attempt, platform request, and route identity.
+Opaque Session bearers are stripped after verification and are neither stored
+in the subordinate command nor forwarded to a provider; an adapter may pass
+only its own package-sealed, non-secret exact binding for the active call.
 
 A terminal reconciler never receives provider-start authority. It first asks
 the Session coordinator for the current recovery decision and may issue a

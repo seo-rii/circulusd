@@ -364,6 +364,23 @@ func TestReferenceLedgerAllocatesStableCommittedIdentities(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerReportsImmutableConstructionLimits(t *testing.T) {
+	limits := effectledger.ReferenceLimits{MaximumPayloadBytes: 1234, MaximumResultBytes: 5678}
+	ledger, err := effectledger.NewReferenceLedger(
+		effectledger.NewReferenceStore(), broker.ServiceModel, testDigest(19), limits,
+	)
+	if err != nil {
+		t.Fatalf("NewReferenceLedger() error = %v", err)
+	}
+	if got := ledger.Limits(); got != limits {
+		t.Fatalf("Limits() = %#v, want %#v", got, limits)
+	}
+	var nilLedger *effectledger.ReferenceLedger
+	if got := nilLedger.Limits(); got != (effectledger.ReferenceLimits{}) {
+		t.Fatalf("nil Limits() = %#v, want zero", got)
+	}
+}
+
 func TestReferenceLedgerAllowsClaimedFailureOrUnknownButRequiresAcceptanceForCommit(t *testing.T) {
 	for index, status := range []effectledger.TerminalStatus{effectledger.TerminalFailed, effectledger.TerminalUnknown} {
 		store := effectledger.NewReferenceStore()

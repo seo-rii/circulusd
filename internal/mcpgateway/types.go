@@ -8,6 +8,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
@@ -57,6 +58,7 @@ func (OpaqueAuthority) GoString() string { return "mcp-authority<redacted>" }
 type Generations struct {
 	TurnLease uint64
 	Placement uint64
+	Sandbox   uint64
 	Policy    uint64
 }
 
@@ -551,6 +553,7 @@ type DispatchCommand struct {
 	Dispatch       DispatchPermit
 	Negotiation    StartNegotiationReceipt
 	Start          ProviderStartPermit
+	Session        SessionProviderPermit
 }
 
 func (DispatchCommand) String() string   { return "mcp-provider-command<redacted>" }
@@ -572,10 +575,46 @@ type NegotiationCommand struct {
 	Authorization ToolAuthorizationPermit
 	Credential    CredentialPermit
 	Dispatch      DispatchPermit
+	Session       SessionProviderPermit
 }
 
 func (NegotiationCommand) String() string   { return "mcp-negotiation-command<redacted>" }
 func (NegotiationCommand) GoString() string { return "mcp-negotiation-command<redacted>" }
+
+var sessionProviderPermitSeal = new(struct{})
+
+// SessionProviderPermit is minted from a broker-sealed Session claim for one
+// provider conversation. It retains only the non-secret dispatch binding; the
+// broker claim and its opaque bearers are never forwarded or persisted.
+type SessionProviderPermit struct {
+	Proof           Digest
+	Durable         bool
+	CommandDigest   Digest
+	RouteDigest     Digest
+	DispatchAttempt uint64
+	start           broker.DispatchStartPermit
+	seal            *struct{}
+}
+
+func (permit SessionProviderPermit) Open() (broker.DispatchStartPermit, bool) {
+	if !permit.Durable || permit.Proof == (Digest{}) || permit.CommandDigest == (Digest{}) ||
+		permit.RouteDigest == (Digest{}) || permit.DispatchAttempt == 0 ||
+		permit.seal != sessionProviderPermitSeal || permit.start.Opaque != "" || permit.start.Dispatch.Opaque != "" ||
+		!permit.start.Durable || permit.start.EventSequence == 0 ||
+		permit.CommandDigest != Digest(permit.start.CommandDigest) ||
+		permit.RouteDigest != Digest(permit.start.Dispatch.ProviderRouteDigest) ||
+		permit.DispatchAttempt != permit.start.Dispatch.DispatchAttempt {
+		return broker.DispatchStartPermit{}, false
+	}
+	proof, err := sessionProviderProof(permit.start)
+	if err != nil || permit.Proof != proof {
+		return broker.DispatchStartPermit{}, false
+	}
+	return permit.start, true
+}
+
+func (SessionProviderPermit) String() string   { return "mcp-session-provider-permit<redacted>" }
+func (SessionProviderPermit) GoString() string { return "mcp-session-provider-permit<redacted>" }
 
 type CancelCommand struct {
 	Scope             ValidatedAuthority
@@ -749,7 +788,8 @@ type ProviderEvent struct {
 
 type ProviderCall interface {
 	Next(context.Context) (ProviderEvent, error)
-	Close() error
+	// Close must stop cleanup and return when the supplied context expires.
+	Close(context.Context) error
 }
 
 type LedgerQuery struct {
@@ -774,6 +814,9 @@ type CancellationResult struct {
 // irreversible dispatch boundary an adapter must validate Start against its
 // expiry/current authority and atomically deduplicate its proof; Cancel carries
 // the same proof so an adapter can install a tombstone before a delayed Start.
+// A Session-dispatch command additionally requires Session.Open to succeed and
+// must not treat the publicly constructible Dispatch or Start fields alone as
+// Session authority.
 type Provider interface {
 	Availability(context.Context, ServerDescriptor) (ServerAvailability, error)
 	Negotiate(context.Context, NegotiationCommand) (StartNegotiationReceipt, error)
