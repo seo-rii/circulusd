@@ -3906,11 +3906,25 @@ Export:
 
 `platformd`는 Docker socket, `/dev/kvm`, host mount/network namespace 조작 capability를 가져서는 안 된다.
 
-`platformd`는 public API 또는 state-backed consumer를 admission하기 전에 production
-state graph 구성을 시도한다. 이 구성에 실패해도 진단용 control socket과
-`control.protocol`은 유지할 수 있지만, state graph를 부분 publish하거나 public API를
-열어서는 안 되며 `state.celld`는 `NOT_WIRED`여야 한다. 성공한 graph는 daemon lifetime에
-귀속되고, control/API listener와 consumer를 먼저 정지한 뒤 마지막에 닫는다.
+production command `platformd`는 public API 또는 state-backed consumer를 admission하기
+전에 state, authentication, audit, object store, model, MCP, secret, scheduler, TLS를 포함한
+전체 production graph를 구성하고 검증해야 한다. 일부 gate만 성공한 graph는 성공으로
+승격하지 않고 즉시 역순 폐기한다. 모든 gate를 통과하기 전에는 public listener를
+생성하지 않는다.
+
+전체 구성에 실패해도 진단용 credentialed control UDS와 `control.protocol`은 유지할 수
+있다. 이 예외는 public/application listener가 아니며 부분 graph를 publish할 권한을 주지
+않는다. 이 상태에서 public API와 state consumer는 닫혀 있고 `state.celld`를 포함한 해당
+capability는 `NOT_WIRED`여야 한다. 성공한 graph는 daemon lifetime에 귀속되고,
+application listener, control listener, consumer를 먼저 정지한 뒤 dependency graph를
+마지막에 닫는다.
+
+development runtime은 별도 command `platformd-dev`로 구성한다. production command는
+reference-memory/fake dependency나 runtime-profile 전환 flag를 받아서는 안 되고,
+development command는 production config, release roots, secret-bearing credential file
+입력을 받아서는 안 된다. 두 command는 control protocol과 종료 수명주기 plumbing을
+공유할 수 있지만, 구성된 dependency graph나 runtime-profile 전환 경로는 공유하지
+않는다.
 
 ### 37.2 `agentd` — Go
 
@@ -4369,6 +4383,24 @@ sudo ./install.sh --profile development
 - process-local reference subordinate ledger와 deterministic fake effect 사용 가능
 - reference store 재구성 테스트는 process kill/durable restart 증거가 아니며 production capability/readiness로 승격 금지
 
+위 `development`는 installer/backend 선택 profile이다. daemon runtime profile과 같은
+개념이 아니며, 이 install profile을 선택했다고 reference state나 fake executor가
+자동으로 활성화되지 않는다.
+
+별도 `platformd-dev` command의 초기 runtime profile 이름은
+`development-reference`이다. 이 profile은 literal loopback TCP에만 bind하고
+`productionEligible=false`를 고정한다. 현재 구현은 `/v1/status`와 credentialed diagnostic
+control UDS만 제공하는 `diagnostic-only` shell이며 Session admission, state store, executor,
+model, MCP를 구성하지 않는다. 따라서 상태에는 `state.implementation=none`,
+`state.durability=none`, `execution.provider=none`,
+`isolationConformance=NOT_RUN`을 보고한다. 실제 process-local ledger나 deterministic fake가
+나중에 연결되기 전에는 `reference-memory` 또는 `fake`를 주장해서는 안 된다.
+
+development public address는 canonical literal `127.0.0.0/8` 또는 `[::1]`과 nonzero port만
+허용한다. wildcard, hostname, IPv4-mapped IPv6, zone ID, noncanonical port는 bind 전에
+거부하고, bind 후 실제 주소도 요청한 loopback endpoint와 정확히 일치하는지 다시
+검증한다. `Forwarded`와 `X-Forwarded-*`는 이 판정에 사용하지 않는다.
+
 ## 42. Air-gap Bundle
 
 배포 파일 하나에 설치와 선택한 profile 실행에 필요한 모든 artifact를 포함한다.
@@ -4675,7 +4707,7 @@ UI/API는 이 결과와 server policy를 결합해 실제 선택 가능한 backe
 /etc/pi-platform/config.yaml
 ```
 
-Reference example:
+Production-shaped reference example:
 
 ```yaml
 server:
@@ -4797,6 +4829,10 @@ retention:
   artifactDefault: 30d
   runtimeRollbackWindow: 24h
 ```
+
+이 파일은 production-shaped 구성 예시이며 `platformd-dev`가 읽지 않는다.
+development diagnostic shell은 `--listen`과 `--socket`만으로 시작하며 production
+configuration, release manifest, trust roots를 받지 않는다.
 
 `state.endpoint`는 pin된 celld의 public Worker listener를 가리키는 명시적
 port의 literal-loopback HTTP origin이어야 한다. Reference service는 celld를

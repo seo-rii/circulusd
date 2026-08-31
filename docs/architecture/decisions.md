@@ -182,3 +182,28 @@ TypeScript Worker/state RPC uses one pinned runtime-validated schema package. St
 Go import boundaries are directional: unprivileged commands may import protocol and narrow clients, but only `cmd/executord` reaches provider, mount, cgroup, Docker, or KVM implementation packages.
 
 Conformance results are exactly `PASS`, `FAIL`, `UNAVAILABLE(reason)`, or `NOT_RUN`. Unit/domain, deterministic fault, and local mock tests never count as real celld, workerd/Pi, backend, or air-gap conformance. A required release profile treats every result other than `PASS` as failure. The `mock` backend is development-only and cannot satisfy a request for NsJail, Docker, or Firecracker.
+
+## ADR-012: Production and development daemon graphs are separate binaries
+
+The production `platformd` and local `platformd-dev` commands use separate
+composition roots. They may share generated protocol types, the credentialed
+control server, and listener/runtime shutdown plumbing, but their flags,
+constructed dependency graphs, and readiness claims remain separate.
+Production does not accept a runtime-profile switch or import
+reference-memory/fake providers. Development does not accept production
+configuration, release roots, secret-bearing credential files, or privileged
+execution providers.
+
+Production opens no public/application listener until the complete production
+graph has passed every required gate. A credentialed diagnostic UDS is the sole
+exception: it may remain available after bootstrap failure, but it cannot
+publish a partial graph and reports all uncomposed capabilities as `NOT_WIRED`.
+A state-only graph is not the production graph and is closed immediately.
+
+The initial `development-reference` graph is intentionally diagnostic-only. It
+binds an exact canonical loopback address, rechecks the kernel-returned address,
+and exposes immutable `/v1/status` metadata with
+`productionEligible=false` and `admissionEnabled=false`. It does not construct
+the legacy Go `MemoryStore`, a fake executor, Session routes, or readiness. Those
+claims may change only when the corresponding dependency is actually composed
+and its limitations are reported explicitly.
