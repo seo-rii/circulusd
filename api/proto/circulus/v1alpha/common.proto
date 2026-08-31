@@ -155,7 +155,11 @@ message HandshakeResponse {
   CapabilityStatus status = 5;
   bytes nonce_proof = 6;
 
-  reserved 7 to 15;
+  // Authenticated by nonce_proof so a client cannot confuse two local daemon
+  // roles that happen to use the same protocol descriptor and UDS owner.
+  ProtocolPeer server_peer = 7;
+
+  reserved 8 to 15;
 }
 
 message RpcRequestMeta {

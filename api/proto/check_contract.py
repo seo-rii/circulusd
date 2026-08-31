@@ -180,6 +180,26 @@ def validate_contract(descriptor_set: descriptor_pb2.FileDescriptorSet) -> None:
     ):
         require_type(messages, message_name, "value", descriptor_pb2.FieldDescriptorProto.TYPE_BYTES)
 
+    handshake_server_peer = field(
+        messages[".circulus.api.v1alpha.HandshakeResponse"], "server_peer"
+    )
+    if handshake_server_peer.number != 7:
+        raise ContractError(
+            ".circulus.api.v1alpha.HandshakeResponse.server_peer must remain field 7"
+        )
+    require_type(
+        messages,
+        ".circulus.api.v1alpha.HandshakeResponse",
+        "server_peer",
+        descriptor_pb2.FieldDescriptorProto.TYPE_ENUM,
+    )
+    require_type_name(
+        messages,
+        ".circulus.api.v1alpha.HandshakeResponse",
+        "server_peer",
+        ".circulus.api.v1alpha.ProtocolPeer",
+    )
+
     # Monotonic sequences, attempts, generations, limits, and deadlines have an
     # explicit unsigned 64-bit wire representation.
     for message_name, field_name in (
@@ -660,6 +680,39 @@ def self_test_contract(candidate: descriptor_pb2.FileDescriptorSet) -> None:
         except ContractError:
             return
         raise ContractError(f"contract self-test accepted {description}")
+
+    missing_server_peer = descriptor_pb2.FileDescriptorSet()
+    missing_server_peer.CopyFrom(candidate)
+    handshake_response = all_messages(missing_server_peer)[
+        ".circulus.api.v1alpha.HandshakeResponse"
+    ]
+    kept_fields = [item for item in handshake_response.field if item.name != "server_peer"]
+    del handshake_response.field[:]
+    handshake_response.field.extend(kept_fields)
+    expect_rejection(missing_server_peer, "a handshake response without server_peer")
+
+    renumbered_server_peer = descriptor_pb2.FileDescriptorSet()
+    renumbered_server_peer.CopyFrom(candidate)
+    server_peer = field(
+        all_messages(renumbered_server_peer)[
+            ".circulus.api.v1alpha.HandshakeResponse"
+        ],
+        "server_peer",
+    )
+    server_peer.number = 8
+    expect_rejection(renumbered_server_peer, "a renumbered handshake server_peer")
+
+    untyped_server_peer = descriptor_pb2.FileDescriptorSet()
+    untyped_server_peer.CopyFrom(candidate)
+    server_peer = field(
+        all_messages(untyped_server_peer)[
+            ".circulus.api.v1alpha.HandshakeResponse"
+        ],
+        "server_peer",
+    )
+    server_peer.type = descriptor_pb2.FieldDescriptorProto.TYPE_UINT32
+    server_peer.type_name = ""
+    expect_rejection(untyped_server_peer, "a non-ProtocolPeer handshake server_peer")
 
     missing_dispatch_attempt = descriptor_pb2.FileDescriptorSet()
     missing_dispatch_attempt.CopyFrom(candidate)

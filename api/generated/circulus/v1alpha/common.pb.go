@@ -867,8 +867,11 @@ type HandshakeResponse struct {
 	DescriptorDigest *Digest                `protobuf:"bytes,4,opt,name=descriptor_digest,json=descriptorDigest,proto3" json:"descriptor_digest,omitempty"`
 	Status           *CapabilityStatus      `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
 	NonceProof       []byte                 `protobuf:"bytes,6,opt,name=nonce_proof,json=nonceProof,proto3" json:"nonce_proof,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Authenticated by nonce_proof so a client cannot confuse two local daemon
+	// roles that happen to use the same protocol descriptor and UDS owner.
+	ServerPeer    ProtocolPeer `protobuf:"varint,7,opt,name=server_peer,json=serverPeer,proto3,enum=circulus.api.v1alpha.ProtocolPeer" json:"server_peer,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HandshakeResponse) Reset() {
@@ -941,6 +944,13 @@ func (x *HandshakeResponse) GetNonceProof() []byte {
 		return x.NonceProof
 	}
 	return nil
+}
+
+func (x *HandshakeResponse) GetServerPeer() ProtocolPeer {
+	if x != nil {
+		return x.ServerPeer
+	}
+	return ProtocolPeer_PROTOCOL_PEER_UNSPECIFIED
 }
 
 type RpcRequestMeta struct {
@@ -1275,7 +1285,7 @@ const file_circulus_v1alpha_common_proto_rawDesc = "" +
 	"\n" +
 	"sandbox_id\x18\b \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\tsandboxId\x12-\n" +
 	"\x12sandbox_generation\x18\t \x01(\x04R\x11sandboxGenerationJ\x04\b\n" +
-	"\x10\vR\fbearer_token\"\xec\x02\n" +
+	"\x10\vR\fbearer_token\"\xb1\x03\n" +
 	"\x11HandshakeResponse\x12P\n" +
 	"\x10selected_version\x18\x01 \x01(\v2%.circulus.api.v1alpha.ProtocolVersionR\x0fselectedVersion\x12%\n" +
 	"\x0efeature_bitmap\x18\x02 \x01(\x04R\rfeatureBitmap\x12,\n" +
@@ -1283,7 +1293,9 @@ const file_circulus_v1alpha_common_proto_rawDesc = "" +
 	"\x11descriptor_digest\x18\x04 \x01(\v2\x1c.circulus.api.v1alpha.DigestR\x10descriptorDigest\x12>\n" +
 	"\x06status\x18\x05 \x01(\v2&.circulus.api.v1alpha.CapabilityStatusR\x06status\x12\x1f\n" +
 	"\vnonce_proof\x18\x06 \x01(\fR\n" +
-	"nonceProofJ\x04\b\a\x10\x10\"\xbf\x02\n" +
+	"nonceProof\x12C\n" +
+	"\vserver_peer\x18\a \x01(\x0e2\".circulus.api.v1alpha.ProtocolPeerR\n" +
+	"serverPeerJ\x04\b\b\x10\x10\"\xbf\x02\n" +
 	"\x0eRpcRequestMeta\x12=\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\trequestId\x12C\n" +
@@ -1413,25 +1425,26 @@ var file_circulus_v1alpha_common_proto_depIdxs = []int32{
 	9,  // 12: circulus.api.v1alpha.HandshakeResponse.selected_version:type_name -> circulus.api.v1alpha.ProtocolVersion
 	7,  // 13: circulus.api.v1alpha.HandshakeResponse.descriptor_digest:type_name -> circulus.api.v1alpha.Digest
 	11, // 14: circulus.api.v1alpha.HandshakeResponse.status:type_name -> circulus.api.v1alpha.CapabilityStatus
-	6,  // 15: circulus.api.v1alpha.RpcRequestMeta.request_id:type_name -> circulus.api.v1alpha.OpaqueId
-	7,  // 16: circulus.api.v1alpha.RpcRequestMeta.request_digest:type_name -> circulus.api.v1alpha.Digest
-	9,  // 17: circulus.api.v1alpha.RpcRequestMeta.protocol_version:type_name -> circulus.api.v1alpha.ProtocolVersion
-	6,  // 18: circulus.api.v1alpha.RpcResponseMeta.request_id:type_name -> circulus.api.v1alpha.OpaqueId
-	7,  // 19: circulus.api.v1alpha.RpcResponseMeta.descriptor_digest:type_name -> circulus.api.v1alpha.Digest
-	14, // 20: circulus.api.v1alpha.GetCapabilitiesRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	15, // 21: circulus.api.v1alpha.GetCapabilitiesResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
-	11, // 22: circulus.api.v1alpha.GetCapabilitiesResponse.capabilities:type_name -> circulus.api.v1alpha.CapabilityStatus
-	9,  // 23: circulus.api.v1alpha.GetCapabilitiesResponse.protocol_version:type_name -> circulus.api.v1alpha.ProtocolVersion
-	7,  // 24: circulus.api.v1alpha.GetCapabilitiesResponse.descriptor_digest:type_name -> circulus.api.v1alpha.Digest
-	12, // 25: circulus.api.v1alpha.ControlService.Handshake:input_type -> circulus.api.v1alpha.HandshakeRequest
-	16, // 26: circulus.api.v1alpha.ControlService.GetCapabilities:input_type -> circulus.api.v1alpha.GetCapabilitiesRequest
-	13, // 27: circulus.api.v1alpha.ControlService.Handshake:output_type -> circulus.api.v1alpha.HandshakeResponse
-	17, // 28: circulus.api.v1alpha.ControlService.GetCapabilities:output_type -> circulus.api.v1alpha.GetCapabilitiesResponse
-	27, // [27:29] is the sub-list for method output_type
-	25, // [25:27] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	1,  // 15: circulus.api.v1alpha.HandshakeResponse.server_peer:type_name -> circulus.api.v1alpha.ProtocolPeer
+	6,  // 16: circulus.api.v1alpha.RpcRequestMeta.request_id:type_name -> circulus.api.v1alpha.OpaqueId
+	7,  // 17: circulus.api.v1alpha.RpcRequestMeta.request_digest:type_name -> circulus.api.v1alpha.Digest
+	9,  // 18: circulus.api.v1alpha.RpcRequestMeta.protocol_version:type_name -> circulus.api.v1alpha.ProtocolVersion
+	6,  // 19: circulus.api.v1alpha.RpcResponseMeta.request_id:type_name -> circulus.api.v1alpha.OpaqueId
+	7,  // 20: circulus.api.v1alpha.RpcResponseMeta.descriptor_digest:type_name -> circulus.api.v1alpha.Digest
+	14, // 21: circulus.api.v1alpha.GetCapabilitiesRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	15, // 22: circulus.api.v1alpha.GetCapabilitiesResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	11, // 23: circulus.api.v1alpha.GetCapabilitiesResponse.capabilities:type_name -> circulus.api.v1alpha.CapabilityStatus
+	9,  // 24: circulus.api.v1alpha.GetCapabilitiesResponse.protocol_version:type_name -> circulus.api.v1alpha.ProtocolVersion
+	7,  // 25: circulus.api.v1alpha.GetCapabilitiesResponse.descriptor_digest:type_name -> circulus.api.v1alpha.Digest
+	12, // 26: circulus.api.v1alpha.ControlService.Handshake:input_type -> circulus.api.v1alpha.HandshakeRequest
+	16, // 27: circulus.api.v1alpha.ControlService.GetCapabilities:input_type -> circulus.api.v1alpha.GetCapabilitiesRequest
+	13, // 28: circulus.api.v1alpha.ControlService.Handshake:output_type -> circulus.api.v1alpha.HandshakeResponse
+	17, // 29: circulus.api.v1alpha.ControlService.GetCapabilities:output_type -> circulus.api.v1alpha.GetCapabilitiesResponse
+	28, // [28:30] is the sub-list for method output_type
+	26, // [26:28] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_circulus_v1alpha_common_proto_init() }

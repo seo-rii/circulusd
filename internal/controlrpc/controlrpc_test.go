@@ -2,6 +2,7 @@ package controlrpc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -82,6 +83,81 @@ func TestControlRPCHandshakeCapabilitiesAndCloneBoundaries(t *testing.T) {
 	}
 	if got := second.GetCapabilities(); len(got) != 1 || got[0].GetName() != "execution.docker" || got[0].GetAttributes()["version"] != "1" {
 		t.Fatalf("second capabilities = %v, want clone boundary", got)
+	}
+}
+
+func TestControlRPCBindsAndAuthenticatesTheServerPeer(t *testing.T) {
+	server := startTestServer(t, ServerConfig{
+		SocketPath:   testSocketPath(t),
+		AllowedUIDs:  []uint32{uint32(os.Getuid())},
+		AllowedPeers: []v1.ProtocolPeer{v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL},
+		ServerPeer:   v1.ProtocolPeer_PROTOCOL_PEER_AGENTD,
+	})
+
+	wrongClient, err := NewClient(ClientConfig{SocketPath: server.SocketPath()})
+	if err != nil {
+		t.Fatalf("NewClient(default peer) error = %v", err)
+	}
+	defer wrongClient.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := wrongClient.GetCapabilities(ctx); connect.CodeOf(err) != connect.CodeDataLoss {
+		t.Fatalf("wrong-daemon GetCapabilities() error = %v, want data_loss", err)
+	}
+
+	rightClient, err := NewClient(ClientConfig{
+		SocketPath:         server.SocketPath(),
+		ExpectedServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD,
+	})
+	if err != nil {
+		t.Fatalf("NewClient(expected agentd) error = %v", err)
+	}
+	defer rightClient.Close()
+	if _, err := rightClient.GetCapabilities(ctx); err != nil {
+		t.Fatalf("expected-agentd GetCapabilities() error = %v", err)
+	}
+
+	nonce := bytes.Repeat([]byte{0xa5}, handshakeNonceBytes)
+	platformdProof := nonceProof(nonce, v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD)
+	agentdProof := nonceProof(nonce, v1.ProtocolPeer_PROTOCOL_PEER_AGENTD)
+	if bytes.Equal(platformdProof, agentdProof) {
+		t.Fatal("nonce proof is not bound to the authenticated server peer")
+	}
+}
+
+func TestControlRPCRejectsPeerUIDCrossProductEscalation(t *testing.T) {
+	_, err := ListenServer(ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid()), uint32(os.Getuid()) + 1},
+		AllowedPeers: []v1.ProtocolPeer{
+			v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL,
+			v1.ProtocolPeer_PROTOCOL_PEER_AGENTD,
+		},
+	})
+	if err == nil {
+		t.Fatal("ListenServer() accepted ambiguous UID/peer cross-product authority")
+	}
+}
+
+func TestControlRPCAuthorizesEachProtocolPeerForItsMappedUID(t *testing.T) {
+	server := startTestServer(t, ServerConfig{
+		SocketPath: testSocketPath(t),
+		PeerUIDAuthorities: []PeerUIDAuthority{
+			{UID: uint32(os.Getuid()), Peer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL},
+			{UID: uint32(os.Getuid()) + 1, Peer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD},
+		},
+	})
+	raw, closeRaw := rawControlClient(t, server.SocketPath())
+	defer closeRaw()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := raw.Handshake(ctx, connect.NewRequest(handshakeRequest(t, v1.ProtocolPeer_PROTOCOL_PEER_AGENTD)))
+	if got := connect.CodeOf(err); got != connect.CodePermissionDenied {
+		t.Fatalf("cross-product Handshake() code = %v error=%v, want permission_denied", got, err)
+	}
+	if _, err := raw.Handshake(ctx, connect.NewRequest(handshakeRequest(t, v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL))); err != nil {
+		t.Fatalf("mapped Handshake() error = %v", err)
 	}
 }
 
@@ -196,8 +272,9 @@ func TestControlServerBoundsWholeRequestAndResponseIO(t *testing.T) {
 	if server.httpServer.ReadTimeout != 5*time.Second {
 		t.Fatalf("ReadTimeout = %s, want 5s", server.httpServer.ReadTimeout)
 	}
-	if server.httpServer.WriteTimeout != 5*time.Second {
-		t.Fatalf("WriteTimeout = %s, want 5s", server.httpServer.WriteTimeout)
+	wantWriteTimeout := maximumRequestDeadline + controlHTTPIOTimeout
+	if server.httpServer.WriteTimeout != wantWriteTimeout {
+		t.Fatalf("WriteTimeout = %s, want %s", server.httpServer.WriteTimeout, wantWriteTimeout)
 	}
 	if !server.httpServer.DisableGeneralOptionsHandler {
 		t.Fatal("general OPTIONS handler is enabled outside the Connect RPC routes")
@@ -363,6 +440,142 @@ func TestHandshakeCannotNegotiateAnUnenforcedFrameLimit(t *testing.T) {
 			t.Fatalf("GetCapabilities() code = %v error=%v, want data_loss", got, err)
 		}
 	})
+}
+
+func TestControlServerRejectsWrongPeerVersionAndDeadlineAtWireBoundary(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*v1.HandshakeRequest, *v1.GetCapabilitiesRequest)
+		wantCode connect.Code
+	}{
+		{
+			name: "wrong logical peer",
+			mutate: func(handshake *v1.HandshakeRequest, _ *v1.GetCapabilitiesRequest) {
+				handshake.Peer = v1.ProtocolPeer_PROTOCOL_PEER_AGENTD
+			},
+			wantCode: connect.CodePermissionDenied,
+		},
+		{
+			name: "unsupported handshake version",
+			mutate: func(handshake *v1.HandshakeRequest, _ *v1.GetCapabilitiesRequest) {
+				handshake.MinimumVersion = &v1.ProtocolVersion{Major: 2}
+				handshake.MaximumVersion = &v1.ProtocolVersion{Major: 2}
+			},
+			wantCode: connect.CodeFailedPrecondition,
+		},
+		{
+			name: "unsupported request version",
+			mutate: func(_ *v1.HandshakeRequest, request *v1.GetCapabilitiesRequest) {
+				request.Meta.ProtocolVersion = &v1.ProtocolVersion{Major: 2}
+			},
+			wantCode: connect.CodeFailedPrecondition,
+		},
+		{
+			name: "missing request deadline",
+			mutate: func(_ *v1.HandshakeRequest, request *v1.GetCapabilitiesRequest) {
+				request.Meta.DeadlineUnixMs = 0
+			},
+			wantCode: connect.CodeInvalidArgument,
+		},
+		{
+			name: "expired request deadline",
+			mutate: func(_ *v1.HandshakeRequest, request *v1.GetCapabilitiesRequest) {
+				request.Meta.DeadlineUnixMs = uint64(time.Now().Add(-time.Second).UnixMilli())
+			},
+			wantCode: connect.CodeDeadlineExceeded,
+		},
+		{
+			name: "unbounded future request deadline",
+			mutate: func(_ *v1.HandshakeRequest, request *v1.GetCapabilitiesRequest) {
+				request.Meta.DeadlineUnixMs = uint64(time.Now().Add(5*time.Minute + time.Second).UnixMilli())
+			},
+			wantCode: connect.CodeInvalidArgument,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := startTestServer(t, ServerConfig{
+				SocketPath:  testSocketPath(t),
+				AllowedUIDs: []uint32{uint32(os.Getuid())},
+			})
+			raw, closeRaw := rawControlClient(t, server.SocketPath())
+			defer closeRaw()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			handshake := handshakeRequest(t, v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL)
+			request := &v1.GetCapabilitiesRequest{Meta: &v1.RpcRequestMeta{
+				RequestId:       &v1.OpaqueId{Value: []byte("0123456789abcdef")},
+				DeadlineUnixMs:  uint64(time.Now().Add(time.Second).UnixMilli()),
+				ProtocolVersion: protocolVersion(),
+			}}
+			test.mutate(handshake, request)
+			handshakeResponse, err := raw.Handshake(ctx, connect.NewRequest(handshake))
+			if test.name == "wrong logical peer" || test.name == "unsupported handshake version" {
+				if got := connect.CodeOf(err); got != test.wantCode {
+					t.Fatalf("Handshake() code = %v error=%v, want %v", got, err, test.wantCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Handshake() error = %v", err)
+			}
+			request.Meta.RequestDigest, err = getCapabilitiesRequestDigest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapped := connect.NewRequest(request)
+			wrapped.Header().Set(sessionHeader, handshakeResponse.Header().Get(sessionHeader))
+			_, err = raw.GetCapabilities(ctx, wrapped)
+			if got := connect.CodeOf(err); got != test.wantCode {
+				t.Fatalf("GetCapabilities() code = %v error=%v, want %v", got, err, test.wantCode)
+			}
+		})
+	}
+}
+
+func TestControlRPCPropagatesExplicitInFlightCancellation(t *testing.T) {
+	providerStarted := make(chan struct{})
+	providerCanceled := make(chan struct{})
+	server := startTestServer(t, ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+		CapabilityProvider: func(ctx context.Context) ([]*v1.CapabilityStatus, error) {
+			close(providerStarted)
+			<-ctx.Done()
+			close(providerCanceled)
+			return nil, ctx.Err()
+		},
+	})
+	client, err := NewClient(ClientConfig{SocketPath: server.SocketPath()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, callErr := client.GetCapabilities(ctx)
+		result <- callErr
+	}()
+	select {
+	case <-providerStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if got := connect.CodeOf(err); got != connect.CodeCanceled {
+			t.Fatalf("GetCapabilities() code = %v error=%v, want canceled", got, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled call did not return")
+	}
+	select {
+	case <-providerCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider did not observe cancellation")
+	}
 }
 
 func TestGetCapabilitiesRequestDigestIsDeterministicAndNonMutating(t *testing.T) {
@@ -794,6 +1007,82 @@ func TestClosedClientFailsWithoutNetworkReuse(t *testing.T) {
 	}
 }
 
+func TestServerClosePreservesFirstCleanupError(t *testing.T) {
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	cleanupErr := errors.New("listener cleanup failed")
+	server.listener = &closeErrorListener{
+		Listener: server.listener,
+		err:      cleanupErr,
+	}
+
+	if err := server.Close(); !errors.Is(err, cleanupErr) {
+		t.Fatalf("first Close() error = %v, want %v", err, cleanupErr)
+	}
+	if err := server.Close(); !errors.Is(err, cleanupErr) {
+		t.Fatalf("second Close() error = %v, want preserved %v", err, cleanupErr)
+	}
+}
+
+func TestServerServeReturnsCleanupErrorOnContextCancellation(t *testing.T) {
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	cleanupErr := errors.New("listener cleanup failed")
+	acceptStarted := make(chan struct{})
+	server.listener = &closeErrorListener{
+		Listener:      server.listener,
+		err:           cleanupErr,
+		acceptStarted: acceptStarted,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveError := make(chan error, 1)
+	go func() { serveError <- server.Serve(ctx) }()
+	select {
+	case <-acceptStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Serve() did not begin accepting connections")
+	}
+	cancel()
+	select {
+	case err := <-serveError:
+		if !errors.Is(err, cleanupErr) {
+			t.Fatalf("Server.Serve() error = %v, want cleanup error %v", err, cleanupErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Serve() did not stop after context cancellation")
+	}
+}
+
+type closeErrorListener struct {
+	net.Listener
+	err           error
+	acceptStarted chan struct{}
+	acceptOnce    sync.Once
+}
+
+func (listener *closeErrorListener) Accept() (net.Conn, error) {
+	if listener.acceptStarted != nil {
+		listener.acceptOnce.Do(func() { close(listener.acceptStarted) })
+	}
+	return listener.Listener.Accept()
+}
+
+func (listener *closeErrorListener) Close() error {
+	_ = listener.Listener.Close()
+	return listener.err
+}
+
 type scriptedControlService struct {
 	v1connect.UnimplementedControlServiceHandler
 	handshakeCalls  atomic.Uint64
@@ -810,11 +1099,12 @@ func (service *scriptedControlService) Handshake(_ context.Context, request *con
 		SelectedVersion:  protocolVersion(),
 		MaximumFrameSize: maximumMessageBytes,
 		DescriptorDigest: descriptorDigest(),
+		ServerPeer:       v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD,
 		Status: &v1.CapabilityStatus{
 			Name:         "control.protocol",
 			Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
 		},
-		NonceProof: nonceProof(request.Msg.GetOneTimeNonce()),
+		NonceProof: nonceProof(request.Msg.GetOneTimeNonce(), v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD),
 	}
 	if service.mutateHandshake != nil {
 		service.mutateHandshake(message)

@@ -35,14 +35,25 @@ const (
 	sessionRandomBytes         = 16
 	sessionPayloadBytes        = 1 + 4 + 4 + 8 + sessionRandomBytes
 	controlHTTPIOTimeout       = 5 * time.Second
+	maximumRequestDeadline     = 5 * time.Minute
 )
 
 type CapabilityProvider func(context.Context) ([]*v1.CapabilityStatus, error)
+
+// PeerUIDAuthority grants one logical protocol role to one kernel-authenticated
+// UDS peer UID. Keeping the pair explicit prevents independent UID and role
+// allowlists from accidentally authorizing their Cartesian product.
+type PeerUIDAuthority struct {
+	UID  uint32
+	Peer v1.ProtocolPeer
+}
 
 type ServerConfig struct {
 	SocketPath         string
 	AllowedUIDs        []uint32
 	AllowedPeers       []v1.ProtocolPeer
+	PeerUIDAuthorities []PeerUIDAuthority
+	ServerPeer         v1.ProtocolPeer
 	Capabilities       []*v1.CapabilityStatus
 	CapabilityProvider CapabilityProvider
 }
@@ -53,15 +64,17 @@ type Server struct {
 	httpServer *http.Server
 	handler    *controlHandler
 
-	serveMu sync.Mutex
-	served  bool
-	close   sync.Once
-	closed  atomic.Bool
+	serveMu    sync.Mutex
+	served     bool
+	close      sync.Once
+	closeError error
+	closed     atomic.Bool
 }
 
 type controlHandler struct {
 	v1connect.UnimplementedControlServiceHandler
-	allowedPeers map[v1.ProtocolPeer]struct{}
+	allowedPeers map[uint32]map[v1.ProtocolPeer]struct{}
+	serverPeer   v1.ProtocolPeer
 	capabilities []*v1.CapabilityStatus
 	provider     CapabilityProvider
 	sessionKey   [sha256.Size]byte
@@ -90,24 +103,63 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	if err := validateServerSocketPath(config.SocketPath); err != nil {
 		return nil, err
 	}
-	if len(config.AllowedUIDs) == 0 {
-		return nil, fmt.Errorf("controlrpc: allowed UID list must not be empty")
+	serverPeer := config.ServerPeer
+	if serverPeer == v1.ProtocolPeer_PROTOCOL_PEER_UNSPECIFIED {
+		serverPeer = v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD
 	}
-	allowedUIDs := make(map[uint32]struct{}, len(config.AllowedUIDs))
-	for _, uid := range config.AllowedUIDs {
-		allowedUIDs[uid] = struct{}{}
+	if !isKnownPeer(serverPeer) {
+		return nil, fmt.Errorf("controlrpc: server peer %d is invalid", serverPeer)
 	}
 
-	allowedPeers := make(map[v1.ProtocolPeer]struct{})
-	if len(config.AllowedPeers) == 0 {
-		allowedPeers[v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL] = struct{}{}
-	} else {
-		for _, peer := range config.AllowedPeers {
-			if !isKnownPeer(peer) {
-				return nil, fmt.Errorf("controlrpc: allowed peer %d is invalid", peer)
-			}
-			allowedPeers[peer] = struct{}{}
+	allowedUIDs := make(map[uint32]struct{})
+	allowedPeers := make(map[uint32]map[v1.ProtocolPeer]struct{})
+	if len(config.PeerUIDAuthorities) != 0 {
+		if len(config.AllowedUIDs) != 0 || len(config.AllowedPeers) != 0 {
+			return nil, fmt.Errorf("controlrpc: configure paired peer authorities or compatibility allowlists, not both")
 		}
+		for _, authority := range config.PeerUIDAuthorities {
+			if !isKnownPeer(authority.Peer) {
+				return nil, fmt.Errorf("controlrpc: allowed peer %d is invalid", authority.Peer)
+			}
+			peers := allowedPeers[authority.UID]
+			if peers == nil {
+				peers = make(map[v1.ProtocolPeer]struct{})
+				allowedPeers[authority.UID] = peers
+			}
+			if _, duplicate := peers[authority.Peer]; duplicate {
+				return nil, fmt.Errorf("controlrpc: peer authority is duplicated")
+			}
+			peers[authority.Peer] = struct{}{}
+			allowedUIDs[authority.UID] = struct{}{}
+		}
+	} else {
+		if len(config.AllowedUIDs) == 0 {
+			return nil, fmt.Errorf("controlrpc: allowed UID list must not be empty")
+		}
+		compatibilityPeers := config.AllowedPeers
+		if len(compatibilityPeers) == 0 {
+			compatibilityPeers = []v1.ProtocolPeer{v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL}
+		}
+		if len(config.AllowedUIDs) > 1 && len(compatibilityPeers) > 1 {
+			return nil, fmt.Errorf("controlrpc: UID and peer allowlists form an ambiguous authority cross-product")
+		}
+		for _, uid := range config.AllowedUIDs {
+			allowedUIDs[uid] = struct{}{}
+			peers := allowedPeers[uid]
+			if peers == nil {
+				peers = make(map[v1.ProtocolPeer]struct{})
+				allowedPeers[uid] = peers
+			}
+			for _, peer := range compatibilityPeers {
+				if !isKnownPeer(peer) {
+					return nil, fmt.Errorf("controlrpc: allowed peer %d is invalid", peer)
+				}
+				peers[peer] = struct{}{}
+			}
+		}
+	}
+	if len(allowedUIDs) == 0 {
+		return nil, fmt.Errorf("controlrpc: peer authority list must not be empty")
 	}
 
 	capabilities, err := cloneCapabilities(config.Capabilities)
@@ -142,6 +194,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 
 	handler := &controlHandler{
 		allowedPeers: allowedPeers,
+		serverPeer:   serverPeer,
 		capabilities: capabilities,
 		provider:     config.CapabilityProvider,
 	}
@@ -164,7 +217,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		Handler:                      rpcHandler,
 		ReadTimeout:                  controlHTTPIOTimeout,
 		ReadHeaderTimeout:            controlHTTPIOTimeout,
-		WriteTimeout:                 controlHTTPIOTimeout,
+		WriteTimeout:                 maximumRequestDeadline + controlHTTPIOTimeout,
 		IdleTimeout:                  30 * time.Second,
 		MaxHeaderBytes:               16 << 10,
 		DisableGeneralOptionsHandler: true,
@@ -201,7 +254,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	server.served = true
 	server.serveMu.Unlock()
 	if server.closed.Load() {
-		return nil
+		return server.Close()
 	}
 
 	stop := make(chan struct{})
@@ -215,7 +268,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	err := server.httpServer.Serve(server.listener)
 	close(stop)
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-		return nil
+		return server.Close()
 	}
 	return err
 }
@@ -224,19 +277,18 @@ func (server *Server) Close() error {
 	if server == nil {
 		return nil
 	}
-	var closeError error
 	server.close.Do(func() {
 		server.closed.Store(true)
 		httpError := server.httpServer.Close()
 		listenerError := server.listener.Close()
 		if httpError != nil && !errors.Is(httpError, net.ErrClosed) {
-			closeError = httpError
+			server.closeError = httpError
 		}
 		if listenerError != nil && !errors.Is(listenerError, net.ErrClosed) {
-			closeError = errors.Join(closeError, listenerError)
+			server.closeError = errors.Join(server.closeError, listenerError)
 		}
 	})
-	return closeError
+	return server.closeError
 }
 
 func (listener *credentialListener) Accept() (net.Conn, error) {
@@ -297,7 +349,8 @@ func (handler *controlHandler) Handshake(ctx context.Context, request *connect.R
 	if hasUnknownFields(message) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("handshake request contains unknown protocol fields"))
 	}
-	if _, allowed := handler.allowedPeers[message.GetPeer()]; !allowed {
+	peers := handler.allowedPeers[credential.uid]
+	if _, allowed := peers[message.GetPeer()]; !allowed {
 		return nil, connect.NewError(connect.CodePermissionDenied, errors.New("protocol peer is not allowed"))
 	}
 	if !versionRangeIncludesProtocol(message.GetMinimumVersion(), message.GetMaximumVersion()) {
@@ -321,11 +374,12 @@ func (handler *controlHandler) Handshake(ctx context.Context, request *connect.R
 		FeatureBitmap:    0,
 		MaximumFrameSize: maximumMessageBytes,
 		DescriptorDigest: descriptorDigest(),
+		ServerPeer:       handler.serverPeer,
 		Status: &v1.CapabilityStatus{
 			Name:         "control.protocol",
 			Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
 		},
-		NonceProof: nonceProof(message.GetOneTimeNonce()),
+		NonceProof: nonceProof(message.GetOneTimeNonce(), handler.serverPeer),
 	})
 	response.Header().Set(sessionHeader, session)
 	return response, nil
@@ -356,8 +410,12 @@ func (handler *controlHandler) GetCapabilities(ctx context.Context, request *con
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request deadline is missing"))
 	}
 	metadataDeadline := time.UnixMilli(int64(meta.GetDeadlineUnixMs()))
-	if !time.Now().Before(metadataDeadline) {
+	now := time.Now()
+	if !now.Before(metadataDeadline) {
 		return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("request deadline has expired"))
+	}
+	if metadataDeadline.Sub(now) > maximumRequestDeadline {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("request deadline exceeds the protocol bound"))
 	}
 	expectedDigest, err := getCapabilitiesRequestDigest(request.Msg)
 	if err != nil || !proto.Equal(expectedDigest, meta.GetRequestDigest()) {
@@ -428,7 +486,7 @@ func (handler *controlHandler) verifySession(token string, uid uint32, now time.
 		return fmt.Errorf("session UID mismatch")
 	}
 	peer := v1.ProtocolPeer(binary.BigEndian.Uint32(payload[5:9]))
-	if _, allowed := handler.allowedPeers[peer]; !allowed {
+	if _, allowed := handler.allowedPeers[uid][peer]; !allowed {
 		return fmt.Errorf("session peer is not allowed")
 	}
 	expiresAt := binary.BigEndian.Uint64(payload[9:17])

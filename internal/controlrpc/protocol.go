@@ -3,6 +3,7 @@ package controlrpc
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 
@@ -12,7 +13,7 @@ import (
 )
 
 const (
-	descriptorSHA256    = "ff942ae0643b6fa2a8b8ccee97e1593e0d4b56cd414ee771ad0b731ff5854f63"
+	descriptorSHA256    = "693b865cbe6eadb0e6d43910707f8bd0cde0bd892642487e514416e8c0ebc1e0"
 	maximumMessageBytes = 1 << 20
 	handshakeNonceBytes = 32
 	sessionHeader       = "Circulus-Protocol-Session"
@@ -65,11 +66,14 @@ func getCapabilitiesRequestDigest(request *v1.GetCapabilitiesRequest) (*v1.Diges
 	return sha256Digest(payload), nil
 }
 
-func nonceProof(nonce []byte) []byte {
+func nonceProof(nonce []byte, serverPeer v1.ProtocolPeer) []byte {
 	descriptor := descriptorDigest().GetValue()
-	payload := make([]byte, 0, len(nonceProofDomain)+len(descriptor)+len(nonce))
+	payload := make([]byte, 0, len(nonceProofDomain)+len(descriptor)+4+len(nonce))
 	payload = append(payload, nonceProofDomain...)
 	payload = append(payload, descriptor...)
+	var encodedPeer [4]byte
+	binary.BigEndian.PutUint32(encodedPeer[:], uint32(serverPeer))
+	payload = append(payload, encodedPeer[:]...)
 	payload = append(payload, nonce...)
 	digest := sha256.Sum256(payload)
 	return append([]byte(nil), digest[:]...)

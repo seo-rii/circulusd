@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	descriptorSHA256       = "ff942ae0643b6fa2a8b8ccee97e1593e0d4b56cd414ee771ad0b731ff5854f63"
+	descriptorSHA256       = "693b865cbe6eadb0e6d43910707f8bd0cde0bd892642487e514416e8c0ebc1e0"
 	maximumMessageBytes    = 1 << 20
 	maximumStdinChunkBytes = 64 << 10
 	maximumOutputBytes     = 64 << 20

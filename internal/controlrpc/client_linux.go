@@ -23,14 +23,16 @@ import (
 const defaultRequestTimeout = 30 * time.Second
 
 type ClientConfig struct {
-	SocketPath string
-	Peer       v1.ProtocolPeer
+	SocketPath         string
+	Peer               v1.ProtocolPeer
+	ExpectedServerPeer v1.ProtocolPeer
 }
 
 type Client struct {
 	socketPath     string
 	socketIdentity socketIdentity
 	peer           v1.ProtocolPeer
+	serverPeer     v1.ProtocolPeer
 	transport      *http.Transport
 	rpc            v1connect.ControlServiceClient
 	closed         atomic.Bool
@@ -58,11 +60,19 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if !isKnownPeer(peer) {
 		return nil, fmt.Errorf("controlrpc: client peer %d is invalid", peer)
 	}
+	serverPeer := config.ExpectedServerPeer
+	if serverPeer == v1.ProtocolPeer_PROTOCOL_PEER_UNSPECIFIED {
+		serverPeer = v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD
+	}
+	if !isKnownPeer(serverPeer) {
+		return nil, fmt.Errorf("controlrpc: expected server peer %d is invalid", serverPeer)
+	}
 
 	client := &Client{
 		socketPath:     config.SocketPath,
 		socketIdentity: identity,
 		peer:           peer,
+		serverPeer:     serverPeer,
 	}
 	client.transport = &http.Transport{
 		DisableCompression:  true,
@@ -224,11 +234,12 @@ func (client *Client) performHandshake(ctx context.Context) (string, error) {
 	if response == nil || response.Msg == nil ||
 		hasUnknownFields(response.Msg) ||
 		!isProtocolVersion(response.Msg.GetSelectedVersion()) ||
+		response.Msg.GetServerPeer() != client.serverPeer ||
 		response.Msg.GetFeatureBitmap() != 0 ||
 		response.Msg.GetMaximumFrameSize() != maximumMessageBytes ||
 		!isDescriptorDigest(response.Msg.GetDescriptorDigest()) ||
 		response.Msg.GetStatus().GetAvailability() != v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE ||
-		!bytes.Equal(response.Msg.GetNonceProof(), nonceProof(nonce)) {
+		!bytes.Equal(response.Msg.GetNonceProof(), nonceProof(nonce, client.serverPeer)) {
 		return "", connect.NewError(connect.CodeDataLoss, errors.New("invalid handshake response"))
 	}
 	session := response.Header().Get(sessionHeader)
