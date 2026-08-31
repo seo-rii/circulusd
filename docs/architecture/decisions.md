@@ -275,3 +275,16 @@ wall-clock guarantee: client construction performs synchronous,
 context-free path metadata validation. The local `/run` convention assumes
 responsive local metadata, while a custom FUSE/NFS-backed path may block beyond
 the deadline and must not be treated as a bounded startup check.
+
+The Unit 10 Phase 0A qualification harness may compose the existing internal
+agent manager, workerd launcher, and cgroup controller to obtain real external
+resource evidence. That harness is not an `agentd` workload graph and creates no
+new application RPC or listener. Until a later unit binds an operational graph
+to current release, state, placement, and private workload authority, the
+`agentd` command keeps its operational capabilities `NOT_WIRED` and
+`admissionEnabled=false` even when the targeted Phase 0A gate passes.
+
+Phase 0A mechanical cgroup evidence also does not claim that a same-UID workerd
+process cannot reopen delegated cgroup controls after a full process
+compromise. Production composition must isolate that authority or place the
+process inside a stronger outer boundary before it can become admission-ready.

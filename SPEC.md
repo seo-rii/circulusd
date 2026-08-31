@@ -5776,6 +5776,11 @@ ExecutionEnvironmentRevision은 immutable하다. package update는 기존 enviro
 
 각 phase에는 명시적 컷 라인을 둔다. 일정 압박 시 Registry 서명 강제화의 유예, quota 세분화, `tenant-workerd`/`session-workerd` profile 등은 뒤로 미룰 수 있다. 그러나 §55 불변식과 §53.2/§53.5의 durable correctness 테스트는 어떤 컷에서도 제외하지 않는다. §53 acceptance matrix 전체가 상당한 구현량이므로 phase별 필수 부분집합을 conformance suite에서 태그로 관리한다.
 
+저장소의 세부 작업 단위, 현재 순서, TDD/커밋 경계는
+`docs/implementation-plan.md`에서 관리한다. 이 계획 문서가 본 SPEC의 MUST/MUST NOT을
+완화할 수 없으며, 작업 단위의 `complete`는 `docs/acceptance.md`에 실제 외부 증거가
+기록된 conformance `PASS`와 같은 의미가 아니다.
+
 ### 51.1 Phase 0A — Pi/workerd 실행 검증
 
 목표:

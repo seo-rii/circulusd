@@ -24,6 +24,11 @@ pnpm check
 
 External runtime and isolation tests report one of `PASS`, `FAIL`, `UNAVAILABLE`, or `NOT_RUN`. Only `PASS` satisfies a required release profile. The current acceptance ledger is maintained in `docs/acceptance.md` as features land.
 
+The phase roadmap is defined in `SPEC.md` §51. The current repository work-unit
+cut, including the accepted Unit 10 Phase 0A resource-qualification plan, is in
+[`docs/implementation-plan.md`](docs/implementation-plan.md). Planned work does
+not change the evidence in [`docs/acceptance.md`](docs/acceptance.md).
+
 The development daemon is a separate, non-production executable:
 
 ```bash

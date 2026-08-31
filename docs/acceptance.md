@@ -30,6 +30,14 @@ Only `PASS` satisfies a required release profile. Development fakes and unit lau
 | §53.17 | ACL/quota | cross-tenant, role and atomic quota rejection suite | NOT_RUN |
 | §53.18 | Install/upgrade | clean network-denied profile installs and rollback suite | NOT_RUN |
 
+## Planned qualification work
+
+Unit 10 is fixed in `docs/implementation-plan.md` as the Phase 0A workerd
+resource-qualification unit. It targets the remaining CPU-limit,
+RSS/cold-start, pressure/recycle, and Worker/shard reconstruction evidence while
+keeping `cmd/agentd` diagnostic-only. This is a plan, not executed evidence; it
+does not change any status in the table above.
+
 ## External qualification notes
 
 - Pi Agent Core `0.84.3` and workerd `v1.20260825.1` remain short of the complete bounded-step Phase 0A gate. The digest-pinned stock workerd binary ran the actual ABI/state-v2 Pi adapter across four fresh engine/core instances over the checkpoint sequence `model -> external-tool -> model -> complete` and observed the complete extension hook sequence without Node compatibility flags. A separate probe rendezvoused the first model settlements and ran that trace concurrently for two distinct content-addressed Dynamic Workers through real Workerd service bindings backed by a deterministic mock MODEL/MCP worker; effect digests, identities, stages, bounded retry, and missing bindings were checked, and its evidence remains `mock: true`. This proves the binding and correlation shape, not production broker authorization, durable delivery, or recovery. No Dynamic Worker kill/recreation, shard recycle, cgroup pressure, CPU-limit, or RSS/cold-start gate has run. Those external boundaries remain explicitly `NOT_RUN`.
