@@ -46,8 +46,9 @@ not silently included in Unit 10.
   Artifact and manifest signatures cover both new provenance fields, and the
   repository pins were checked against the official x86_64 and aarch64 assets.
   Release/package race tests, the API schema contract, and the complete Go test
-  suite pass. Runtime extraction/opened-executable verification remains in the
-  external-runner slice.
+  suite pass. Archive extraction remains owned by the separate release/install
+  workflow, and runner composition remains; release-bound installed-executable
+  verification is recorded below.
 - 2026-08-31: the resource fixture now renders only the pinned
   `serve --experimental -I<fixture> <fixture>/phase0-resource.capnp` argument
   vector from a short canonical absolute directory. Golden tests reject unsafe
@@ -62,8 +63,9 @@ not silently included in Unit 10.
   survive caller cancellation. Shutdown starts independent cleanup in parallel,
   joins results deterministically, retries uncertain cleanup, and fences
   replacement until the prior generation is quiescent. Repeated package
-  race/shuffle tests pass. The low-level workerd launcher generation rename and
-  fixed-configuration Manager adapter remain in U10.1.
+  race/shuffle tests pass. At this checkpoint, the low-level workerd launcher
+  generation rename and fixed-configuration Manager adapter remained; both are
+  recorded as complete below.
 - 2026-09-01: the qualification release resolver now validates the manifest
   and configured trust policy for every release status, requires promotion
   verification for candidate/production releases, selects exactly one workerd
@@ -125,16 +127,20 @@ not silently included in Unit 10.
   Ensure, readiness, starter commands, handles, cgroup leases/leaves/samples,
   current/history keys, and stop ownership carry the same boot-scoped agent ID.
   A low-level launcher binds atomically to its first valid agent instance for
-  its entire lifetime; another boot fails before readiness, process, or cgroup
-  callbacks, so history cannot accumulate across boots. Exact mismatch,
-  lock-free callback, first-bind race, and cgroup integration tests pass under
-  full repository race and vet gates.
-- 2026-09-01: cgroup error classification now reserves `NOT_RUN` for genuine
-  host absence or unsupported kernel operations. Permission denial,
-  insufficient privilege, and a read-only provisioned root fail the cgroup
-  contract; those failures dominate an unavailable member in a joined error
-  instead of being laundered into `NOT_RUN`. Constructor, direct-classifier,
-  mixed-error, availability, agent, and conformance race tests pass.
+  its entire lifetime. It rechecks the cached cancellation signal inside the
+  binding critical section, so a request canceled while waiting for that lock
+  cannot reserve the lifetime or create pending work. Another boot fails before
+  readiness, process, or cgroup callbacks, so history cannot accumulate across
+  boots. Exact mismatch, cancellation-window, lock-free callback, first-bind
+  race, and cgroup integration tests pass under full repository race and vet
+  gates.
+- 2026-09-01: the low-level cgroup error classifier now makes permission,
+  privilege, read-only, and mixed provisioning failures contract failures
+  distinct from the genuine-absence sentinel. This is reference-only
+  classification: operation-scoped host absence versus post-provision path
+  loss and U10.4 external status mapping remain. Constructor,
+  direct-classifier, mixed-error, availability, agent, and conformance race
+  tests pass.
 
 ### Outcome
 
@@ -228,9 +234,10 @@ Four identity domains remain distinct:
   used only by the reference fixture in Unit 10 and is never passed to the
   process launcher or used in a cgroup leaf name. Real rotation and downstream
   broker rejection belong to Unit 11 and later composition work.
-- `agentInstanceID` is a fresh, non-secret 128-bit identifier created for one
-  qualification-runtime boot by Manager construction after the host boot
-  identity is loaded. Restarting that runtime creates a new value.
+- The qualification composition root MUST load the host boot identity before
+  constructing Manager. Manager construction then creates `agentInstanceID`, a
+  fresh, non-secret 128-bit identifier for that qualification-runtime boot.
+  Restarting that runtime creates a new value.
 - `shardID` names one manager-owned logical shard slot inside an agent instance.
 - `shardGeneration` is allocated monotonically by `Manager`, scoped to
   `(agentInstanceID, shardID)`. Every OS start attempt consumes a new
@@ -252,18 +259,20 @@ one; reusing the old launcher with another agent identity fails before
 allocation or callbacks. Per-shard generation history therefore cannot grow
 across boots.
 
-Every readiness response, exit callback, resource sample, and stop completion
-carries `(agentInstanceID, shardID, shardGeneration)` plus a non-reusable
-process-instance token and the pinned cgroup device/inode identity. On Linux,
-the process token uses a pidfd when available and verifies PID start identity;
-a numeric PID alone is insufficient. A late callback from a prior start cannot
-publish, drain, account, or remove its replacement.
+At U10.2 completion, every readiness response, exit callback, resource sample,
+and stop completion MUST carry `(agentInstanceID, shardID, shardGeneration)`
+plus a non-reusable process-instance token and the pinned cgroup device/inode
+identity. On Linux, the completed process token MUST use a pidfd when available
+and verify PID start identity; a numeric PID alone is insufficient. A late
+callback from a prior start must not publish, drain, account, or remove its
+replacement.
 
-One observer loop owns each shard generation. It serializes samples and assigns
-a monotonic `observationSequence` after a complete read. `ObservedAt` is
-diagnostic only; Manager rejects duplicate or decreasing sequences rather than
-using wall-clock order. Cumulative `memory.events` and `cpu.stat` values are
-compared with the baseline captured for that exact generation.
+One observer loop will own each shard generation. It will serialize samples and
+assign a monotonic `observationSequence` after a complete read. `ObservedAt`
+will remain diagnostic only; Manager will reject duplicate or decreasing
+sequences rather than using wall-clock order. Cumulative `memory.events` and
+`cpu.stat` values will be compared with the baseline captured for that exact
+generation.
 
 ### Readiness boundary
 
@@ -504,6 +513,11 @@ binary/cgroup external `PASS`.
 
 #### U10.1 — Release pin, generation, and composition contracts
 
+Status: in progress. Items 1–4 and item 5's adapter/fixed-snapshot contract are
+implemented; its release-resolver binding remains in U10.4. The independent
+lifecycle review added item 6 before observation delivery can depend on cleanup
+fences.
+
 1. Add failing release-manifest/schema tests for extraction provenance and the
    installed executable digest, plus failing qualification-input tests that
    reject caller-supplied expected identities or raw launch inputs.
@@ -511,26 +525,46 @@ binary/cgroup external `PASS`.
    bounded finite `CPUMax` value; reject zero, `max`, range violations, extra
    tokens, and legacy multiplication/overflow behavior.
 3. Add failing agent tests for the generation allocator/API rename, one fresh
-   generation per OS attempt, placement-generation non-flow, stale callback
-   rejection, and readiness identity separation.
+   generation per OS attempt, placement-generation non-flow, and readiness
+   identity separation.
 4. Add cross-contract RED tests for “initiator cancels after a second waiter
-   attaches → one OS start and remaining waiter succeeds” and for blocking or
-   reentrant `ID`/readiness callbacks under Manager operations.
+   attaches → one OS start and remaining waiter succeeds”, cancellation between
+   the final precheck and first launcher identity bind, and blocking or reentrant
+   identity/readiness callbacks under Manager operations.
 5. Implement the narrow manager/launcher adapter, canonical CPU-max migration,
    manager-owned launch context, immutable waiter result, and release-bound
    fixed launch configuration.
+6. Add failing Manager and workerd tests that make retryable cleanup start one
+   fresh shared epoch on the next explicit caller while terminal integrity or
+   identity failures remain cached and side-effect free. Preserve parallel
+   starts and deterministic joins during shutdown. Then define the minimal
+   `ShardProcess.Stop` outcome contract for retryable ownership-retained versus
+   terminal ownership-released or poisoned failures, and implement Manager
+   epoch replacement or terminal caching from that contract without inferring
+   disposition from an arbitrary non-nil error.
 
 #### U10.2 — Generation-bound resource observation
+
+Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
+generation baselines, `(pid,startTicks)` RSS reads, and permission/read-only
+dominance in the low-level classifier are implemented. Operation-scoped host
+absence versus post-provision path loss, controller availability versus
+enablement, pidfd ownership, launcher attachment, serialized sequences, Manager
+delivery, and evidence-artifact status mapping remain.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include
    controller write/readback tests for the canonical quota/period and
    process-RSS tests pinned to the process token/PID start identity. Add
    classification tests that distinguish genuine absence/unsupported errors
-   from permission, read-only, and mixed provisioned-root failures.
-2. Add failing race tests for stale cgroup identity, duplicate/decreasing
-   observation sequence, delayed old low-memory samples, and cumulative-counter
-   baseline replacement.
+   from permission, read-only, and mixed provisioned-root failures. Include the
+   operation phase: initial host/root absence may be unavailable, while loss,
+   replacement, or unsupported operations on an already provisioned leaf fail
+   the integrity contract. Distinguish an unavailable controller from one the
+   operator failed to enable.
+2. Add failing race tests for stale callback/cgroup identity,
+   duplicate/decreasing observation sequence, delayed old low-memory samples,
+   and cumulative-counter baseline replacement.
 3. Implement one serialized observer loop per shard generation. Feed immutable
    observations into Manager without holding manager/cgroup locks across I/O or
    callbacks.
@@ -538,6 +572,8 @@ binary/cgroup external `PASS`.
    and unavailable/malformed evidence distinct in code and artifacts.
 
 #### U10.3 — Distinct reconstruction and recycle contracts
+
+Status: queued.
 
 1. Add failing host-independent contract tests for all three new reconstruction
    result names, their non-substitutability, checkpoint commit/ack ordering,
@@ -566,6 +602,14 @@ binary/cgroup external `PASS`.
 
 #### U10.4 — External runner, status, and evidence
 
+Status: partially implemented. The bounded input schema, fixed argument
+renderer, release resolver, and sealed executable snapshot exist. The runner
+consumes a preinstalled executable; archive extraction remains owned by the
+separate release/install workflow. Pinned-binary CLI and provisioning
+preflights, status/PASS predicates, sealed snapshot-to-launcher handoff,
+persistent socket composition, real probes, canonical evidence retention, and
+result promotion remain.
+
 1. Add failing host-independent tests for the exact input schema, fixed argv,
    provisioning preflight, status table, component PASS predicates, evidence
    class/identity agreement, canonical artifact validator, atomic retention,
@@ -587,6 +631,8 @@ binary/cgroup external `PASS`.
    when any one is missing, substituted, canceled, timed out, or not quiescent.
 
 #### U10.5 — Close the unit without widening readiness
+
+Status: queued.
 
 1. Run focused race/shuffle/repetition tests for `internal/agent`, the workerd
    conformance harness, and `cmd/agentd`.
