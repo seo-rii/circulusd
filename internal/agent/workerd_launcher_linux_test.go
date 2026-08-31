@@ -1213,8 +1213,8 @@ func TestWorkerdShardHandleStopRetriesAfterTimedOutRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handle.Stop(context.Background()); !errors.Is(err, ErrWorkerdStopTimeout) {
-		t.Fatalf("Stop(first round) error = %v, want timeout", err)
+	if err := handle.Stop(context.Background()); !errors.Is(err, ErrWorkerdStopTimeout) || errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("Stop(first round) error = %v, want unmarked retryable timeout", err)
 	}
 	if err := handle.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop(second round) error = %v", err)
@@ -1316,6 +1316,42 @@ func TestWorkerdShardHandleStaleGenerationCannotStopReplacement(t *testing.T) {
 	}
 	if err := newHandle.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop(replacement) error = %v", err)
+	}
+}
+
+func TestWorkerdShardHandleStaleExactIdentityIsTerminalAndSideEffectFree(t *testing.T) {
+	t.Parallel()
+	_, launcher := newWorkerdLauncherFixture(t, &recordingWorkerdStarter{}, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	instance := &workerdInstance{
+		key: workerdLaunchKey{
+			agentInstanceID: workerdTestAgentInstanceID(0),
+			shardID:         "untracked-stale-handle",
+			generation:      7,
+		},
+	}
+	handle := &WorkerdShardHandle{launcher: launcher, instance: instance}
+
+	var firstErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		err := handle.Stop(context.Background())
+		if !errors.Is(err, ErrStaleWorkerdGeneration) || !errors.Is(err, ErrTerminalShardCleanup) {
+			t.Fatalf("Stop(stale exact handle attempt %d) error = %v", attempt+1, err)
+		}
+		if attempt == 0 {
+			firstErr = err
+		} else if err != firstErr {
+			t.Fatalf("Stop(stale exact handle) replay error = %p, want cached %p", err, firstErr)
+		}
+	}
+	launcher.mu.Lock()
+	instances := len(launcher.instances)
+	launcher.mu.Unlock()
+	instance.mu.Lock()
+	stop := instance.stop
+	requested := instance.handleStopRequested
+	instance.mu.Unlock()
+	if instances != 0 || stop != nil || requested {
+		t.Fatalf("stale Stop side effects = instances %d, stop %#v, requested %v", instances, stop, requested)
 	}
 }
 

@@ -23,6 +23,11 @@ var (
 	ErrManagerClosed      = errors.New("agent: manager is shut down")
 )
 
+// ErrTerminalShardCleanup marks a cleanup result whose process ownership has
+// been released or quarantined, making another Stop unsafe or meaningless. The
+// same marked error must be replayed without side effects.
+var ErrTerminalShardCleanup = errors.New("agent: terminal shard cleanup failure")
+
 type ProcessScope string
 
 const (
@@ -113,8 +118,10 @@ type ShardProcess interface {
 	ID() string
 	AgentInstanceID() identity.ID
 	ShardGeneration() ShardGeneration
-	// Stop is idempotent and returns nil only after the shard can no longer
-	// execute requests. A daemon shutdown retries uncertain failures.
+	// Stop returns nil only after the shard can no longer execute requests.
+	// A nil result is idempotent, while unknown non-nil errors are retryable.
+	// ErrTerminalShardCleanup marks an error for released or quarantined
+	// ownership that must be replayed without another cleanup side effect.
 	Stop(context.Context) error
 }
 

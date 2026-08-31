@@ -42,6 +42,8 @@ var (
 	ErrWorkerdAgentInstanceMismatch = errors.New("agent: workerd launcher is bound to a different agent instance")
 )
 
+var errTerminalStaleWorkerdGeneration = errors.Join(ErrStaleWorkerdGeneration, ErrTerminalShardCleanup)
+
 const (
 	maximumWorkerdReadinessTimeout      = 5 * time.Minute
 	maximumWorkerdStopGracePeriod       = 30 * time.Second
@@ -1017,7 +1019,11 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 	go func() {
 		if instance.cgroup != nil {
 			cleanupErr := instance.cgroup.destroy(context.Background())
-			if instance.cgroup.destroyedState() {
+			destroyed := instance.cgroup.destroyedState()
+			if cleanupErr != nil && destroyed {
+				cleanupErr = errors.Join(cleanupErr, ErrTerminalShardCleanup)
+			}
+			if destroyed {
 				launcher.mu.Lock()
 				instance.mu.Lock()
 				instance.groupGone = true
@@ -1320,7 +1326,7 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	if instance.replacementRetired {
 		instance.mu.Unlock()
 		launcher.mu.Unlock()
-		return ErrStaleWorkerdGeneration
+		return errTerminalStaleWorkerdGeneration
 	}
 	if launcher.current[shardKey] == instance {
 		if launcher.retiredGenerations[shardKey] < instance.key.generation {
@@ -1336,7 +1342,7 @@ func (handle *WorkerdShardHandle) Stop(ctx context.Context) error {
 	if !tracked && !instance.handleStopRequested {
 		instance.mu.Unlock()
 		launcher.mu.Unlock()
-		return ErrStaleWorkerdGeneration
+		return errTerminalStaleWorkerdGeneration
 	}
 	instance.handleStopRequested = true
 	instance.mu.Unlock()

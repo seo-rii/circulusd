@@ -150,6 +150,17 @@ not silently included in Unit 10.
   provisioning or contradictory states dominate absence. Scoped classifier,
   controller matrix, real prepare-path, complete agent race, repository test,
   and vet gates pass. U10.4 external result mapping remains.
+- 2026-09-01: Manager cleanup now distinguishes retryable ownership from a
+  terminal released-or-quarantined result through
+  `ErrTerminalShardCleanup`. It classifies returned errors outside the Manager
+  mutex, gives the next explicit Release, Acquire, or Shutdown caller one fresh
+  shared epoch after an unknown retryable error, and caches terminal results
+  without another `Stop` call. Existing waiters retain their immutable epoch
+  result and caller cancellation affects only the wait. Workerd marks destroyed
+  cgroup cleanup failures and stale exact handles terminal, while process-group
+  timeouts and pre-removal cgroup failures remain retryable. Retry sharing,
+  cancellation, reentrant classification, mixed parallel shutdown, stale-
+  handle, removal, poison, and terminal-close race tests pass.
 
 ### Outcome
 
@@ -522,10 +533,10 @@ binary/cgroup external `PASS`.
 
 #### U10.1 — Release pin, generation, and composition contracts
 
-Status: in progress. Items 1–4 and item 5's adapter/fixed-snapshot contract are
-implemented; its release-resolver binding remains in U10.4. The independent
-lifecycle review added item 6 before observation delivery can depend on cleanup
-fences.
+Status: complete for the host-independent U10.1 contracts. Items 1–4, item 5's
+adapter/fixed-snapshot contract, and the review-added cleanup item 6 are
+implemented. Resolver-snapshot handoff into the live qualification composition
+remains in U10.4.
 
 1. Add failing release-manifest/schema tests for extraction provenance and the
    installed executable digest, plus failing qualification-input tests that

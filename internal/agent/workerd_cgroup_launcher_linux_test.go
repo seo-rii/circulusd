@@ -398,11 +398,11 @@ func TestWorkerdCgroupLauncherReplaysTerminalPoisonWithoutRetryingKill(t *testin
 		backend.replaceChild(childName)
 	}
 
-	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupPoisoned) {
-		t.Fatalf("first Stop() error = %v, want poisoned", err)
+	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupPoisoned) || !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("first Stop() error = %v, want poisoned terminal cleanup", err)
 	}
-	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupPoisoned) {
-		t.Fatalf("replayed Stop() error = %v, want cached poison", err)
+	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupPoisoned) || !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("replayed Stop() error = %v, want cached terminal poison", err)
 	}
 	if calls := backend.killCallCount(); calls != 1 {
 		t.Fatalf("cgroup.kill calls after poison replay = %d, want 1", calls)
@@ -432,11 +432,11 @@ func TestWorkerdCgroupLauncherReplaysTerminalLeafCloseFailure(t *testing.T) {
 	backend.closeFailures[leaseFD] = 1
 	backend.killHook = func() { process.finishGroup(nil) }
 
-	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupContract) {
-		t.Fatalf("first Stop() error = %v, want terminal close contract error", err)
+	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupContract) || !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("first Stop() error = %v, want terminal close contract error and marker", err)
 	}
-	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupContract) {
-		t.Fatalf("replayed Stop() error = %v, want cached terminal close error", err)
+	if err := handle.Stop(context.Background()); !errors.Is(err, errWorkerdCgroupContract) || !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("replayed Stop() error = %v, want cached terminal close error and marker", err)
 	}
 	if backend.killCallCount() != 1 || backend.closeCalls[leaseFD] != 1 {
 		t.Fatalf("terminal replay kill/leaf-close calls = %d/%d, want 1/1", backend.killCallCount(), backend.closeCalls[leaseFD])
@@ -455,6 +455,36 @@ func TestWorkerdCgroupLauncherReplaysTerminalLeafCloseFailure(t *testing.T) {
 	if descriptors := backend.openFileDescriptors(); descriptors != 0 {
 		t.Fatalf("descriptors after terminal close replay = %d, want none", descriptors)
 	}
+}
+
+func TestWorkerdCgroupLauncherRetriesRemovalWithoutTerminalMarker(t *testing.T) {
+	_, backend, cgroups := newWorkerdCgroupLauncherController(t)
+	process := newFakeWorkerdProcess(20_018, true)
+	backend.killHook = func() { process.finishGroup(nil) }
+	backend.removeFailures = 1
+	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0),
+		ShardID: "retryable-removal", ShardGeneration: 1,
+	})
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+
+	firstErr := handle.Stop(context.Background())
+	if !errors.Is(firstErr, errWorkerdCgroupContract) || errors.Is(firstErr, ErrTerminalShardCleanup) {
+		t.Fatalf("Stop(retryable removal) error = %v, want unmarked cgroup contract error", firstErr)
+	}
+	if err := handle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(removal retry) error = %v", err)
+	}
+	if err := handle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(after successful removal) error = %v", err)
+	}
+	if kills, removes := backend.killCallCount(), backend.removeCallCount(); kills != 2 || removes != 2 {
+		t.Fatalf("retry kill/remove calls = %d/%d, want 2/2", kills, removes)
+	}
+	closeWorkerdCgroupIntegratedLauncher(t, launcher, nil)
 }
 
 func TestWorkerdCgroupLauncherDrainsResidualBeforeStartingNewGeneration(t *testing.T) {

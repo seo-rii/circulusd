@@ -69,6 +69,7 @@ type stopPending struct {
 	done      chan struct{}
 	startOnce sync.Once
 	err       error
+	terminal  bool
 }
 
 type trackedStop struct {
@@ -337,6 +338,7 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 			}
 		}
 		if priorStop != nil {
+			priorStop.pending, _ = manager.selectStopEpochLocked(priorStop.pending.spec, priorStop.pending.process, false)
 			manager.mu.Unlock()
 			if err := manager.executeTrackedStop(ctx, *priorStop); err != nil {
 				return Placement{}, err
@@ -743,6 +745,7 @@ func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) err
 		cleanup, cleanupFound := manager.releaseCleanups[request.SessionID]
 		if cleanupFound && cleanup.placementGeneration == request.PlacementGeneration {
 			if pending := manager.pendingStops[cleanup.key]; pending != nil {
+				pending, _ = manager.selectStopEpochLocked(pending.spec, pending.process, false)
 				stop := trackedStop{
 					key: cleanup.key, pending: pending, reason: "wait for released workerd shard cleanup",
 				}
@@ -820,8 +823,8 @@ func (manager *Manager) Observe(observation ShardObservation) error {
 
 // Shutdown permanently fences admission, waits for launches and previously
 // initiated stops to leave their critical windows, and then drains every shard.
-// A canceled or failed call may be retried; uncertain Stop failures remain
-// tracked until a later call confirms process termination.
+// A canceled or failed call may be retried. Retryable Stop failures get a fresh
+// epoch; terminal cleanup failures remain cached without another Stop call.
 func (manager *Manager) Shutdown(ctx context.Context) error {
 	if manager == nil || ctx == nil || manager.shutdownGate == nil {
 		return ErrInvalidRequest
@@ -883,24 +886,29 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 		})
 		newStops[key] = struct{}{}
 	}
-	for key, pending := range manager.pendingStops {
-		if _, newlyTracked := newStops[key]; newlyTracked {
+	pendingKeys := make([]shardProcessKey, 0, len(manager.pendingStops))
+	for key := range manager.pendingStops {
+		if _, newlyTracked := newStops[key]; !newlyTracked {
+			pendingKeys = append(pendingKeys, key)
+		}
+	}
+	sort.Slice(pendingKeys, func(left, right int) bool {
+		if pendingKeys[left].shardID != pendingKeys[right].shardID {
+			return pendingKeys[left].shardID < pendingKeys[right].shardID
+		}
+		return pendingKeys[left].shardGeneration < pendingKeys[right].shardGeneration
+	})
+	for _, key := range pendingKeys {
+		previous := manager.pendingStops[key]
+		pending, fresh := manager.selectStopEpochLocked(previous.spec, previous.process, false)
+		if pending == nil {
 			continue
 		}
-		select {
-		case <-pending.done:
-			if pending.err != nil {
-				retry := &stopPending{spec: pending.spec, process: pending.process, done: make(chan struct{})}
-				manager.pendingStops[key] = retry
-				stops = append(stops, trackedStop{
-					key: key, pending: retry, reason: "retry uncertain workerd shard stop during shutdown",
-				})
-			}
-		default:
-			stops = append(stops, trackedStop{
-				key: key, pending: pending, reason: "wait for workerd shard stop during shutdown",
-			})
+		reason := "wait for workerd shard stop during shutdown"
+		if fresh {
+			reason = "retry uncertain workerd shard stop during shutdown"
 		}
+		stops = append(stops, trackedStop{key: key, pending: pending, reason: reason})
 	}
 	manager.placements = make(map[identity.ID]Placement)
 	sort.Slice(stops, func(left, right int) bool {
@@ -927,23 +935,55 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 }
 
 // trackStopLocked transfers process ownership from the live shard map to a
-// retryable termination record. manager.mu must be held by the caller.
+// manager-owned cleanup epoch. manager.mu must be held by the caller.
 func (manager *Manager) trackStopLocked(spec ShardSpec, process ShardProcess) *stopPending {
-	key := shardProcessKeyFor(spec)
-	if pending := manager.pendingStops[key]; pending != nil {
-		return pending
-	}
-	pending := &stopPending{spec: spec, process: process, done: make(chan struct{})}
-	manager.pendingStops[key] = pending
+	pending, _ := manager.selectStopEpochLocked(spec, process, true)
 	return pending
+}
+
+// selectStopEpochLocked joins unfinished work, replays a completed terminal
+// result, or installs one fresh epoch after a retryable result. A missing
+// record is created only while ownership is being transferred into cleanup.
+// manager.mu must be held by the caller.
+func (manager *Manager) selectStopEpochLocked(spec ShardSpec, process ShardProcess, create bool) (*stopPending, bool) {
+	key := shardProcessKeyFor(spec)
+	pending := manager.pendingStops[key]
+	if pending == nil {
+		if !create {
+			return nil, false
+		}
+		pending = &stopPending{spec: spec, process: process, done: make(chan struct{})}
+		manager.pendingStops[key] = pending
+		return pending, true
+	}
+	select {
+	case <-pending.done:
+		if pending.err == nil {
+			if manager.pendingStops[key] == pending {
+				delete(manager.pendingStops, key)
+			}
+			if !create {
+				return nil, false
+			}
+		} else if pending.terminal {
+			return pending, false
+		}
+		pending = &stopPending{spec: pending.spec, process: pending.process, done: make(chan struct{})}
+		manager.pendingStops[key] = pending
+		return pending, true
+	default:
+		return pending, false
+	}
 }
 
 func (manager *Manager) startTrackedStop(stop trackedStop) {
 	stop.pending.startOnce.Do(func() {
 		go func() {
 			err := stop.pending.process.Stop(context.Background())
+			terminal := errors.Is(err, ErrTerminalShardCleanup)
 			manager.mu.Lock()
 			stop.pending.err = err
+			stop.pending.terminal = terminal
 			close(stop.pending.done)
 			if err == nil && manager.pendingStops[stop.key] == stop.pending {
 				delete(manager.pendingStops, stop.key)

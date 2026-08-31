@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -14,11 +15,41 @@ import (
 
 var errControlledStop = errors.New("test: controlled stop failure")
 
+func TestTerminalShardCleanupMarkerSurvivesWrappingAndJoining(t *testing.T) {
+	wrapped := fmt.Errorf("terminal cleanup: %w", ErrTerminalShardCleanup)
+	joined := errors.Join(errControlledStop, wrapped)
+	if !errors.Is(wrapped, ErrTerminalShardCleanup) {
+		t.Fatalf("errors.Is(wrapped, ErrTerminalShardCleanup) = false")
+	}
+	if !errors.Is(joined, ErrTerminalShardCleanup) {
+		t.Fatalf("errors.Is(joined, ErrTerminalShardCleanup) = false")
+	}
+}
+
 type controlledStopLauncher struct {
 	mu      sync.Mutex
 	process *controlledStopProcess
 	starts  int
 	specs   []ShardSpec
+}
+
+type controlledStopSequenceLauncher struct {
+	mu        sync.Mutex
+	processes []*controlledStopProcess
+	next      int
+}
+
+func (launcher *controlledStopSequenceLauncher) Start(_ context.Context, spec ShardSpec) (ShardProcess, error) {
+	launcher.mu.Lock()
+	process := launcher.processes[launcher.next]
+	launcher.next++
+	launcher.mu.Unlock()
+	process.mu.Lock()
+	process.agentInstanceID = spec.AgentInstanceID
+	process.id = spec.ShardID
+	process.shardGeneration = spec.ShardGeneration
+	process.mu.Unlock()
+	return process, nil
 }
 
 func (launcher *controlledStopLauncher) Start(_ context.Context, spec ShardSpec) (ShardProcess, error) {
@@ -47,8 +78,11 @@ type controlledStopProcess struct {
 	shardGeneration ShardGeneration
 	calls           int
 	failures        int
+	failureErr      error
 	stopEntered     chan struct{}
 	stopGate        <-chan struct{}
+	stopCallEntered chan int
+	stopCallGates   map[int]<-chan struct{}
 	stopEnteredOnce sync.Once
 }
 
@@ -75,6 +109,9 @@ func (process *controlledStopProcess) Stop(ctx context.Context) error {
 	process.calls++
 	call := process.calls
 	failures := process.failures
+	failureErr := process.failureErr
+	callEntered := process.stopCallEntered
+	callGate := process.stopCallGates[call]
 	process.mu.Unlock()
 	if process.stopEntered != nil {
 		process.stopEnteredOnce.Do(func() { close(process.stopEntered) })
@@ -86,10 +123,56 @@ func (process *controlledStopProcess) Stop(ctx context.Context) error {
 		case <-process.stopGate:
 		}
 	}
+	if callEntered != nil {
+		callEntered <- call
+	}
+	if callGate != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-callGate:
+		}
+	}
 	if call <= failures {
+		if failureErr != nil {
+			return failureErr
+		}
 		return errControlledStop
 	}
 	return nil
+}
+
+type observedDoneContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+type mutexObservingTerminalError struct {
+	manager *Manager
+	result  chan bool
+	once    sync.Once
+}
+
+func (*mutexObservingTerminalError) Error() string { return "test: terminal cleanup" }
+
+func (err *mutexObservingTerminalError) Is(target error) bool {
+	managerLockHeld := !err.manager.mu.TryLock()
+	if !managerLockHeld {
+		err.manager.mu.Unlock()
+	}
+	err.once.Do(func() { err.result <- managerLockHeld })
+	return target == ErrTerminalShardCleanup
+}
+
+func (ctx *observedDoneContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.observed) })
+	return ctx.Context.Done()
+}
+
+func newObservedDoneContext() (*observedDoneContext, context.CancelFunc) {
+	inner, cancel := context.WithCancel(context.Background())
+	return &observedDoneContext{Context: inner, observed: make(chan struct{})}, cancel
 }
 
 func (process *controlledStopProcess) stopCalls() int {
@@ -440,6 +523,43 @@ func TestManagerShutdownRetriesAnUncertainEarlierStop(t *testing.T) {
 	}
 }
 
+func TestManagerReleaseRetriesACompletedRetryableCleanupInANewEpoch(t *testing.T) {
+	process := &controlledStopProcess{failures: 1}
+	manager := mustManager(t, &controlledStopLauncher{process: process}, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := dedicatedRequest(t, "release-epoch-retry", time.Unix(2_000_001_410, 0).UTC())
+	mustAcquire(t, manager, request)
+	release := ReleaseRequest{SessionID: request.SessionID, PlacementGeneration: request.PlacementGeneration}
+
+	if err := manager.Release(context.Background(), release); !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(epoch 1) error = %v, want controlled failure", err)
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls after epoch 1 = %d, want 1", calls)
+	}
+	if err := manager.Release(context.Background(), release); err != nil {
+		t.Fatalf("Release(epoch 2) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 2 {
+		t.Fatalf("Stop() calls after epoch 2 = %d, want 2", calls)
+	}
+	manager.mu.Lock()
+	cleanup := manager.releaseCleanups[request.SessionID]
+	_, cleanupRetained := manager.pendingStops[cleanup.key]
+	manager.mu.Unlock()
+	if cleanupRetained {
+		t.Fatal("successful cleanup epoch remained in pendingStops")
+	}
+	if err := manager.Release(context.Background(), release); err != nil {
+		t.Fatalf("Release(after successful cleanup) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 2 {
+		t.Fatalf("Stop() calls after completed cleanup = %d, want 2", calls)
+	}
+}
+
 func TestManagerReleaseCancellationOnlyCancelsWaitAndShutdownJoinsStop(t *testing.T) {
 	stopGate := make(chan struct{})
 	var releaseGate sync.Once
@@ -521,6 +641,189 @@ func TestManagerRepeatedReleaseJoinsTheSameCleanupEpoch(t *testing.T) {
 	}
 }
 
+func TestManagerCanceledReleaseWaiterDoesNotSplitAnInflightEpoch(t *testing.T) {
+	stopGate := make(chan struct{})
+	process := &controlledStopProcess{
+		failures: 1, stopEntered: make(chan struct{}), stopGate: stopGate,
+	}
+	manager := mustManager(t, &controlledStopLauncher{process: process}, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := dedicatedRequest(t, "cancel-inflight-epoch", time.Unix(2_000_001_453, 0).UTC())
+	mustAcquire(t, manager, request)
+	release := ReleaseRequest{SessionID: request.SessionID, PlacementGeneration: request.PlacementGeneration}
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- manager.Release(context.Background(), release) }()
+	<-process.stopEntered
+	secondContext, cancelSecond := newObservedDoneContext()
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- manager.Release(secondContext, release) }()
+	<-secondContext.observed
+	cancelSecond()
+	if err := receiveError(t, secondResult); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Release(canceled waiter) error = %v, want context.Canceled", err)
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls while epoch 1 is in flight = %d, want 1", calls)
+	}
+
+	close(stopGate)
+	if err := receiveError(t, firstResult); !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(epoch 1 owner) error = %v, want controlled failure", err)
+	}
+	if err := manager.Release(context.Background(), release); err != nil {
+		t.Fatalf("Release(epoch 2) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 2 {
+		t.Fatalf("Stop() calls after epoch 2 = %d, want 2", calls)
+	}
+}
+
+func TestManagerConcurrentLateReleaseCallersShareOneFreshRetryEpoch(t *testing.T) {
+	retryGate := make(chan struct{})
+	process := &controlledStopProcess{
+		failures:        1,
+		stopCallEntered: make(chan int, 2),
+		stopCallGates:   map[int]<-chan struct{}{2: retryGate},
+	}
+	manager := mustManager(t, &controlledStopLauncher{process: process}, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := dedicatedRequest(t, "concurrent-late-retry", time.Unix(2_000_001_453, 0).UTC())
+	mustAcquire(t, manager, request)
+	release := ReleaseRequest{SessionID: request.SessionID, PlacementGeneration: request.PlacementGeneration}
+	if err := manager.Release(context.Background(), release); !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(epoch 1) error = %v, want controlled failure", err)
+	}
+	if call := <-process.stopCallEntered; call != 1 {
+		t.Fatalf("entered Stop call = %d, want epoch 1", call)
+	}
+	manager.mu.Lock()
+	cleanup := manager.releaseCleanups[request.SessionID]
+	oldPending := manager.pendingStops[cleanup.key]
+	manager.mu.Unlock()
+	if oldPending == nil {
+		t.Fatal("completed retryable epoch was not retained")
+	}
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- manager.Release(context.Background(), release) }()
+	if call := <-process.stopCallEntered; call != 2 {
+		t.Fatalf("entered Stop call = %d, want epoch 2", call)
+	}
+	secondContext, cancelSecond := newObservedDoneContext()
+	defer cancelSecond()
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- manager.Release(secondContext, release) }()
+	<-secondContext.observed
+
+	manager.mu.Lock()
+	newPending := manager.pendingStops[cleanup.key]
+	oldErr := oldPending.err
+	manager.mu.Unlock()
+	if newPending == nil || newPending == oldPending {
+		t.Fatalf("retry pending = %p, old = %p; want a fresh immutable epoch", newPending, oldPending)
+	}
+	if !errors.Is(oldErr, errControlledStop) {
+		t.Fatalf("old immutable epoch error = %v, want controlled failure", oldErr)
+	}
+	if calls := process.stopCalls(); calls != 2 {
+		t.Fatalf("Stop() calls with two epoch 2 waiters = %d, want 2", calls)
+	}
+
+	close(retryGate)
+	if err := receiveError(t, firstResult); err != nil {
+		t.Fatalf("Release(first epoch 2 waiter) error = %v", err)
+	}
+	if err := receiveError(t, secondResult); err != nil {
+		t.Fatalf("Release(second epoch 2 waiter) error = %v", err)
+	}
+	if calls := process.stopCalls(); calls != 2 {
+		t.Fatalf("Stop() calls after shared epoch 2 = %d, want 2", calls)
+	}
+}
+
+func TestManagerTerminalCleanupIsReplayedWithoutAnotherStopEpoch(t *testing.T) {
+	terminalErr := errors.Join(errControlledStop, fmt.Errorf("wrapped terminal marker: %w", ErrTerminalShardCleanup))
+	process := &controlledStopProcess{failures: 10, failureErr: terminalErr}
+	launcher := &controlledStopLauncher{process: process}
+	manager := mustManager(t, launcher, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	request := dedicatedRequest(t, "terminal-cleanup", time.Unix(2_000_001_454, 0).UTC())
+	mustAcquire(t, manager, request)
+	release := ReleaseRequest{SessionID: request.SessionID, PlacementGeneration: request.PlacementGeneration}
+
+	if err := manager.Release(context.Background(), release); !errors.Is(err, ErrTerminalShardCleanup) || !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(terminal attempt 1) error = %v", err)
+	}
+	manager.mu.Lock()
+	cleanup := manager.releaseCleanups[request.SessionID]
+	terminalPending := manager.pendingStops[cleanup.key]
+	manager.mu.Unlock()
+	if terminalPending == nil {
+		t.Fatal("terminal cleanup epoch was not retained")
+	}
+	for attempt := 1; attempt < 2; attempt++ {
+		err := manager.Release(context.Background(), release)
+		if !errors.Is(err, ErrTerminalShardCleanup) || !errors.Is(err, errControlledStop) {
+			t.Fatalf("Release(terminal attempt %d) error = %v", attempt+1, err)
+		}
+	}
+	request.PlacementGeneration++
+	if placement, err := manager.Acquire(context.Background(), request); placement != (Placement{}) || !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("Acquire(terminal prior cleanup) = %#v, %v", placement, err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := manager.Shutdown(context.Background()); !errors.Is(err, ErrTerminalShardCleanup) {
+			t.Fatalf("Shutdown(terminal attempt %d) error = %v", attempt+1, err)
+		}
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls for terminal cleanup = %d, want 1", calls)
+	}
+	if starts, _ := launcher.launchState(); starts != 1 {
+		t.Fatalf("launcher starts = %d, want no replacement behind terminal cleanup", starts)
+	}
+	manager.mu.Lock()
+	cachedPending := manager.pendingStops[cleanup.key]
+	cachedErr := terminalPending.err
+	manager.mu.Unlock()
+	if cachedPending != terminalPending || !errors.Is(cachedErr, ErrTerminalShardCleanup) {
+		t.Fatalf("cached terminal epoch = %p/%p, error %v; want immutable replay", cachedPending, terminalPending, cachedErr)
+	}
+}
+
+func TestManagerClassifiesTerminalCleanupOutsideItsMutex(t *testing.T) {
+	process := &controlledStopProcess{failures: 10}
+	manager := mustManager(t, &controlledStopLauncher{process: process}, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	terminalErr := &mutexObservingTerminalError{manager: manager, result: make(chan bool, 1)}
+	process.failureErr = terminalErr
+	request := dedicatedRequest(t, "terminal-classification-lock", time.Unix(2_000_001_454, 0).UTC())
+	mustAcquire(t, manager, request)
+	release := ReleaseRequest{SessionID: request.SessionID, PlacementGeneration: request.PlacementGeneration}
+	if err := manager.Release(context.Background(), release); err == nil {
+		t.Fatal("Release(epoch 1) error = nil, want terminal failure")
+	}
+	secondErr := manager.Release(context.Background(), release)
+	if managerLockHeld := <-terminalErr.result; managerLockHeld {
+		t.Fatal("terminal error classification called Is while manager.mu was held")
+	}
+	if !errors.Is(secondErr, ErrTerminalShardCleanup) {
+		t.Fatalf("Release(replay terminal) error = %v, want terminal marker", secondErr)
+	}
+	if calls := process.stopCalls(); calls != 1 {
+		t.Fatalf("Stop() calls = %d, want one terminal epoch", calls)
+	}
+}
+
 func TestManagerShutdownCancellationOnlyCancelsWaitForSameStopEpoch(t *testing.T) {
 	stopGate := make(chan struct{})
 	var releaseGate sync.Once
@@ -587,6 +890,82 @@ func TestManagerShutdownStartsIndependentShardStopsBeforeWaiting(t *testing.T) {
 	}
 }
 
+func TestManagerShutdownRetriesOnlyRetryableEpochsBeforeDeterministicJoin(t *testing.T) {
+	firstRetryGate := make(chan struct{})
+	secondRetryGate := make(chan struct{})
+	terminal := &controlledStopProcess{
+		failures: 10,
+		failureErr: errors.Join(
+			errControlledStop,
+			fmt.Errorf("terminal cleanup: %w", ErrTerminalShardCleanup),
+		),
+	}
+	firstRetryable := &controlledStopProcess{
+		failures:        1,
+		stopCallEntered: make(chan int, 2),
+		stopCallGates:   map[int]<-chan struct{}{2: firstRetryGate},
+	}
+	secondRetryable := &controlledStopProcess{
+		failures:        1,
+		stopCallEntered: make(chan int, 2),
+		stopCallGates:   map[int]<-chan struct{}{2: secondRetryGate},
+	}
+	launcher := &controlledStopSequenceLauncher{processes: []*controlledStopProcess{terminal, firstRetryable, secondRetryable}}
+	manager := mustManager(t, launcher, Limits{
+		MaximumSessions: 1, MemoryLimitBytes: 1_000,
+		AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour,
+	})
+	now := time.Unix(2_000_001_462, 0).UTC()
+	terminalRequest := dedicatedRequest(t, "mixed-terminal", now)
+	firstRetryableRequest := dedicatedRequest(t, "mixed-retryable-a", now.Add(time.Second))
+	secondRetryableRequest := dedicatedRequest(t, "mixed-retryable-b", now.Add(2*time.Second))
+	mustAcquire(t, manager, terminalRequest)
+	mustAcquire(t, manager, firstRetryableRequest)
+	mustAcquire(t, manager, secondRetryableRequest)
+
+	if err := manager.Release(context.Background(), ReleaseRequest{SessionID: terminalRequest.SessionID, PlacementGeneration: terminalRequest.PlacementGeneration}); !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("Release(terminal) error = %v", err)
+	}
+	if err := manager.Release(context.Background(), ReleaseRequest{SessionID: firstRetryableRequest.SessionID, PlacementGeneration: firstRetryableRequest.PlacementGeneration}); !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(first retryable) error = %v", err)
+	}
+	if err := manager.Release(context.Background(), ReleaseRequest{SessionID: secondRetryableRequest.SessionID, PlacementGeneration: secondRetryableRequest.PlacementGeneration}); !errors.Is(err, errControlledStop) {
+		t.Fatalf("Release(second retryable) error = %v", err)
+	}
+	if call := <-firstRetryable.stopCallEntered; call != 1 {
+		t.Fatalf("first retryable entered call = %d, want epoch 1", call)
+	}
+	if call := <-secondRetryable.stopCallEntered; call != 1 {
+		t.Fatalf("second retryable entered call = %d, want epoch 1", call)
+	}
+
+	shutdownResult := make(chan error, 1)
+	go func() { shutdownResult <- manager.Shutdown(context.Background()) }()
+	if call := <-firstRetryable.stopCallEntered; call != 2 {
+		t.Fatalf("first retryable entered call = %d, want epoch 2", call)
+	}
+	if call := <-secondRetryable.stopCallEntered; call != 2 {
+		t.Fatalf("second retryable entered call = %d, want epoch 2", call)
+	}
+	if terminalCalls := terminal.stopCalls(); terminalCalls != 1 {
+		t.Fatalf("terminal Stop() calls before retry join = %d, want 1", terminalCalls)
+	}
+	close(firstRetryGate)
+	close(secondRetryGate)
+	if err := receiveError(t, shutdownResult); !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("Shutdown(mixed cleanup) error = %v, want terminal marker", err)
+	}
+	if firstCalls, secondCalls := firstRetryable.stopCalls(), secondRetryable.stopCalls(); firstCalls != 2 || secondCalls != 2 {
+		t.Fatalf("retryable Stop() calls = %d/%d, want 2/2", firstCalls, secondCalls)
+	}
+	if err := manager.Shutdown(context.Background()); !errors.Is(err, ErrTerminalShardCleanup) {
+		t.Fatalf("Shutdown(replay terminal cleanup) error = %v", err)
+	}
+	if terminalCalls, firstCalls, secondCalls := terminal.stopCalls(), firstRetryable.stopCalls(), secondRetryable.stopCalls(); terminalCalls != 1 || firstCalls != 2 || secondCalls != 2 {
+		t.Fatalf("replayed Shutdown Stop() calls = terminal %d, retryable %d/%d; want 1,2/2", terminalCalls, firstCalls, secondCalls)
+	}
+}
+
 func TestManagerShutdownJoinsParallelStopErrorsInShardGenerationOrder(t *testing.T) {
 	launcher := newParallelStopLauncher()
 	launcher.failStops = true
@@ -628,7 +1007,7 @@ func TestManagerShutdownJoinsParallelStopErrorsInShardGenerationOrder(t *testing
 	}
 }
 
-func TestManagerReplacementWaitsForPriorUncertainShardGenerationCleanup(t *testing.T) {
+func TestManagerReplacementRetriesPriorUncertainShardGenerationCleanup(t *testing.T) {
 	process := &controlledStopProcess{failures: 1}
 	launcher := &controlledStopLauncher{process: process}
 	manager := mustManager(t, launcher, Limits{
@@ -655,17 +1034,21 @@ func TestManagerReplacementWaitsForPriorUncertainShardGenerationCleanup(t *testi
 		t.Fatalf("pending stop key = %#v, count=%d, spec=%#v", key, pendingCount, specs[0])
 	}
 
-	if placement, err := manager.Acquire(context.Background(), request); !errors.Is(err, errControlledStop) || placement != (Placement{}) {
-		t.Fatalf("Acquire(behind uncertain stop) = %#v, %v; want same stop fence", placement, err)
+	second, err := manager.Acquire(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Acquire(retry prior cleanup) error = %v", err)
 	}
-	if starts, _ := launcher.launchState(); starts != 1 {
-		t.Fatalf("launcher starts = %d, want no replacement before cleanup confirmation", starts)
+	if second.ShardID == "" {
+		t.Fatal("Acquire(retry prior cleanup) returned an empty placement")
 	}
-	if err := manager.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown(retry cleanup) error = %v", err)
+	if starts, _ := launcher.launchState(); starts != 2 {
+		t.Fatalf("launcher starts = %d, want replacement after cleanup retry", starts)
 	}
 	if calls := process.stopCalls(); calls != 2 {
-		t.Fatalf("Stop() calls = %d, want failure plus shutdown retry", calls)
+		t.Fatalf("Stop() calls = %d, want failed cleanup plus Acquire retry", calls)
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
 	}
 }
 
