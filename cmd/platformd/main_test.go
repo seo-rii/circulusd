@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,13 +14,50 @@ import (
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/controlrpc"
+	"github.com/hancomac/circulusd/internal/statebootstrap"
 )
+
+type recordingRuntime struct {
+	events *[]string
+	closes int
+}
+
+func (runtime *recordingRuntime) Close() {
+	runtime.closes++
+	if runtime.events != nil {
+		*runtime.events = append(*runtime.events, "runtime.close")
+	}
+}
+
+type recordingServer struct {
+	events   *[]string
+	serveErr error
+	closes   int
+}
+
+func (server *recordingServer) Serve(context.Context) error {
+	if server.events != nil {
+		*server.events = append(*server.events, "server.serve")
+	}
+	return server.serveErr
+}
+
+func (server *recordingServer) Close() error {
+	server.closes++
+	if server.events != nil {
+		*server.events = append(*server.events, "server.close")
+	}
+	return nil
+}
 
 func TestPlatformdServesHonestCapabilitiesAndRemovesItsSocket(t *testing.T) {
 	socketPath := platformdSocketPath(t)
 	var stderr bytes.Buffer
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return &recordingRuntime{}, nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
@@ -115,6 +153,9 @@ func TestPlatformdRejectsInvalidCLIWithoutReplacingExistingPaths(t *testing.T) {
 			var stderr bytes.Buffer
 			dependencies := defaultDependencies()
 			dependencies.stderr = &stderr
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				return &recordingRuntime{}, nil
+			}
 			if exitCode := execute(context.Background(), test.arguments, dependencies); exitCode != 2 {
 				t.Fatalf("execute() = %d, want 2; stderr=%q", exitCode, stderr.String())
 			}
@@ -128,6 +169,9 @@ func TestPlatformdRejectsInvalidCLIWithoutReplacingExistingPaths(t *testing.T) {
 	var stderr bytes.Buffer
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return &recordingRuntime{}, nil
+	}
 	if exitCode := execute(context.Background(), []string{"--socket", existingPath}, dependencies); exitCode != 1 {
 		t.Fatalf("execute(existing path) = %d, want 1; stderr=%q", exitCode, stderr.String())
 	}
@@ -151,6 +195,9 @@ func TestPlatformdUsesExplicitUIDAllowlist(t *testing.T) {
 	var stderr bytes.Buffer
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return &recordingRuntime{}, nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)
 	go func() {
@@ -227,5 +274,399 @@ func TestDefaultCapabilitiesNeverClaimMockOrReferenceReadiness(t *testing.T) {
 				t.Fatalf("default capability reports non-production evidence: %v", capability)
 			}
 		}
+	}
+}
+
+func TestDefaultStateCapabilityReportsTheRemainingProductionGate(t *testing.T) {
+	dependencies := defaultDependencies()
+	capabilities, err := dependencies.capabilityProvider(context.Background())
+	if err != nil {
+		t.Fatalf("capabilityProvider() error = %v", err)
+	}
+	for _, capability := range capabilities {
+		if capability.GetName() != "state.celld" {
+			continue
+		}
+		if capability.GetAvailability() != v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE ||
+			capability.GetUnavailableReason().GetReason() != "NOT_WIRED" ||
+			capability.GetUnavailableReason().GetMessage() != "state.celld native signer and restart conformance are not qualified" {
+			t.Fatalf("state.celld capability = %v", capability)
+		}
+		return
+	}
+	t.Fatal("state.celld capability is missing")
+}
+
+func TestPlatformdForwardsDefaultAndExplicitProductionStatePaths(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments []string
+		want      statebootstrap.Files
+	}{
+		{
+			name:      "defaults",
+			arguments: []string{"--socket", "/tmp/platformd-defaults.sock", "--allow-uid", "1000"},
+			want: statebootstrap.Files{
+				Configuration:     "/etc/pi-platform/config.yaml",
+				ReleaseManifest:   "/usr/lib/pi-platform/release-manifest.json",
+				ReleaseTrustRoots: "/etc/pi-platform/release-trust-roots.json",
+			},
+		},
+		{
+			name: "explicit",
+			arguments: []string{
+				"--socket", "/tmp/platformd-explicit.sock",
+				"--allow-uid", "1000",
+				"--config", "/srv/platform/config.yaml",
+				"--release-manifest", "/srv/platform/release.json",
+				"--release-trust-roots", "/srv/platform/roots.json",
+			},
+			want: statebootstrap.Files{
+				Configuration:     "/srv/platform/config.yaml",
+				ReleaseManifest:   "/srv/platform/release.json",
+				ReleaseTrustRoots: "/srv/platform/roots.json",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			var got statebootstrap.Files
+			dependencies := defaultDependencies()
+			dependencies.stderr = &stderr
+			dependencies.bootstrap = func(_ context.Context, files statebootstrap.Files) (stateRuntime, error) {
+				got = files
+				return &recordingRuntime{}, nil
+			}
+			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+				return &recordingServer{}, nil
+			}
+
+			if exitCode := execute(context.Background(), test.arguments, dependencies); exitCode != 0 {
+				t.Fatalf("execute() = %d, want 0; stderr=%q", exitCode, stderr.String())
+			}
+			if got.Configuration != test.want.Configuration ||
+				got.ReleaseManifest != test.want.ReleaseManifest ||
+				got.ReleaseTrustRoots != test.want.ReleaseTrustRoots {
+				t.Fatalf("bootstrap files = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPlatformdBootstrapsBeforeListeningAndClosesInDependencyOrder(t *testing.T) {
+	var stderr bytes.Buffer
+	var events []string
+	runtime := &recordingRuntime{events: &events}
+	server := &recordingServer{events: &events}
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		events = append(events, "bootstrap")
+		return runtime, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		events = append(events, "listen")
+		return server, nil
+	}
+
+	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	want := []string{"bootstrap", "listen", "server.serve", "server.close", "runtime.close"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	if server.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+	}
+}
+
+func TestPlatformdBootstrapFailureKeepsOnlyTheDiagnosticControlPlaneAvailable(t *testing.T) {
+	var stderr bytes.Buffer
+	var events []string
+	runtime := &recordingRuntime{events: &events}
+	listenCalls := 0
+	server := &recordingServer{events: &events}
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		events = append(events, "bootstrap")
+		return runtime, errors.New("private bootstrap detail")
+	}
+	dependencies.listen = func(config controlrpc.ServerConfig) (controlServer, error) {
+		listenCalls++
+		events = append(events, "listen")
+		capabilities, err := config.CapabilityProvider(context.Background())
+		if err != nil {
+			t.Fatalf("CapabilityProvider() error = %v", err)
+		}
+		for _, capability := range capabilities {
+			if capability.GetName() == "state.celld" &&
+				(capability.GetAvailability() != v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_UNAVAILABLE ||
+					capability.GetUnavailableReason().GetReason() != "NOT_WIRED") {
+				t.Fatalf("state.celld capability = %v, want NOT_WIRED", capability)
+			}
+		}
+		return server, nil
+	}
+
+	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want 0", exitCode)
+	}
+	if listenCalls != 1 {
+		t.Fatalf("listen calls = %d, want 1", listenCalls)
+	}
+	if runtime.closes != 1 || server.closes != 1 {
+		t.Fatalf("close counts = runtime %d server %d, want one each", runtime.closes, server.closes)
+	}
+	wantEvents := []string{"bootstrap", "runtime.close", "listen", "server.serve", "server.close"}
+	if strings.Join(events, ",") != strings.Join(wantEvents, ",") {
+		t.Fatalf("events = %v, want %v", events, wantEvents)
+	}
+	if !strings.Contains(stderr.String(), "production state is unavailable") {
+		t.Fatalf("stderr = %q, want stable bootstrap failure", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "private bootstrap detail") {
+		t.Fatalf("stderr leaked bootstrap detail: %q", stderr.String())
+	}
+}
+
+func TestPlatformdListenFailureClosesBootstrapRuntime(t *testing.T) {
+	var stderr bytes.Buffer
+	var events []string
+	runtime := &recordingRuntime{events: &events}
+	server := &recordingServer{events: &events}
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		events = append(events, "bootstrap")
+		return runtime, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		events = append(events, "listen")
+		return server, errors.New("listen failed")
+	}
+
+	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 1 {
+		t.Fatalf("execute() = %d, want 1", exitCode)
+	}
+	want := []string{"bootstrap", "listen", "server.close", "runtime.close"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	if server.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+	}
+}
+
+func TestPlatformdServeOutcomesAlwaysCloseServerBeforeRuntime(t *testing.T) {
+	tests := []struct {
+		name     string
+		serveErr error
+		wantExit int
+	}{
+		{name: "return", wantExit: 0},
+		{name: "error", serveErr: errors.New("serve failed"), wantExit: 1},
+		{name: "context error without daemon cancellation", serveErr: context.Canceled, wantExit: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			var events []string
+			runtime := &recordingRuntime{events: &events}
+			server := &recordingServer{events: &events, serveErr: test.serveErr}
+			dependencies := defaultDependencies()
+			dependencies.stderr = &stderr
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				return runtime, nil
+			}
+			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+				return server, nil
+			}
+
+			if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != test.wantExit {
+				t.Fatalf("execute() = %d, want %d", exitCode, test.wantExit)
+			}
+			want := []string{"server.serve", "server.close", "runtime.close"}
+			if strings.Join(events, ",") != strings.Join(want, ",") {
+				t.Fatalf("events = %v, want %v", events, want)
+			}
+			if server.closes != 1 || runtime.closes != 1 {
+				t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+			}
+		})
+	}
+}
+
+func TestPlatformdRejectsMalformedProductionPathsBeforeBootstrapOrListen(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments []string
+	}{
+		{name: "relative socket", arguments: []string{"--socket", "run/platformd.sock"}},
+		{name: "root socket", arguments: []string{"--socket", "/"}},
+		{name: "unclean socket", arguments: []string{"--socket", "/run/../run/platformd.sock"}},
+		{name: "relative config", arguments: []string{"--config", "config.yaml"}},
+		{name: "root config", arguments: []string{"--config", "/"}},
+		{name: "unclean config", arguments: []string{"--config", "/etc/../etc/config.yaml"}},
+		{name: "control character config", arguments: []string{"--config", "/etc/pi-platform/config\n.yaml"}},
+		{name: "invalid UTF-8 config", arguments: []string{"--config", "/etc/pi-platform/config-\xff.yaml"}},
+		{name: "relative manifest", arguments: []string{"--release-manifest", "release.json"}},
+		{name: "root manifest", arguments: []string{"--release-manifest", "/"}},
+		{name: "unclean manifest", arguments: []string{"--release-manifest", "/usr/lib/../lib/release.json"}},
+		{name: "relative roots", arguments: []string{"--release-trust-roots", "roots.json"}},
+		{name: "root roots", arguments: []string{"--release-trust-roots", "/"}},
+		{name: "unclean roots", arguments: []string{"--release-trust-roots", "/etc/../etc/roots.json"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			bootstrapCalls := 0
+			listenCalls := 0
+			dependencies := defaultDependencies()
+			dependencies.stderr = &stderr
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				bootstrapCalls++
+				return &recordingRuntime{}, nil
+			}
+			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+				listenCalls++
+				return &recordingServer{}, nil
+			}
+
+			if exitCode := execute(context.Background(), test.arguments, dependencies); exitCode != 2 {
+				t.Fatalf("execute() = %d, want 2; stderr=%q", exitCode, stderr.String())
+			}
+			if bootstrapCalls != 0 || listenCalls != 0 {
+				t.Fatalf("calls = bootstrap %d listen %d, want zero", bootstrapCalls, listenCalls)
+			}
+		})
+	}
+}
+
+func TestPlatformdMissingDependenciesAndNilContextFailBeforeBootstrap(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		mutate func(*daemonDependencies)
+	}{
+		{name: "nil context", mutate: func(*daemonDependencies) {}},
+		{name: "pre-canceled context", ctx: canceled, mutate: func(*daemonDependencies) {}},
+		{name: "nil stderr", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.stderr = nil }},
+		{name: "nil effective UID", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.effectiveUID = nil }},
+		{name: "nil capabilities", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.capabilityProvider = nil }},
+		{name: "nil bootstrap", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.bootstrap = nil }},
+		{name: "nil listen", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.listen = nil }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bootstrapCalls := 0
+			dependencies := defaultDependencies()
+			dependencies.stderr = io.Discard
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				bootstrapCalls++
+				return &recordingRuntime{}, nil
+			}
+			test.mutate(&dependencies)
+
+			wantExit := 1
+			if test.ctx == canceled {
+				wantExit = 0
+			}
+			if exitCode := execute(test.ctx, []string{"--allow-uid", "1000"}, dependencies); exitCode != wantExit {
+				t.Fatalf("execute() = %d, want %d", exitCode, wantExit)
+			}
+			if bootstrapCalls != 0 {
+				t.Fatalf("bootstrap calls = %d, want 0", bootstrapCalls)
+			}
+		})
+	}
+}
+
+func TestPlatformdNilRuntimeOrServerFailsSafely(t *testing.T) {
+	tests := []struct {
+		name            string
+		runtimeTypedNil bool
+		serverFailure   bool
+		serverTypedNil  bool
+		wantExit        int
+		wantListen      int
+	}{
+		{name: "nil runtime", wantListen: 1},
+		{name: "typed nil runtime", runtimeTypedNil: true, wantListen: 1},
+		{name: "nil server", serverFailure: true, wantExit: 1, wantListen: 1},
+		{name: "typed nil server", serverFailure: true, serverTypedNil: true, wantExit: 1, wantListen: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &recordingRuntime{}
+			server := &recordingServer{}
+			listenCalls := 0
+			dependencies := defaultDependencies()
+			dependencies.stderr = io.Discard
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				if !test.serverFailure {
+					if test.runtimeTypedNil {
+						var nilRuntime *recordingRuntime
+						return nilRuntime, nil
+					}
+					return nil, nil
+				}
+				return runtime, nil
+			}
+			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+				listenCalls++
+				if !test.serverFailure {
+					return server, nil
+				}
+				if test.serverTypedNil {
+					var nilServer *recordingServer
+					return nilServer, nil
+				}
+				return nil, nil
+			}
+			if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != test.wantExit {
+				t.Fatalf("execute() = %d, want %d", exitCode, test.wantExit)
+			}
+			if listenCalls != test.wantListen {
+				t.Fatalf("listen calls = %d, want %d", listenCalls, test.wantListen)
+			}
+			wantRuntimeCloses := 0
+			if test.serverFailure {
+				wantRuntimeCloses = 1
+			}
+			if runtime.closes != wantRuntimeCloses {
+				t.Fatalf("runtime closes = %d, want %d", runtime.closes, wantRuntimeCloses)
+			}
+		})
+	}
+}
+
+func TestPlatformdCancellationDuringBootstrapClosesRuntimeWithoutListening(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := &recordingRuntime{}
+	listenCalls := 0
+	dependencies := defaultDependencies()
+	dependencies.stderr = io.Discard
+	dependencies.bootstrap = func(got context.Context, _ statebootstrap.Files) (stateRuntime, error) {
+		if got != ctx {
+			t.Fatal("bootstrap did not receive the exact daemon context")
+		}
+		cancel()
+		return runtime, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		listenCalls++
+		return &recordingServer{}, nil
+	}
+
+	if exitCode := execute(ctx, []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want 0", exitCode)
+	}
+	if runtime.closes != 1 || listenCalls != 0 {
+		t.Fatalf("runtime closes/listen calls = %d/%d, want 1/0", runtime.closes, listenCalls)
 	}
 }

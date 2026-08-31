@@ -3852,6 +3852,12 @@ Export:
 
 `platformd`는 Docker socket, `/dev/kvm`, host mount/network namespace 조작 capability를 가져서는 안 된다.
 
+`platformd`는 public API 또는 state-backed consumer를 admission하기 전에 production
+state graph 구성을 시도한다. 이 구성에 실패해도 진단용 control socket과
+`control.protocol`은 유지할 수 있지만, state graph를 부분 publish하거나 public API를
+열어서는 안 되며 `state.celld`는 `NOT_WIRED`여야 한다. 성공한 graph는 daemon lifetime에
+귀속되고, control/API listener와 consumer를 먼저 정지한 뒤 마지막에 닫는다.
+
 ### 37.2 `agentd` — Go
 
 ```text
@@ -4928,6 +4934,24 @@ factory는 두 adapter를 동일한 exact client에서만 만든다. zero/invali
 claim이나 provider start 전에 실패해야 한다. reference-memory helper는 production
 constructor와 같은 exported raw 경로를 제공하지 않는다. process restart나 celld/state-app
 교체는 기존 adapter, seal과 consumer graph 전체를 폐기하고 새 challenge로 다시 구성한다.
+
+reference `platformd`는 `--config /etc/pi-platform/config.yaml`,
+`--release-manifest /usr/lib/pi-platform/release-manifest.json`,
+`--release-trust-roots /etc/pi-platform/release-trust-roots.json`을 기본값으로 사용하며 세
+경로와 control socket 경로는 canonical absolute non-root path여야 한다. startup factory는
+validated configuration, signed release artifact pair, sealed fixed requirements, pinned
+proof bundle, credential client 순서로 구성한다. credential client 하나에서 두 좁은
+adapter를 만들고 같은 verifier/evidence/requirements로 순차 challenge한 뒤 두 seal을
+함께 `RequireAtomicDomain`해야만 graph를 publish한다. 두 번째 probe, joint-domain 검사
+또는 그 이후 취소가 실패하면 첫 seal을 포함한 전체 후보 graph를 버리고 client를 닫는다.
+
+configuration과 release manifest/trust-root는 startup 중 각각 한 번 읽은 값이며 proof와
+credential loader의 pinned batch와 합쳐 전역 원자 filesystem rollout을 증명하지 않는다.
+릴리스 digest, evidence descriptor와 live response의 교차 검사가 불일치를 fail-closed하지만,
+설치기는 이 파일들을 versioned generation으로 원자 배포해야 한다. bootstrap 실패 시 raw
+경로, key, signature 또는 내부 오류를 control capability에 노출하지 않고 state/public
+admission만 비활성화한다. 성공한 graph도 native signer와 restart conformance gate를
+대체하지 않는다.
 
 repository의 client/contract 구현만으로 celld 지원을 가정하지 않는다. pinned celld가
 이 native signer와 immutable provenance를 실제 제공하고 process restart 때 기존 graph를
