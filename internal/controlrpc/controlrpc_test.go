@@ -1,6 +1,7 @@
 package controlrpc
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -197,6 +198,40 @@ func TestControlServerBoundsWholeRequestAndResponseIO(t *testing.T) {
 	}
 	if server.httpServer.WriteTimeout != 5*time.Second {
 		t.Fatalf("WriteTimeout = %s, want 5s", server.httpServer.WriteTimeout)
+	}
+	if !server.httpServer.DisableGeneralOptionsHandler {
+		t.Fatal("general OPTIONS handler is enabled outside the Connect RPC routes")
+	}
+}
+
+func TestControlServerRejectsGeneralOptionsAsteriskForm(t *testing.T) {
+	server := startTestServer(t, ServerConfig{
+		SocketPath:  testSocketPath(t),
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	connection, err := net.DialTimeout("unix", server.SocketPath(), time.Second)
+	if err != nil {
+		t.Fatalf("dial control socket: %v", err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if err := connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set connection deadline: %v", err)
+	}
+	if _, err := connection.Write([]byte(
+		"OPTIONS * HTTP/1.1\r\nHost: control.invalid\r\nConnection: close\r\n\r\n",
+	)); err != nil {
+		t.Fatalf("write OPTIONS request: %v", err)
+	}
+	response, err := http.ReadResponse(
+		bufio.NewReader(connection),
+		&http.Request{Method: http.MethodOptions},
+	)
+	if err != nil {
+		t.Fatalf("read OPTIONS response: %v", err)
+	}
+	t.Cleanup(func() { _ = response.Body.Close() })
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("OPTIONS * status = %d, want 404", response.StatusCode)
 	}
 }
 

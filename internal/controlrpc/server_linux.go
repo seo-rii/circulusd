@@ -161,12 +161,13 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		handler:    handler,
 	}
 	server.httpServer = &http.Server{
-		Handler:           rpcHandler,
-		ReadTimeout:       controlHTTPIOTimeout,
-		ReadHeaderTimeout: controlHTTPIOTimeout,
-		WriteTimeout:      controlHTTPIOTimeout,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    16 << 10,
+		Handler:                      rpcHandler,
+		ReadTimeout:                  controlHTTPIOTimeout,
+		ReadHeaderTimeout:            controlHTTPIOTimeout,
+		WriteTimeout:                 controlHTTPIOTimeout,
+		IdleTimeout:                  30 * time.Second,
+		MaxHeaderBytes:               16 << 10,
+		DisableGeneralOptionsHandler: true,
 		ConnContext: func(ctx context.Context, connection net.Conn) context.Context {
 			credentialed, ok := connection.(*credentialConn)
 			if !ok {

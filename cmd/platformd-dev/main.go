@@ -309,12 +309,13 @@ func listenDevelopmentHTTP(
 	return &developmentHTTPServer{
 		listener: once,
 		httpServer: &http.Server{
-			Handler:           developmentStatusHandler(),
-			ReadTimeout:       developmentHTTPIOTimeout,
-			ReadHeaderTimeout: developmentHTTPIOTimeout,
-			WriteTimeout:      developmentHTTPIOTimeout,
-			IdleTimeout:       30 * time.Second,
-			MaxHeaderBytes:    16 << 10,
+			Handler:                      developmentStatusHandler(),
+			ReadTimeout:                  developmentHTTPIOTimeout,
+			ReadHeaderTimeout:            developmentHTTPIOTimeout,
+			WriteTimeout:                 developmentHTTPIOTimeout,
+			IdleTimeout:                  30 * time.Second,
+			MaxHeaderBytes:               16 << 10,
+			DisableGeneralOptionsHandler: true,
 		},
 	}, nil
 }

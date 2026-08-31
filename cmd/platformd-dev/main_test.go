@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -372,6 +373,9 @@ func TestDevelopmentHTTPServerBoundsWholeRequestAndResponseIO(t *testing.T) {
 	}
 	if server.httpServer.WriteTimeout != 5*time.Second {
 		t.Fatalf("WriteTimeout = %s, want 5s", server.httpServer.WriteTimeout)
+	}
+	if !server.httpServer.DisableGeneralOptionsHandler {
+		t.Fatal("general OPTIONS handler is enabled outside the diagnostic route")
 	}
 }
 
@@ -758,6 +762,43 @@ func TestPlatformdDevServesLoopbackStatusAndDevelopmentCapabilities(t *testing.T
 	if responseBody != developmentStatusJSON {
 		cancel()
 		t.Fatalf("status body = %q", responseBody)
+	}
+	optionsConnection, err := net.DialTimeout("tcp4", listenAddress, time.Second)
+	if err != nil {
+		cancel()
+		t.Fatalf("dial OPTIONS probe: %v", err)
+	}
+	if err := optionsConnection.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		_ = optionsConnection.Close()
+		cancel()
+		t.Fatalf("set OPTIONS deadline: %v", err)
+	}
+	if _, err := io.WriteString(
+		optionsConnection,
+		"OPTIONS * HTTP/1.1\r\nHost: platformd-dev.invalid\r\nConnection: close\r\n\r\n",
+	); err != nil {
+		_ = optionsConnection.Close()
+		cancel()
+		t.Fatalf("write OPTIONS probe: %v", err)
+	}
+	optionsResponse, err := http.ReadResponse(
+		bufio.NewReader(optionsConnection),
+		&http.Request{Method: http.MethodOptions},
+	)
+	if err != nil {
+		_ = optionsConnection.Close()
+		cancel()
+		t.Fatalf("read OPTIONS response: %v", err)
+	}
+	if closeError := optionsResponse.Body.Close(); closeError != nil {
+		t.Errorf("close OPTIONS response: %v", closeError)
+	}
+	if closeError := optionsConnection.Close(); closeError != nil {
+		t.Errorf("close OPTIONS connection: %v", closeError)
+	}
+	if optionsResponse.StatusCode != http.StatusNotFound {
+		cancel()
+		t.Fatalf("OPTIONS * status = %d, want 404", optionsResponse.StatusCode)
 	}
 
 	for time.Now().Before(deadline) {
