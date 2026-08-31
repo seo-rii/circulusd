@@ -17,6 +17,7 @@ import (
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/controlrpc"
+	"github.com/hancomac/circulusd/internal/platformdaemon"
 	"github.com/hancomac/circulusd/internal/statebootstrap"
 )
 
@@ -27,6 +28,8 @@ const (
 	defaultReleaseTrustRootsPath = "/etc/pi-platform/release-trust-roots.json"
 	maximumAllowedUIDs           = 64
 )
+
+var errProductionGraphIncomplete = fmt.Errorf("production graph is incomplete")
 
 type stateRuntime interface {
 	Close()
@@ -43,6 +46,7 @@ type daemonDependencies struct {
 	capabilityProvider controlrpc.CapabilityProvider
 	bootstrap          func(context.Context, statebootstrap.Files) (stateRuntime, error)
 	listen             func(controlrpc.ServerConfig) (controlServer, error)
+	listenPublic       func(context.Context, stateRuntime) (controlServer, error)
 }
 
 type uidValues struct {
@@ -116,7 +120,8 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		return 2
 	}
 	if ctx == nil || dependencies.stderr == nil || dependencies.effectiveUID == nil ||
-		dependencies.capabilityProvider == nil || dependencies.bootstrap == nil || dependencies.listen == nil {
+		dependencies.capabilityProvider == nil || dependencies.bootstrap == nil || dependencies.listen == nil ||
+		dependencies.listenPublic == nil {
 		return 1
 	}
 	if ctx.Err() != nil {
@@ -149,14 +154,51 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		if !runtimeIsNil {
 			runtime.Close()
 		}
+		runtime = nil
 		if ctx.Err() != nil {
 			return 0
 		}
-		fmt.Fprintln(dependencies.stderr, "platformd: production state is unavailable")
-	} else {
-		defer runtime.Close()
+		fmt.Fprintln(dependencies.stderr, "platformd: production graph is unavailable")
 	}
 	if ctx.Err() != nil {
+		if runtimeReady {
+			runtime.Close()
+		}
+		return 0
+	}
+
+	var publicServer controlServer
+	if runtimeReady {
+		publicServer, err = dependencies.listenPublic(ctx, runtime)
+		publicServerIsNil := publicServer == nil
+		if !publicServerIsNil {
+			value := reflect.ValueOf(publicServer)
+			switch value.Kind() {
+			case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+				publicServerIsNil = value.IsNil()
+			}
+		}
+		if err != nil || publicServerIsNil {
+			if !publicServerIsNil {
+				_ = publicServer.Close()
+			}
+			runtime.Close()
+			runtime = nil
+			runtimeReady = false
+			publicServer = nil
+			if ctx.Err() != nil {
+				return 0
+			}
+			fmt.Fprintln(dependencies.stderr, "platformd: production public service is unavailable")
+		}
+	}
+	if ctx.Err() != nil {
+		if publicServer != nil {
+			_ = publicServer.Close()
+		}
+		if runtimeReady {
+			runtime.Close()
+		}
 		return 0
 	}
 
@@ -183,14 +225,19 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		} else {
 			fmt.Fprintln(dependencies.stderr, "platformd: listen returned no control server")
 		}
+		if publicServer != nil {
+			_ = publicServer.Close()
+		}
+		if runtimeReady {
+			runtime.Close()
+		}
 		return 1
 	}
-	defer server.Close()
-	if err := server.Serve(ctx); err != nil {
+	if err := platformdaemon.Serve(ctx, server, publicServer, runtime); err != nil {
 		if ctx.Err() != nil {
 			return 0
 		}
-		fmt.Fprintf(dependencies.stderr, "platformd: serve control socket: %v\n", err)
+		fmt.Fprintf(dependencies.stderr, "platformd: serve platform listeners: %v\n", err)
 		return 1
 	}
 	return 0
@@ -201,10 +248,17 @@ func defaultDependencies() daemonDependencies {
 		stderr:       os.Stderr,
 		effectiveUID: os.Geteuid,
 		bootstrap: func(ctx context.Context, files statebootstrap.Files) (stateRuntime, error) {
-			return statebootstrap.Load(ctx, files)
+			graph, err := statebootstrap.Load(ctx, files)
+			if err != nil {
+				return graph, err
+			}
+			return graph, errProductionGraphIncomplete
 		},
 		listen: func(config controlrpc.ServerConfig) (controlServer, error) {
 			return controlrpc.ListenServer(config)
+		},
+		listenPublic: func(context.Context, stateRuntime) (controlServer, error) {
+			return nil, errProductionGraphIncomplete
 		},
 		capabilityProvider: func(ctx context.Context) ([]*v1.CapabilityStatus, error) {
 			if err := ctx.Err(); err != nil {

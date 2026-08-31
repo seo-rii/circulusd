@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,24 +32,45 @@ func (runtime *recordingRuntime) Close() {
 }
 
 type recordingServer struct {
-	events   *[]string
-	serveErr error
-	closes   int
+	mu        sync.Mutex
+	events    *[]string
+	serveErr  error
+	closes    int
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func (server *recordingServer) Serve(context.Context) error {
+	server.mu.Lock()
 	if server.events != nil {
 		*server.events = append(*server.events, "server.serve")
 	}
-	return server.serveErr
+	err := server.serveErr
+	closed := server.closed
+	server.mu.Unlock()
+	if closed != nil {
+		<-closed
+	}
+	return err
 }
 
 func (server *recordingServer) Close() error {
+	server.mu.Lock()
 	server.closes++
 	if server.events != nil {
 		*server.events = append(*server.events, "server.close")
 	}
+	server.mu.Unlock()
+	server.closeOnce.Do(func() {
+		if server.closed != nil {
+			close(server.closed)
+		}
+	})
 	return nil
+}
+
+func blockingRecordingServer() *recordingServer {
+	return &recordingServer{closed: make(chan struct{})}
 }
 
 func TestPlatformdServesHonestCapabilitiesAndRemovesItsSocket(t *testing.T) {
@@ -359,6 +382,7 @@ func TestPlatformdBootstrapsBeforeListeningAndClosesInDependencyOrder(t *testing
 	var events []string
 	runtime := &recordingRuntime{events: &events}
 	server := &recordingServer{events: &events}
+	publicServer := blockingRecordingServer()
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
 	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
@@ -369,16 +393,20 @@ func TestPlatformdBootstrapsBeforeListeningAndClosesInDependencyOrder(t *testing
 		events = append(events, "listen")
 		return server, nil
 	}
+	dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+		events = append(events, "public.listen")
+		return publicServer, nil
+	}
 
 	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
 		t.Fatalf("execute() = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
-	want := []string{"bootstrap", "listen", "server.serve", "server.close", "runtime.close"}
+	want := []string{"bootstrap", "public.listen", "listen", "server.serve", "server.close", "runtime.close"}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("events = %v, want %v", events, want)
 	}
-	if server.closes != 1 || runtime.closes != 1 {
-		t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+	if server.closes != 1 || publicServer.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = control %d public %d runtime %d, want one each", server.closes, publicServer.closes, runtime.closes)
 	}
 }
 
@@ -424,11 +452,109 @@ func TestPlatformdBootstrapFailureKeepsOnlyTheDiagnosticControlPlaneAvailable(t 
 	if strings.Join(events, ",") != strings.Join(wantEvents, ",") {
 		t.Fatalf("events = %v, want %v", events, wantEvents)
 	}
-	if !strings.Contains(stderr.String(), "production state is unavailable") {
+	if !strings.Contains(stderr.String(), "production graph is unavailable") {
 		t.Fatalf("stderr = %q, want stable bootstrap failure", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "private bootstrap detail") {
 		t.Fatalf("stderr leaked bootstrap detail: %q", stderr.String())
+	}
+}
+
+func TestPlatformdBootstrapFailureNeverConstructsPublicListener(t *testing.T) {
+	var stderr bytes.Buffer
+	publicListenCalls := 0
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return &recordingRuntime{}, errors.New("private bootstrap detail")
+	}
+	dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+		publicListenCalls++
+		return &recordingServer{}, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		return &recordingServer{}, nil
+	}
+
+	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want diagnostic-only success", exitCode)
+	}
+	if publicListenCalls != 0 {
+		t.Fatalf("public listen calls = %d, want zero", publicListenCalls)
+	}
+}
+
+func TestPlatformdPublicListenerFailureDiscardsTheGraphBeforeDiagnosticServe(t *testing.T) {
+	var stderr bytes.Buffer
+	var events []string
+	runtime := &recordingRuntime{events: &events}
+	publicCandidate := &recordingServer{events: &events}
+	diagnostic := &recordingServer{events: &events}
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		events = append(events, "bootstrap")
+		return runtime, nil
+	}
+	dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+		events = append(events, "public.listen")
+		return publicCandidate, errors.New("private public bind detail")
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		events = append(events, "diagnostic.listen")
+		return diagnostic, nil
+	}
+
+	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want diagnostic-only success", exitCode)
+	}
+	want := []string{
+		"bootstrap", "public.listen", "server.close", "runtime.close",
+		"diagnostic.listen", "server.serve", "server.close",
+	}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	if publicCandidate.closes != 1 || diagnostic.closes != 1 || runtime.closes != 1 {
+		t.Fatalf(
+			"close counts = public %d diagnostic %d runtime %d, want one each",
+			publicCandidate.closes, diagnostic.closes, runtime.closes,
+		)
+	}
+	if !strings.Contains(stderr.String(), "production public service is unavailable") ||
+		strings.Contains(stderr.String(), "private public bind detail") {
+		t.Fatalf("stderr = %q, want stable redacted public failure", stderr.String())
+	}
+}
+
+func TestPlatformdNilPublicListenerDowngradesToDiagnosticOnly(t *testing.T) {
+	for _, typed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("typed=%t", typed), func(t *testing.T) {
+			runtime := &recordingRuntime{}
+			diagnostic := &recordingServer{}
+			dependencies := defaultDependencies()
+			dependencies.stderr = io.Discard
+			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+				return runtime, nil
+			}
+			dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+				if typed {
+					var nilServer *recordingServer
+					return nilServer, nil
+				}
+				return nil, nil
+			}
+			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+				return diagnostic, nil
+			}
+
+			if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+				t.Fatalf("execute() = %d, want diagnostic-only success", exitCode)
+			}
+			if runtime.closes != 1 || diagnostic.closes != 1 {
+				t.Fatalf("close counts = runtime %d diagnostic %d", runtime.closes, diagnostic.closes)
+			}
+		})
 	}
 }
 
@@ -437,6 +563,7 @@ func TestPlatformdListenFailureClosesBootstrapRuntime(t *testing.T) {
 	var events []string
 	runtime := &recordingRuntime{events: &events}
 	server := &recordingServer{events: &events}
+	publicServer := &recordingServer{events: &events}
 	dependencies := defaultDependencies()
 	dependencies.stderr = &stderr
 	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
@@ -447,16 +574,20 @@ func TestPlatformdListenFailureClosesBootstrapRuntime(t *testing.T) {
 		events = append(events, "listen")
 		return server, errors.New("listen failed")
 	}
+	dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+		events = append(events, "public.listen")
+		return publicServer, nil
+	}
 
 	if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != 1 {
 		t.Fatalf("execute() = %d, want 1", exitCode)
 	}
-	want := []string{"bootstrap", "listen", "server.close", "runtime.close"}
+	want := []string{"bootstrap", "public.listen", "listen", "server.close", "server.close", "runtime.close"}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("events = %v, want %v", events, want)
 	}
-	if server.closes != 1 || runtime.closes != 1 {
-		t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+	if server.closes != 1 || publicServer.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = control %d public %d runtime %d, want one each", server.closes, publicServer.closes, runtime.closes)
 	}
 }
 
@@ -476,6 +607,7 @@ func TestPlatformdServeOutcomesAlwaysCloseServerBeforeRuntime(t *testing.T) {
 			var events []string
 			runtime := &recordingRuntime{events: &events}
 			server := &recordingServer{events: &events, serveErr: test.serveErr}
+			publicServer := blockingRecordingServer()
 			dependencies := defaultDependencies()
 			dependencies.stderr = &stderr
 			dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
@@ -483,6 +615,9 @@ func TestPlatformdServeOutcomesAlwaysCloseServerBeforeRuntime(t *testing.T) {
 			}
 			dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
 				return server, nil
+			}
+			dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+				return publicServer, nil
 			}
 
 			if exitCode := execute(context.Background(), []string{"--allow-uid", "1000"}, dependencies); exitCode != test.wantExit {
@@ -492,8 +627,8 @@ func TestPlatformdServeOutcomesAlwaysCloseServerBeforeRuntime(t *testing.T) {
 			if strings.Join(events, ",") != strings.Join(want, ",") {
 				t.Fatalf("events = %v, want %v", events, want)
 			}
-			if server.closes != 1 || runtime.closes != 1 {
-				t.Fatalf("close counts = server %d runtime %d, want one each", server.closes, runtime.closes)
+			if server.closes != 1 || publicServer.closes != 1 || runtime.closes != 1 {
+				t.Fatalf("close counts = control %d public %d runtime %d, want one each", server.closes, publicServer.closes, runtime.closes)
 			}
 		})
 	}
@@ -560,6 +695,7 @@ func TestPlatformdMissingDependenciesAndNilContextFailBeforeBootstrap(t *testing
 		{name: "nil capabilities", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.capabilityProvider = nil }},
 		{name: "nil bootstrap", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.bootstrap = nil }},
 		{name: "nil listen", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.listen = nil }},
+		{name: "nil public listen", ctx: context.Background(), mutate: func(dependencies *daemonDependencies) { dependencies.listenPublic = nil }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -668,5 +804,38 @@ func TestPlatformdCancellationDuringBootstrapClosesRuntimeWithoutListening(t *te
 	}
 	if runtime.closes != 1 || listenCalls != 0 {
 		t.Fatalf("runtime closes/listen calls = %d/%d, want 1/0", runtime.closes, listenCalls)
+	}
+}
+
+func TestPlatformdPassesCancellationFenceToPublicListener(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := &recordingRuntime{}
+	publicServer := &recordingServer{}
+	diagnosticListenCalls := 0
+	dependencies := defaultDependencies()
+	dependencies.stderr = io.Discard
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return runtime, nil
+	}
+	dependencies.listenPublic = func(got context.Context, _ stateRuntime) (controlServer, error) {
+		if got != ctx {
+			t.Fatal("public listener did not receive the exact daemon context")
+		}
+		cancel()
+		return publicServer, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		diagnosticListenCalls++
+		return &recordingServer{}, nil
+	}
+
+	if exitCode := execute(ctx, []string{"--allow-uid", "1000"}, dependencies); exitCode != 0 {
+		t.Fatalf("execute() = %d, want 0", exitCode)
+	}
+	if publicServer.closes != 1 || runtime.closes != 1 || diagnosticListenCalls != 0 {
+		t.Fatalf(
+			"public/runtime closes and diagnostic listens = %d/%d/%d, want 1/1/0",
+			publicServer.closes, runtime.closes, diagnosticListenCalls,
+		)
 	}
 }
