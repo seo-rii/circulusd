@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -71,6 +72,19 @@ func (server *recordingServer) Close() error {
 
 func blockingRecordingServer() *recordingServer {
 	return &recordingServer{closed: make(chan struct{})}
+}
+
+func TestPlatformdProductionDependenciesExcludeReferenceMemoryAPI(t *testing.T) {
+	command := exec.Command("go", "list", "-deps", ".")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps: %v\n%s", err, output)
+	}
+	for _, dependency := range strings.Fields(string(output)) {
+		if dependency == "github.com/hancomac/circulusd/internal/platformapi" {
+			t.Fatalf("production dependency graph contains reference-memory package %q", dependency)
+		}
+	}
 }
 
 func TestPlatformdServesHonestCapabilitiesAndRemovesItsSocket(t *testing.T) {

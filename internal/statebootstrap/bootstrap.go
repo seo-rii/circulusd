@@ -21,8 +21,8 @@ import (
 	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/config"
 	"github.com/hancomac/circulusd/internal/dependency"
-	"github.com/hancomac/circulusd/internal/platformapi"
 	"github.com/hancomac/circulusd/internal/release"
+	"github.com/hancomac/circulusd/internal/sessionevent"
 	"github.com/hancomac/circulusd/internal/stateappadapter"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
@@ -41,7 +41,7 @@ type Files struct {
 // representation is private so callers cannot copy or format the credential-
 // bearing client; verified adapters and metadata remain immutable.
 type Graph interface {
-	SessionEventReader() dependency.Verified[platformapi.SessionEventPageReader]
+	SessionEventReader() dependency.Verified[sessionevent.SessionEventPageReader]
 	DispatchStartClaimer() dependency.Verified[broker.DispatchStartClaimer]
 	Descriptor() dependency.Descriptor
 	DispatchStartTimeout() time.Duration
@@ -49,7 +49,7 @@ type Graph interface {
 }
 
 type graph struct {
-	sessionEventReader   dependency.Verified[platformapi.SessionEventPageReader]
+	sessionEventReader   dependency.Verified[sessionevent.SessionEventPageReader]
 	dispatchStartClaimer dependency.Verified[broker.DispatchStartClaimer]
 	descriptor           dependency.Descriptor
 	dispatchStartTimeout time.Duration
@@ -61,9 +61,9 @@ type graph struct {
 func (*graph) String() string   { return "production-state-graph<redacted>" }
 func (*graph) GoString() string { return "production-state-graph<redacted>" }
 
-func (graph *graph) SessionEventReader() dependency.Verified[platformapi.SessionEventPageReader] {
+func (graph *graph) SessionEventReader() dependency.Verified[sessionevent.SessionEventPageReader] {
 	if graph == nil {
-		return dependency.Verified[platformapi.SessionEventPageReader]{}
+		return dependency.Verified[sessionevent.SessionEventPageReader]{}
 	}
 	return graph.sessionEventReader
 }
@@ -137,15 +137,15 @@ type bootstrapSources struct {
 		dependency.ProductionRequirementsConfig,
 	) (dependency.Requirements, error)
 	newClient    func(stateappclient.CredentialFileConfig) (*stateappclient.Client, error)
-	newReader    func(*stateappclient.Client) (platformapi.SessionEventPageReader, error)
+	newReader    func(*stateappclient.Client) (sessionevent.SessionEventPageReader, error)
 	newClaimer   func(*stateappclient.Client) (broker.DispatchStartClaimer, error)
 	verifyReader func(
 		context.Context,
 		*dependency.Verifier,
-		platformapi.SessionEventPageReader,
+		sessionevent.SessionEventPageReader,
 		dependency.Evidence,
 		dependency.Requirements,
-	) (dependency.Verified[platformapi.SessionEventPageReader], error)
+	) (dependency.Verified[sessionevent.SessionEventPageReader], error)
 	verifyClaimer func(
 		context.Context,
 		*dependency.Verifier,
@@ -217,7 +217,7 @@ func Load(ctx context.Context, files Files) (Graph, error) {
 		loadProofs:      dependency.NewVerifierFromFiles,
 		newRequirements: dependency.NewProductionRequirements,
 		newClient:       stateappclient.NewFromCredentialFiles,
-		newReader: func(client *stateappclient.Client) (platformapi.SessionEventPageReader, error) {
+		newReader: func(client *stateappclient.Client) (sessionevent.SessionEventPageReader, error) {
 			return stateappadapter.New(client)
 		},
 		newClaimer: func(client *stateappclient.Client) (broker.DispatchStartClaimer, error) {
@@ -226,10 +226,10 @@ func Load(ctx context.Context, files Files) (Graph, error) {
 		verifyReader: func(
 			ctx context.Context,
 			verifier *dependency.Verifier,
-			reader platformapi.SessionEventPageReader,
+			reader sessionevent.SessionEventPageReader,
 			evidence dependency.Evidence,
 			requirements dependency.Requirements,
-		) (dependency.Verified[platformapi.SessionEventPageReader], error) {
+		) (dependency.Verified[sessionevent.SessionEventPageReader], error) {
 			return dependency.VerifyDependency(ctx, verifier, reader, evidence, requirements)
 		},
 		verifyClaimer: func(

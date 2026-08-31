@@ -12,7 +12,7 @@ import (
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
-	"github.com/hancomac/circulusd/internal/platformapi"
+	"github.com/hancomac/circulusd/internal/sessionevent"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
 
@@ -37,7 +37,7 @@ type Reader struct {
 // operational reads and the production challenge.
 func New(client *stateappclient.Client) (*Reader, error) {
 	if adapterClientIsNil(client) {
-		return nil, platformapi.ErrInvalidConfig
+		return nil, sessionevent.ErrInvalidConfig
 	}
 	return &Reader{client: client}, nil
 }
@@ -46,7 +46,7 @@ func New(client *stateappclient.Client) (*Reader, error) {
 // allowing deterministic contract tests without a network listener.
 func newCandidateReaderForTest(client sessionEventClient) (*Reader, error) {
 	if adapterClientIsNil(client) {
-		return nil, platformapi.ErrInvalidConfig
+		return nil, sessionevent.ErrInvalidConfig
 	}
 	return &Reader{client: client}, nil
 }
@@ -63,36 +63,36 @@ func (reader *Reader) ProbeProduction(
 
 func (reader *Reader) ReadSessionEventPage(
 	ctx context.Context,
-	request platformapi.AuthorizedSessionEventPageRequest,
-) (platformapi.SessionPublicEventPage, error) {
+	request sessionevent.AuthorizedSessionEventPageRequest,
+) (sessionevent.SessionPublicEventPage, error) {
 	if ctx == nil {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrInvalidRequest
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrInvalidRequest
 	}
 	if err := ctx.Err(); err != nil {
-		return platformapi.SessionPublicEventPage{}, err
+		return sessionevent.SessionPublicEventPage{}, err
 	}
 	if reader == nil || adapterClientIsNil(reader.client) {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 	permit := request.Authorization
-	if permit.Operation != platformapi.OperationReadEvents ||
+	if permit.Operation != sessionevent.OperationReadEvents ||
 		permit.Principal.TenantID == "" || permit.Principal.SubjectID == "" ||
 		permit.SessionID != request.SessionID || permit.AuthorizationGeneration < 1 ||
 		permit.AuthorizationGeneration > maximumSharedInteger ||
-		permit.Proof == (platformapi.OpaqueAuthorizationProof{}) {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrAccessDenied
+		permit.Proof == (sessionevent.OpaqueAuthorizationProof{}) {
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrAccessDenied
 	}
 	if _, err := identity.Parse(identity.Tenant, permit.Principal.TenantID); err != nil {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrAccessDenied
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrAccessDenied
 	}
 	if _, err := identity.Parse(identity.Subject, permit.Principal.SubjectID); err != nil {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrAccessDenied
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrAccessDenied
 	}
 	if _, err := identity.Parse(identity.Session, request.SessionID); err != nil {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrAccessDenied
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrAccessDenied
 	}
 	if request.AfterSequence > maximumSharedInteger || request.Limit < 1 || request.Limit > maximumEventPageEvents {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrInvalidCursor
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrInvalidCursor
 	}
 
 	result, err := reader.client.ReadSessionEvents(ctx, stateappclient.Request{
@@ -102,42 +102,42 @@ func (reader *Reader) ReadSessionEventPage(
 		AfterSequence:                   request.AfterSequence, Limit: request.Limit,
 	})
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return platformapi.SessionPublicEventPage{}, ctxErr
+		return sessionevent.SessionPublicEventPage{}, ctxErr
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return platformapi.SessionPublicEventPage{}, err
+			return sessionevent.SessionPublicEventPage{}, err
 		}
 		var remote *stateappclient.RemoteError
 		if errors.As(err, &remote) {
 			switch remote.Code {
 			case "NOT_FOUND", "NOT_INITIALIZED":
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrSessionNotFound
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrSessionNotFound
 			case "PERMISSION_DENIED":
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrAccessDenied
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrAccessDenied
 			case "STALE_GENERATION":
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrStaleAuthority
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrStaleAuthority
 			case "INVALID_ARGUMENT":
 				if remote.Status == http.StatusOK {
-					return platformapi.SessionPublicEventPage{}, platformapi.ErrInvalidCursor
+					return sessionevent.SessionPublicEventPage{}, sessionevent.ErrInvalidCursor
 				}
 			}
 		}
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 
 	record, ok := result.(canonical.Map)
 	if !ok || len(record) != 2 {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 	snapshotValue, hasSnapshot := record["snapshot"]
 	eventsValue, hasEvents := record["events"]
 	if !hasSnapshot || !hasEvents {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 	snapshot, ok := snapshotValue.(canonical.Map)
 	if !ok || len(snapshot) != 4 {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 	sessionID, sessionIDOK := snapshot["sessionId"].(string)
 	activeTurnValue, hasActiveTurn := snapshot["activeTurnId"]
@@ -147,34 +147,34 @@ func (reader *Reader) ReadSessionEventPage(
 	if !sessionIDOK || sessionID != request.SessionID ||
 		!hasActiveTurn || !hasTurnStatus || !hasLastSequence || !lastSequenceOK ||
 		lastSequence < 0 || uint64(lastSequence) > maximumSharedInteger {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
 	var activeTurnID *string
 	if activeTurnValue != nil {
 		value, valueOK := activeTurnValue.(string)
 		if !valueOK {
-			return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+			return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 		}
 		activeTurnID = &value
 	}
-	var turnStatus *platformapi.TurnStatus
+	var turnStatus *sessionevent.TurnStatus
 	if turnStatusValue != nil {
 		value, valueOK := turnStatusValue.(string)
-		status := platformapi.TurnStatus(value)
-		if !valueOK || status != platformapi.TurnActive && status != platformapi.TurnNeedsConfirmation {
-			return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		status := sessionevent.TurnStatus(value)
+		if !valueOK || status != sessionevent.TurnActive && status != sessionevent.TurnNeedsConfirmation {
+			return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 		}
 		turnStatus = &status
 	}
 	eventValues, ok := eventsValue.(canonical.Array)
 	if !ok || len(eventValues) > request.Limit || len(eventValues) > maximumEventPageEvents {
-		return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+		return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 	}
-	events := make([]platformapi.SessionPublicEvent, 0, len(eventValues))
+	events := make([]sessionevent.SessionPublicEvent, 0, len(eventValues))
 	for _, eventValue := range eventValues {
 		eventRecord, eventOK := eventValue.(canonical.Map)
 		if !eventOK {
-			return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+			return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 		}
 		typeValue, hasType := eventRecord["type"]
 		eventTypeText, typeOK := typeValue.(string)
@@ -188,25 +188,25 @@ func (reader *Reader) ReadSessionEventPage(
 			uint64(sequence) > maximumSharedInteger || !hasTurnID || !turnIDOK ||
 			!hasTurnSequence || !turnSequenceOK || turnSequence < 0 ||
 			uint64(turnSequence) > maximumSharedInteger {
-			return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+			return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 		}
-		event := platformapi.SessionPublicEvent{
-			Sequence: uint64(sequence), Type: platformapi.EventType(eventTypeText),
+		event := sessionevent.SessionPublicEvent{
+			Sequence: uint64(sequence), Type: sessionevent.EventType(eventTypeText),
 			TurnID: turnID, TurnSequence: uint64(turnSequence),
 		}
 		switch event.Type {
-		case platformapi.EventTurnAccepted:
+		case sessionevent.EventTurnAccepted:
 			statusValue, hasStatus := eventRecord["status"]
 			statusText, statusOK := statusValue.(string)
-			status := platformapi.TurnStatus(statusText)
+			status := sessionevent.TurnStatus(statusText)
 			if len(eventRecord) != 5 || !hasStatus || !statusOK ||
-				status != platformapi.TurnActive && status != platformapi.TurnQueued {
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+				status != sessionevent.TurnActive && status != sessionevent.TurnQueued {
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 			}
 			event.Status = status
-		case platformapi.EventModelEffectPrepared, platformapi.EventToolEffectPrepared,
-			platformapi.EventToolExternallyCommit, platformapi.EventModelSettled,
-			platformapi.EventToolSettled, platformapi.EventTurnNeedsConfirmation:
+		case sessionevent.EventModelEffectPrepared, sessionevent.EventToolEffectPrepared,
+			sessionevent.EventToolExternallyCommit, sessionevent.EventModelSettled,
+			sessionevent.EventToolSettled, sessionevent.EventTurnNeedsConfirmation:
 			effectIDValue, hasEffectID := eventRecord["effectId"]
 			effectID, effectIDOK := effectIDValue.(string)
 			invocationIDValue, hasInvocationID := eventRecord["invocationId"]
@@ -215,62 +215,62 @@ func (reader *Reader) ReadSessionEventPage(
 			serviceText, serviceOK := serviceValue.(string)
 			operationValue, hasOperation := eventRecord["operation"]
 			operation, operationOK := operationValue.(string)
-			service := platformapi.SessionEffectService(serviceText)
-			validService := service == platformapi.SessionEffectModel ||
-				service == platformapi.SessionEffectWorkspace ||
-				service == platformapi.SessionEffectExecutor ||
-				service == platformapi.SessionEffectMCP ||
-				service == platformapi.SessionEffectArtifact ||
-				service == platformapi.SessionEffectExternalTool
+			service := sessionevent.SessionEffectService(serviceText)
+			validService := service == sessionevent.SessionEffectModel ||
+				service == sessionevent.SessionEffectWorkspace ||
+				service == sessionevent.SessionEffectExecutor ||
+				service == sessionevent.SessionEffectMCP ||
+				service == sessionevent.SessionEffectArtifact ||
+				service == sessionevent.SessionEffectExternalTool
 			if !hasEffectID || !effectIDOK || !hasInvocationID || !invocationIDOK ||
 				!hasService || !serviceOK || !validService || !hasOperation || !operationOK {
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 			}
 			event.EffectID = effectID
 			event.InvocationID = invocationID
 			event.Service = service
 			event.Operation = operation
 			switch event.Type {
-			case platformapi.EventToolExternallyCommit:
+			case sessionevent.EventToolExternallyCommit:
 				externalCommitValue, hasExternalCommit := eventRecord["externalCommitId"]
 				externalCommitID, externalCommitOK := externalCommitValue.(string)
 				resultRefValue, hasResultRef := eventRecord["resultRef"]
 				resultRef, resultRefOK := resultRefValue.(string)
 				if len(eventRecord) != 10 || !hasExternalCommit || !externalCommitOK ||
 					!hasResultRef || !resultRefOK {
-					return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+					return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 				}
 				event.ExternalCommitID = externalCommitID
 				event.ResultRef = resultRef
-			case platformapi.EventModelSettled, platformapi.EventToolSettled:
+			case sessionevent.EventModelSettled, sessionevent.EventToolSettled:
 				settlementValue, hasSettlement := eventRecord["settlementKind"]
 				settlementText, settlementOK := settlementValue.(string)
-				settlement := platformapi.SessionSettlementKind(settlementText)
-				validSettlement := settlement == platformapi.SessionSettlementSuccess ||
-					settlement == platformapi.SessionSettlementError ||
-					settlement == platformapi.SessionSettlementInterruptedUnknown ||
-					settlement == platformapi.SessionSettlementAbandoned
+				settlement := sessionevent.SessionSettlementKind(settlementText)
+				validSettlement := settlement == sessionevent.SessionSettlementSuccess ||
+					settlement == sessionevent.SessionSettlementError ||
+					settlement == sessionevent.SessionSettlementInterruptedUnknown ||
+					settlement == sessionevent.SessionSettlementAbandoned
 				if len(eventRecord) != 9 || !hasSettlement || !settlementOK || !validSettlement {
-					return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+					return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 				}
 				event.SettlementKind = settlement
 			default:
 				if len(eventRecord) != 8 {
-					return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+					return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 				}
 			}
-		case platformapi.EventTurnCompleted, platformapi.EventTurnFailed, platformapi.EventTurnAborted:
+		case sessionevent.EventTurnCompleted, sessionevent.EventTurnFailed, sessionevent.EventTurnAborted:
 			if len(eventRecord) != 4 {
-				return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+				return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 			}
 		default:
-			return platformapi.SessionPublicEventPage{}, platformapi.ErrRepositoryFailure
+			return sessionevent.SessionPublicEventPage{}, sessionevent.ErrRepositoryFailure
 		}
 		events = append(events, event)
 	}
 
-	return platformapi.SessionPublicEventPage{
-		Snapshot: platformapi.SessionPublicEventSnapshot{
+	return sessionevent.SessionPublicEventPage{
+		Snapshot: sessionevent.SessionPublicEventSnapshot{
 			SessionID: sessionID, ActiveTurnID: activeTurnID, TurnStatus: turnStatus,
 			LastEventSequence: uint64(lastSequence),
 		},
@@ -291,4 +291,4 @@ func adapterClientIsNil(client any) bool {
 	}
 }
 
-var _ platformapi.SessionEventPageReader = (*Reader)(nil)
+var _ sessionevent.SessionEventPageReader = (*Reader)(nil)

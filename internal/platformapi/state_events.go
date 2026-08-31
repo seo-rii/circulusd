@@ -9,6 +9,7 @@ import (
 
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
+	"github.com/hancomac/circulusd/internal/sessionevent"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -20,20 +21,12 @@ const (
 // SessionEventPageReader is deliberately read-only. Implementations must not
 // expose an append or mutation operation through this authority boundary. The
 // live probe must be served by the same concrete reader that handles requests.
-type SessionEventPageReader interface {
-	dependency.ProductionProbe
-	ReadSessionEventPage(context.Context, AuthorizedSessionEventPageRequest) (SessionPublicEventPage, error)
-}
+type SessionEventPageReader = sessionevent.SessionEventPageReader
 
 // AuthorizedSessionEventPageRequest carries the exact permit returned by the
 // public Authorizer. Readers re-fence its authorization generation while
 // reading the authoritative Session snapshot and journal page atomically.
-type AuthorizedSessionEventPageRequest struct {
-	Authorization AuthorizationPermit
-	SessionID     string
-	AfterSequence uint64
-	Limit         int
-}
+type AuthorizedSessionEventPageRequest = sessionevent.AuthorizedSessionEventPageRequest
 
 type ReadSessionEventPageRequest struct {
 	Principal     Principal
@@ -42,57 +35,35 @@ type ReadSessionEventPageRequest struct {
 	Limit         int
 }
 
-type SessionEffectService string
+type SessionEffectService = sessionevent.SessionEffectService
 
 const (
-	SessionEffectModel        SessionEffectService = "model"
-	SessionEffectWorkspace    SessionEffectService = "workspace"
-	SessionEffectExecutor     SessionEffectService = "executor"
-	SessionEffectMCP          SessionEffectService = "mcp"
-	SessionEffectArtifact     SessionEffectService = "artifact"
-	SessionEffectExternalTool SessionEffectService = "external-tool"
+	SessionEffectModel        = sessionevent.SessionEffectModel
+	SessionEffectWorkspace    = sessionevent.SessionEffectWorkspace
+	SessionEffectExecutor     = sessionevent.SessionEffectExecutor
+	SessionEffectMCP          = sessionevent.SessionEffectMCP
+	SessionEffectArtifact     = sessionevent.SessionEffectArtifact
+	SessionEffectExternalTool = sessionevent.SessionEffectExternalTool
 )
 
-type SessionSettlementKind string
+type SessionSettlementKind = sessionevent.SessionSettlementKind
 
 const (
-	SessionSettlementSuccess            SessionSettlementKind = "success"
-	SessionSettlementError              SessionSettlementKind = "error"
-	SessionSettlementInterruptedUnknown SessionSettlementKind = "interrupted_unknown"
-	SessionSettlementAbandoned          SessionSettlementKind = "abandoned"
+	SessionSettlementSuccess            = sessionevent.SessionSettlementSuccess
+	SessionSettlementError              = sessionevent.SessionSettlementError
+	SessionSettlementInterruptedUnknown = sessionevent.SessionSettlementInterruptedUnknown
+	SessionSettlementAbandoned          = sessionevent.SessionSettlementAbandoned
 )
 
 // SessionPublicEvent mirrors the state-app SessionPublicEvent discriminated
 // union. Fields not belonging to an event's Type must retain their zero value;
 // the service validates this exact family shape before returning a page.
-type SessionPublicEvent struct {
-	Sequence         uint64                `json:"sequence"`
-	Type             EventType             `json:"type"`
-	TurnID           string                `json:"turnId"`
-	TurnSequence     uint64                `json:"turnSequence"`
-	Status           TurnStatus            `json:"status,omitempty"`
-	EffectID         string                `json:"effectId,omitempty"`
-	InvocationID     string                `json:"invocationId,omitempty"`
-	Service          SessionEffectService  `json:"service,omitempty"`
-	Operation        string                `json:"operation,omitempty"`
-	ExternalCommitID string                `json:"externalCommitId,omitempty"`
-	ResultRef        string                `json:"resultRef,omitempty"`
-	SettlementKind   SessionSettlementKind `json:"settlementKind,omitempty"`
-}
+type SessionPublicEvent = sessionevent.SessionPublicEvent
 
 // SessionPublicEventSnapshot mirrors state-app's page-time Session snapshot.
 // Nil ActiveTurnID and TurnStatus represent its null active-turn fields.
-type SessionPublicEventSnapshot struct {
-	SessionID         string      `json:"sessionId"`
-	ActiveTurnID      *string     `json:"activeTurnId"`
-	TurnStatus        *TurnStatus `json:"turnStatus"`
-	LastEventSequence uint64      `json:"lastEventSequence"`
-}
-
-type SessionPublicEventPage struct {
-	Snapshot SessionPublicEventSnapshot `json:"snapshot"`
-	Events   []SessionPublicEvent       `json:"events"`
-}
+type SessionPublicEventSnapshot = sessionevent.SessionPublicEventSnapshot
+type SessionPublicEventPage = sessionevent.SessionPublicEventPage
 
 type SessionEventServiceConfig struct {
 	Reader            dependency.Verified[SessionEventPageReader]

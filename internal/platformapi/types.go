@@ -9,60 +9,36 @@ import (
 	"errors"
 
 	"github.com/hancomac/circulusd/internal/authority"
+	"github.com/hancomac/circulusd/internal/sessionevent"
 )
 
 var (
-	ErrInvalidConfig        = errors.New("platform api: invalid configuration")
-	ErrInvalidRequest       = errors.New("platform api: invalid request")
-	ErrAccessDenied         = errors.New("platform api: access denied")
-	ErrSessionNotFound      = errors.New("platform api: session not found")
+	ErrInvalidConfig        = sessionevent.ErrInvalidConfig
+	ErrInvalidRequest       = sessionevent.ErrInvalidRequest
+	ErrAccessDenied         = sessionevent.ErrAccessDenied
+	ErrSessionNotFound      = sessionevent.ErrSessionNotFound
 	ErrTurnNotFound         = errors.New("platform api: turn not found")
 	ErrIdempotencyConflict  = errors.New("platform api: idempotency conflict")
 	ErrSequenceConflict     = errors.New("platform api: durable event sequence conflict")
-	ErrInvalidCursor        = errors.New("platform api: invalid durable event cursor")
-	ErrStaleAuthority       = errors.New("platform api: stale event authority")
+	ErrInvalidCursor        = sessionevent.ErrInvalidCursor
+	ErrStaleAuthority       = sessionevent.ErrStaleAuthority
 	ErrInvalidTransition    = errors.New("platform api: invalid turn transition")
-	ErrRepositoryFailure    = errors.New("platform api: repository failure")
+	ErrRepositoryFailure    = sessionevent.ErrRepositoryFailure
 	ErrRepositoryNotDurable = errors.New("platform api: repository is not crash durable")
 )
 
-type Operation string
+type Operation = sessionevent.Operation
 
 const (
-	OperationCreateTurn Operation = "create-turn"
-	OperationReadEvents Operation = "read-events"
+	OperationCreateTurn = sessionevent.OperationCreateTurn
+	OperationReadEvents = sessionevent.OperationReadEvents
 )
 
-type Principal struct {
-	TenantID  string
-	SubjectID string
-}
-
-type AuthorizationRequest struct {
-	Operation Operation
-	Principal Principal
-	SessionID string
-}
-
-type OpaqueAuthorizationProof [32]byte
-
-func (OpaqueAuthorizationProof) String() string   { return "api-authorization<redacted>" }
-func (OpaqueAuthorizationProof) GoString() string { return "api-authorization<redacted>" }
-
-// AuthorizationPermit is trusted output from Authorizer. Repository adapters
-// compare its current generation inside the same transaction as the protected
-// read or mutation, closing revocation races after the initial policy check.
-type AuthorizationPermit struct {
-	Operation               Operation
-	Principal               Principal
-	SessionID               string
-	AuthorizationGeneration uint64
-	Proof                   OpaqueAuthorizationProof
-}
-
-type Authorizer interface {
-	Authorize(context.Context, AuthorizationRequest) (AuthorizationPermit, error)
-}
+type Principal = sessionevent.Principal
+type AuthorizationRequest = sessionevent.AuthorizationRequest
+type OpaqueAuthorizationProof = sessionevent.OpaqueAuthorizationProof
+type AuthorizationPermit = sessionevent.AuthorizationPermit
+type Authorizer = sessionevent.Authorizer
 
 // EventAuthorizer verifies fresh Session authority before any repository
 // lookup. EventAuthority fields are comparison targets, not credentials.
@@ -75,15 +51,15 @@ type Message struct {
 	Content string
 }
 
-type TurnStatus string
+type TurnStatus = sessionevent.TurnStatus
 
 const (
-	TurnQueued            TurnStatus = "queued"
-	TurnActive            TurnStatus = "active"
-	TurnNeedsConfirmation TurnStatus = "needs_confirmation"
-	TurnCompleted         TurnStatus = "completed"
-	TurnFailed            TurnStatus = "failed"
-	TurnAborted           TurnStatus = "aborted"
+	TurnQueued            = sessionevent.TurnQueued
+	TurnActive            = sessionevent.TurnActive
+	TurnNeedsConfirmation = sessionevent.TurnNeedsConfirmation
+	TurnCompleted         = sessionevent.TurnCompleted
+	TurnFailed            = sessionevent.TurnFailed
+	TurnAborted           = sessionevent.TurnAborted
 )
 
 type Turn struct {
@@ -107,23 +83,23 @@ type CreateTurnResult struct {
 	Deduplicated bool
 }
 
-type EventType string
+type EventType = sessionevent.EventType
 
 const (
-	EventTurnAccepted          EventType = "turn.accepted"
-	EventModelEffectPrepared   EventType = "model.effect.prepared"
-	EventModelSettled          EventType = "model.settled"
-	EventToolEffectPrepared    EventType = "tool.effect.prepared"
-	EventToolExternallyCommit  EventType = "tool.externally_committed"
-	EventToolSettled           EventType = "tool.settled"
-	EventTurnNeedsConfirmation EventType = "turn.needs_confirmation"
-	EventTurnCompleted         EventType = "turn.completed"
-	EventTurnFailed            EventType = "turn.failed"
-	EventTurnAborted           EventType = "turn.aborted"
-	EventModelDelta            EventType = "model.delta"
-	EventToolStdout            EventType = "tool.stdout"
-	EventToolStderr            EventType = "tool.stderr"
-	EventToolLeaseWaiting      EventType = "tool.lease.waiting"
+	EventTurnAccepted          = sessionevent.EventTurnAccepted
+	EventModelEffectPrepared   = sessionevent.EventModelEffectPrepared
+	EventModelSettled          = sessionevent.EventModelSettled
+	EventToolEffectPrepared    = sessionevent.EventToolEffectPrepared
+	EventToolExternallyCommit  = sessionevent.EventToolExternallyCommit
+	EventToolSettled           = sessionevent.EventToolSettled
+	EventTurnNeedsConfirmation = sessionevent.EventTurnNeedsConfirmation
+	EventTurnCompleted         = sessionevent.EventTurnCompleted
+	EventTurnFailed            = sessionevent.EventTurnFailed
+	EventTurnAborted           = sessionevent.EventTurnAborted
+	EventModelDelta            = sessionevent.EventModelDelta
+	EventToolStdout            = sessionevent.EventToolStdout
+	EventToolStderr            = sessionevent.EventToolStderr
+	EventToolLeaseWaiting      = sessionevent.EventToolLeaseWaiting
 )
 
 type EventAuthority struct {
