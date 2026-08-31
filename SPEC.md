@@ -2230,6 +2230,37 @@ interface SpawnRequest {
 
 `executable`은 manifest/environment allowlist에서 resolve해야 하며 arbitrary host path로 해석해서는 안 된다.
 
+현재 `executord -> sandboxd` private RPC의 `Spawn` 경계는 Session
+`DispatchPermit`과 `WorkspaceProtectionPermit`을 함께 요구한다. `sandboxd`는 runner 호출
+전에 다음 구조적 관계를 fail-closed 검증한다.
+
+- dispatch service가 `EXECUTOR`, operation이 `executor.run`이고 replay policy가 알려진 값인지
+- 두 permit 사이 tenant/user/session/effect가 일치하고, 두 permit과 request 사이
+  invocation/request digest가 일치하는지
+- sandbox ID/backend와 dispatch attempt, turn lease, placement, sandbox,
+  authorization generation이 서로 일치하고 현재 sandbox generation인지
+- server launch 시 고정한 backend와 canonical execution-environment SHA-256 digest가
+  request의 `SandboxHandle`과 정확히 같은지
+- dispatch deadline이 미래이고, read-write Workspace permit에 non-empty lease ID,
+  positive lease generation과 enqueue sequence가 있으며
+  `issuedAt <= now < expiresAt <= maximumHoldDeadline`인지
+- RPC idempotency key의 재사용이 같은 logical request인지; 같은 key의 다른 request는
+  process 시작 전에 거부하는지
+
+이 검사는 cross-service/cross-invocation confusion과 RPC replay 충돌을 막지만 durable
+Session/Workspace authority 검증을 대신하지 않는다. `sandboxd`는 opaque permit의 signature,
+issuer, signing-key generation/revocation을 cryptographically 검증하지 않는다. trusted
+`executord`가 private sandbox channel로 `Spawn`을 전달하기 전에 두 permit의 암호학적
+진위와 현재 authority를 검증해야 하며, `sandboxd`에 state authority key를 배포해서 이
+책임을 이전해서는 안 된다.
+
+backend와 execution-environment digest는 trusted launcher가 `sandboxd` 시작 인자로 주며
+server handler가 listener 생성 전에 immutable copy로 보관한다. 허용 backend는 `nsjail`,
+`docker`, `firecracker`뿐이고 environment digest는 lowercase canonical
+`sha256:<64-hex>`여야 한다. 이 결속은 같은 sandbox ID/generation을 다른 backend나 image로
+혼동하는 것을 막지만, handshake nonce proof가 backend binary나 image bytes를 attest한다는
+뜻은 아니다. signed release와 실제 backend/environment qualification은 별도 gate다.
+
 ### 20.3 ProcessHandle
 
 ```ts
@@ -3940,6 +3971,14 @@ agentd
 
 실제 Worker Loader 호출은 workerd 안의 trusted TypeScript `SessionHost`가 수행한다.
 
+현재 `agentd` command는 위 operational graph를 아직 구성하지 않는
+`diagnostic-only` credentialed control-UDS shell이다. workerd process, cgroup, shard 또는
+application listener를 만들지 않고 `agent.workerd`와 `agent.isolation`을 `NOT_WIRED`로
+보고한다. 시작 시 `--allow-platformd-uid` 또는 `--allow-platformctl-uid` 중 적어도 하나로
+kernel UID와 logical peer role의 명시적 pair를 받아야 하며, 권한을 생략한 same-effective-UID
+default는 없다. 이 shell의 `control.protocol`과 `daemon.agentd` 응답은 진단용
+reachability이지 shard admission이나 production activation이 아니다.
+
 ### 37.3 `SessionHost` / `pi-runtime` — TypeScript
 
 ```text
@@ -3995,6 +4034,15 @@ executord
 
 가능하면 full root daemon 하나 대신 systemd sandboxing과 최소 capability set을 사용한다.
 
+현재 `executord` command도 위 privileged provider graph를 구성하지 않는
+`diagnostic-only` credentialed control-UDS shell이다. NsJail/Docker/Firecracker provider와
+sandbox launcher를 만들지 않고, Docker socket이나 `/dev/kvm` handle을 열거나
+cgroup/network/mount operation을 호출하지 않으며 모든 execution capability를 `NOT_WIRED`로
+보고한다. `agentd`와 동일하게 명시적인
+platformd/platformctl UID-to-role pair가 하나 이상 있어야 bind하며,
+`control.protocol`과 `daemon.executord`가 `AVAILABLE`이어도 workload admission,
+isolation conformance 또는 production activation을 뜻하지 않는다.
+
 ### 37.6 `sandboxd` — Go
 
 NsJail jail, Docker container, Firecracker guest 안에서 동일한 작은 binary를 사용한다.
@@ -4007,6 +4055,25 @@ NsJail jail, Docker container, Firecracker guest 안에서 동일한 작은 bina
 - object store admin credential
 - celld admin credential
 - 다른 sandbox control socket
+
+현재 Linux command는 listener를 열기 전에 다음 launch 입력을 모두 요구한다.
+
+- canonical private `--control-socket`과 sealed `--command-manifest`의 effective value
+  (둘은 설치 layout 기본값을 사용할 수 있음)
+- non-root canonical `--command-manifest-owner-uid`
+- canonical `--sandbox-id`와 positive `--generation`
+- `--backend=nsjail|docker|firecracker`
+- canonical `--execution-environment-digest=sha256:<64-lowercase-hex>`
+- `--protocol-version=1`과 하나 이상의 `--allow-client-uid`
+- FD 3의 one-use 32-byte named-pipe launch nonce
+
+backend와 execution-environment digest는 `ServerConfig`의 launch authority로 고정된다.
+`Spawn`의 `SandboxHandle`이 sandbox ID, generation, backend 또는 environment digest 중
+하나라도 다르면 runner 호출 전에 거부하며, 이후 process operation은 그 검증된 Spawn으로
+만든 server-local process binding 안에서만 resolve된다. process RPC metadata deadline은
+최대 5분이고 deadline 없는 client 요청의 기본값은 30초다. server는 whole-request read를
+5초로 제한하고 write horizon은 최대 metadata deadline 뒤 slow-reader 응답 여유 5초를 둔
+5분 5초로 제한한다. 이 추가 5초는 authority나 operation deadline을 연장하지 않는다.
 
 ### 37.7 `platformctl` — Go
 
@@ -4047,6 +4114,31 @@ platformctl ↔ daemons
 - request size limit
 - structured error code
 - deadline/cancellation
+
+현재 Linux `controlrpc`는 socket path를 canonical absolute Linux UDS path로 제한하고,
+symlink parent와 group/other-writable parent를 거부하며 socket mode를 정확히 `0600`으로
+고정한다. client는 path의 device/inode/owner를 dial 전후에 다시 확인하고 kernel
+`SO_PEERCRED` UID가 socket owner와 같은지 검증한다. agentd/executord shell의 server
+authority는 `(UID, ProtocolPeer)` pair로 표현한다. 기존 independent allowlist compatibility
+경로도 남아 있지만 multi-UID/multi-role Cartesian product가 생기는 구성은 거부한다. 두
+shell은 `PLATFORMD`와 `PLATFORMCTL` 권한을 각각 명시적으로 설정하고, 한 UID에 두 role을
+주는 설정은 development 편의일 뿐 service isolation 증거가 아니다.
+
+handshake는 protocol 1.0, descriptor digest, 최대 1 MiB message/frame, client role과 nonce를
+검증하고, 응답의 configured server role을 nonce transcript에 결속한다. client는 endpoint별
+expected server role을 확인하며 발급된 짧은 session은 kernel UID와 client role에 결속된다.
+role-bound nonce digest 자체는 공개 transcript hash이므로 endpoint authentication은 pinned
+UDS identity/ownership와 `SO_PEERCRED`에 의존한다. 이는 같은 UID의 악성 process에 대한
+executable attestation이 아니다.
+
+capability RPC는 request digest와 metadata deadline을 검증하고 caller cancellation을
+provider까지 전파한다. caller가 deadline을 주지 않으면 client 기본값은 30초이며 server는
+현재 시각보다 5분을 초과하는 metadata deadline을 거부한다. request/header read timeout은
+5초이고 transport write horizon은 최대 metadata deadline에 slow-reader 응답 여유 5초를
+더한 5분 5초다. 이 여유는 provider context나 request authority를 연장하지 않는다.
+1 MiB message bound와 bounded header를 함께 적용하며 timeout, cancellation,
+protocol/authority 오류는 structured RPC status로 fail-closed 처리한다. `platformctl doctor`의
+세 daemon query는 이 per-request 상한과 별개로 더 짧은 30초 shared total budget을 사용한다.
 
 다중 노드에서는 동일 logical protocol을 mTLS HTTP/2 transport로 확장할 수 있다.
 
@@ -4698,6 +4790,66 @@ Firecracker  unavailable: /dev/kvm not found
 ```
 
 UI/API는 이 결과와 server policy를 결합해 실제 선택 가능한 backend만 노출한다.
+
+### 44.10 Daemon UDS와 machine-readable report 경계
+
+현재 `platformctl doctor`는 하나의 `uds.protocol` probe에서 서로 다른 canonical UDS
+세 개를 정확히 다음 role로 확인한다.
+
+```text
+platformd.sock  -> PLATFORMD
+agentd.sock     -> AGENTD
+executord.sock  -> EXECUTORD
+```
+
+각 query는 caller `PLATFORMCTL`, endpoint의 expected server role, protocol version과
+descriptor digest, request identity/sequence, capability semantics를 검증한다. agentd와
+executord에는 각각 `daemon.agentd`, `daemon.executord` capability가 필요하다. 세 query는
+개별 timeout이 아니라 하나의 shared total deadline을 사용하며 `--uds-timeout`은 30초를
+초과할 수 없다. 단, 이는 process wall-clock hard bound가 아니다. 현재 `NewClient`의
+canonical-path, symlink, `Lstat`/identity 검사는 context를 받지 않는 synchronous filesystem
+lookup이다. custom FUSE/NFS-backed path가 metadata lookup에서 멈추면 shared deadline을
+초과할 수 있다. 기본 local `/run` layout은 local metadata가 bounded하게 응답한다는 운영
+가정이며, hard bound가 필요하면 context-aware descriptor-relative lookup 또는 별도 process
+isolation이 추가되어야 한다. authority/protocol/semantic contradiction은 `FAIL`, endpoint
+reachability나 shared deadline 소진은 `UNAVAILABLE`, 개별 probe가 관찰한 caller
+cancellation은 `NOT_RUN`이다. 다만 enclosing doctor run이 최종 완료 경계까지 cancellation을
+관찰하면 부분 report 전체를 버리고 context error를 반환한다. 어느 non-`PASS` 결과도 profile
+qualification을 만족시키지 않는다.
+
+doctor JSON은 `schemaVersion=1`, `apiVersion=v1alpha`, probe run ID, profile,
+configuration/release digest, host ID, `platformctl` runner binary digest, boot-target instance
+ID, production-profile bit, 정렬된 exact required-component set, 시작/종료/관찰 시각과 각
+result/evidence class/artifact digest를 포함한다. result는 component 순서, 각
+`artifactReferences`는 artifact name 순서로 canonical sort하며 duplicate나 noncanonical
+순서를 의미 검증에서 거부한다. 생성 시 reason/evidence 형식, required result 누락,
+production evidence class, `profileQualified`, `productionEligible`, `failureReason`의 의미를
+결과에서 다시 계산하여 검증한다.
+
+`api/json-schema/v1alpha/doctor-report.schema.json`은 wire document의 구조와 bounded field
+형식만 검증한다. schema validation만으로 current identity, canonical ordering, freshness,
+required-component 충족이나 qualification 의미가 증명되지 않는다. 저장된 report를
+재사용하려는 caller는 추가로 `internal/doctor.ValidateCurrent`를 호출해 현재 identity와
+결과 의미를 다시 검증해야 한다. freshness age는 `ObservedAt`이 아니라 probe 전체를 포함한
+`StartedAt`부터 계산한다. caller maximum age는 positive이고 24시간 이하여야 하며,
+`FinishedAt` 또는 `ObservedAt`이 현재보다 미래이거나 `FinishedAt-StartedAt` evidence window가
+24시간을 넘으면 거부한다. `ObservedAt`도 `[StartedAt, FinishedAt]` 범위 안이어야 한다.
+
+이 report와 UDS probe의 한계는 명시적이다. `runnerBinaryDigest`는 report를 만든
+`platformctl` binary의 identity이고, UDS artifact digest는 공통 protocol descriptor
+identity다. handshake role은 그 socket에 구성된 logical server role을 증명할 뿐 daemon
+executable/build digest, process instance 또는 complete dependency graph를 attest하지 않는다.
+retained JSON은 서명되지 않고 pinned trusted storage에서 읽히지 않으며 현재 production
+startup은 이를 소비하지 않는다. 따라서 descriptor/role `PASS`나 report 자체를 public
+listener, daemon admission 또는 production startup authority로 사용해서는 안 된다.
+
+기본 `/run/pi-platform/platformd.sock`, `agentd.sock`, `executord.sock`은 현재 local
+single-node runtime layout의 가정일 뿐 service discovery나 component identity가 아니다.
+`--platformd-socket`, `--agentd-socket`, `--executord-socket` override는 그 doctor invocation의
+진단 target만 바꾸며 daemon startup configuration을 바꾸지 않는다. 선택한 socket path는
+retained report의 component identity에 포함되지도 않는다. production graph가 없는
+`platformd-dev`, 초기 `agentd`/`executord` diagnostic shell 또는 custom UDS가 handshake에
+응답했다는 사실을 startup authority로 승격해서는 안 된다.
 
 ## 45. 기본 설정 파일
 

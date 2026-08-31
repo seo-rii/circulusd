@@ -54,6 +54,90 @@ readiness or production qualification. The control socket's parent directory
 must be owned by the current user and must not be writable by group or others;
 placing the socket directly under `/tmp` is rejected.
 
+The current `agentd` and `executord` commands are also diagnostic-only control
+shells. They start no workerd shard, sandbox, or execution provider and refuse
+to bind until at least one `--allow-platformd-uid` or
+`--allow-platformctl-uid` grants an explicit UID-to-protocol-role authority.
+Giving one UID both roles is useful for local development, but is not service
+isolation or a production deployment claim. Their canonical private UDS paths
+are created with mode `0600`, and operational capabilities remain `NOT_WIRED`.
+
+For example, after creating `CIRCULUSD_DEV_RUN_DIR` as above, the two shells can
+be started in separate terminals for a local protocol exercise:
+
+```bash
+CIRCULUSD_LOCAL_UID="$(id -u)"
+go run ./cmd/agentd \
+  --socket "${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/circulusd/agentd.sock" \
+  --allow-platformd-uid "$CIRCULUSD_LOCAL_UID" \
+  --allow-platformctl-uid "$CIRCULUSD_LOCAL_UID"
+
+CIRCULUSD_LOCAL_UID="$(id -u)"
+go run ./cmd/executord \
+  --socket "${XDG_RUNTIME_DIR:?set XDG_RUNTIME_DIR}/circulusd/executord.sock" \
+  --allow-platformd-uid "$CIRCULUSD_LOCAL_UID" \
+  --allow-platformctl-uid "$CIRCULUSD_LOCAL_UID"
+```
+
+`sandboxd` is launcher-facing rather than a diagnostic shell. Its Linux CLI
+requires the launch backend and execution-environment digest as well as the
+sandbox identity, generation, protocol version, manifest owner, and at least
+one executord UID. File descriptor 3 must be the read end of the launcher's
+one-use 32-byte nonce pipe. A complete invocation has this shape:
+
+```bash
+./sandboxd \
+  --control-socket "$CIRCULUSD_SANDBOX_CONTROL_SOCKET" \
+  --command-manifest "$CIRCULUSD_COMMAND_MANIFEST" \
+  --command-manifest-owner-uid "$CIRCULUSD_MANIFEST_OWNER_UID" \
+  --sandbox-id "$CIRCULUSD_SANDBOX_ID" \
+  --generation "$CIRCULUSD_SANDBOX_GENERATION" \
+  --backend nsjail \
+  --execution-environment-digest "$CIRCULUSD_EXECUTION_ENVIRONMENT_DIGEST" \
+  --protocol-version 1 \
+  --allow-client-uid "$CIRCULUSD_EXECUTORD_UID" \
+  3<"$CIRCULUSD_LAUNCH_NONCE_PIPE"
+```
+
+The backend must be `nsjail`, `docker`, or `firecracker`, and the environment
+digest must be `sha256:` followed by 64 lowercase hexadecimal digits. The
+manifest owner must be a canonical non-root UID and the sandbox generation must
+be positive. These values are fixed before the control socket opens; they are
+not client-selected process options.
+
+`platformctl doctor` includes one bounded `uds.protocol` probe over exactly
+three distinct control sockets: platformd as `PLATFORMD`, agentd as `AGENTD`,
+and executord as `EXECUTORD`. `--uds-timeout` is a shared total budget and may
+not exceed 30 seconds. It is not a hard wall-clock bound: client construction
+performs synchronous socket-path metadata checks without a context, so a custom
+FUSE/NFS-backed path can block past the deadline. The default local `/run`
+layout assumes responsive local metadata. The JSON report binds the run to the
+profile, configuration and release digests, host, `platformctl` binary, boot
+target, required-component set, and observation time, and its qualification
+booleans are recomputed from the results. The retained report is unsigned and
+production startup does not consume it. A successful role/descriptor probe
+proves only live protocol compatibility at that socket; it is not daemon binary
+attestation, process-instance identity, or startup authority. If caller
+cancellation is observed before report completion, the partial report is
+discarded instead of being emitted as a reusable snapshot.
+
+The default `/run/pi-platform/{platformd,agentd,executord}.sock` locations are a
+current local single-node runtime convention, not discovery or component
+identity. Custom `platformctl doctor` socket flags retarget only that diagnostic
+invocation; they do not reconfigure daemon startup, and the selected paths are
+not included in retained component identity or startup authority. Artifact
+references in a generated report are sorted by name. The JSON Schema validates
+the serialized structure, while retained-report
+acceptance additionally requires `internal/doctor.ValidateCurrent`: freshness
+is measured from `startedAt`, future `finishedAt`/`observedAt` values and an
+evidence window over 24 hours are rejected, and the identity and derived
+qualification fields are recomputed.
+
+Control and sandbox RPC metadata deadlines are capped at five minutes. Their
+servers bound request reads to five seconds and keep a five-minute-five-second
+write horizon so a response still has a short slow-reader margin after the
+maximum RPC deadline; that transport margin does not extend request authority.
+
 ## Security status
 
 This repository begins at version `0.3.0` in development status. A compiled unit-test build is not a production qualification. In particular, celld, workerd/Pi, NsJail, Docker, Firecracker, the object store, and the offline bundle each have separate fail-closed conformance gates.

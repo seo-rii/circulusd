@@ -175,13 +175,61 @@ Authentication and authorization happen before idempotency lookup. Public API id
 
 ## ADR-011: Protocol and conformance classes fail closed
 
-Host-daemon RPC uses generated Protobuf/Connect messages over UDS. A pre-mutation handshake binds protocol major/minor, feature bitmap, maximum frame size, build/release digest, and peer role. UDS filesystem permissions and peer credentials are method-level authorization inputs.
+Host-daemon RPC uses generated Protobuf/Connect messages over UDS. The control
+transport accepts only a canonical socket beneath a private, owner-controlled
+directory, pins the socket identity across connection setup, checks kernel
+`SO_PEERCRED`, and authorizes an explicit `(UID, claimed client role)` pair.
+Independent UID and role allowlists may be used only when they cannot create an
+ambiguous authority cross-product.
+
+The pre-operation handshake fixes protocol version, feature bitmap, maximum
+frame size, and the checked descriptor digest. Its response proof binds the
+one-time nonce to that descriptor and the expected server-role label; the
+sandbox handshake additionally binds sandbox identity and generation. This
+prevents endpoint/role confusion inside the UDS authority boundary. It is not
+component identity attestation: the handshake carries and proves no daemon
+binary, build, or release digest, and a process already trusted under the same
+socket-directory and UID boundary remains part of the trusted computing base.
+
+Sandbox backend and execution-environment identity are a separate launch-time
+binding. The trusted launcher must supply one real backend and one canonical
+SHA-256 environment digest before `sandboxd` reads its one-use nonce or opens
+the listener. The server retains immutable copies and rejects a `Spawn`
+`SandboxHandle` that does not match them before invoking the runner. This keeps
+one sandbox ID/generation from being replayed against another backend or image;
+it does not turn the nonce proof into binary or image attestation.
+
+Control and sandbox request metadata deadlines are bounded at five minutes;
+clients without a deadline use 30 seconds. Servers allow five seconds for the
+whole request read and a five-minute-five-second write horizon. The final five
+seconds are transport headroom for delivering a deadline result to a slow
+reader, not additional operation authority. The doctor daemon probe retains a
+separate, shorter 30-second shared budget across all three control endpoints.
 
 TypeScript Worker/state RPC uses one pinned runtime-validated schema package. Structured clone is transport only. Every envelope has protocol version, schema digest, request ID, size/depth limits, and explicit byte/integer rules. Persisted checkpoint payloads are opaque bytes with an encoding and digest, never arbitrary class instances.
 
 Go import boundaries are directional: unprivileged commands may import protocol and narrow clients, but only `cmd/executord` reaches provider, mount, cgroup, Docker, or KVM implementation packages.
 
 Conformance results are exactly `PASS`, `FAIL`, `UNAVAILABLE(reason)`, or `NOT_RUN`. Unit/domain, deterministic fault, and local mock tests never count as real celld, workerd/Pi, backend, or air-gap conformance. A required release profile treats every result other than `PASS` as failure. The `mock` backend is development-only and cannot satisfy a request for NsJail, Docker, or Firecracker.
+
+`platformctl doctor` emits a versioned evidence snapshot bound to the selected
+profile and required-component set, configuration and release digests, host,
+runner binary, target boot instance, probe run, observation time, and explicit
+evidence classes. Its UDS artifacts identify the checked protocol descriptor;
+they deliberately omit a daemon `binaryDigest`. The top-level
+`runnerBinaryDigest` identifies the reporting `platformctl` executable, not any
+probed daemon. The report is unsigned diagnostic evidence, is not consumed by
+daemon startup, and cannot itself authorize admission. Any future startup gate
+must independently authenticate current component builds/releases and
+revalidate the exact target rather than trusting report summary booleans.
+
+Report generation sorts required components, results, and each result's
+artifact references by their canonical keys. The JSON Schema checks bounded
+wire structure, but it cannot establish current identity, ordering across
+semantic keys, evidence freshness, or a valid qualification summary. Retained
+reports therefore require `internal/doctor.ValidateCurrent`. Freshness begins
+at `StartedAt`, covers the complete evidence window, rejects future
+`FinishedAt`/`ObservedAt` values, and has an absolute 24-hour ceiling.
 
 ## ADR-012: Production and development daemon graphs are separate binaries
 
@@ -207,3 +255,23 @@ and exposes immutable `/v1/status` metadata with
 the legacy Go `MemoryStore`, a fake executor, Session routes, or readiness. Those
 claims may change only when the corresponding dependency is actually composed
 and its limitations are reported explicitly.
+
+## ADR-013: Initial agentd and executord shells are control-only
+
+The first `agentd` and `executord` commands bind only their private diagnostic
+control UDS and require at least one explicit platformd or platformctl UID-role
+authority. Their daemon-role and control-protocol capabilities are available;
+workerd management, isolation, execution environments, and privileged backend
+capabilities remain `NOT_WIRED`, with admission and production eligibility
+fixed false. They have no application listener or workload provider dependency.
+A successful handshake or `uds.protocol` probe therefore proves only the live
+local control boundary, not daemon workload readiness or any §53 runtime gate.
+The `/run/pi-platform/{platformd,agentd,executord}.sock` defaults are a local
+single-node layout convention. A custom socket flag changes only the diagnostic
+target for that invocation; the selected path is absent from retained component
+identity, and neither it nor an available diagnostic shell is production
+startup authority. The UDS probe's 30-second shared context is also not a hard
+wall-clock guarantee: client construction performs synchronous,
+context-free path metadata validation. The local `/run` convention assumes
+responsive local metadata, while a custom FUSE/NFS-backed path may block beyond
+the deadline and must not be treated as a bounded startup check.
