@@ -64,6 +64,16 @@ not silently included in Unit 10.
   replacement until the prior generation is quiescent. Repeated package
   race/shuffle tests pass. The low-level workerd launcher generation rename and
   fixed-configuration Manager adapter remain in U10.1.
+- 2026-09-01: the qualification release resolver now validates the manifest
+  and configured trust policy for every release status, requires promotion
+  verification for candidate/production releases, selects exactly one workerd
+  artifact for the requested architecture, and derives all executable identity
+  from its extraction provenance. It opens the installed executable through a
+  no-symlink `openat2` walk, rejects unsafe type/mode/size or digest mismatch,
+  and retains only a sealed memfd snapshot. Missing artifacts and unavailable
+  host features remain distinct from malformed, permission, and identity
+  failures. Focused race tests, the complete conformance package, and vet pass;
+  runner launch composition and evidence serialization remain unimplemented.
 
 ### Outcome
 
