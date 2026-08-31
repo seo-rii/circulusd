@@ -46,6 +46,9 @@ const (
 	maximumWorkerdCgroupPathBytes    = 4096
 	maximumWorkerdCgroupShardIDBytes = 1024
 	maximumWorkerdCgroupControlBytes = 4096
+	maximumWorkerdCgroupScalarBytes  = 64
+	maximumWorkerdCgroupCPUMaxBytes  = 64
+	maximumWorkerdCgroupCounterBytes = maximumWorkerdCgroupControlBytes
 	workerdCgroupDrainPollInterval   = 10 * time.Millisecond
 	workerdCgroupLeafDomain          = "circulusd/workerd-cgroup/v1\x00"
 )
@@ -60,6 +63,42 @@ type workerdCgroupConfig struct {
 	SwapMaxBytes   uint64
 	CPUMax         CPUMax
 	PIDsMax        uint64
+}
+
+type workerdCgroupMemoryEvents struct {
+	Low          uint64
+	High         uint64
+	Max          uint64
+	OOM          uint64
+	OOMKill      uint64
+	OOMGroupKill uint64
+}
+
+type workerdCgroupCPUStat struct {
+	UsageMicros      uint64
+	UserMicros       uint64
+	SystemMicros     uint64
+	Periods          uint64
+	ThrottledPeriods uint64
+	ThrottledMicros  uint64
+}
+
+type workerdCgroupCounterBaseline struct {
+	MemoryEvents workerdCgroupMemoryEvents
+	CPUStat      workerdCgroupCPUStat
+}
+
+type workerdCgroupResourceSample struct {
+	ShardID            string
+	Generation         ShardGeneration
+	Identity           workerdCgroupIdentity
+	MemoryCurrentBytes uint64
+	MemoryEvents       workerdCgroupMemoryEvents
+	MemoryEventsDelta  workerdCgroupMemoryEvents
+	CPUStat            workerdCgroupCPUStat
+	CPUStatDelta       workerdCgroupCPUStat
+	PIDsCurrent        uint64
+	CPUMax             CPUMax
 }
 
 type workerdCgroupEvidence struct {
@@ -117,16 +156,23 @@ type workerdCgroupBackend interface {
 }
 
 type workerdCgroupController struct {
+	// authority orders short borrow/writer registrations. Cgroup I/O runs only
+	// after this mutex is released; the counters below retain logical ownership.
 	authority sync.RWMutex
 	mu        sync.Mutex
 
-	config   workerdCgroupConfig
-	backend  workerdCgroupBackend
-	rootFD   int
-	reserved int
-	poisoned bool
-	closed   bool
-	closeErr error
+	config                  workerdCgroupConfig
+	backend                 workerdCgroupBackend
+	rootFD                  int
+	reserved                int
+	activeBorrows           int
+	authorityWritersWaiting int
+	authorityWriterActive   bool
+	authorityChanged        chan struct{}
+	poisoned                bool
+	closed                  bool
+	closeDone               chan struct{}
+	closeErr                error
 }
 
 type workerdCgroupDestroyOperation struct {
@@ -138,14 +184,19 @@ type workerdCgroupDestroyOperation struct {
 type workerdCgroupLease struct {
 	controller *workerdCgroupController
 	name       string
+	shardID    string
+	generation ShardGeneration
 	fd         int
 	identity   workerdCgroupIdentity
+	baseline   workerdCgroupCounterBaseline
 
 	mu               sync.Mutex
 	attachable       bool
 	destroyed        bool
 	terminalErr      error
 	destroyOperation *workerdCgroupDestroyOperation
+	activeBorrows    int
+	borrowQuiescent  chan struct{}
 }
 
 type linuxWorkerdCgroupBackend struct{}
@@ -223,9 +274,10 @@ func newWorkerdCgroupControllerWithBackend(config workerdCgroupConfig, backend w
 		return nil, rootErr
 	}
 	return &workerdCgroupController{
-		config:  config,
-		backend: backend,
-		rootFD:  inspection.DirectoryFD,
+		config:           config,
+		backend:          backend,
+		rootFD:           inspection.DirectoryFD,
+		authorityChanged: make(chan struct{}),
 	}, nil
 }
 
@@ -260,7 +312,46 @@ func probeWorkerdCgroupAvailability(config workerdCgroupConfig) workerdCgroupAva
 	return workerdCgroupAvailability{Status: "REFERENCE_ONLY", Available: true, Reason: "mechanical attachment is implemented but production cgroup authority isolation is not", Evidence: evidence}
 }
 
-func (controller *workerdCgroupController) prepare(ctx context.Context, shardID string, generation uint64) (resultLease *workerdCgroupLease, resultErr error) {
+func (controller *workerdCgroupController) notifyAuthorityChangedLocked() {
+	close(controller.authorityChanged)
+	controller.authorityChanged = make(chan struct{})
+}
+
+func (controller *workerdCgroupController) beginAuthorityWrite() {
+	announced := false
+	for {
+		controller.authority.Lock()
+		controller.mu.Lock()
+		if !announced {
+			controller.authorityWritersWaiting++
+			controller.notifyAuthorityChangedLocked()
+			announced = true
+		}
+		if !controller.authorityWriterActive && controller.activeBorrows == 0 {
+			controller.authorityWritersWaiting--
+			controller.authorityWriterActive = true
+			controller.notifyAuthorityChangedLocked()
+			controller.mu.Unlock()
+			controller.authority.Unlock()
+			return
+		}
+		changed := controller.authorityChanged
+		controller.mu.Unlock()
+		controller.authority.Unlock()
+		<-changed
+	}
+}
+
+func (controller *workerdCgroupController) endAuthorityWrite() {
+	controller.authority.Lock()
+	controller.mu.Lock()
+	controller.authorityWriterActive = false
+	controller.notifyAuthorityChangedLocked()
+	controller.mu.Unlock()
+	controller.authority.Unlock()
+}
+
+func (controller *workerdCgroupController) prepare(ctx context.Context, shardID string, generation ShardGeneration) (resultLease *workerdCgroupLease, resultErr error) {
 	if ctx == nil || shardID == "" || len(shardID) > maximumWorkerdCgroupShardIDBytes || strings.IndexByte(shardID, 0) >= 0 || generation == 0 {
 		return nil, errInvalidWorkerdCgroupRequest
 	}
@@ -292,33 +383,32 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 	}
 	fd, identity, err := controller.backend.openChild(controller.rootFD, name)
 	if err != nil {
-		controller.authority.Lock()
 		controller.mu.Lock()
 		controller.reserved--
 		controller.poisoned = true
+		controller.notifyAuthorityChangedLocked()
 		controller.mu.Unlock()
-		controller.authority.Unlock()
 		return nil, errors.Join(classifyWorkerdCgroupError("open shard cgroup", err), errWorkerdCgroupPoisoned)
 	}
-	lease := &workerdCgroupLease{controller: controller, name: name, fd: fd, identity: identity}
+	lease := &workerdCgroupLease{controller: controller, name: name, shardID: shardID, generation: generation, fd: fd, identity: identity}
 	rollbackRequired := true
 	defer func() {
 		if !rollbackRequired || resultErr == nil {
 			return
 		}
-		controller.authority.Lock()
-		defer controller.authority.Unlock()
-		controller.mu.Lock()
+		controller.beginAuthorityWrite()
+		defer controller.endAuthorityWrite()
 		currentIdentity, exists, identityErr := controller.backend.identityAt(controller.rootFD, name)
 		if identityErr != nil {
-			controller.mu.Unlock()
 			resultLease = lease
 			resultErr = errors.Join(resultErr, classifyWorkerdCgroupError("verify rollback cgroup identity", identityErr))
 			return
 		}
 		if !exists || currentIdentity != identity {
+			controller.mu.Lock()
 			controller.reserved--
 			controller.poisoned = true
+			controller.notifyAuthorityChangedLocked()
 			controller.mu.Unlock()
 			closeErr := controller.backend.closeFD(fd)
 			resultLease = nil
@@ -330,11 +420,11 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 		}
 		removeErr := controller.backend.removeChild(controller.rootFD, name)
 		if removeErr != nil {
-			controller.mu.Unlock()
 			resultLease = lease
 			resultErr = errors.Join(resultErr, classifyWorkerdCgroupError("rollback shard cgroup", removeErr))
 			return
 		}
+		controller.mu.Lock()
 		controller.reserved--
 		controller.mu.Unlock()
 		resultLease = nil
@@ -408,14 +498,36 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 		if err := controller.backend.writeControl(fd, limit.name, limit.value); err != nil {
 			return nil, classifyWorkerdCgroupError("write shard limit", err)
 		}
-		readback, err := controller.backend.readControl(fd, limit.name, maximumWorkerdCgroupControlBytes)
+		readLimit := maximumWorkerdCgroupControlBytes
+		if limit.name == "cpu.max" {
+			readLimit = maximumWorkerdCgroupCPUMaxBytes
+		}
+		readback, err := controller.backend.readControl(fd, limit.name, readLimit)
 		if err != nil {
 			return nil, classifyWorkerdCgroupError("read shard limit", err)
+		}
+		if limit.name == "cpu.max" {
+			cpuMax, parseErr := parseWorkerdCgroupCPUMax(readback)
+			if parseErr != nil || cpuMax != controller.config.CPUMax {
+				return nil, fmt.Errorf("%w: shard limit readback mismatch", errWorkerdCgroupContract)
+			}
+			continue
 		}
 		if !exactCgroupControlValue(readback, limit.value) {
 			return nil, fmt.Errorf("%w: shard limit readback mismatch", errWorkerdCgroupContract)
 		}
 	}
+	if err := lease.verifyPinnedIdentity("verify resource baseline cgroup identity"); err != nil {
+		return nil, err
+	}
+	baseline, err := readWorkerdCgroupCumulativeCounters(ctx, controller.backend, fd)
+	if err != nil {
+		return nil, err
+	}
+	if err := lease.verifyPinnedIdentity("reverify resource baseline cgroup identity"); err != nil {
+		return nil, err
+	}
+	lease.baseline = baseline
 	controller.mu.Lock()
 	poisoned := controller.poisoned
 	controller.mu.Unlock()
@@ -427,37 +539,330 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, shardID 
 	return lease, nil
 }
 
-func workerdCgroupLeafName(shardID string, generation uint64) string {
+func workerdCgroupLeafName(shardID string, generation ShardGeneration) string {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(workerdCgroupLeafDomain))
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], uint64(len(shardID)))
 	_, _ = hash.Write(encoded[:])
 	_, _ = hash.Write([]byte(shardID))
-	binary.BigEndian.PutUint64(encoded[:], generation)
+	binary.BigEndian.PutUint64(encoded[:], uint64(generation))
 	_, _ = hash.Write(encoded[:])
 	return "workerd-" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func canonicalWorkerdCgroupPayload(value string, maximumBytes int) (string, error) {
+	if value == "" || len(value) > maximumBytes || strings.IndexByte(value, 0) >= 0 {
+		return "", fmt.Errorf("%w: malformed cgroup control value", errWorkerdCgroupContract)
+	}
+	if strings.HasSuffix(value, "\n") {
+		value = strings.TrimSuffix(value, "\n")
+	}
+	if value == "" || strings.ContainsRune(value, '\r') {
+		return "", fmt.Errorf("%w: malformed cgroup control value", errWorkerdCgroupContract)
+	}
+	return value, nil
+}
+
+func parseCanonicalWorkerdCgroupUint(value string) (uint64, error) {
+	if value == "" {
+		return 0, fmt.Errorf("%w: empty cgroup counter", errWorkerdCgroupContract)
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(parsed, 10) != value {
+		return 0, fmt.Errorf("%w: noncanonical cgroup counter", errWorkerdCgroupContract)
+	}
+	return parsed, nil
+}
+
+func parseWorkerdCgroupScalar(value string) (uint64, error) {
+	payload, err := canonicalWorkerdCgroupPayload(value, maximumWorkerdCgroupScalarBytes)
+	if err != nil {
+		return 0, err
+	}
+	return parseCanonicalWorkerdCgroupUint(payload)
+}
+
+func parseWorkerdCgroupCounters(value string) (map[string]uint64, error) {
+	payload, err := canonicalWorkerdCgroupPayload(value, maximumWorkerdCgroupCounterBytes)
+	if err != nil {
+		return nil, err
+	}
+	counters := make(map[string]uint64)
+	for _, line := range strings.Split(payload, "\n") {
+		separator := strings.IndexByte(line, ' ')
+		if separator <= 0 || separator == len(line)-1 || strings.IndexByte(line[separator+1:], ' ') >= 0 {
+			return nil, fmt.Errorf("%w: malformed cgroup counter line", errWorkerdCgroupContract)
+		}
+		name := line[:separator]
+		for _, character := range name {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '_' {
+				return nil, fmt.Errorf("%w: malformed cgroup counter name", errWorkerdCgroupContract)
+			}
+		}
+		if _, duplicate := counters[name]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate cgroup counter", errWorkerdCgroupContract)
+		}
+		parsed, parseErr := parseCanonicalWorkerdCgroupUint(line[separator+1:])
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		counters[name] = parsed
+	}
+	return counters, nil
+}
+
+func parseWorkerdCgroupMemoryEvents(value string) (workerdCgroupMemoryEvents, error) {
+	counters, err := parseWorkerdCgroupCounters(value)
+	if err != nil {
+		return workerdCgroupMemoryEvents{}, err
+	}
+	for _, required := range []string{"low", "high", "max", "oom", "oom_kill"} {
+		if _, found := counters[required]; !found {
+			return workerdCgroupMemoryEvents{}, fmt.Errorf("%w: incomplete memory.events", errWorkerdCgroupContract)
+		}
+	}
+	return workerdCgroupMemoryEvents{
+		Low:          counters["low"],
+		High:         counters["high"],
+		Max:          counters["max"],
+		OOM:          counters["oom"],
+		OOMKill:      counters["oom_kill"],
+		OOMGroupKill: counters["oom_group_kill"],
+	}, nil
+}
+
+func parseWorkerdCgroupCPUStat(value string) (workerdCgroupCPUStat, error) {
+	counters, err := parseWorkerdCgroupCounters(value)
+	if err != nil {
+		return workerdCgroupCPUStat{}, err
+	}
+	for _, required := range []string{"usage_usec", "user_usec", "system_usec", "nr_periods", "nr_throttled", "throttled_usec"} {
+		if _, found := counters[required]; !found {
+			return workerdCgroupCPUStat{}, fmt.Errorf("%w: incomplete cpu.stat", errWorkerdCgroupContract)
+		}
+	}
+	return workerdCgroupCPUStat{
+		UsageMicros:      counters["usage_usec"],
+		UserMicros:       counters["user_usec"],
+		SystemMicros:     counters["system_usec"],
+		Periods:          counters["nr_periods"],
+		ThrottledPeriods: counters["nr_throttled"],
+		ThrottledMicros:  counters["throttled_usec"],
+	}, nil
+}
+
+func parseWorkerdCgroupCPUMax(value string) (CPUMax, error) {
+	payload, err := canonicalWorkerdCgroupPayload(value, maximumWorkerdCgroupCPUMaxBytes)
+	if err != nil {
+		return CPUMax{}, err
+	}
+	separator := strings.IndexByte(payload, ' ')
+	if separator <= 0 || separator == len(payload)-1 || strings.IndexByte(payload[separator+1:], ' ') >= 0 {
+		return CPUMax{}, fmt.Errorf("%w: cpu.max must contain exactly two tokens", errWorkerdCgroupContract)
+	}
+	quota, err := parseCanonicalWorkerdCgroupUint(payload[:separator])
+	if err != nil {
+		return CPUMax{}, err
+	}
+	period, err := parseCanonicalWorkerdCgroupUint(payload[separator+1:])
+	if err != nil {
+		return CPUMax{}, err
+	}
+	if quota < minimumWorkerdCgroupCPUQuota || quota > maximumWorkerdCgroupCPUQuota ||
+		period < minimumWorkerdCgroupCPUPeriod || period > maximumWorkerdCgroupCPUPeriod {
+		return CPUMax{}, fmt.Errorf("%w: cpu.max is outside finite bounds", errWorkerdCgroupContract)
+	}
+	return CPUMax{QuotaMicros: quota, PeriodMicros: period}, nil
+}
+
+func readWorkerdCgroupCumulativeCounters(ctx context.Context, backend workerdCgroupBackend, directoryFD int) (workerdCgroupCounterBaseline, error) {
+	if err := ctx.Err(); err != nil {
+		return workerdCgroupCounterBaseline{}, err
+	}
+	memoryValue, err := backend.readControl(directoryFD, "memory.events", maximumWorkerdCgroupCounterBytes)
+	if err != nil {
+		return workerdCgroupCounterBaseline{}, classifyWorkerdCgroupError("read shard memory events", err)
+	}
+	memoryEvents, err := parseWorkerdCgroupMemoryEvents(memoryValue)
+	if err != nil {
+		return workerdCgroupCounterBaseline{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return workerdCgroupCounterBaseline{}, err
+	}
+	cpuValue, err := backend.readControl(directoryFD, "cpu.stat", maximumWorkerdCgroupCounterBytes)
+	if err != nil {
+		return workerdCgroupCounterBaseline{}, classifyWorkerdCgroupError("read shard cpu stat", err)
+	}
+	cpuStat, err := parseWorkerdCgroupCPUStat(cpuValue)
+	if err != nil {
+		return workerdCgroupCounterBaseline{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return workerdCgroupCounterBaseline{}, err
+	}
+	return workerdCgroupCounterBaseline{MemoryEvents: memoryEvents, CPUStat: cpuStat}, nil
+}
+
+func (lease *workerdCgroupLease) verifyPinnedIdentity(operation string) error {
+	identity, exists, err := lease.controller.backend.identityAt(lease.controller.rootFD, lease.name)
+	if err != nil {
+		return classifyWorkerdCgroupError(operation, err)
+	}
+	if !exists || identity != lease.identity {
+		lease.controller.mu.Lock()
+		lease.controller.poisoned = true
+		lease.controller.notifyAuthorityChangedLocked()
+		lease.controller.mu.Unlock()
+		return fmt.Errorf("%s: %w", operation, errors.Join(errWorkerdCgroupPathReplaced, errWorkerdCgroupPoisoned))
+	}
+	return nil
+}
+
+func (lease *workerdCgroupLease) sampleResources(ctx context.Context) (workerdCgroupResourceSample, error) {
+	if lease == nil || lease.controller == nil || ctx == nil {
+		return workerdCgroupResourceSample{}, errInvalidWorkerdCgroupRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return workerdCgroupResourceSample{}, err
+	}
+	var sample workerdCgroupResourceSample
+	err := lease.withDirectoryFD(func(directoryFD int) error {
+		if err := lease.verifyPinnedIdentity("verify resource sample cgroup identity"); err != nil {
+			return err
+		}
+		memoryValue, err := lease.controller.backend.readControl(directoryFD, "memory.current", maximumWorkerdCgroupScalarBytes)
+		if err != nil {
+			return classifyWorkerdCgroupError("read shard memory current", err)
+		}
+		memoryCurrent, err := parseWorkerdCgroupScalar(memoryValue)
+		if err != nil {
+			return err
+		}
+		counters, err := readWorkerdCgroupCumulativeCounters(ctx, lease.controller.backend, directoryFD)
+		if err != nil {
+			return err
+		}
+		cpuMaxValue, err := lease.controller.backend.readControl(directoryFD, "cpu.max", maximumWorkerdCgroupCPUMaxBytes)
+		if err != nil {
+			return classifyWorkerdCgroupError("read shard cpu max", err)
+		}
+		cpuMax, err := parseWorkerdCgroupCPUMax(cpuMaxValue)
+		if err != nil {
+			return err
+		}
+		if cpuMax != lease.controller.config.CPUMax {
+			return fmt.Errorf("%w: cpu.max changed after launch", errWorkerdCgroupContract)
+		}
+		pidsValue, err := lease.controller.backend.readControl(directoryFD, "pids.current", maximumWorkerdCgroupScalarBytes)
+		if err != nil {
+			return classifyWorkerdCgroupError("read shard pids current", err)
+		}
+		pidsCurrent, err := parseWorkerdCgroupScalar(pidsValue)
+		if err != nil {
+			return err
+		}
+		baselineMemory := lease.baseline.MemoryEvents
+		currentMemory := counters.MemoryEvents
+		if currentMemory.Low < baselineMemory.Low || currentMemory.High < baselineMemory.High || currentMemory.Max < baselineMemory.Max ||
+			currentMemory.OOM < baselineMemory.OOM || currentMemory.OOMKill < baselineMemory.OOMKill || currentMemory.OOMGroupKill < baselineMemory.OOMGroupKill {
+			return fmt.Errorf("%w: memory.events decreased from generation baseline", errWorkerdCgroupContract)
+		}
+		baselineCPU := lease.baseline.CPUStat
+		currentCPU := counters.CPUStat
+		if currentCPU.UsageMicros < baselineCPU.UsageMicros || currentCPU.UserMicros < baselineCPU.UserMicros || currentCPU.SystemMicros < baselineCPU.SystemMicros ||
+			currentCPU.Periods < baselineCPU.Periods || currentCPU.ThrottledPeriods < baselineCPU.ThrottledPeriods || currentCPU.ThrottledMicros < baselineCPU.ThrottledMicros {
+			return fmt.Errorf("%w: cpu.stat decreased from generation baseline", errWorkerdCgroupContract)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := lease.verifyPinnedIdentity("reverify resource sample cgroup identity"); err != nil {
+			return err
+		}
+		sample = workerdCgroupResourceSample{
+			ShardID:            lease.shardID,
+			Generation:         lease.generation,
+			Identity:           lease.identity,
+			MemoryCurrentBytes: memoryCurrent,
+			MemoryEvents:       currentMemory,
+			MemoryEventsDelta: workerdCgroupMemoryEvents{
+				Low: currentMemory.Low - baselineMemory.Low, High: currentMemory.High - baselineMemory.High,
+				Max: currentMemory.Max - baselineMemory.Max, OOM: currentMemory.OOM - baselineMemory.OOM,
+				OOMKill: currentMemory.OOMKill - baselineMemory.OOMKill, OOMGroupKill: currentMemory.OOMGroupKill - baselineMemory.OOMGroupKill,
+			},
+			CPUStat: currentCPU,
+			CPUStatDelta: workerdCgroupCPUStat{
+				UsageMicros: currentCPU.UsageMicros - baselineCPU.UsageMicros, UserMicros: currentCPU.UserMicros - baselineCPU.UserMicros,
+				SystemMicros: currentCPU.SystemMicros - baselineCPU.SystemMicros, Periods: currentCPU.Periods - baselineCPU.Periods,
+				ThrottledPeriods: currentCPU.ThrottledPeriods - baselineCPU.ThrottledPeriods, ThrottledMicros: currentCPU.ThrottledMicros - baselineCPU.ThrottledMicros,
+			},
+			PIDsCurrent: pidsCurrent,
+			CPUMax:      cpuMax,
+		}
+		return nil
+	})
+	if err != nil {
+		return workerdCgroupResourceSample{}, err
+	}
+	return sample, nil
 }
 
 func (lease *workerdCgroupLease) withDirectoryFD(use func(int) error) error {
 	if lease == nil || lease.controller == nil || use == nil {
 		return errInvalidWorkerdCgroupRequest
 	}
-	lease.mu.Lock()
-	defer lease.mu.Unlock()
 	controller := lease.controller
+	for {
+		controller.authority.RLock()
+		controller.mu.Lock()
+		if controller.poisoned || controller.closed {
+			controller.mu.Unlock()
+			controller.authority.RUnlock()
+			return errWorkerdCgroupLeaseUnavailable
+		}
+		if controller.authorityWriterActive || controller.authorityWritersWaiting > 0 {
+			changed := controller.authorityChanged
+			controller.mu.Unlock()
+			controller.authority.RUnlock()
+			<-changed
+			continue
+		}
+		controller.activeBorrows++
+		controller.mu.Unlock()
+		controller.authority.RUnlock()
+		break
+	}
+	lease.mu.Lock()
 	if !lease.attachable || lease.destroyed || lease.destroyOperation != nil {
+		lease.mu.Unlock()
+		controller.mu.Lock()
+		controller.activeBorrows--
+		controller.notifyAuthorityChangedLocked()
+		controller.mu.Unlock()
 		return errWorkerdCgroupLeaseUnavailable
 	}
-	controller.authority.RLock()
-	defer controller.authority.RUnlock()
-	controller.mu.Lock()
-	unavailable := controller.poisoned || controller.closed
-	controller.mu.Unlock()
-	if unavailable {
-		return errWorkerdCgroupLeaseUnavailable
+	if lease.activeBorrows == 0 {
+		lease.borrowQuiescent = make(chan struct{})
 	}
-	return use(lease.fd)
+	lease.activeBorrows++
+	directoryFD := lease.fd
+	lease.mu.Unlock()
+	defer func() {
+		lease.mu.Lock()
+		lease.activeBorrows--
+		if lease.activeBorrows == 0 {
+			close(lease.borrowQuiescent)
+			lease.borrowQuiescent = nil
+		}
+		lease.mu.Unlock()
+		controller.mu.Lock()
+		controller.activeBorrows--
+		controller.notifyAuthorityChangedLocked()
+		controller.mu.Unlock()
+	}()
+	return use(directoryFD)
 }
 
 func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
@@ -487,12 +892,16 @@ func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
 	operation := &workerdCgroupDestroyOperation{done: make(chan struct{})}
 	lease.destroyOperation = operation
 	cleanupOnly := !lease.attachable
+	borrowQuiescent := lease.borrowQuiescent
 	lease.mu.Unlock()
 
 	go func() {
 		controller := lease.controller
 		var cleanupErr error
 		ownershipReleased := false
+		if borrowQuiescent != nil {
+			<-borrowQuiescent
+		}
 		if !cleanupOnly {
 			if err := controller.backend.writeControl(lease.fd, "cgroup.kill", "1"); err != nil {
 				cleanupErr = classifyWorkerdCgroupError("kill shard cgroup", err)
@@ -549,37 +958,34 @@ func (lease *workerdCgroupLease) destroy(ctx context.Context) error {
 			cancel()
 		}
 		if cleanupErr == nil {
-			controller.authority.Lock()
-			controller.mu.Lock()
+			controller.beginAuthorityWrite()
 			identity, exists, err := controller.backend.identityAt(controller.rootFD, lease.name)
 			if err != nil {
-				controller.mu.Unlock()
-				controller.authority.Unlock()
 				cleanupErr = classifyWorkerdCgroupError("verify shard cgroup identity", err)
 			} else if !exists || identity != lease.identity {
+				controller.mu.Lock()
 				controller.reserved--
 				controller.poisoned = true
+				controller.notifyAuthorityChangedLocked()
 				ownershipReleased = true
 				controller.mu.Unlock()
 				closeErr := controller.backend.closeFD(lease.fd)
-				controller.authority.Unlock()
 				cleanupErr = errors.Join(errWorkerdCgroupPathReplaced, errWorkerdCgroupPoisoned)
 				if closeErr != nil {
 					cleanupErr = errors.Join(cleanupErr, classifyWorkerdCgroupError("close poisoned shard cgroup", closeErr))
 				}
 			} else if err := controller.backend.removeChild(controller.rootFD, lease.name); err != nil {
-				controller.mu.Unlock()
-				controller.authority.Unlock()
 				cleanupErr = classifyWorkerdCgroupError("remove shard cgroup", err)
 			} else {
+				controller.mu.Lock()
 				controller.reserved--
 				ownershipReleased = true
 				controller.mu.Unlock()
 				if closeErr := controller.backend.closeFD(lease.fd); closeErr != nil {
 					cleanupErr = classifyWorkerdCgroupError("close removed shard cgroup", closeErr)
 				}
-				controller.authority.Unlock()
 			}
+			controller.endAuthorityWrite()
 		}
 		lease.mu.Lock()
 		operation.err = cleanupErr
@@ -616,29 +1022,40 @@ func (controller *workerdCgroupController) close() error {
 	if controller == nil {
 		return nil
 	}
-	controller.authority.Lock()
-	defer controller.authority.Unlock()
 	controller.mu.Lock()
 	if controller.closed {
-		err := controller.closeErr
+		done := controller.closeDone
 		controller.mu.Unlock()
-		return err
+		<-done
+		controller.mu.Lock()
+		closeErr := controller.closeErr
+		controller.mu.Unlock()
+		return closeErr
 	}
 	if controller.reserved != 0 {
 		controller.mu.Unlock()
 		return errWorkerdCgroupBusy
 	}
 	controller.closed = true
+	controller.closeDone = make(chan struct{})
+	controller.notifyAuthorityChangedLocked()
 	rootFD := controller.rootFD
 	controller.rootFD = -1
+	controller.mu.Unlock()
+
+	controller.beginAuthorityWrite()
 	var closeErr error
 	if err := controller.backend.closeFD(rootFD); err != nil {
 		closeErr = classifyWorkerdCgroupError("close delegated root", err)
 	}
+	controller.endAuthorityWrite()
+
+	controller.mu.Lock()
 	if controller.poisoned {
 		closeErr = errors.Join(errWorkerdCgroupPoisoned, closeErr)
 	}
 	controller.closeErr = closeErr
+	close(controller.closeDone)
 	controller.mu.Unlock()
 	return closeErr
 }

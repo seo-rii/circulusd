@@ -22,6 +22,50 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestWorkerdProcessBoundaryUsesOnlyTypedShardGeneration(t *testing.T) {
+	shardGenerationType := reflect.TypeOf(ShardGeneration(0))
+	for _, contract := range []struct {
+		name       string
+		value      any
+		wantedName string
+	}{
+		{name: "ensure request", value: WorkerdEnsureRequest{}, wantedName: "ShardGeneration"},
+		{name: "readiness info", value: WorkerdProcessInfo{}, wantedName: "ShardGeneration"},
+		{name: "launch command", value: workerdLaunchCommand{}, wantedName: "ShardGeneration"},
+	} {
+		contractType := reflect.TypeOf(contract.value)
+		if _, found := contractType.FieldByName("PlacementGeneration"); found {
+			t.Errorf("%s still exposes PlacementGeneration", contract.name)
+		}
+		field, found := contractType.FieldByName(contract.wantedName)
+		if !found || field.Type != shardGenerationType {
+			t.Errorf("%s %s field = %#v, want %v", contract.name, contract.wantedName, field, shardGenerationType)
+		}
+	}
+	for _, contract := range []struct {
+		name      string
+		value     any
+		fieldName string
+	}{
+		{name: "launch key", value: workerdLaunchKey{}, fieldName: "generation"},
+		{name: "cgroup lease", value: workerdCgroupLease{}, fieldName: "generation"},
+		{name: "cgroup sample", value: workerdCgroupResourceSample{}, fieldName: "Generation"},
+	} {
+		field, found := reflect.TypeOf(contract.value).FieldByName(contract.fieldName)
+		if !found || field.Type != shardGenerationType {
+			t.Errorf("%s generation field = %#v, want %v", contract.name, field, shardGenerationType)
+		}
+	}
+	handleType := reflect.TypeOf((*WorkerdShardHandle)(nil))
+	if _, found := handleType.MethodByName("PlacementGeneration"); found {
+		t.Error("WorkerdShardHandle still exposes PlacementGeneration")
+	}
+	method, found := handleType.MethodByName("ShardGeneration")
+	if !found || method.Type.NumOut() != 1 || method.Type.Out(0) != shardGenerationType {
+		t.Errorf("WorkerdShardHandle.ShardGeneration = %#v, want %v result", method, shardGenerationType)
+	}
+}
+
 func TestOSWorkerdProcessStarterUsesCloneIntoCgroupWithoutExtraFile(t *testing.T) {
 	var startedCommand *exec.Cmd
 	starter := osWorkerdProcessStarter{start: func(command *exec.Cmd) error {
@@ -278,7 +322,7 @@ func TestWorkerdProcessLauncherRejectsUnboundedArgumentsBeforeStart(t *testing.T
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-				ShardID: fmt.Sprintf("unbounded-args-%d", index), PlacementGeneration: 1, Arguments: test.arguments,
+				ShardID: fmt.Sprintf("unbounded-args-%d", index), ShardGeneration: 1, Arguments: test.arguments,
 			})
 			if handle != nil || !errors.Is(err, ErrInvalidWorkerdEnsureRequest) {
 				t.Fatalf("Ensure() = %#v, %v, want nil, invalid request", handle, err)
@@ -294,7 +338,7 @@ func TestWorkerdProcessLauncherRejectsUnboundedArgumentsBeforeStart(t *testing.T
 		maximumArguments[index] = strings.Repeat("x", 64<<10)
 	}
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "bounded-args", PlacementGeneration: 1, Arguments: maximumArguments,
+		ShardID: "bounded-args", ShardGeneration: 1, Arguments: maximumArguments,
 	})
 	if err != nil {
 		t.Fatalf("Ensure(exact 1 MiB arguments) error = %v", err)
@@ -318,7 +362,7 @@ func TestWorkerdProcessLauncherHistoryCapacityRejectsBeforeAllocationOrStart(t *
 	}
 	for index := range 32 {
 		_, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: fmt.Sprintf("failed-history-%02d", index), PlacementGeneration: 1,
+			ShardID: fmt.Sprintf("failed-history-%02d", index), ShardGeneration: 1,
 		})
 		if index < config.HistoryCapacity {
 			if !errors.Is(ensureErr, ErrWorkerdNotReady) {
@@ -354,7 +398,7 @@ func TestWorkerdProcessLauncherCanceledShardHistoryRemainsBounded(t *testing.T) 
 		t.Fatal(err)
 	}
 	for index := range config.HistoryCapacity {
-		request := WorkerdEnsureRequest{ShardID: fmt.Sprintf("canceled-history-%d", index), PlacementGeneration: 1}
+		request := WorkerdEnsureRequest{ShardID: fmt.Sprintf("canceled-history-%d", index), ShardGeneration: 1}
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
 		go func() {
@@ -368,7 +412,7 @@ func TestWorkerdProcessLauncherCanceledShardHistoryRemainsBounded(t *testing.T) 
 		}
 		waitForNoPendingWorkerdLaunch(t, launcher, request)
 	}
-	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "over-canceled-cap", PlacementGeneration: 1})
+	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "over-canceled-cap", ShardGeneration: 1})
 	if !errors.Is(err, ErrWorkerdHistoryCapacity) {
 		t.Fatalf("Ensure(over capacity) error = %v, want history capacity", err)
 	}
@@ -401,7 +445,7 @@ func TestWorkerdProcessLauncherExecutesSealedSnapshotAfterPathReplacement(t *tes
 		t.Fatal(err)
 	}
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "shared-shard-a", PlacementGeneration: 7, Arguments: []string{"serve", "--config=/sealed/workerd.capnp"},
+		ShardID: "shared-shard-a", ShardGeneration: 7, Arguments: []string{"serve", "--config=/sealed/workerd.capnp"},
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -432,8 +476,8 @@ func TestWorkerdProcessLauncherExecutesSealedSnapshotAfterPathReplacement(t *tes
 	if len(command.ExtraFiles) != 0 {
 		t.Fatalf("extra files = %d, want none", len(command.ExtraFiles))
 	}
-	if command.ShardID != "shared-shard-a" || command.PlacementGeneration != 7 {
-		t.Fatalf("command identity = %q/%d", command.ShardID, command.PlacementGeneration)
+	if command.ShardID != "shared-shard-a" || command.ShardGeneration != 7 {
+		t.Fatalf("command identity = %q/%d", command.ShardID, command.ShardGeneration)
 	}
 	output := handle.Output()
 	if output.Stdout != "01234567" || output.Stderr != "abcdefgh" || !output.StdoutTruncated || !output.StderrTruncated {
@@ -471,7 +515,7 @@ func TestWorkerdProcessLauncherExecutesSealedSnapshotAfterOwnerMutatesOriginalIn
 	if !os.SameFile(originalInfo, mutatedInfo) {
 		t.Fatal("test replaced the path instead of mutating the verified inode")
 	}
-	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "sealed-owner-writable", PlacementGeneration: 1})
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "sealed-owner-writable", ShardGeneration: 1})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
 	}
@@ -523,12 +567,12 @@ func TestWorkerdProcessLauncherCoalescesConcurrentEnsureAfterReadiness(t *testin
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	probe := newControlledWorkerdProbe()
 	_, launcher := newWorkerdLauncherFixture(t, starter, probe)
-	request := WorkerdEnsureRequest{ShardID: "shared-shard", PlacementGeneration: 9, Arguments: []string{"serve"}}
+	request := WorkerdEnsureRequest{ShardID: "shared-shard", ShardGeneration: 9, Arguments: []string{"serve"}}
 
 	const workers = 64
 	results := startConcurrentWorkerdEnsures(launcher, request, workers)
 	entered := awaitProbe(t, probe.entered)
-	if entered.ShardID != request.ShardID || entered.PlacementGeneration != request.PlacementGeneration || entered.PID != process.pid {
+	if entered.ShardID != request.ShardID || entered.ShardGeneration != request.ShardGeneration || entered.PID != process.pid {
 		t.Fatalf("readiness identity = %#v", entered)
 	}
 	waitForPendingWorkerdWaiters(t, launcher, request, workers)
@@ -539,7 +583,7 @@ func TestWorkerdProcessLauncherCoalescesConcurrentEnsureAfterReadiness(t *testin
 	}
 
 	_, conflictErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: request.ShardID, PlacementGeneration: request.PlacementGeneration, Arguments: []string{"different"},
+		ShardID: request.ShardID, ShardGeneration: request.ShardGeneration, Arguments: []string{"different"},
 	})
 	if !errors.Is(conflictErr, ErrWorkerdLaunchConflict) {
 		t.Fatalf("Ensure(conflicting immutable identity) error = %v", conflictErr)
@@ -575,7 +619,7 @@ func TestWorkerdProcessLauncherSnapshotsArgumentsAndStoresFixedIdentity(t *testi
 	probe := newControlledWorkerdProbe()
 	_, launcher := newWorkerdLauncherFixture(t, starter, probe)
 	arguments := []string{"serve", "original"}
-	request := WorkerdEnsureRequest{ShardID: "argument-snapshot", PlacementGeneration: 1, Arguments: arguments}
+	request := WorkerdEnsureRequest{ShardID: "argument-snapshot", ShardGeneration: 1, Arguments: arguments}
 	resultChannel := make(chan workerdEnsureResult, 1)
 	go func() {
 		handle, err := launcher.Ensure(context.Background(), request)
@@ -594,18 +638,18 @@ func TestWorkerdProcessLauncherSnapshotsArgumentsAndStoresFixedIdentity(t *testi
 		t.Fatalf("launched arguments = %#v, want immutable snapshot", commands)
 	}
 	launcher.mu.Lock()
-	identityBytes := len(launcher.launchIdentities[workerdLaunchKey{shardID: request.ShardID, generation: request.PlacementGeneration}])
+	identityBytes := len(launcher.launchIdentities[workerdLaunchKey{shardID: request.ShardID, generation: request.ShardGeneration}])
 	launcher.mu.Unlock()
 	if identityBytes != sha256.Size {
 		t.Fatalf("stored launch identity bytes = %d, want fixed SHA-256 size", identityBytes)
 	}
 	if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: request.ShardID, PlacementGeneration: request.PlacementGeneration, Arguments: []string{"serve", "original"},
+		ShardID: request.ShardID, ShardGeneration: request.ShardGeneration, Arguments: []string{"serve", "original"},
 	}); err != nil {
 		t.Fatalf("Ensure(original replay) error = %v", err)
 	}
 	if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: request.ShardID, PlacementGeneration: request.PlacementGeneration, Arguments: arguments,
+		ShardID: request.ShardID, ShardGeneration: request.ShardGeneration, Arguments: arguments,
 	}); !errors.Is(err, ErrWorkerdLaunchConflict) {
 		t.Fatalf("Ensure(mutated replay) error = %v, want conflict", err)
 	}
@@ -619,10 +663,10 @@ func TestWorkerdProcessLauncherPrunesOlderGenerationIdentities(t *testing.T) {
 	starter := &recordingWorkerdStarter{}
 	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
 	var handle *WorkerdShardHandle
-	for generation := uint64(1); generation <= 12; generation++ {
+	for generation := ShardGeneration(1); generation <= 12; generation++ {
 		var err error
 		handle, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: "identity-pruning", PlacementGeneration: generation, Arguments: []string{fmt.Sprintf("generation-%d", generation)},
+			ShardID: "identity-pruning", ShardGeneration: generation, Arguments: []string{fmt.Sprintf("generation-%d", generation)},
 		})
 		if err != nil {
 			t.Fatalf("Ensure(generation %d) error = %v", generation, err)
@@ -643,7 +687,7 @@ func TestWorkerdProcessLauncherOutputBuffersAllocateLazily(t *testing.T) {
 	t.Parallel()
 	starter := &recordingWorkerdStarter{}
 	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
-	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "lazy-output", PlacementGeneration: 1})
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "lazy-output", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,8 +707,8 @@ func TestWorkerdProcessLauncherStartsDifferentShardsIndependently(t *testing.T) 
 	probe := newControlledWorkerdProbe()
 	_, launcher := newWorkerdLauncherFixture(t, starter, probe)
 	requests := []WorkerdEnsureRequest{
-		{ShardID: "shard-a", PlacementGeneration: 1, Arguments: []string{"serve", "a"}},
-		{ShardID: "shard-b", PlacementGeneration: 1, Arguments: []string{"serve", "b"}},
+		{ShardID: "shard-a", ShardGeneration: 1, Arguments: []string{"serve", "a"}},
+		{ShardID: "shard-b", ShardGeneration: 1, Arguments: []string{"serve", "b"}},
 	}
 	results := make(chan workerdEnsureResult, len(requests))
 	for _, request := range requests {
@@ -707,7 +751,7 @@ func TestWorkerdProcessLauncherSerializesGenerationsBeforeStartingReplacement(t 
 	probe := WorkerdReadinessProbeFunc(func(ctx context.Context, info WorkerdProcessInfo) error {
 		entered <- info
 		ready := firstReady
-		if info.PlacementGeneration == 2 {
+		if info.ShardGeneration == 2 {
 			ready = secondReady
 		}
 		select {
@@ -721,23 +765,23 @@ func TestWorkerdProcessLauncherSerializesGenerationsBeforeStartingReplacement(t 
 	firstResult := make(chan workerdEnsureResult, 1)
 	go func() {
 		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: "serialized-generation", PlacementGeneration: 1,
+			ShardID: "serialized-generation", ShardGeneration: 1,
 		})
 		firstResult <- workerdEnsureResult{handle: handle, err: err}
 	}()
-	if info := awaitProbe(t, entered); info.PlacementGeneration != 1 {
-		t.Fatalf("first readiness generation = %d, want 1", info.PlacementGeneration)
+	if info := awaitProbe(t, entered); info.ShardGeneration != 1 {
+		t.Fatalf("first readiness generation = %d, want 1", info.ShardGeneration)
 	}
 	secondResult := make(chan workerdEnsureResult, 1)
 	go func() {
 		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: "serialized-generation", PlacementGeneration: 2,
+			ShardID: "serialized-generation", ShardGeneration: 2,
 		})
 		secondResult <- workerdEnsureResult{handle: handle, err: err}
 	}()
 	select {
 	case info := <-entered:
-		t.Fatalf("generation %d started before generation 1 resolved", info.PlacementGeneration)
+		t.Fatalf("generation %d started before generation 1 resolved", info.ShardGeneration)
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(firstReady)
@@ -745,8 +789,8 @@ func TestWorkerdProcessLauncherSerializesGenerationsBeforeStartingReplacement(t 
 	if first.err != nil {
 		t.Fatalf("Ensure(generation 1) error = %v", first.err)
 	}
-	if info := awaitProbe(t, entered); info.PlacementGeneration != 2 {
-		t.Fatalf("second readiness generation = %d, want 2", info.PlacementGeneration)
+	if info := awaitProbe(t, entered); info.ShardGeneration != 2 {
+		t.Fatalf("second readiness generation = %d, want 2", info.ShardGeneration)
 	}
 	close(secondReady)
 	second := <-secondResult
@@ -776,7 +820,7 @@ func TestWorkerdProcessLauncherFansOutReadinessTimeoutAndCleansProcessGroup(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := WorkerdEnsureRequest{ShardID: "timeout-shard", PlacementGeneration: 1}
+	request := WorkerdEnsureRequest{ShardID: "timeout-shard", ShardGeneration: 1}
 	const workers = 16
 	results := startConcurrentWorkerdEnsures(launcher, request, workers)
 	waitForPendingWorkerdWaiters(t, launcher, request, workers)
@@ -803,7 +847,7 @@ func TestWorkerdProcessLauncherFansOutEarlyExitAndKillsDescendantGroup(t *testin
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	probe := newControlledWorkerdProbe()
 	_, launcher := newWorkerdLauncherFixture(t, starter, probe)
-	request := WorkerdEnsureRequest{ShardID: "early-exit-shard", PlacementGeneration: 3}
+	request := WorkerdEnsureRequest{ShardID: "early-exit-shard", ShardGeneration: 3}
 	const workers = 8
 	results := startConcurrentWorkerdEnsures(launcher, request, workers)
 	_ = awaitProbe(t, probe.entered)
@@ -833,7 +877,7 @@ func TestWorkerdProcessLauncherWaiterCancellationDoesNotCancelSharedStart(t *tes
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	probe := newControlledWorkerdProbe()
 	_, launcher := newWorkerdLauncherFixture(t, starter, probe)
-	request := WorkerdEnsureRequest{ShardID: "shared-cancel-shard", PlacementGeneration: 1}
+	request := WorkerdEnsureRequest{ShardID: "shared-cancel-shard", ShardGeneration: 1}
 	firstContext, cancelFirst := context.WithCancel(context.Background())
 	firstResult := make(chan workerdEnsureResult, 1)
 	secondResult := make(chan workerdEnsureResult, 1)
@@ -888,7 +932,7 @@ func TestWorkerdProcessLauncherLastWaiterCancellationAbandonsAndCleansStart(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := WorkerdEnsureRequest{ShardID: "abandoned-shard", PlacementGeneration: 11}
+	request := WorkerdEnsureRequest{ShardID: "abandoned-shard", ShardGeneration: 11}
 	waiterContext, cancelWaiter := context.WithCancel(context.Background())
 	resultChannel := make(chan workerdEnsureResult, 1)
 	go func() {
@@ -934,7 +978,7 @@ func TestWorkerdShardHandleStopIsIdempotentTermThenKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "stop-shard", PlacementGeneration: 1})
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "stop-shard", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -974,7 +1018,7 @@ func TestWorkerdShardHandleStopRetriesAfterTimedOutRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "retry-stop", PlacementGeneration: 1})
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "retry-stop", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,7 +1042,7 @@ func TestWorkerdProcessLauncherBlocksReplacementUntilFailedStopIsRetried(t *test
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{oldProcess, newProcess}}
 	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
 	oldHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "failed-stop-replacement", PlacementGeneration: 1,
+		ShardID: "failed-stop-replacement", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1007,7 +1051,7 @@ func TestWorkerdProcessLauncherBlocksReplacementUntilFailedStopIsRetried(t *test
 		t.Fatalf("Stop(first round) error = %v, want timeout", err)
 	}
 	if handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "failed-stop-replacement", PlacementGeneration: 2,
+		ShardID: "failed-stop-replacement", ShardGeneration: 2,
 	}); handle != nil || !errors.Is(err, ErrWorkerdStopTimeout) {
 		t.Fatalf("Ensure(while old group lives) = %#v, %v, want nil, stop timeout", handle, err)
 	}
@@ -1018,7 +1062,7 @@ func TestWorkerdProcessLauncherBlocksReplacementUntilFailedStopIsRetried(t *test
 		t.Fatalf("Stop(retry) error = %v", err)
 	}
 	newHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "failed-stop-replacement", PlacementGeneration: 2,
+		ShardID: "failed-stop-replacement", ShardGeneration: 2,
 	})
 	if err != nil {
 		t.Fatalf("Ensure(after termination proof) error = %v", err)
@@ -1033,7 +1077,7 @@ func TestWorkerdProcessLauncherCleansDescendantsAfterNaturalLeaderExit(t *testin
 	process := newFakeWorkerdProcess(852, false)
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
-	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "leader-exit-descendant", PlacementGeneration: 1})
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "leader-exit-descendant", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,16 +1103,16 @@ func TestWorkerdShardHandleStaleGenerationCannotStopReplacement(t *testing.T) {
 	newProcess := newFakeWorkerdProcess(902, true)
 	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{oldProcess, newProcess}}
 	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
-	oldHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "replacement-shard", PlacementGeneration: 4})
+	oldHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "replacement-shard", ShardGeneration: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	newHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "replacement-shard", PlacementGeneration: 5})
+	newHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "replacement-shard", ShardGeneration: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if oldHandle == newHandle || newHandle.PlacementGeneration() != 5 {
-		t.Fatalf("replacement handles = %p/%p generation=%d", oldHandle, newHandle, newHandle.PlacementGeneration())
+	if oldHandle == newHandle || newHandle.ShardGeneration() != 5 {
+		t.Fatalf("replacement handles = %p/%p generation=%d", oldHandle, newHandle, newHandle.ShardGeneration())
 	}
 	if signals := oldProcess.signalSnapshot(); !reflect.DeepEqual(signals, []syscall.Signal{syscall.SIGTERM}) {
 		t.Fatalf("replaced process signals = %#v, want TERM", signals)
@@ -1120,7 +1164,7 @@ func TestWorkerdProcessLauncherCloseIsConcurrentIdempotentAndClosesExecutable(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-current", PlacementGeneration: 1})
+	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-current", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1148,7 +1192,7 @@ func TestWorkerdProcessLauncherCloseIsConcurrentIdempotentAndClosesExecutable(t 
 	}
 	waitForWorkerdSignals(t, process, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL})
 	waitForClosedWorkerdExecutable(t, executable)
-	if handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "after-close", PlacementGeneration: 1}); handle != nil || !errors.Is(ensureErr, ErrWorkerdLauncherClosed) {
+	if handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "after-close", ShardGeneration: 1}); handle != nil || !errors.Is(ensureErr, ErrWorkerdLauncherClosed) {
 		t.Fatalf("Ensure(after Close) = %#v, %v, want nil, closed", handle, ensureErr)
 	}
 }
@@ -1163,7 +1207,7 @@ func TestWorkerdProcessLauncherCloseCallerCancellationOnlyStopsWaiting(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "canceled-close", PlacementGeneration: 1})
+	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "canceled-close", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1191,7 +1235,7 @@ func TestWorkerdProcessLauncherCloseRetriesFailedCleanupRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "retry-close", PlacementGeneration: 1}); err != nil {
+	if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "retry-close", ShardGeneration: 1}); err != nil {
 		t.Fatal(err)
 	}
 	executable := launcher.executable
@@ -1222,7 +1266,7 @@ func TestWorkerdProcessLauncherCloseStartsAllCurrentProcessGroupsConcurrently(t 
 		t.Fatal(err)
 	}
 	for index, shardID := range []string{"close-concurrent-a", "close-concurrent-b"} {
-		if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: shardID, PlacementGeneration: uint64(index + 1)}); err != nil {
+		if _, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: shardID, ShardGeneration: ShardGeneration(index + 1)}); err != nil {
 			t.Fatalf("Ensure(%s) error = %v", shardID, err)
 		}
 	}
@@ -1266,7 +1310,7 @@ func TestWorkerdProcessLauncherCloseWinsReadinessPublicationRace(t *testing.T) {
 	}
 	ensureResult := make(chan workerdEnsureResult, 1)
 	go func() {
-		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "publication-race", PlacementGeneration: 1})
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "publication-race", ShardGeneration: 1})
 		ensureResult <- workerdEnsureResult{handle: handle, err: ensureErr}
 	}()
 	_ = awaitProbe(t, entered)
@@ -1293,7 +1337,7 @@ func TestWorkerdProcessLauncherCloseRacesReplacementAndHandleStopWithoutCrossSig
 	replacementEntered := make(chan WorkerdProcessInfo, 1)
 	releaseReplacement := make(chan struct{})
 	probe := WorkerdReadinessProbeFunc(func(_ context.Context, info WorkerdProcessInfo) error {
-		if info.PlacementGeneration == 1 {
+		if info.ShardGeneration == 1 {
 			return nil
 		}
 		replacementEntered <- info
@@ -1306,13 +1350,13 @@ func TestWorkerdProcessLauncherCloseRacesReplacementAndHandleStopWithoutCrossSig
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-replacement", PlacementGeneration: 1})
+	oldHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-replacement", ShardGeneration: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	replacementResult := make(chan workerdEnsureResult, 1)
 	go func() {
-		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-replacement", PlacementGeneration: 2})
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "close-replacement", ShardGeneration: 2})
 		replacementResult <- workerdEnsureResult{handle: handle, err: ensureErr}
 	}()
 	_ = awaitProbe(t, replacementEntered)
@@ -1398,7 +1442,7 @@ func TestWorkerdProcessLauncherProductionStarterRunsOpenedTestBinary(t *testing.
 	}
 	closeWorkerdLauncherForTest(t, launcher)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "production-starter-shard", PlacementGeneration: 1,
+		ShardID: "production-starter-shard", ShardGeneration: 1,
 		Arguments: []string{"-test.run=^TestWorkerdLauncherChildProcess$", "--", "--workerd-launcher-child", readyPath},
 	})
 	if err != nil {
@@ -1499,7 +1543,7 @@ func startConcurrentWorkerdEnsures(launcher *WorkerdProcessLauncher, request Wor
 func waitForPendingWorkerdWaiters(t *testing.T, launcher *WorkerdProcessLauncher, request WorkerdEnsureRequest, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	key := workerdLaunchKey{shardID: request.ShardID, generation: request.PlacementGeneration}
+	key := workerdLaunchKey{shardID: request.ShardID, generation: request.ShardGeneration}
 	for time.Now().Before(deadline) {
 		launcher.mu.Lock()
 		pending := launcher.pending[key]
@@ -1519,7 +1563,7 @@ func waitForPendingWorkerdWaiters(t *testing.T, launcher *WorkerdProcessLauncher
 func waitForNoPendingWorkerdLaunch(t *testing.T, launcher *WorkerdProcessLauncher, request WorkerdEnsureRequest) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	key := workerdLaunchKey{shardID: request.ShardID, generation: request.PlacementGeneration}
+	key := workerdLaunchKey{shardID: request.ShardID, generation: request.ShardGeneration}
 	for time.Now().Before(deadline) {
 		launcher.mu.Lock()
 		_, found := launcher.pending[key]
@@ -1630,14 +1674,14 @@ func (probe *controlledWorkerdProbe) callCount() int {
 }
 
 type recordedWorkerdCommand struct {
-	Executable          string
-	Arguments           []string
-	Environment         []string
-	ExtraFiles          []*os.File
-	CgroupFD            int
-	ShardID             string
-	PlacementGeneration uint64
-	executableContent   []byte
+	Executable        string
+	Arguments         []string
+	Environment       []string
+	ExtraFiles        []*os.File
+	CgroupFD          int
+	ShardID           string
+	ShardGeneration   ShardGeneration
+	executableContent []byte
 }
 
 type recordingWorkerdStarter struct {
@@ -1656,7 +1700,7 @@ func (starter *recordingWorkerdStarter) Start(command workerdLaunchCommand) (wor
 		Executable: command.Executable, Arguments: slices.Clone(command.Arguments),
 		Environment: slices.Clone(command.Environment), ExtraFiles: slices.Clone(command.ExtraFiles),
 		CgroupFD: command.CgroupFD,
-		ShardID:  command.ShardID, PlacementGeneration: command.PlacementGeneration,
+		ShardID:  command.ShardID, ShardGeneration: command.ShardGeneration,
 		executableContent: content,
 	}
 	starter.mu.Lock()

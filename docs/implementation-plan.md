@@ -74,6 +74,18 @@ not silently included in Unit 10.
   host features remain distinct from malformed, permission, and identity
   failures. Focused race tests, the complete conformance package, and vet pass;
   runner launch composition and evidence serialization remain unimplemented.
+- 2026-09-01: every low-level workerd launch, readiness identity, cgroup leaf,
+  and returned handle now carries the named `ShardGeneration`; the launcher no
+  longer exposes or accepts a placement generation. Each cgroup lease captures
+  bounded canonical `memory.events` and `cpu.stat` baselines before process
+  attachment, then returns immutable `memory.current`, cumulative/delta event
+  and CPU counters, `pids.current`, and exact finite `cpu.max` samples from its
+  pinned directory descriptor. Sampling verifies dev/inode before and after
+  reads and poisons admission on replacement. A borrow/quiescence gate keeps
+  mutexes out of cgroup I/O while preventing destruction or a queued integrity
+  writer from racing an active descriptor borrower. Focused and complete
+  repeated race tests pass. The fixed-configuration Manager adapter, process
+  token/RSS, serialized observation sequence, and Manager delivery remain.
 
 ### Outcome
 

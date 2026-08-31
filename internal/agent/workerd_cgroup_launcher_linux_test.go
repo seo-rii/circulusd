@@ -62,7 +62,7 @@ func TestWorkerdCgroupLauncherPreparesExactControlsBeforeStart(t *testing.T) {
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
 
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cgroup-before-start", PlacementGeneration: 1,
+		ShardID: "cgroup-before-start", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -98,7 +98,7 @@ func TestWorkerdCgroupLauncherStartFailureCleansLeaseBeforeReturning(t *testing.
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
 
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cgroup-start-failure", PlacementGeneration: 1,
+		ShardID: "cgroup-start-failure", ShardGeneration: 1,
 	})
 	if handle != nil || !errors.Is(err, ErrWorkerdLaunchFailed) {
 		t.Fatalf("Ensure(start failure) = %#v, %v, want nil, launch failed", handle, err)
@@ -127,7 +127,7 @@ func TestWorkerdCgroupLauncherCleansPartialPrepareAuthorityWithoutStarting(t *te
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
 
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cgroup-partial-prepare", PlacementGeneration: 1,
+		ShardID: "cgroup-partial-prepare", ShardGeneration: 1,
 	})
 	if handle != nil || !errors.Is(err, errWorkerdCgroupContract) {
 		t.Fatalf("Ensure(partial prepare) = %#v, %v, want nil, cgroup contract error", handle, err)
@@ -155,7 +155,7 @@ func TestWorkerdCgroupLauncherConcurrentStopCoalescesCgroupDestroy(t *testing.T)
 	starter := &cgroupObservingWorkerdStarter{backend: backend, inner: inner}
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cgroup-concurrent-stop", PlacementGeneration: 1,
+		ShardID: "cgroup-concurrent-stop", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -199,7 +199,7 @@ func TestWorkerdCgroupLauncherPoisonedControllerNeverStarts(t *testing.T) {
 
 	for index, shardID := range []string{"poison-trigger", "poison-must-fence"} {
 		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: shardID, PlacementGeneration: 1,
+			ShardID: shardID, ShardGeneration: 1,
 		})
 		if handle != nil || !errors.Is(err, errWorkerdCgroupPoisoned) {
 			t.Fatalf("Ensure(poison call %d) = %#v, %v, want nil, poisoned", index+1, handle, err)
@@ -223,7 +223,7 @@ func TestWorkerdCgroupLauncherReplaysTerminalPoisonWithoutRetryingKill(t *testin
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "terminal-poison-replay", PlacementGeneration: 1,
+		ShardID: "terminal-poison-replay", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -259,7 +259,7 @@ func TestWorkerdCgroupLauncherReplaysTerminalLeafCloseFailure(t *testing.T) {
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "terminal-leaf-close-replay", PlacementGeneration: 1,
+		ShardID: "terminal-leaf-close-replay", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -303,7 +303,7 @@ func TestWorkerdCgroupLauncherDrainsResidualBeforeStartingNewGeneration(t *testi
 	}
 	starter := &cgroupObservingWorkerdStarter{backend: backend, inner: inner}
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
-	firstRequest := WorkerdEnsureRequest{ShardID: "cgroup-residual-retry", PlacementGeneration: 1}
+	firstRequest := WorkerdEnsureRequest{ShardID: "cgroup-residual-retry", ShardGeneration: 1}
 
 	firstHandle, firstErr := launcher.Ensure(context.Background(), firstRequest)
 	if firstHandle != nil || !errors.Is(firstErr, ErrWorkerdLaunchFailed) {
@@ -314,7 +314,7 @@ func TestWorkerdCgroupLauncherDrainsResidualBeforeStartingNewGeneration(t *testi
 	}
 
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: firstRequest.ShardID, PlacementGeneration: 2,
+		ShardID: firstRequest.ShardID, ShardGeneration: 2,
 	})
 	if err != nil {
 		t.Fatalf("second Ensure() error = %v", err)
@@ -357,14 +357,14 @@ func TestWorkerdCgroupLauncherStartsIndependentShardsInParallel(t *testing.T) {
 	firstResult := make(chan ensureResult, 1)
 	secondResult := make(chan ensureResult, 1)
 	go func() {
-		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "parallel-a", PlacementGeneration: 1})
+		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "parallel-a", ShardGeneration: 1})
 		firstResult <- ensureResult{handle: handle, err: err}
 	}()
 	if entered := <-starter.entered; entered != "parallel-a" {
 		t.Fatalf("first Start shard = %q, want parallel-a", entered)
 	}
 	go func() {
-		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "parallel-b", PlacementGeneration: 1})
+		handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{ShardID: "parallel-b", ShardGeneration: 1})
 		secondResult <- ensureResult{handle: handle, err: err}
 	}()
 	parallel := false
@@ -414,7 +414,7 @@ func TestWorkerdCgroupLauncherCloseCancellationDoesNotCancelGatedStartCleanup(t 
 	ensureResult := make(chan error, 1)
 	go func() {
 		_, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: "close-gated-start", PlacementGeneration: 1,
+			ShardID: "close-gated-start", ShardGeneration: 1,
 		})
 		ensureResult <- err
 	}()
@@ -428,7 +428,7 @@ func TestWorkerdCgroupLauncherCloseCancellationDoesNotCancelGatedStartCleanup(t 
 		t.Fatalf("Close(gated Start) error = %v, want caller deadline", err)
 	}
 	if handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "must-remain-closed", PlacementGeneration: 1,
+		ShardID: "must-remain-closed", ShardGeneration: 1,
 	}); handle != nil || !errors.Is(err, ErrWorkerdLauncherClosed) {
 		t.Fatalf("Ensure(after Close began) = %#v, %v, want permanently closed", handle, err)
 	}
@@ -453,7 +453,7 @@ func TestWorkerdCgroupLauncherCloseCanFenceWhilePrepareIsGated(t *testing.T) {
 	ensureResult := make(chan error, 1)
 	go func() {
 		_, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-			ShardID: "close-gated-prepare", PlacementGeneration: 1,
+			ShardID: "close-gated-prepare", ShardGeneration: 1,
 		})
 		ensureResult <- err
 	}()
@@ -465,7 +465,7 @@ func TestWorkerdCgroupLauncherCloseCanFenceWhilePrepareIsGated(t *testing.T) {
 		t.Fatalf("Close(gated prepare) error = %v, want caller deadline", err)
 	}
 	if handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "closed-during-prepare", PlacementGeneration: 1,
+		ShardID: "closed-during-prepare", ShardGeneration: 1,
 	}); handle != nil || !errors.Is(err, ErrWorkerdLauncherClosed) {
 		t.Fatalf("Ensure(after gated prepare Close) = %#v, %v, want closed", handle, err)
 	}
@@ -489,7 +489,7 @@ func TestWorkerdCgroupLauncherStopCancellationOnlyCancelsCallerWait(t *testing.T
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cancel-stop-wait", PlacementGeneration: 1,
+		ShardID: "cancel-stop-wait", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -522,7 +522,7 @@ func TestWorkerdCgroupLauncherSameGenerationEnsureRejectsGatedStop(t *testing.T)
 	backend.killHook = func() { process.finishGroup(nil) }
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
-	request := WorkerdEnsureRequest{ShardID: "same-generation-during-stop", PlacementGeneration: 1}
+	request := WorkerdEnsureRequest{ShardID: "same-generation-during-stop", ShardGeneration: 1}
 	handle, err := launcher.Ensure(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -552,7 +552,7 @@ func TestWorkerdCgroupLauncherCloseRetriesActiveInstanceRemoval(t *testing.T) {
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "active-removal-retry", PlacementGeneration: 1,
+		ShardID: "active-removal-retry", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -578,7 +578,7 @@ func TestWorkerdCgroupLauncherNaturalLeaderExitUsesOnlyCgroupCleanup(t *testing.
 	backend.killHook = func() { process.finishGroup(nil) }
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
-	request := WorkerdEnsureRequest{ShardID: "natural-leader-exit", PlacementGeneration: 1}
+	request := WorkerdEnsureRequest{ShardID: "natural-leader-exit", ShardGeneration: 1}
 	handle, err := launcher.Ensure(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -608,7 +608,7 @@ func TestWorkerdCgroupLauncherNaturalExitStopAndCloseShareOneDestroy(t *testing.
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "natural-stop-close-race", PlacementGeneration: 1,
+		ShardID: "natural-stop-close-race", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure() error = %v", err)
@@ -648,7 +648,7 @@ func TestWorkerdCgroupLauncherCloseRetriesResidualPreStartCleanup(t *testing.T) 
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
 
 	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "cgroup-close-residual", PlacementGeneration: 1,
+		ShardID: "cgroup-close-residual", ShardGeneration: 1,
 	})
 	if handle != nil || !errors.Is(err, ErrWorkerdLaunchFailed) {
 		t.Fatalf("Ensure() = %#v, %v, want nil, launch failed", handle, err)
@@ -672,13 +672,13 @@ func TestWorkerdCgroupLauncherCloseDropsTransientErrorResolvedByConcurrentStop(t
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{firstProcess, secondProcess}}
 	launcher := newWorkerdCgroupLauncherForTest(t, &cgroupObservingWorkerdStarter{backend: backend, inner: inner}, cgroups)
 	firstHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "close-race-a", PlacementGeneration: 1,
+		ShardID: "close-race-a", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure(first) error = %v", err)
 	}
 	secondHandle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
-		ShardID: "close-race-b", PlacementGeneration: 1,
+		ShardID: "close-race-b", ShardGeneration: 1,
 	})
 	if err != nil {
 		t.Fatalf("Ensure(second) error = %v", err)
@@ -727,7 +727,7 @@ func TestWorkerdCgroupLauncherDoesNotReturnExitedCurrentGeneration(t *testing.T)
 	inner := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
 	starter := &cgroupObservingWorkerdStarter{backend: backend, inner: inner}
 	launcher := newWorkerdCgroupLauncherForTest(t, starter, cgroups)
-	request := WorkerdEnsureRequest{ShardID: "cgroup-exited-current", PlacementGeneration: 1}
+	request := WorkerdEnsureRequest{ShardID: "cgroup-exited-current", ShardGeneration: 1}
 
 	handle, err := launcher.Ensure(context.Background(), request)
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,7 +166,7 @@ func TestWorkerdCgroupPrepareWritesAndReadsBackExactControls(t *testing.T) {
 		t.Fatalf("leaf name = %q, want deterministic domain-separated identity", firstName)
 	}
 	if firstName == workerdCgroupLeafName("shared-shard-a", 8) {
-		t.Fatal("leaf name does not bind placement generation")
+		t.Fatal("leaf name does not bind shard generation")
 	}
 	evidence := controller.evidence()
 	if !evidence.ReferenceOnly || evidence.ProductionEligible || evidence.ConformanceClaimed {
@@ -205,6 +207,378 @@ func TestWorkerdCgroupPrepareRejectsNonCanonicalCPUMaxReadback(t *testing.T) {
 				t.Fatalf("close() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestParseWorkerdCgroupScalarRejectsNonCanonicalOrOversizedValues(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":               "",
+		"negative":            "-1\n",
+		"plus sign":           "+1\n",
+		"leading zero":        "01\n",
+		"leading whitespace":  " 1\n",
+		"trailing whitespace": "1 \n",
+		"extra token":         "1 2\n",
+		"unlimited":           "max\n",
+		"extra newline":       "1\n\n",
+		"overflow":            "18446744073709551616\n",
+		"oversized":           strings.Repeat("1", maximumWorkerdCgroupScalarBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if parsed, err := parseWorkerdCgroupScalar(value); parsed != 0 || !errors.Is(err, errWorkerdCgroupContract) {
+				t.Fatalf("parseWorkerdCgroupScalar(%q) = %d, %v, want zero, contract error", value, parsed, err)
+			}
+		})
+	}
+	for name, value := range map[string]string{
+		"zero":    "0\n",
+		"decimal": "50000\n",
+		"uint64":  "18446744073709551615\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := parseWorkerdCgroupScalar(value)
+			if err != nil {
+				t.Fatalf("parseWorkerdCgroupScalar(%q) error = %v", value, err)
+			}
+			if strconv.FormatUint(parsed, 10)+"\n" != value {
+				t.Fatalf("parsed scalar = %d, does not round-trip to %q", parsed, value)
+			}
+		})
+	}
+}
+
+func TestParseWorkerdCgroupMemoryEventsRejectsMalformedCounters(t *testing.T) {
+	valid := "low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\noom_group_kill 6\n"
+	parsed, err := parseWorkerdCgroupMemoryEvents(valid)
+	if err != nil {
+		t.Fatalf("parseWorkerdCgroupMemoryEvents(valid) error = %v", err)
+	}
+	if parsed != (workerdCgroupMemoryEvents{Low: 1, High: 2, Max: 3, OOM: 4, OOMKill: 5, OOMGroupKill: 6}) {
+		t.Fatalf("memory events = %+v", parsed)
+	}
+	for name, value := range map[string]string{
+		"empty":            "",
+		"missing oom kill": "low 1\nhigh 2\nmax 3\noom 4\n",
+		"duplicate":        valid + "oom 7\n",
+		"negative":         strings.Replace(valid, "oom 4", "oom -1", 1),
+		"plus sign":        strings.Replace(valid, "oom 4", "oom +4", 1),
+		"leading zero":     strings.Replace(valid, "oom 4", "oom 04", 1),
+		"whitespace":       strings.Replace(valid, "oom 4", "oom  4", 1),
+		"extra token":      strings.Replace(valid, "oom 4", "oom 4 extra", 1),
+		"overflow":         strings.Replace(valid, "oom 4", "oom 18446744073709551616", 1),
+		"oversized":        strings.Repeat("x", maximumWorkerdCgroupCounterBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, parseErr := parseWorkerdCgroupMemoryEvents(value); got != (workerdCgroupMemoryEvents{}) || !errors.Is(parseErr, errWorkerdCgroupContract) {
+				t.Fatalf("parseWorkerdCgroupMemoryEvents(%q) = %+v, %v, want zero, contract error", value, got, parseErr)
+			}
+		})
+	}
+}
+
+func TestParseWorkerdCgroupCPUStatRejectsMalformedCounters(t *testing.T) {
+	valid := "usage_usec 10\nuser_usec 4\nsystem_usec 6\nnr_periods 8\nnr_throttled 3\nthrottled_usec 2\n"
+	parsed, err := parseWorkerdCgroupCPUStat(valid)
+	if err != nil {
+		t.Fatalf("parseWorkerdCgroupCPUStat(valid) error = %v", err)
+	}
+	if parsed != (workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2}) {
+		t.Fatalf("cpu stat = %+v", parsed)
+	}
+	for name, value := range map[string]string{
+		"empty":                "",
+		"missing nr throttled": "usage_usec 10\nuser_usec 4\nsystem_usec 6\nnr_periods 8\nthrottled_usec 2\n",
+		"duplicate":            valid + "usage_usec 11\n",
+		"negative":             strings.Replace(valid, "usage_usec 10", "usage_usec -1", 1),
+		"plus sign":            strings.Replace(valid, "usage_usec 10", "usage_usec +10", 1),
+		"leading zero":         strings.Replace(valid, "usage_usec 10", "usage_usec 010", 1),
+		"whitespace":           strings.Replace(valid, "usage_usec 10", "usage_usec\t10", 1),
+		"extra token":          strings.Replace(valid, "usage_usec 10", "usage_usec 10 extra", 1),
+		"overflow":             strings.Replace(valid, "usage_usec 10", "usage_usec 18446744073709551616", 1),
+		"oversized":            strings.Repeat("x", maximumWorkerdCgroupCounterBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, parseErr := parseWorkerdCgroupCPUStat(value); got != (workerdCgroupCPUStat{}) || !errors.Is(parseErr, errWorkerdCgroupContract) {
+				t.Fatalf("parseWorkerdCgroupCPUStat(%q) = %+v, %v, want zero, contract error", value, got, parseErr)
+			}
+		})
+	}
+}
+
+func TestParseWorkerdCgroupCPUMaxRequiresExactFiniteTwoTokens(t *testing.T) {
+	for name, value := range map[string]string{
+		"minimum":   "1000 1000\n",
+		"reference": "50000 100000\n",
+		"maximum":   "1000000000 1000000\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseWorkerdCgroupCPUMax(value); err != nil {
+				t.Fatalf("parseWorkerdCgroupCPUMax(%q) error = %v", value, err)
+			}
+		})
+	}
+	for name, value := range map[string]string{
+		"empty":              "",
+		"unlimited":          "max 100000\n",
+		"zero quota":         "0 100000\n",
+		"quota below range":  "999 100000\n",
+		"quota above range":  "1000000001 100000\n",
+		"zero period":        "50000 0\n",
+		"period below range": "50000 999\n",
+		"period above range": "50000 1000001\n",
+		"leading zero":       "050000 100000\n",
+		"whitespace":         "50000  100000\n",
+		"missing period":     "50000\n",
+		"extra token":        "50000 100000 extra\n",
+		"overflow":           "18446744073709551616 100000\n",
+		"oversized":          strings.Repeat("1", maximumWorkerdCgroupCPUMaxBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := parseWorkerdCgroupCPUMax(value); got != (CPUMax{}) || !errors.Is(err, errWorkerdCgroupContract) {
+				t.Fatalf("parseWorkerdCgroupCPUMax(%q) = %+v, %v, want zero, contract error", value, got, err)
+			}
+		})
+	}
+}
+
+func TestWorkerdCgroupResourceSampleUsesPinnedGenerationBaselineAndBoundedReads(t *testing.T) {
+	baselineMemory := workerdCgroupMemoryEvents{Low: 1, High: 2, Max: 3, OOM: 4, OOMKill: 5, OOMGroupKill: 6}
+	baselineCPU := workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2}
+	backend := newFakeWorkerdCgroupBackend()
+	backend.initialMemoryEvents = formatFakeWorkerdCgroupMemoryEvents(baselineMemory)
+	backend.initialCPUStat = formatFakeWorkerdCgroupCPUStat(baselineCPU)
+	config := validWorkerdCgroupConfig()
+	controller, err := newWorkerdCgroupControllerWithBackend(config, backend)
+	if err != nil {
+		t.Fatalf("newWorkerdCgroupControllerWithBackend() error = %v", err)
+	}
+	lease, err := controller.prepare(context.Background(), "resource-baseline", 9)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+
+	currentMemory := workerdCgroupMemoryEvents{Low: 3, High: 5, Max: 7, OOM: 8, OOMKill: 10, OOMGroupKill: 12}
+	currentCPU := workerdCgroupCPUStat{UsageMicros: 30, UserMicros: 14, SystemMicros: 16, Periods: 18, ThrottledPeriods: 8, ThrottledMicros: 7}
+	backend.setOnlyChildControl(t, "memory.current", "67108864\n")
+	backend.setOnlyChildControl(t, "memory.events", formatFakeWorkerdCgroupMemoryEvents(currentMemory))
+	backend.setOnlyChildControl(t, "cpu.stat", formatFakeWorkerdCgroupCPUStat(currentCPU))
+	backend.setOnlyChildControl(t, "pids.current", "17\n")
+	backend.resetControlReads()
+
+	sample, err := lease.sampleResources(context.Background())
+	if err != nil {
+		t.Fatalf("sampleResources() error = %v", err)
+	}
+	want := workerdCgroupResourceSample{
+		ShardID:            "resource-baseline",
+		Generation:         9,
+		Identity:           lease.identity,
+		MemoryCurrentBytes: 67_108_864,
+		MemoryEvents:       currentMemory,
+		MemoryEventsDelta:  workerdCgroupMemoryEvents{Low: 2, High: 3, Max: 4, OOM: 4, OOMKill: 5, OOMGroupKill: 6},
+		CPUStat:            currentCPU,
+		CPUStatDelta:       workerdCgroupCPUStat{UsageMicros: 20, UserMicros: 10, SystemMicros: 10, Periods: 10, ThrottledPeriods: 5, ThrottledMicros: 5},
+		PIDsCurrent:        17,
+		CPUMax:             config.CPUMax,
+	}
+	if sample != want {
+		t.Fatalf("sampleResources() = %+v, want %+v", sample, want)
+	}
+	wantReads := []fakeWorkerdCgroupRead{
+		{Name: "memory.current", Limit: maximumWorkerdCgroupScalarBytes},
+		{Name: "memory.events", Limit: maximumWorkerdCgroupCounterBytes},
+		{Name: "cpu.stat", Limit: maximumWorkerdCgroupCounterBytes},
+		{Name: "cpu.max", Limit: maximumWorkerdCgroupCPUMaxBytes},
+		{Name: "pids.current", Limit: maximumWorkerdCgroupScalarBytes},
+	}
+	if reads := backend.controlReads(); !reflect.DeepEqual(reads, wantReads) {
+		t.Fatalf("resource control reads = %#v, want %#v", reads, wantReads)
+	}
+
+	backend.setOnlyChildControl(t, "memory.current", "1\n")
+	if sample.MemoryCurrentBytes != want.MemoryCurrentBytes || sample.MemoryEvents != want.MemoryEvents || sample.CPUStat != want.CPUStat {
+		t.Fatalf("returned sample changed after backend mutation: %+v", sample)
+	}
+	if err := lease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy() error = %v", err)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupResourceSampleRejectsCounterDecreaseFromGenerationBaseline(t *testing.T) {
+	tests := []struct {
+		name           string
+		memoryBaseline workerdCgroupMemoryEvents
+		memoryCurrent  workerdCgroupMemoryEvents
+		cpuBaseline    workerdCgroupCPUStat
+		cpuCurrent     workerdCgroupCPUStat
+	}{
+		{
+			name:           "memory events",
+			memoryBaseline: workerdCgroupMemoryEvents{Low: 1, High: 1, Max: 1, OOM: 9, OOMKill: 1},
+			memoryCurrent:  workerdCgroupMemoryEvents{Low: 1, High: 1, Max: 1, OOM: 8, OOMKill: 1},
+			cpuBaseline:    workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2},
+			cpuCurrent:     workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2},
+		},
+		{
+			name:           "cpu stat",
+			memoryBaseline: workerdCgroupMemoryEvents{Low: 1, High: 1, Max: 1, OOM: 1, OOMKill: 1},
+			memoryCurrent:  workerdCgroupMemoryEvents{Low: 1, High: 1, Max: 1, OOM: 1, OOMKill: 1},
+			cpuBaseline:    workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2},
+			cpuCurrent:     workerdCgroupCPUStat{UsageMicros: 9, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeWorkerdCgroupBackend()
+			backend.initialMemoryEvents = formatFakeWorkerdCgroupMemoryEvents(test.memoryBaseline)
+			backend.initialCPUStat = formatFakeWorkerdCgroupCPUStat(test.cpuBaseline)
+			controller, err := newWorkerdCgroupControllerWithBackend(validWorkerdCgroupConfig(), backend)
+			if err != nil {
+				t.Fatalf("new controller error = %v", err)
+			}
+			lease, err := controller.prepare(context.Background(), "counter-decrease", 1)
+			if err != nil {
+				t.Fatalf("prepare() error = %v", err)
+			}
+			backend.setOnlyChildControl(t, "memory.events", formatFakeWorkerdCgroupMemoryEvents(test.memoryCurrent))
+			backend.setOnlyChildControl(t, "cpu.stat", formatFakeWorkerdCgroupCPUStat(test.cpuCurrent))
+			if sample, sampleErr := lease.sampleResources(context.Background()); sample != (workerdCgroupResourceSample{}) || !errors.Is(sampleErr, errWorkerdCgroupContract) {
+				t.Fatalf("sampleResources(counter decrease) = %+v, %v, want zero, contract error", sample, sampleErr)
+			}
+			if err := lease.destroy(context.Background()); err != nil {
+				t.Fatalf("destroy() error = %v", err)
+			}
+			if err := controller.close(); err != nil {
+				t.Fatalf("close() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestWorkerdCgroupResourceSampleRejectsOversizedControl(t *testing.T) {
+	_, backend, controller := newWorkerdCgroupFixture(t)
+	lease, err := controller.prepare(context.Background(), "oversized-resource", 1)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	backend.setOnlyChildControl(t, "memory.current", strings.Repeat("1", maximumWorkerdCgroupScalarBytes+1))
+	if sample, sampleErr := lease.sampleResources(context.Background()); sample != (workerdCgroupResourceSample{}) || !errors.Is(sampleErr, errWorkerdCgroupContract) {
+		t.Fatalf("sampleResources(oversized) = %+v, %v, want zero, contract error", sample, sampleErr)
+	}
+	if err := lease.destroy(context.Background()); err != nil {
+		t.Fatalf("destroy() error = %v", err)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+}
+
+func TestWorkerdCgroupResourceSampleRejectsPathReplacementDuringRead(t *testing.T) {
+	_, backend, controller := newWorkerdCgroupFixture(t)
+	lease, err := controller.prepare(context.Background(), "resource-replacement", 1)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	backend.replaceOnReadback = "memory.current"
+	if sample, sampleErr := lease.sampleResources(context.Background()); sample != (workerdCgroupResourceSample{}) || !errors.Is(sampleErr, errWorkerdCgroupPathReplaced) || !errors.Is(sampleErr, errWorkerdCgroupPoisoned) {
+		t.Fatalf("sampleResources(replacement) = %+v, %v, want zero, path replaced and poisoned", sample, sampleErr)
+	}
+	if next, prepareErr := controller.prepare(context.Background(), "must-not-observe-after-replacement", 1); next != nil || !errors.Is(prepareErr, errWorkerdCgroupPoisoned) {
+		if next != nil {
+			_ = next.destroy(context.Background())
+		}
+		t.Fatalf("prepare(after sample replacement) = %#v, %v, want poisoned", next, prepareErr)
+	}
+	if err := lease.destroy(context.Background()); !errors.Is(err, errWorkerdCgroupPathReplaced) || !errors.Is(err, errWorkerdCgroupPoisoned) {
+		t.Fatalf("destroy(replaced lease) error = %v, want path replaced and poisoned", err)
+	}
+	if err := controller.close(); !errors.Is(err, errWorkerdCgroupPoisoned) {
+		t.Fatalf("close(poisoned) error = %v, want poisoned", err)
+	}
+}
+
+func TestWorkerdCgroupResourceSampleReleasesLocksAndExcludesDestroy(t *testing.T) {
+	_, backend, controller := newWorkerdCgroupFixture(t)
+	lease, err := controller.prepare(context.Background(), "sample-destroy-race", 1)
+	if err != nil {
+		t.Fatalf("prepare() error = %v", err)
+	}
+	readEntered := make(chan struct{}, 1)
+	readGate := make(chan struct{})
+	backend.readEnteredByControl["memory.current"] = readEntered
+	backend.readGatesByControl["memory.current"] = readGate
+	sampleResult := make(chan error, 1)
+	go func() {
+		_, sampleErr := lease.sampleResources(context.Background())
+		sampleResult <- sampleErr
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("sample did not enter memory.current read")
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- controller.close() }()
+	destroyResult := make(chan error, 1)
+	go func() { destroyResult <- lease.destroy(context.Background()) }()
+	destroyRegistered := make(chan struct{})
+	go func() {
+		for {
+			lease.mu.Lock()
+			registered := lease.destroyOperation != nil
+			lease.mu.Unlock()
+			if registered {
+				close(destroyRegistered)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	closeBlocked := false
+	select {
+	case err := <-closeResult:
+		if !errors.Is(err, errWorkerdCgroupBusy) {
+			t.Errorf("close() during sample error = %v, want busy", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		closeBlocked = true
+	}
+	destroyRegistrationBlocked := false
+	select {
+	case <-destroyRegistered:
+	case <-time.After(250 * time.Millisecond):
+		destroyRegistrationBlocked = true
+	}
+	select {
+	case err := <-destroyResult:
+		t.Fatalf("destroy completed while sample held pinned lease: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(readGate)
+	if err := <-sampleResult; err != nil {
+		t.Fatalf("sampleResources() error = %v", err)
+	}
+	if err := <-destroyResult; err != nil {
+		t.Fatalf("destroy() error = %v", err)
+	}
+	if closeBlocked {
+		if err := <-closeResult; !errors.Is(err, errWorkerdCgroupBusy) {
+			t.Errorf("delayed close() error = %v, want busy", err)
+		}
+		t.Error("controller close blocked behind resource sample I/O")
+	}
+	if destroyRegistrationBlocked {
+		<-destroyRegistered
+		t.Error("destroy epoch registration blocked behind resource sample I/O")
+	}
+	if sample, sampleErr := lease.sampleResources(context.Background()); sample != (workerdCgroupResourceSample{}) || !errors.Is(sampleErr, errWorkerdCgroupLeaseUnavailable) {
+		t.Fatalf("sampleResources(after destroy) = %+v, %v, want zero, unavailable", sample, sampleErr)
+	}
+	if err := controller.close(); err != nil {
+		t.Fatalf("close() error = %v", err)
 	}
 }
 
@@ -744,7 +1118,7 @@ func TestWorkerdCgroupControllerAndLeasesDoNotLeakFileDescriptors(t *testing.T) 
 	if err != nil {
 		t.Fatalf("new controller error = %v", err)
 	}
-	for generation := uint64(1); generation <= 100; generation++ {
+	for generation := ShardGeneration(1); generation <= 100; generation++ {
 		lease, prepareErr := controller.prepare(context.Background(), "fd-cycle", generation)
 		if prepareErr != nil {
 			t.Fatalf("prepare(%d) error = %v", generation, prepareErr)
@@ -864,8 +1238,13 @@ func TestWorkerdCgroupControllerPoisonWriterWaitsForActiveBorrow(t *testing.T) {
 	destroyResult := make(chan error, 1)
 	go func() { destroyResult <- poisonedLease.destroy(context.Background()) }()
 	writerDeadline := time.Now().Add(time.Second)
-	for controller.authority.TryRLock() {
-		controller.authority.RUnlock()
+	for {
+		controller.mu.Lock()
+		writerQueued := controller.authorityWritersWaiting > 0
+		controller.mu.Unlock()
+		if writerQueued {
+			break
+		}
 		if time.Now().After(writerDeadline) {
 			t.Fatal("poison writer did not queue behind active borrow")
 		}
@@ -946,6 +1325,20 @@ func validWorkerdCgroupConfig() workerdCgroupConfig {
 	}
 }
 
+func formatFakeWorkerdCgroupMemoryEvents(events workerdCgroupMemoryEvents) string {
+	return fmt.Sprintf(
+		"low %d\nhigh %d\nmax %d\noom %d\noom_kill %d\noom_group_kill %d\n",
+		events.Low, events.High, events.Max, events.OOM, events.OOMKill, events.OOMGroupKill,
+	)
+}
+
+func formatFakeWorkerdCgroupCPUStat(stat workerdCgroupCPUStat) string {
+	return fmt.Sprintf(
+		"usage_usec %d\nuser_usec %d\nsystem_usec %d\nnr_periods %d\nnr_throttled %d\nthrottled_usec %d\n",
+		stat.UsageMicros, stat.UserMicros, stat.SystemMicros, stat.Periods, stat.ThrottledPeriods, stat.ThrottledMicros,
+	)
+}
+
 func newWorkerdCgroupFixture(t *testing.T) (workerdCgroupConfig, *fakeWorkerdCgroupBackend, *workerdCgroupController) {
 	t.Helper()
 	config := validWorkerdCgroupConfig()
@@ -962,6 +1355,11 @@ type fakeWorkerdCgroupWrite struct {
 	Value string
 }
 
+type fakeWorkerdCgroupRead struct {
+	Name  string
+	Limit int
+}
+
 type fakeWorkerdCgroup struct {
 	identity workerdCgroupIdentity
 	fd       int
@@ -972,39 +1370,44 @@ type fakeWorkerdCgroup struct {
 type fakeWorkerdCgroupBackend struct {
 	mu sync.Mutex
 
-	effectiveUID uint32
-	effectiveGID uint32
-	inspection   workerdCgroupRootInspection
-	inspectErr   error
-	nextFD       int
-	openFDs      map[int]struct{}
-	groupsByFD   map[int]*fakeWorkerdCgroup
-	children     map[string]*fakeWorkerdCgroup
-	writes       []fakeWorkerdCgroupWrite
-	nextInode    uint64
+	effectiveUID        uint32
+	effectiveGID        uint32
+	inspection          workerdCgroupRootInspection
+	inspectErr          error
+	nextFD              int
+	openFDs             map[int]struct{}
+	groupsByFD          map[int]*fakeWorkerdCgroup
+	children            map[string]*fakeWorkerdCgroup
+	writes              []fakeWorkerdCgroupWrite
+	reads               []fakeWorkerdCgroupRead
+	nextInode           uint64
+	initialMemoryEvents string
+	initialCPUStat      string
 
-	corruptReadback   map[string]string
-	replaceOnReadback string
-	writeFailures     map[string]int
-	openFailures      int
-	removeFailures    int
-	mkdirCalls        int
-	mkdirModes        []uint32
-	removeCalls       int
-	killCalls         int
-	waitCalls         int
-	mkdirEntered      chan struct{}
-	mkdirGate         <-chan struct{}
-	killEntered       chan struct{}
-	killGate          <-chan struct{}
-	killHook          func()
-	killEnteredByFD   map[int]chan struct{}
-	killGatesByFD     map[int]<-chan struct{}
-	killHooksByFD     map[int]func()
-	closeEntered      chan int
-	closeGates        map[int]<-chan struct{}
-	closeFailures     map[int]int
-	closeCalls        map[int]int
+	corruptReadback      map[string]string
+	replaceOnReadback    string
+	writeFailures        map[string]int
+	openFailures         int
+	removeFailures       int
+	mkdirCalls           int
+	mkdirModes           []uint32
+	removeCalls          int
+	killCalls            int
+	waitCalls            int
+	mkdirEntered         chan struct{}
+	mkdirGate            <-chan struct{}
+	killEntered          chan struct{}
+	killGate             <-chan struct{}
+	killHook             func()
+	killEnteredByFD      map[int]chan struct{}
+	killGatesByFD        map[int]<-chan struct{}
+	killHooksByFD        map[int]func()
+	closeEntered         chan int
+	closeGates           map[int]<-chan struct{}
+	closeFailures        map[int]int
+	closeCalls           map[int]int
+	readEnteredByControl map[string]chan struct{}
+	readGatesByControl   map[string]<-chan struct{}
 }
 
 func newFakeWorkerdCgroupBackend() *fakeWorkerdCgroupBackend {
@@ -1027,24 +1430,52 @@ func newFakeWorkerdCgroupBackend() *fakeWorkerdCgroupBackend {
 			Controllers:    "cpu memory pids\n",
 			SubtreeControl: "cpu memory pids\n",
 		},
-		nextFD:          11,
-		openFDs:         map[int]struct{}{},
-		groupsByFD:      map[int]*fakeWorkerdCgroup{},
-		children:        map[string]*fakeWorkerdCgroup{},
-		nextInode:       100,
-		corruptReadback: map[string]string{},
-		writeFailures:   map[string]int{},
-		killEnteredByFD: map[int]chan struct{}{},
-		killGatesByFD:   map[int]<-chan struct{}{},
-		killHooksByFD:   map[int]func(){},
-		closeGates:      map[int]<-chan struct{}{},
-		closeFailures:   map[int]int{},
-		closeCalls:      map[int]int{},
+		nextFD:               11,
+		openFDs:              map[int]struct{}{},
+		groupsByFD:           map[int]*fakeWorkerdCgroup{},
+		children:             map[string]*fakeWorkerdCgroup{},
+		nextInode:            100,
+		initialMemoryEvents:  "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+		initialCPUStat:       "usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n",
+		corruptReadback:      map[string]string{},
+		writeFailures:        map[string]int{},
+		killEnteredByFD:      map[int]chan struct{}{},
+		killGatesByFD:        map[int]<-chan struct{}{},
+		killHooksByFD:        map[int]func(){},
+		closeGates:           map[int]<-chan struct{}{},
+		closeFailures:        map[int]int{},
+		closeCalls:           map[int]int{},
+		readEnteredByControl: map[string]chan struct{}{},
+		readGatesByControl:   map[string]<-chan struct{}{},
 	}
 }
 
 func (backend *fakeWorkerdCgroupBackend) effectiveIDs() (uint32, uint32) {
 	return backend.effectiveUID, backend.effectiveGID
+}
+
+func (backend *fakeWorkerdCgroupBackend) setOnlyChildControl(t *testing.T, name string, value string) {
+	t.Helper()
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.children) != 1 {
+		t.Fatalf("child count = %d, want one", len(backend.children))
+	}
+	for _, group := range backend.children {
+		group.controls[name] = value
+	}
+}
+
+func (backend *fakeWorkerdCgroupBackend) resetControlReads() {
+	backend.mu.Lock()
+	backend.reads = nil
+	backend.mu.Unlock()
+}
+
+func (backend *fakeWorkerdCgroupBackend) controlReads() []fakeWorkerdCgroupRead {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]fakeWorkerdCgroupRead(nil), backend.reads...)
 }
 
 func (backend *fakeWorkerdCgroupBackend) inspectRoot(string) (workerdCgroupRootInspection, error) {
@@ -1088,6 +1519,10 @@ func (backend *fakeWorkerdCgroupBackend) mkdirExclusive(_ int, name string, mode
 			"cgroup.procs":           "",
 			"cgroup.subtree_control": "",
 			"cgroup.stat":            "nr_descendants 0\nnr_dying_descendants 0\n",
+			"memory.current":         "0\n",
+			"memory.events":          backend.initialMemoryEvents,
+			"cpu.stat":               backend.initialCPUStat,
+			"pids.current":           "0\n",
 		},
 	}
 	return nil
@@ -1159,13 +1594,28 @@ func (backend *fakeWorkerdCgroupBackend) writeControl(fd int, name string, value
 	return nil
 }
 
-func (backend *fakeWorkerdCgroupBackend) readControl(fd int, name string, _ int) (string, error) {
+func (backend *fakeWorkerdCgroupBackend) readControl(fd int, name string, limit int) (string, error) {
 	backend.mu.Lock()
-	defer backend.mu.Unlock()
 	group := backend.groupsByFD[fd]
 	if group == nil {
+		backend.mu.Unlock()
 		return "", unix.EBADF
 	}
+	backend.reads = append(backend.reads, fakeWorkerdCgroupRead{Name: name, Limit: limit})
+	entered := backend.readEnteredByControl[name]
+	gate := backend.readGatesByControl[name]
+	backend.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		<-gate
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 	if backend.replaceOnReadback == name {
 		for childName, child := range backend.children {
 			if child == group {
@@ -1180,19 +1630,33 @@ func (backend *fakeWorkerdCgroupBackend) readControl(fd int, name string, _ int)
 		backend.replaceOnReadback = ""
 	}
 	if corrupted, exists := backend.corruptReadback[name]; exists {
+		if len(corrupted) > limit {
+			return "", errWorkerdCgroupContract
+		}
 		return corrupted, nil
 	}
 	if name == "cgroup.events" {
 		if len(group.events) == 0 {
-			return "populated 0\nfrozen 0\n", nil
+			value := "populated 0\nfrozen 0\n"
+			if len(value) > limit {
+				return "", errWorkerdCgroupContract
+			}
+			return value, nil
 		}
 		value := group.events[0]
 		if len(group.events) > 1 {
 			group.events = group.events[1:]
 		}
+		if len(value) > limit {
+			return "", errWorkerdCgroupContract
+		}
 		return value, nil
 	}
-	return group.controls[name], nil
+	value := group.controls[name]
+	if len(value) > limit {
+		return "", errWorkerdCgroupContract
+	}
+	return value, nil
 }
 
 func (backend *fakeWorkerdCgroupBackend) identityAt(_ int, name string) (workerdCgroupIdentity, bool, error) {

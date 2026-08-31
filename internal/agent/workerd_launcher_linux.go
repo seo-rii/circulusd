@@ -30,7 +30,7 @@ var (
 	ErrUnsafeWorkerdExecutable      = errors.New("agent: unsafe workerd executable")
 	ErrWorkerdDigestMismatch        = errors.New("agent: workerd executable digest mismatch")
 	ErrWorkerdLaunchConflict        = errors.New("agent: workerd shard generation reused with different launch inputs")
-	ErrStaleWorkerdGeneration       = errors.New("agent: stale workerd placement generation")
+	ErrStaleWorkerdGeneration       = errors.New("agent: stale workerd shard generation")
 	ErrWorkerdReadinessTimeout      = errors.New("agent: workerd readiness timeout")
 	ErrWorkerdExitedBeforeReady     = errors.New("agent: workerd exited before readiness")
 	ErrWorkerdNotReady              = errors.New("agent: workerd readiness probe failed")
@@ -91,17 +91,17 @@ type CPUMax struct {
 // WorkerdEnsureRequest is the immutable identity of one shard generation.
 // Reusing the same identity with different arguments is rejected.
 type WorkerdEnsureRequest struct {
-	ShardID             string
-	PlacementGeneration uint64
-	Arguments           []string
+	ShardID         string
+	ShardGeneration ShardGeneration
+	Arguments       []string
 }
 
 // WorkerdProcessInfo is the process identity made available to a readiness
 // probe. It is not an admission grant.
 type WorkerdProcessInfo struct {
-	ShardID             string
-	PlacementGeneration uint64
-	PID                 int
+	ShardID         string
+	ShardGeneration ShardGeneration
+	PID             int
 }
 
 // WorkerdReadinessProbe gates publication of a shard handle. Implementations
@@ -149,15 +149,15 @@ type WorkerdOutput struct {
 }
 
 type workerdLaunchCommand struct {
-	Executable          string
-	Arguments           []string
-	Environment         []string
-	ExtraFiles          []*os.File
-	CgroupFD            int
-	Stdout              io.Writer
-	Stderr              io.Writer
-	ShardID             string
-	PlacementGeneration uint64
+	Executable      string
+	Arguments       []string
+	Environment     []string
+	ExtraFiles      []*os.File
+	CgroupFD        int
+	Stdout          io.Writer
+	Stderr          io.Writer
+	ShardID         string
+	ShardGeneration ShardGeneration
 }
 
 type workerdProcessStarter interface {
@@ -175,7 +175,7 @@ type workerdStartedProcess interface {
 
 type workerdLaunchKey struct {
 	shardID    string
-	generation uint64
+	generation ShardGeneration
 }
 
 type workerdLaunchIdentity [sha256.Size]byte
@@ -227,9 +227,9 @@ type workerdInstance struct {
 
 // WorkerdProcessLauncher owns the verified sealed executable snapshot and
 // coordinates starts independently per immutable shard generation. This is a
-// low-level launcher, not a Launcher implementation: ShardSpec cannot express
-// its bounded static arguments or placement generation, and this slice does
-// not yet provide the cgroup isolation required for Manager admission.
+// low-level launcher, not a Launcher implementation: its bounded static
+// arguments and release-bound executable/environment still need to be sealed
+// by a narrow Manager adapter.
 type WorkerdProcessLauncher struct {
 	mu                 sync.Mutex
 	executable         *os.File
@@ -246,8 +246,8 @@ type WorkerdProcessLauncher struct {
 	pending            map[workerdLaunchKey]*workerdPendingLaunch
 	allocations        map[*workerdCgroupLease]workerdCgroupAllocation
 	current            map[string]*workerdInstance
-	latestGenerations  map[string]uint64
-	retiredGenerations map[string]uint64
+	latestGenerations  map[string]ShardGeneration
+	retiredGenerations map[string]ShardGeneration
 	launchIdentities   map[workerdLaunchKey]workerdLaunchIdentity
 	instances          map[*workerdInstance]struct{}
 	closed             bool
@@ -443,8 +443,8 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		pending:            make(map[workerdLaunchKey]*workerdPendingLaunch),
 		allocations:        make(map[*workerdCgroupLease]workerdCgroupAllocation),
 		current:            make(map[string]*workerdInstance),
-		latestGenerations:  make(map[string]uint64),
-		retiredGenerations: make(map[string]uint64),
+		latestGenerations:  make(map[string]ShardGeneration),
+		retiredGenerations: make(map[string]ShardGeneration),
 		launchIdentities:   make(map[workerdLaunchKey]workerdLaunchIdentity),
 		instances:          make(map[*workerdInstance]struct{}),
 	}, nil
@@ -461,7 +461,7 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 	if ctx == nil || launcher == nil || launcher.starter == nil || launcher.readinessProbe == nil ||
 		request.ShardID == "" || request.ShardID != strings.TrimSpace(request.ShardID) ||
 		len(request.ShardID) > 256 || strings.ContainsRune(request.ShardID, '\x00') ||
-		request.PlacementGeneration == 0 {
+		request.ShardGeneration == 0 {
 		return nil, ErrInvalidWorkerdEnsureRequest
 	}
 	argumentsBytes := 0
@@ -484,7 +484,7 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	key := workerdLaunchKey{shardID: request.ShardID, generation: request.PlacementGeneration}
+	key := workerdLaunchKey{shardID: request.ShardID, generation: request.ShardGeneration}
 
 	for {
 		launcher.mu.Lock()
@@ -496,8 +496,8 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdHistoryCapacity
 		}
-		if retired := launcher.retiredGenerations[request.ShardID]; retired >= request.PlacementGeneration ||
-			launcher.latestGenerations[request.ShardID] > request.PlacementGeneration {
+		if retired := launcher.retiredGenerations[request.ShardID]; retired >= request.ShardGeneration ||
+			launcher.latestGenerations[request.ShardID] > request.ShardGeneration {
 			launcher.mu.Unlock()
 			return nil, ErrStaleWorkerdGeneration
 		}
@@ -606,13 +606,13 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdHistoryCapacity
 		}
-		if request.PlacementGeneration > launcher.latestGenerations[request.ShardID] {
+		if request.ShardGeneration > launcher.latestGenerations[request.ShardID] {
 			for existingKey := range launcher.launchIdentities {
-				if existingKey.shardID == request.ShardID && existingKey.generation < request.PlacementGeneration {
+				if existingKey.shardID == request.ShardID && existingKey.generation < request.ShardGeneration {
 					delete(launcher.launchIdentities, existingKey)
 				}
 			}
-			launcher.latestGenerations[request.ShardID] = request.PlacementGeneration
+			launcher.latestGenerations[request.ShardID] = request.ShardGeneration
 		}
 		launcher.launchIdentities[key] = identity
 		launchContext, cancel := context.WithTimeout(context.Background(), launcher.readinessTimeout)
@@ -742,15 +742,15 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	stderr := &boundedWorkerdWriter{limit: launcher.outputLimitBytes}
 	arguments := slices.Clone(pending.arguments)
 	command := workerdLaunchCommand{
-		Executable:          launcher.executableProcPath,
-		Arguments:           arguments,
-		Environment:         slices.Clone(launcher.environment),
-		ExtraFiles:          make([]*os.File, 0),
-		CgroupFD:            -1,
-		Stdout:              stdout,
-		Stderr:              stderr,
-		ShardID:             pending.key.shardID,
-		PlacementGeneration: pending.key.generation,
+		Executable:      launcher.executableProcPath,
+		Arguments:       arguments,
+		Environment:     slices.Clone(launcher.environment),
+		ExtraFiles:      make([]*os.File, 0),
+		CgroupFD:        -1,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		ShardID:         pending.key.shardID,
+		ShardGeneration: pending.key.generation,
 	}
 	var process workerdStartedProcess
 	var startErr error
@@ -807,7 +807,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	probeResult := make(chan error, 1)
 	go func() {
 		probeResult <- launcher.readinessProbe.WaitReady(pending.ctx, WorkerdProcessInfo{
-			ShardID: pending.key.shardID, PlacementGeneration: pending.key.generation, PID: process.PID(),
+			ShardID: pending.key.shardID, ShardGeneration: pending.key.generation, PID: process.PID(),
 		})
 	}()
 	readinessSucceeded := false
@@ -1296,8 +1296,8 @@ func (handle *WorkerdShardHandle) ID() string {
 	return handle.ShardID()
 }
 
-// PlacementGeneration returns the immutable placement generation.
-func (handle *WorkerdShardHandle) PlacementGeneration() uint64 {
+// ShardGeneration returns the immutable OS-process generation.
+func (handle *WorkerdShardHandle) ShardGeneration() ShardGeneration {
 	if handle == nil || handle.instance == nil {
 		return 0
 	}
