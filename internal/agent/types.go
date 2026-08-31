@@ -95,12 +95,18 @@ type ReleaseRequest struct {
 	PlacementGeneration uint64
 }
 
+// ShardGeneration identifies one concrete OS process start attempt. It is
+// manager-owned and is independent from a session's PlacementGeneration.
+type ShardGeneration uint64
+
 type ShardSpec struct {
-	ShardID   string
-	ScopeKey  string
-	Profile   PlacementProfile
-	Limits    Limits
-	CreatedAt time.Time
+	AgentInstanceID identity.ID
+	ShardID         string
+	ShardGeneration ShardGeneration
+	ScopeKey        string
+	Profile         PlacementProfile
+	Limits          Limits
+	CreatedAt       time.Time
 }
 
 type ShardProcess interface {

@@ -3,7 +3,7 @@
 Status: Unit 10 implementation in progress after independent architecture and
 concurrency review
 
-Updated: 2026-08-31
+Updated: 2026-09-01
 
 This document turns the normative phase roadmap in `SPEC.md` §51 into small,
 reviewable repository work units. `SPEC.md` remains the product contract;
@@ -53,6 +53,17 @@ not silently included in Unit 10.
   vector from a short canonical absolute directory. Golden tests reject unsafe
   paths and prove each call returns an unaliased fixed vector. Pinned-binary CLI
   preflight and persistent socket materialization remain to be implemented.
+- 2026-09-01: Manager now creates one boot-scoped process identity and consumes
+  a fresh typed shard generation for every OS start attempt. Manager-owned
+  launch operations share one immutable result while caller cancellation only
+  removes that caller; the last waiter requests cancellation without releasing
+  cleanup ownership. Process `ID` and `Stop` callbacks run outside the Manager
+  mutex, typed-nil processes fail closed, and generation-keyed stop epochs
+  survive caller cancellation. Shutdown starts independent cleanup in parallel,
+  joins results deterministically, retries uncertain cleanup, and fences
+  replacement until the prior generation is quiescent. Repeated package
+  race/shuffle tests pass. The low-level workerd launcher generation rename and
+  fixed-configuration Manager adapter remain in U10.1.
 
 ### Outcome
 

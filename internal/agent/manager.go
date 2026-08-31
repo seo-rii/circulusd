@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -31,19 +32,39 @@ type shard struct {
 }
 
 type launchPending struct {
-	done chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	spec      ShardSpec
+	sessions  map[identity.ID]struct{}
+	waiters   int
+	abandoned bool
+	finished  bool
+	err       error
+}
+
+type shardProcessKey struct {
+	shardID         string
+	shardGeneration ShardGeneration
 }
 
 type stopPending struct {
-	process ShardProcess
-	done    chan struct{}
-	err     error
+	spec      ShardSpec
+	process   ShardProcess
+	done      chan struct{}
+	startOnce sync.Once
+	err       error
 }
 
 type trackedStop struct {
-	shardID string
+	key     shardProcessKey
 	pending *stopPending
 	reason  string
+}
+
+type releaseCleanup struct {
+	placementGeneration uint64
+	key                 shardProcessKey
 }
 
 // Manager serializes placement metadata while performing process launches
@@ -54,15 +75,18 @@ type Manager struct {
 	shutdownGate        chan struct{}
 	launcher            Launcher
 	limits              Limits
+	agentInstanceID     identity.ID
 	shards              map[string]*shard
 	placements          map[identity.ID]Placement
 	latestGenerations   map[identity.ID]uint64
 	releasedGenerations map[identity.ID]uint64
 	requestIdentities   map[identity.ID]requestIdentity
+	releaseCleanups     map[identity.ID]releaseCleanup
 	pendingSessions     map[identity.ID]*launchPending
 	pendingScopes       map[string]*launchPending
-	pendingStops        map[string]*stopPending
+	pendingStops        map[shardProcessKey]*stopPending
 	nextShardSequence   uint64
+	nextShardGeneration ShardGeneration
 	closed              bool
 }
 
@@ -70,21 +94,28 @@ func NewManager(launcher Launcher, limits Limits) (*Manager, error) {
 	if launcher == nil || limits.MaximumSessions <= 0 || limits.MemoryLimitBytes == 0 || limits.AdmissionMemoryWatermarkBytes == 0 || limits.AdmissionMemoryWatermarkBytes > limits.MemoryLimitBytes || limits.MaximumLifetime <= 0 {
 		return nil, ErrInvalidConfig
 	}
+	agentInstanceID, err := identity.New(identity.Process)
+	if err != nil {
+		return nil, fmt.Errorf("generate agent instance identity: %w", err)
+	}
 	shutdownGate := make(chan struct{}, 1)
 	shutdownGate <- struct{}{}
 	return &Manager{
 		shutdownGate:        shutdownGate,
 		launcher:            launcher,
 		limits:              limits,
+		agentInstanceID:     agentInstanceID,
 		shards:              make(map[string]*shard),
 		placements:          make(map[identity.ID]Placement),
 		latestGenerations:   make(map[identity.ID]uint64),
 		releasedGenerations: make(map[identity.ID]uint64),
 		requestIdentities:   make(map[identity.ID]requestIdentity),
+		releaseCleanups:     make(map[identity.ID]releaseCleanup),
 		pendingSessions:     make(map[identity.ID]*launchPending),
 		pendingScopes:       make(map[string]*launchPending),
-		pendingStops:        make(map[string]*stopPending),
+		pendingStops:        make(map[shardProcessKey]*stopPending),
 		nextShardSequence:   1,
+		nextShardGeneration: 1,
 	}, nil
 }
 
@@ -176,6 +207,13 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 		return Placement{}, err
 	}
 	fingerprint := requestIdentity{tenantID: request.TenantID, workerID: workerID, profile: request.Profile, estimatedMemoryBytes: request.EstimatedMemoryBytes}
+	scopeKey := string(request.Profile.ProcessScope) + "/" + string(request.Profile.OuterIsolation)
+	switch request.Profile.ProcessScope {
+	case ScopeTenant:
+		scopeKey += "/" + request.TenantID.String()
+	case ScopeSession:
+		scopeKey += "/" + request.SessionID.String()
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -188,6 +226,15 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 			return Placement{}, ErrManagerClosed
 		}
 		if pending := manager.pendingSessions[request.SessionID]; pending != nil {
+			if !pending.abandoned && !pending.finished && pending.spec.ScopeKey == scopeKey {
+				pending.waiters++
+				pending.sessions[request.SessionID] = struct{}{}
+				manager.mu.Unlock()
+				if err := manager.waitForLaunch(ctx, pending); err != nil {
+					return Placement{}, err
+				}
+				continue
+			}
 			done := pending.done
 			manager.mu.Unlock()
 			select {
@@ -235,9 +282,9 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 					}
 					if oldShard.draining && len(oldShard.sessions) == 0 {
 						delete(manager.shards, oldShard.spec.ShardID)
-						pendingStop := manager.trackStopLocked(oldShard.spec.ShardID, oldShard.process)
+						pendingStop := manager.trackStopLocked(oldShard.spec, oldShard.process)
 						stopBeforePlacement = &trackedStop{
-							shardID: oldShard.spec.ShardID, pending: pendingStop,
+							key: shardProcessKeyFor(oldShard.spec), pending: pendingStop,
 							reason: "stop replaced session shard",
 						}
 					}
@@ -254,14 +301,25 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 			}
 			continue
 		}
-
-		scopeKey := string(request.Profile.ProcessScope) + "/" + string(request.Profile.OuterIsolation)
-		switch request.Profile.ProcessScope {
-		case ScopeTenant:
-			scopeKey += "/" + request.TenantID.String()
-		case ScopeSession:
-			scopeKey += "/" + request.SessionID.String()
+		var priorStop *trackedStop
+		for key, pending := range manager.pendingStops {
+			if pending.spec.ScopeKey != scopeKey {
+				continue
+			}
+			if priorStop == nil || key.shardID < priorStop.key.shardID || (key.shardID == priorStop.key.shardID && key.shardGeneration < priorStop.key.shardGeneration) {
+				priorStop = &trackedStop{
+					key: key, pending: pending, reason: "wait for prior workerd shard generation cleanup",
+				}
+			}
 		}
+		if priorStop != nil {
+			manager.mu.Unlock()
+			if err := manager.executeTrackedStop(ctx, *priorStop); err != nil {
+				return Placement{}, err
+			}
+			continue
+		}
+
 		candidates := make([]*shard, 0)
 		expiredStops := make([]trackedStop, 0)
 		for shardID, candidate := range manager.shards {
@@ -270,8 +328,8 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 				if len(candidate.sessions) == 0 {
 					delete(manager.shards, shardID)
 					expiredStops = append(expiredStops, trackedStop{
-						shardID: shardID,
-						pending: manager.trackStopLocked(shardID, candidate.process),
+						key:     shardProcessKeyFor(candidate.spec),
+						pending: manager.trackStopLocked(candidate.spec, candidate.process),
 						reason:  "stop expired workerd shard",
 					})
 				}
@@ -324,6 +382,16 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 		}
 
 		if pending := manager.pendingScopes[scopeKey]; pending != nil {
+			if !pending.abandoned && !pending.finished {
+				pending.waiters++
+				pending.sessions[request.SessionID] = struct{}{}
+				manager.pendingSessions[request.SessionID] = pending
+				manager.mu.Unlock()
+				if err := manager.waitForLaunch(ctx, pending); err != nil {
+					return Placement{}, err
+				}
+				continue
+			}
 			done := pending.done
 			manager.mu.Unlock()
 			select {
@@ -333,42 +401,153 @@ func (manager *Manager) Acquire(ctx context.Context, request PlacementRequest) (
 				continue
 			}
 		}
-		pending := &launchPending{done: make(chan struct{})}
-		manager.pendingScopes[scopeKey] = pending
-		manager.pendingSessions[request.SessionID] = pending
+		shardGeneration := manager.nextShardGeneration
+		if shardGeneration == 0 {
+			manager.mu.Unlock()
+			return Placement{}, fmt.Errorf("%w: shard generation exhausted", ErrInvalidConfig)
+		}
+		if shardGeneration == ^ShardGeneration(0) {
+			manager.nextShardGeneration = 0
+		} else {
+			manager.nextShardGeneration++
+		}
 		shardID := fmt.Sprintf("agent-shard-%020d", manager.nextShardSequence)
 		manager.nextShardSequence++
-		spec := ShardSpec{ShardID: shardID, ScopeKey: scopeKey, Profile: request.Profile, Limits: manager.limits, CreatedAt: request.Now}
+		spec := ShardSpec{
+			AgentInstanceID: manager.agentInstanceID,
+			ShardID:         shardID,
+			ShardGeneration: shardGeneration,
+			ScopeKey:        scopeKey,
+			Profile:         request.Profile,
+			Limits:          manager.limits,
+			CreatedAt:       request.Now,
+		}
+		launchCtx, cancelLaunch := context.WithCancel(context.Background())
+		pending := &launchPending{
+			ctx:      launchCtx,
+			cancel:   cancelLaunch,
+			done:     make(chan struct{}),
+			spec:     spec,
+			sessions: map[identity.ID]struct{}{request.SessionID: {}},
+			waiters:  1,
+		}
+		manager.pendingScopes[scopeKey] = pending
+		manager.pendingSessions[request.SessionID] = pending
 		manager.mu.Unlock()
+		go manager.runLaunch(pending)
+		if err := manager.waitForLaunch(ctx, pending); err != nil {
+			return Placement{}, err
+		}
+	}
+}
 
-		process, launchErr := manager.launcher.Start(ctx, spec)
-		var rejectedProcess ShardProcess
+func (manager *Manager) waitForLaunch(ctx context.Context, pending *launchPending) error {
+	select {
+	case <-ctx.Done():
+		var cancel context.CancelFunc
 		manager.mu.Lock()
-		delete(manager.pendingScopes, scopeKey)
-		delete(manager.pendingSessions, request.SessionID)
-		if launchErr == nil {
-			if process == nil || process.ID() != shardID {
-				launchErr = ErrInvalidConfig
+		if pending.waiters > 0 {
+			pending.waiters--
+		}
+		if !pending.finished && pending.waiters == 0 && !pending.abandoned {
+			pending.abandoned = true
+			cancel = pending.cancel
+		}
+		manager.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return ctx.Err()
+	case <-pending.done:
+		manager.mu.Lock()
+		if pending.waiters > 0 {
+			pending.waiters--
+		}
+		err := pending.err
+		manager.mu.Unlock()
+		return err
+	}
+}
+
+func (manager *Manager) runLaunch(pending *launchPending) {
+	process, launchErr := manager.launcher.Start(pending.ctx, pending.spec)
+	var rejectedProcess ShardProcess
+	processIsNil := process == nil
+	if !processIsNil {
+		value := reflect.ValueOf(process)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			processIsNil = value.IsNil()
+		}
+	}
+	processID := ""
+	if launchErr == nil && !processIsNil {
+		processID = process.ID()
+	}
+
+	manager.mu.Lock()
+	if launchErr == nil {
+		if processIsNil || processID != pending.spec.ShardID {
+			launchErr = ErrInvalidConfig
+			if !processIsNil {
 				rejectedProcess = process
-			} else {
-				manager.shards[shardID] = &shard{spec: spec, process: process, sessions: make(map[identity.ID]Placement)}
-				if manager.closed {
-					manager.shards[shardID].draining = true
-					launchErr = ErrManagerClosed
-				}
+			}
+		} else if manager.closed {
+			launchErr = ErrManagerClosed
+			rejectedProcess = process
+		} else if pending.abandoned {
+			launchErr = context.Canceled
+			rejectedProcess = process
+		} else {
+			manager.shards[pending.spec.ShardID] = &shard{
+				spec: pending.spec, process: process, sessions: make(map[identity.ID]Placement),
+			}
+		}
+	} else if !processIsNil {
+		rejectedProcess = process
+	}
+	if rejectedProcess == nil {
+		if launchErr != nil {
+			pending.err = fmt.Errorf("launch workerd shard: %w", launchErr)
+		}
+		pending.finished = true
+		if manager.pendingScopes[pending.spec.ScopeKey] == pending {
+			delete(manager.pendingScopes, pending.spec.ScopeKey)
+		}
+		for sessionID := range pending.sessions {
+			if manager.pendingSessions[sessionID] == pending {
+				delete(manager.pendingSessions, sessionID)
 			}
 		}
 		close(pending.done)
 		manager.mu.Unlock()
-		if rejectedProcess != nil {
-			if stopErr := rejectedProcess.Stop(ctx); stopErr != nil {
-				launchErr = errors.Join(launchErr, fmt.Errorf("stop rejected workerd process: %w", stopErr))
-			}
-		}
-		if launchErr != nil {
-			return Placement{}, fmt.Errorf("launch workerd shard: %w", launchErr)
+		pending.cancel()
+		return
+	}
+	rejectedStop := trackedStop{
+		key:     shardProcessKeyFor(pending.spec),
+		pending: manager.trackStopLocked(pending.spec, rejectedProcess),
+		reason:  "stop rejected workerd process",
+	}
+	manager.mu.Unlock()
+
+	if stopErr := manager.executeTrackedStop(context.Background(), rejectedStop); stopErr != nil {
+		launchErr = errors.Join(launchErr, stopErr)
+	}
+	manager.mu.Lock()
+	pending.err = fmt.Errorf("launch workerd shard: %w", launchErr)
+	pending.finished = true
+	if manager.pendingScopes[pending.spec.ScopeKey] == pending {
+		delete(manager.pendingScopes, pending.spec.ScopeKey)
+	}
+	for sessionID := range pending.sessions {
+		if manager.pendingSessions[sessionID] == pending {
+			delete(manager.pendingSessions, sessionID)
 		}
 	}
+	close(pending.done)
+	manager.mu.Unlock()
+	pending.cancel()
 }
 
 func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) error {
@@ -395,6 +574,16 @@ func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) err
 	placement, found := manager.placements[request.SessionID]
 	if !found {
 		manager.releasedGenerations[request.SessionID] = request.PlacementGeneration
+		cleanup, cleanupFound := manager.releaseCleanups[request.SessionID]
+		if cleanupFound && cleanup.placementGeneration == request.PlacementGeneration {
+			if pending := manager.pendingStops[cleanup.key]; pending != nil {
+				stop := trackedStop{
+					key: cleanup.key, pending: pending, reason: "wait for released workerd shard cleanup",
+				}
+				manager.mu.Unlock()
+				return manager.executeTrackedStop(ctx, stop)
+			}
+		}
 		manager.mu.Unlock()
 		return nil
 	}
@@ -412,9 +601,13 @@ func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) err
 		if currentShard.draining && len(currentShard.sessions) == 0 {
 			delete(manager.shards, currentShard.spec.ShardID)
 			stop = &trackedStop{
-				shardID: currentShard.spec.ShardID,
-				pending: manager.trackStopLocked(currentShard.spec.ShardID, currentShard.process),
+				key:     shardProcessKeyFor(currentShard.spec),
+				pending: manager.trackStopLocked(currentShard.spec, currentShard.process),
 				reason:  "stop empty workerd shard",
+			}
+			manager.releaseCleanups[request.SessionID] = releaseCleanup{
+				placementGeneration: request.PlacementGeneration,
+				key:                 stop.key,
 			}
 		}
 	}
@@ -447,8 +640,8 @@ func (manager *Manager) Observe(observation ShardObservation) error {
 	if current.draining && len(current.sessions) == 0 {
 		delete(manager.shards, observation.ShardID)
 		stop = &trackedStop{
-			shardID: observation.ShardID,
-			pending: manager.trackStopLocked(observation.ShardID, current.process),
+			key:     shardProcessKeyFor(current.spec),
+			pending: manager.trackStopLocked(current.spec, current.process),
 			reason:  "stop drained workerd shard",
 		}
 	}
@@ -504,99 +697,108 @@ func (manager *Manager) Shutdown(ctx context.Context) error {
 	}
 	sort.Strings(shardIDs)
 	stops := make([]trackedStop, 0, len(shardIDs)+len(manager.pendingStops))
-	newStops := make(map[string]struct{}, len(shardIDs))
+	newStops := make(map[shardProcessKey]struct{}, len(shardIDs))
 	for _, shardID := range shardIDs {
 		current := manager.shards[shardID]
 		delete(manager.shards, shardID)
 		for sessionID := range current.sessions {
 			delete(manager.placements, sessionID)
 		}
-		pending := manager.trackStopLocked(shardID, current.process)
+		key := shardProcessKeyFor(current.spec)
+		pending := manager.trackStopLocked(current.spec, current.process)
 		stops = append(stops, trackedStop{
-			shardID: shardID, pending: pending, reason: "stop workerd shard during shutdown",
+			key: key, pending: pending, reason: "stop workerd shard during shutdown",
 		})
-		newStops[shardID] = struct{}{}
+		newStops[key] = struct{}{}
 	}
-	pendingIDs := make([]string, 0, len(manager.pendingStops))
-	for shardID := range manager.pendingStops {
-		if _, newlyTracked := newStops[shardID]; !newlyTracked {
-			pendingIDs = append(pendingIDs, shardID)
+	for key, pending := range manager.pendingStops {
+		if _, newlyTracked := newStops[key]; newlyTracked {
+			continue
 		}
-	}
-	sort.Strings(pendingIDs)
-	waiting := make([]<-chan struct{}, 0, len(pendingIDs))
-	for _, shardID := range pendingIDs {
-		pending := manager.pendingStops[shardID]
 		select {
 		case <-pending.done:
 			if pending.err != nil {
-				retry := &stopPending{process: pending.process, done: make(chan struct{})}
-				manager.pendingStops[shardID] = retry
+				retry := &stopPending{spec: pending.spec, process: pending.process, done: make(chan struct{})}
+				manager.pendingStops[key] = retry
 				stops = append(stops, trackedStop{
-					shardID: shardID, pending: retry, reason: "retry uncertain workerd shard stop during shutdown",
+					key: key, pending: retry, reason: "retry uncertain workerd shard stop during shutdown",
 				})
 			}
 		default:
-			waiting = append(waiting, pending.done)
+			stops = append(stops, trackedStop{
+				key: key, pending: pending, reason: "wait for workerd shard stop during shutdown",
+			})
 		}
 	}
 	manager.placements = make(map[identity.ID]Placement)
+	sort.Slice(stops, func(left, right int) bool {
+		if stops[left].key.shardID != stops[right].key.shardID {
+			return stops[left].key.shardID < stops[right].key.shardID
+		}
+		return stops[left].key.shardGeneration < stops[right].key.shardGeneration
+	})
 	manager.mu.Unlock()
 
+	for _, stop := range stops {
+		manager.startTrackedStop(stop)
+	}
 	var stopErr error
 	for _, stop := range stops {
 		if err := manager.executeTrackedStop(ctx, stop); err != nil {
 			stopErr = errors.Join(stopErr, err)
-		}
-	}
-	for _, done := range waiting {
-		select {
-		case <-ctx.Done():
-			stopErr = errors.Join(stopErr, ctx.Err())
-		case <-done:
-		}
-	}
-	manager.mu.Lock()
-	for _, pending := range manager.pendingStops {
-		select {
-		case <-pending.done:
-			if pending.err != nil {
-				stopErr = errors.Join(stopErr, pending.err)
+			if ctx.Err() != nil {
+				break
 			}
-		default:
-			stopErr = errors.Join(stopErr, context.Canceled)
 		}
 	}
-	manager.mu.Unlock()
 	return stopErr
 }
 
 // trackStopLocked transfers process ownership from the live shard map to a
 // retryable termination record. manager.mu must be held by the caller.
-func (manager *Manager) trackStopLocked(shardID string, process ShardProcess) *stopPending {
-	if pending := manager.pendingStops[shardID]; pending != nil {
+func (manager *Manager) trackStopLocked(spec ShardSpec, process ShardProcess) *stopPending {
+	key := shardProcessKeyFor(spec)
+	if pending := manager.pendingStops[key]; pending != nil {
 		return pending
 	}
-	pending := &stopPending{process: process, done: make(chan struct{})}
-	manager.pendingStops[shardID] = pending
+	pending := &stopPending{spec: spec, process: process, done: make(chan struct{})}
+	manager.pendingStops[key] = pending
 	return pending
 }
 
+func (manager *Manager) startTrackedStop(stop trackedStop) {
+	stop.pending.startOnce.Do(func() {
+		go func() {
+			err := stop.pending.process.Stop(context.Background())
+			manager.mu.Lock()
+			stop.pending.err = err
+			close(stop.pending.done)
+			if err == nil && manager.pendingStops[stop.key] == stop.pending {
+				delete(manager.pendingStops, stop.key)
+			}
+			manager.mu.Unlock()
+		}()
+	})
+}
+
 func (manager *Manager) executeTrackedStop(ctx context.Context, stop trackedStop) error {
-	err := stop.pending.process.Stop(ctx)
-	manager.mu.Lock()
-	if current := manager.pendingStops[stop.shardID]; current == stop.pending {
-		stop.pending.err = err
-		close(stop.pending.done)
-		if err == nil {
-			delete(manager.pendingStops, stop.shardID)
+	manager.startTrackedStop(stop)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-stop.pending.done:
+		manager.mu.Lock()
+		err := stop.pending.err
+		manager.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("%s: %w", stop.reason, err)
 		}
+		return nil
 	}
-	manager.mu.Unlock()
-	if err != nil {
-		return fmt.Errorf("%s: %w", stop.reason, err)
-	}
-	return nil
+}
+
+func shardProcessKeyFor(spec ShardSpec) shardProcessKey {
+	return shardProcessKey{shardID: spec.ShardID, shardGeneration: spec.ShardGeneration}
 }
 
 func (manager *Manager) Snapshot() ManagerSnapshot {

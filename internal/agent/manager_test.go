@@ -20,6 +20,7 @@ var errLaunch = errors.New("test: launch failed")
 type fakeLauncher struct {
 	mu         sync.Mutex
 	starts     int
+	specs      []ShardSpec
 	stops      []string
 	failNext   bool
 	startGate  chan struct{}
@@ -29,6 +30,7 @@ type fakeLauncher struct {
 func (launcher *fakeLauncher) Start(ctx context.Context, spec ShardSpec) (ShardProcess, error) {
 	launcher.mu.Lock()
 	launcher.starts++
+	launcher.specs = append(launcher.specs, spec)
 	fail := launcher.failNext
 	launcher.failNext = false
 	gate := launcher.startGate
@@ -56,6 +58,12 @@ func (launcher *fakeLauncher) counts() (int, []string) {
 	return launcher.starts, append([]string(nil), launcher.stops...)
 }
 
+func (launcher *fakeLauncher) launchSpecs() []ShardSpec {
+	launcher.mu.Lock()
+	defer launcher.mu.Unlock()
+	return append([]ShardSpec(nil), launcher.specs...)
+}
+
 type fakeProcess struct {
 	id       string
 	launcher *fakeLauncher
@@ -72,6 +80,89 @@ func (process *fakeProcess) Stop(context.Context) error {
 	})
 	return nil
 }
+
+type delayedCancellationLauncher struct {
+	mu              sync.Mutex
+	specs           []ShardSpec
+	contextCanceled chan struct{}
+	returnGate      chan struct{}
+	releaseOnce     sync.Once
+}
+
+func newDelayedCancellationLauncher() *delayedCancellationLauncher {
+	return &delayedCancellationLauncher{
+		contextCanceled: make(chan struct{}),
+		returnGate:      make(chan struct{}),
+	}
+}
+
+func (launcher *delayedCancellationLauncher) Start(ctx context.Context, spec ShardSpec) (ShardProcess, error) {
+	launcher.mu.Lock()
+	launcher.specs = append(launcher.specs, spec)
+	call := len(launcher.specs)
+	launcher.mu.Unlock()
+	if call == 1 {
+		<-ctx.Done()
+		close(launcher.contextCanceled)
+		<-launcher.returnGate
+		return nil, ctx.Err()
+	}
+	return &fakeProcess{id: spec.ShardID, launcher: &fakeLauncher{}}, nil
+}
+
+func (launcher *delayedCancellationLauncher) releaseFirstStart() {
+	launcher.releaseOnce.Do(func() { close(launcher.returnGate) })
+}
+
+func (launcher *delayedCancellationLauncher) launchSpecs() []ShardSpec {
+	launcher.mu.Lock()
+	defer launcher.mu.Unlock()
+	return append([]ShardSpec(nil), launcher.specs...)
+}
+
+type blockingIDLauncher struct {
+	idEntered   chan struct{}
+	idGate      chan struct{}
+	releaseOnce sync.Once
+}
+
+func newBlockingIDLauncher() *blockingIDLauncher {
+	return &blockingIDLauncher{idEntered: make(chan struct{}), idGate: make(chan struct{})}
+}
+
+func (launcher *blockingIDLauncher) Start(_ context.Context, spec ShardSpec) (ShardProcess, error) {
+	return &blockingIDProcess{id: spec.ShardID, launcher: launcher}, nil
+}
+
+func (launcher *blockingIDLauncher) releaseID() {
+	launcher.releaseOnce.Do(func() { close(launcher.idGate) })
+}
+
+type blockingIDProcess struct {
+	id       string
+	launcher *blockingIDLauncher
+}
+
+func (process *blockingIDProcess) ID() string {
+	close(process.launcher.idEntered)
+	<-process.launcher.idGate
+	return process.id
+}
+
+func (*blockingIDProcess) Stop(context.Context) error { return nil }
+
+type typedNilLauncher struct{}
+
+func (typedNilLauncher) Start(context.Context, ShardSpec) (ShardProcess, error) {
+	var process *typedNilProcess
+	return process, nil
+}
+
+type typedNilProcess struct{}
+
+func (*typedNilProcess) ID() string { panic("typed-nil process ID callback") }
+
+func (*typedNilProcess) Stop(context.Context) error { panic("typed-nil process Stop callback") }
 
 func TestValidateProfileEnforcesTrustClassMinimums(t *testing.T) {
 	t.Parallel()
@@ -367,6 +458,157 @@ func TestManagerConcurrentSameSessionStartsAndAdmitsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestManagerInitiatorCancellationDoesNotCancelAttachedSameSessionFollower(t *testing.T) {
+	launcher := &fakeLauncher{startGate: make(chan struct{})}
+	var releaseGate sync.Once
+	releaseStart := func() { releaseGate.Do(func() { close(launcher.startGate) }) }
+	defer releaseStart()
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 8, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "shared-context-tenant", "shared-context-session", 1, time.Unix(2_000_000_350, 0).UTC())
+	initiatorCtx, cancelInitiator := context.WithCancel(context.Background())
+	defer cancelInitiator()
+	initiatorResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(initiatorCtx, request)
+		initiatorResult <- err
+	}()
+	waitForLauncherStarts(t, launcher, 1)
+
+	followerResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(context.Background(), request)
+		followerResult <- err
+	}()
+	waitForPendingLaunchWaiters(t, manager, request.SessionID, 2)
+	cancelInitiator()
+	if err := receiveError(t, initiatorResult); !errors.Is(err, context.Canceled) {
+		t.Fatalf("initiator Acquire() error = %v, want context.Canceled", err)
+	}
+	releaseStart()
+	if err := receiveError(t, followerResult); err != nil {
+		t.Fatalf("follower Acquire() error = %v", err)
+	}
+	starts, _ := launcher.counts()
+	if starts != 1 {
+		t.Fatalf("launcher starts = %d, want one shared attempt", starts)
+	}
+}
+
+func TestManagerInitiatorCancellationDoesNotCancelAttachedSameScopeFollower(t *testing.T) {
+	launcher := &fakeLauncher{startGate: make(chan struct{})}
+	var releaseGate sync.Once
+	releaseStart := func() { releaseGate.Do(func() { close(launcher.startGate) }) }
+	defer releaseStart()
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 8, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	now := time.Unix(2_000_000_360, 0).UTC()
+	initiatorRequest := baseRequest(t, "shared-scope-tenant-a", "shared-scope-session-a", 1, now)
+	followerRequest := baseRequest(t, "shared-scope-tenant-b", "shared-scope-session-b", 1, now)
+	initiatorCtx, cancelInitiator := context.WithCancel(context.Background())
+	defer cancelInitiator()
+	initiatorResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(initiatorCtx, initiatorRequest)
+		initiatorResult <- err
+	}()
+	waitForLauncherStarts(t, launcher, 1)
+
+	followerResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(context.Background(), followerRequest)
+		followerResult <- err
+	}()
+	waitForPendingLaunchWaiters(t, manager, followerRequest.SessionID, 2)
+	cancelInitiator()
+	if err := receiveError(t, initiatorResult); !errors.Is(err, context.Canceled) {
+		t.Fatalf("initiator Acquire() error = %v, want context.Canceled", err)
+	}
+	releaseStart()
+	if err := receiveError(t, followerResult); err != nil {
+		t.Fatalf("same-scope follower Acquire() error = %v", err)
+	}
+	starts, _ := launcher.counts()
+	if starts != 1 {
+		t.Fatalf("launcher starts = %d, want one shared attempt", starts)
+	}
+}
+
+func TestManagerSharedLaunchFailureFansOutWithoutFollowerRetry(t *testing.T) {
+	launcher := &fakeLauncher{failNext: true, startGate: make(chan struct{})}
+	var releaseGate sync.Once
+	releaseStart := func() { releaseGate.Do(func() { close(launcher.startGate) }) }
+	defer releaseStart()
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 8, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	now := time.Unix(2_000_000_370, 0).UTC()
+	firstRequest := baseRequest(t, "failure-fanout-tenant-a", "failure-fanout-session-a", 1, now)
+	secondRequest := baseRequest(t, "failure-fanout-tenant-b", "failure-fanout-session-b", 1, now)
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(context.Background(), firstRequest)
+		firstResult <- err
+	}()
+	waitForLauncherStarts(t, launcher, 1)
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(context.Background(), secondRequest)
+		secondResult <- err
+	}()
+	waitForPendingLaunchWaiters(t, manager, secondRequest.SessionID, 2)
+	releaseStart()
+	if err := receiveError(t, firstResult); !errors.Is(err, errLaunch) {
+		t.Fatalf("first Acquire() error = %v, want launch failure", err)
+	}
+	if err := receiveError(t, secondResult); !errors.Is(err, errLaunch) {
+		t.Fatalf("second Acquire() error = %v, want same launch failure", err)
+	}
+	starts, _ := launcher.counts()
+	if starts != 1 {
+		t.Fatalf("launcher starts = %d, want failed attempt shared without retry", starts)
+	}
+}
+
+func TestManagerLastLaunchWaiterCancellationLeavesAbandonedBarrierUntilStartReturns(t *testing.T) {
+	launcher := newDelayedCancellationLauncher()
+	defer launcher.releaseFirstStart()
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 8, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "abandoned-tenant", "abandoned-session", 1, time.Unix(2_000_000_380, 0).UTC())
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(ctx, request)
+		result <- err
+	}()
+	waitForDelayedLauncherStarts(t, launcher, 1)
+	cancel()
+	if err := receiveError(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Acquire() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-launcher.contextCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("manager-owned launch context was not canceled after its last waiter left")
+	}
+	waitForPendingLaunchAbandoned(t, manager, request.SessionID)
+
+	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelBarrier()
+	if _, err := manager.Acquire(barrierCtx, request); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Acquire(behind abandoned launch) error = %v, want deadline", err)
+	}
+	if specs := launcher.launchSpecs(); len(specs) != 1 {
+		t.Fatalf("launches before abandoned attempt returned = %#v, want one", specs)
+	}
+
+	launcher.releaseFirstStart()
+	waitForNoPendingLaunch(t, manager, request.SessionID)
+	if _, err := manager.Acquire(context.Background(), request); err != nil {
+		t.Fatalf("Acquire(retry) error = %v", err)
+	}
+	specs := launcher.launchSpecs()
+	if len(specs) != 2 || specs[1].ShardGeneration != specs[0].ShardGeneration+1 {
+		t.Fatalf("retry launch specs = %#v, want a fresh generation", specs)
+	}
+}
+
 func TestManagerRecoversAfterShardLaunchFailure(t *testing.T) {
 	t.Parallel()
 	launcher := &fakeLauncher{failNext: true}
@@ -384,6 +626,71 @@ func TestManagerRecoversAfterShardLaunchFailure(t *testing.T) {
 	}
 }
 
+func TestManagerLaunchSpecBindsOneAgentInstanceAndFreshShardGeneration(t *testing.T) {
+	t.Parallel()
+	launcher := &fakeLauncher{}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 1, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	now := time.Unix(2_000_000_425, 0).UTC()
+	mustAcquire(t, manager, baseRequest(t, "identity-tenant-a", "identity-session-a", 1, now))
+	mustAcquire(t, manager, baseRequest(t, "identity-tenant-b", "identity-session-b", 1, now.Add(time.Second)))
+
+	specs := launcher.launchSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("launch specs = %#v, want two", specs)
+	}
+	if specs[0].AgentInstanceID.Kind() != identity.Process || specs[0].AgentInstanceID.String() == "" {
+		t.Fatalf("first AgentInstanceID = %q (%q), want process identity", specs[0].AgentInstanceID.String(), specs[0].AgentInstanceID.Kind())
+	}
+	if specs[1].AgentInstanceID != specs[0].AgentInstanceID {
+		t.Fatalf("AgentInstanceIDs = %q and %q, want one manager-owned identity", specs[0].AgentInstanceID, specs[1].AgentInstanceID)
+	}
+	if specs[0].ShardGeneration == 0 || specs[1].ShardGeneration != specs[0].ShardGeneration+1 {
+		t.Fatalf("ShardGenerations = %d and %d, want consecutive nonzero generations", specs[0].ShardGeneration, specs[1].ShardGeneration)
+	}
+}
+
+func TestManagerLaunchRetryConsumesFreshShardGeneration(t *testing.T) {
+	t.Parallel()
+	launcher := &fakeLauncher{failNext: true}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 1, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "retry-generation-tenant", "retry-generation-session", 1, time.Unix(2_000_000_430, 0).UTC())
+
+	if _, err := manager.Acquire(context.Background(), request); !errors.Is(err, errLaunch) {
+		t.Fatalf("first Acquire() error = %v, want launch error", err)
+	}
+	mustAcquire(t, manager, request)
+
+	specs := launcher.launchSpecs()
+	if len(specs) != 2 {
+		t.Fatalf("launch specs = %#v, want two", specs)
+	}
+	if specs[0].ShardGeneration == 0 || specs[1].ShardGeneration != specs[0].ShardGeneration+1 {
+		t.Fatalf("retry ShardGenerations = %d and %d, want fresh consecutive generations", specs[0].ShardGeneration, specs[1].ShardGeneration)
+	}
+	if specs[0].AgentInstanceID != specs[1].AgentInstanceID {
+		t.Fatalf("retry AgentInstanceIDs = %q and %q", specs[0].AgentInstanceID, specs[1].AgentInstanceID)
+	}
+}
+
+func TestManagerShardGenerationOverflowFailsClosedBeforeAnotherStart(t *testing.T) {
+	t.Parallel()
+	launcher := &fakeLauncher{failNext: true}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 1, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	manager.nextShardGeneration = ^ShardGeneration(0)
+	request := baseRequest(t, "overflow-tenant", "overflow-session", 1, time.Unix(2_000_000_435, 0).UTC())
+
+	if _, err := manager.Acquire(context.Background(), request); !errors.Is(err, errLaunch) {
+		t.Fatalf("maximum generation Acquire() error = %v, want launch error", err)
+	}
+	if _, err := manager.Acquire(context.Background(), request); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("post-overflow Acquire() error = %v, want ErrInvalidConfig", err)
+	}
+	specs := launcher.launchSpecs()
+	if len(specs) != 1 || specs[0].ShardGeneration != ^ShardGeneration(0) {
+		t.Fatalf("overflow launch specs = %#v, want one maximum-generation attempt", specs)
+	}
+}
+
 func TestManagerStopsAProcessThatViolatesTheLauncherIdentityContract(t *testing.T) {
 	t.Parallel()
 	launcher := &fakeLauncher{returnedID: "wrong-shard"}
@@ -395,6 +702,46 @@ func TestManagerStopsAProcessThatViolatesTheLauncherIdentityContract(t *testing.
 	_, stops := launcher.counts()
 	if len(stops) != 1 || stops[0] != "wrong-shard" {
 		t.Fatalf("invalid launcher process stops = %#v", stops)
+	}
+}
+
+func TestManagerProcessIDCallbackRunsWithoutManagerMutex(t *testing.T) {
+	launcher := newBlockingIDLauncher()
+	defer launcher.releaseID()
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 2, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "callback-tenant", "callback-session", 1, time.Unix(2_000_000_460, 0).UTC())
+	acquireResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire(context.Background(), request)
+		acquireResult <- err
+	}()
+	select {
+	case <-launcher.idEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process ID callback was not entered")
+	}
+
+	snapshotResult := make(chan ManagerSnapshot, 1)
+	go func() { snapshotResult <- manager.Snapshot() }()
+	select {
+	case snapshot := <-snapshotResult:
+		if snapshot != (ManagerSnapshot{}) {
+			t.Fatalf("Snapshot() while identity callback blocked = %#v", snapshot)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Snapshot() blocked behind process ID callback")
+	}
+	launcher.releaseID()
+	if err := receiveError(t, acquireResult); err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+}
+
+func TestManagerRejectsTypedNilShardProcessWithoutInvokingIt(t *testing.T) {
+	manager := mustManager(t, typedNilLauncher{}, Limits{MaximumSessions: 2, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	request := baseRequest(t, "typed-nil-tenant", "typed-nil-session", 1, time.Unix(2_000_000_465, 0).UTC())
+	if placement, err := manager.Acquire(context.Background(), request); !errors.Is(err, ErrInvalidConfig) || placement != (Placement{}) {
+		t.Fatalf("Acquire() = %#v, %v; want ErrInvalidConfig", placement, err)
 	}
 }
 
@@ -438,3 +785,85 @@ func mustID(t *testing.T, kind identity.Kind, seed string) identity.ID {
 }
 
 func digest(character string) string { return "sha256:" + strings.Repeat(character, 64) }
+
+func waitForPendingLaunchWaiters(t *testing.T, manager *Manager, sessionID identity.ID, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		manager.mu.Lock()
+		pending := manager.pendingSessions[sessionID]
+		waiters := 0
+		if pending != nil {
+			waiters = pending.waiters
+		}
+		manager.mu.Unlock()
+		if waiters == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending launch waiters = %d, want %d", waiters, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForPendingLaunchAbandoned(t *testing.T, manager *Manager, sessionID identity.ID) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		manager.mu.Lock()
+		pending := manager.pendingSessions[sessionID]
+		abandoned := pending != nil && pending.abandoned
+		manager.mu.Unlock()
+		if abandoned {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending launch did not enter abandoned state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForNoPendingLaunch(t *testing.T, manager *Manager, sessionID identity.ID) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		manager.mu.Lock()
+		pending := manager.pendingSessions[sessionID]
+		manager.mu.Unlock()
+		if pending == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pending launch was not removed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForDelayedLauncherStarts(t *testing.T, launcher *delayedCancellationLauncher, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		starts := len(launcher.launchSpecs())
+		if starts >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("launcher starts = %d, want at least %d", starts, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func receiveError(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for operation result")
+		return nil
+	}
+}
