@@ -165,14 +165,21 @@ not silently included in Unit 10.
   `(agentInstanceID, shardID, shardGeneration)` before a generation-local,
   strictly increasing `observationSequence`, and performs neither state
   mutation nor stop scheduling for invalid, missing, stale, duplicate, or
-  decreasing input. A new generation resets sequence ownership. `ObservedAt`
-  remains required diagnostic metadata but no longer drives lifetime or drain;
-  admission-time lifetime enforcement remains separate. Simultaneous equal-
-  sequence delivery linearizes to one winner without loser-payload mutation,
-  draining is irreversible, and observation-triggered Stop callbacks may
-  reenter Manager without its mutex held. Focused 50-pass and complete agent
-  10-pass race/shuffle gates, repository tests, and vet pass. The serialized
-  producer, process-token attachment, and lifecycle delivery remain.
+  decreasing input. Its stable classification order is malformed, closed
+  Manager, wrong agent boot, missing shard, wrong shard generation, then stale
+  sequence, so another boot cannot probe shard existence. A generation-scoped
+  live-shard state starts with no accepted sequence; a tuple-consistent
+  replacement-state test accepts its first nonzero value independently of the
+  prior state. `ObservedAt` remains required diagnostic metadata but no longer
+  drives lifetime or drain. The current lifetime path still trusts
+  composition-supplied `PlacementRequest.Now`; composition-owned clock wiring
+  remains open and is not claimed by this result. Simultaneous equal-sequence
+  delivery linearizes to one winner without loser-payload mutation, draining
+  is irreversible, observation-triggered Stop callbacks may reenter Manager
+  without its mutex held, and sequence wrap is rejected. Focused 50-pass and
+  complete agent 10-pass race/shuffle gates, repository tests, and vet pass.
+  The serialized producer, process-token attachment, and lifecycle delivery
+  remain.
 
 ### Outcome
 
@@ -308,9 +315,10 @@ start must not publish, drain, account, or remove its replacement.
 
 One observer loop will own each shard generation. It will serialize samples and
 assign a monotonic `observationSequence` after a complete read before delivery
-to the already-fenced Manager endpoint. Cumulative `memory.events` and
-`cpu.stat` values will be compared with the baseline captured for that exact
-generation.
+to the already-fenced Manager endpoint. It must never wrap a sequence inside
+one generation; exhaustion must recycle that generation or fail closed before
+another sample. Cumulative `memory.events` and `cpu.stat` values will be
+compared with the baseline captured for that exact generation.
 
 ### Readiness boundary
 

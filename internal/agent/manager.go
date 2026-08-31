@@ -788,6 +788,8 @@ func (manager *Manager) Release(ctx context.Context, request ReleaseRequest) err
 	return nil
 }
 
+// Observe validates shape, manager state, boot identity, shard existence,
+// shard generation, and sequence in that order before mutating live state.
 func (manager *Manager) Observe(observation ShardObservation) error {
 	if manager == nil || observation.AgentInstanceID.Kind() != identity.Process || observation.ShardID == "" ||
 		observation.ShardGeneration == 0 || observation.ObservationSequence == 0 || observation.ObservedAt.IsZero() {
@@ -798,13 +800,16 @@ func (manager *Manager) Observe(observation ShardObservation) error {
 		manager.mu.Unlock()
 		return ErrManagerClosed
 	}
+	if observation.AgentInstanceID != manager.agentInstanceID {
+		manager.mu.Unlock()
+		return ErrStaleObservation
+	}
 	current := manager.shards[observation.ShardID]
 	if current == nil {
 		manager.mu.Unlock()
 		return ErrShardNotFound
 	}
-	if observation.AgentInstanceID != manager.agentInstanceID ||
-		observation.AgentInstanceID != current.spec.AgentInstanceID ||
+	if observation.AgentInstanceID != current.spec.AgentInstanceID ||
 		observation.ShardGeneration != current.spec.ShardGeneration {
 		manager.mu.Unlock()
 		return ErrStaleObservation

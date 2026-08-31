@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -522,6 +523,55 @@ func TestManagerObserveRejectsInvalidIdentityBeforeMutation(t *testing.T) {
 	manager.mu.Unlock()
 }
 
+func TestManagerObserveUsesStableErrorPrecedenceWithoutLeakingShardExistenceAcrossBoots(t *testing.T) {
+	launcher := &fakeLauncher{}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 4, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	now := time.Unix(2_000_000_115, 0).UTC()
+	placement := mustAcquire(t, manager, baseRequest(t, "observation-precedence-tenant", "observation-precedence-session", 1, now))
+	spec := launcher.launchSpecs()[0]
+	otherAgentInstanceID, err := identity.New(identity.Process)
+	if err != nil {
+		t.Fatalf("identity.New(process) error = %v", err)
+	}
+	valid := ShardObservation{
+		AgentInstanceID: spec.AgentInstanceID, ShardID: placement.ShardID, ShardGeneration: spec.ShardGeneration,
+		ObservationSequence: 1, RSSBytes: 100, ObservedAt: now.Add(time.Second),
+	}
+
+	wrongBootMissing := valid
+	wrongBootMissing.AgentInstanceID = otherAgentInstanceID
+	wrongBootMissing.ShardID = "missing-shard"
+	if observeErr := manager.Observe(wrongBootMissing); !errors.Is(observeErr, ErrStaleObservation) {
+		t.Fatalf("Observe(wrong boot and missing shard) error = %v, want ErrStaleObservation", observeErr)
+	}
+	missing := valid
+	missing.ShardID = "missing-shard"
+	if observeErr := manager.Observe(missing); !errors.Is(observeErr, ErrShardNotFound) {
+		t.Fatalf("Observe(current boot and missing shard) error = %v, want ErrShardNotFound", observeErr)
+	}
+	wrongGenerationAndSequence := valid
+	wrongGenerationAndSequence.ShardGeneration++
+	if observeErr := manager.Observe(wrongGenerationAndSequence); !errors.Is(observeErr, ErrStaleObservation) {
+		t.Fatalf("Observe(wrong generation and duplicate sequence) error = %v, want ErrStaleObservation", observeErr)
+	}
+
+	manager.mu.Lock()
+	current := manager.shards[placement.ShardID]
+	if current == nil || current.lastObservationSequence != 0 || current.rssBytes != 0 || current.draining {
+		t.Fatalf("shard mutated while classifying observation errors: %#v", current)
+	}
+	manager.closed = true
+	manager.mu.Unlock()
+	if observeErr := manager.Observe(wrongBootMissing); !errors.Is(observeErr, ErrManagerClosed) {
+		t.Fatalf("Observe(closed, wrong boot, missing shard) error = %v, want ErrManagerClosed", observeErr)
+	}
+	malformed := wrongBootMissing
+	malformed.AgentInstanceID = identity.ID{}
+	if observeErr := manager.Observe(malformed); !errors.Is(observeErr, ErrInvalidRequest) {
+		t.Fatalf("Observe(malformed closed request) error = %v, want ErrInvalidRequest", observeErr)
+	}
+}
+
 func TestManagerObserveRejectsStaleTupleAndSequenceBeforeMutation(t *testing.T) {
 	launcher := &fakeLauncher{}
 	manager := mustManager(t, launcher, Limits{MaximumSessions: 4, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
@@ -733,8 +783,14 @@ func TestManagerObserveRejectsDelayedOldGenerationWithoutRewritingReplacement(t 
 	oldShard := manager.shards[placement.ShardID]
 	replacementSpec := oldShard.spec
 	replacementSpec.ShardGeneration++
+	replacementProcess := &fakeProcess{
+		agentInstanceID: replacementSpec.AgentInstanceID,
+		id:              replacementSpec.ShardID,
+		shardGeneration: replacementSpec.ShardGeneration,
+		launcher:        launcher,
+	}
 	replacement := &shard{
-		spec: replacementSpec, process: oldShard.process, sessions: oldShard.sessions,
+		spec: replacementSpec, process: replacementProcess, sessions: oldShard.sessions,
 		estimatedResidentBytes: oldShard.estimatedResidentBytes, rssBytes: 700,
 	}
 	manager.shards[placement.ShardID] = replacement
@@ -763,6 +819,34 @@ func TestManagerObserveRejectsDelayedOldGenerationWithoutRewritingReplacement(t 
 	current = manager.shards[placement.ShardID]
 	if current != replacement || current.lastObservationSequence != 1 || current.rssBytes != 600 || current.draining {
 		t.Fatalf("replacement first observation = %#v", current)
+	}
+	manager.mu.Unlock()
+}
+
+func TestManagerObserveNeverWrapsSequenceWithinAGeneration(t *testing.T) {
+	launcher := &fakeLauncher{}
+	manager := mustManager(t, launcher, Limits{MaximumSessions: 4, MemoryLimitBytes: 1_000, AdmissionMemoryWatermarkBytes: 800, MaximumLifetime: time.Hour})
+	now := time.Unix(2_000_000_142, 0).UTC()
+	placement := mustAcquire(t, manager, baseRequest(t, "observation-exhaustion-tenant", "observation-exhaustion-session", 1, now))
+	spec := launcher.launchSpecs()[0]
+	maximum := ShardObservation{
+		AgentInstanceID: spec.AgentInstanceID, ShardID: placement.ShardID, ShardGeneration: spec.ShardGeneration,
+		ObservationSequence: math.MaxUint64, RSSBytes: 100, ObservedAt: now.Add(time.Second),
+	}
+	if err := manager.Observe(maximum); err != nil {
+		t.Fatalf("Observe(maximum sequence) error = %v", err)
+	}
+	wrapped := maximum
+	wrapped.ObservationSequence = 1
+	wrapped.RSSBytes = 900
+	wrapped.HeapPressure = true
+	if err := manager.Observe(wrapped); !errors.Is(err, ErrStaleObservationSequence) {
+		t.Fatalf("Observe(wrapped sequence) error = %v, want ErrStaleObservationSequence", err)
+	}
+	manager.mu.Lock()
+	current := manager.shards[placement.ShardID]
+	if current == nil || current.lastObservationSequence != math.MaxUint64 || current.rssBytes != 100 || current.draining {
+		t.Fatalf("shard mutated by wrapped observation: %#v", current)
 	}
 	manager.mu.Unlock()
 }

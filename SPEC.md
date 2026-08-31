@@ -546,7 +546,8 @@ shard 제거 또는 stop scheduling을 변경하기 전에 정확한
 감소한 sequence는 어떤 Manager 상태도 변경해서는 안 된다. `ObservedAt`은 비어
 있지 않은 진단 메타데이터여야 하지만 ordering, freshness, maximum lifetime 또는
 drain 판단의 권위로 사용해서는 안 된다. Maximum lifetime은 observation의 벽시계가
-아니라 Manager가 신뢰한 admission 시각을 기준으로 계속 강제한다.
+아니라 Manager composition이 소유하거나 검증한 trusted time source를 기준으로 MUST
+강제하며, 신뢰되지 않은 workload caller가 그 시각을 선택해서는 안 된다.
 
 ## 9. Pi 세션 실행 모델
 
