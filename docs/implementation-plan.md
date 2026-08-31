@@ -36,6 +36,11 @@ not silently included in Unit 10.
   direct decimal serialization and exact readback rejection tests. Focused and
   full `internal/agent` race tests pass. This is a host-independent contract
   result only and does not promote an external qualification status.
+- 2026-08-31: the versioned 64 KiB qualification-input parser now accepts only
+  bounded operator paths, architecture, finite limits, timeouts, and sample
+  count. Strict JSON tests reject duplicate/unknown members and any
+  caller-controlled digest, version, argv, or child environment. Package race
+  tests and vet pass; the external runner remains unimplemented.
 
 ### Outcome
 
