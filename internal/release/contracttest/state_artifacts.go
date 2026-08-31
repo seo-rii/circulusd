@@ -52,6 +52,10 @@ func StateArtifactDigests(
 				Architecture: "any", Name: name + ".tar.zst", SHA256: digest, SizeBytes: &size,
 			}},
 		}
+		if name == "workerd" {
+			component.Artifacts[0].ExtractionRecipe = release.ExtractionRecipeGzipSingleFileV1
+			component.Artifacts[0].ExtractedExecutableSHA256 = strings.Repeat("c", 64)
+		}
 		signingDigest, err := release.ArtifactSigningDigest(manifest.Release, component, component.Artifacts[0])
 		if err != nil {
 			t.Fatalf("ArtifactSigningDigest() error = %v", err)

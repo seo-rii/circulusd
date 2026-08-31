@@ -3,6 +3,7 @@ package release
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -186,6 +187,51 @@ func TestManifestSignatureCoversArtifactSignatures(t *testing.T) {
 	}
 }
 
+func TestWorkerdExtractionProvenanceIsCoveredByArtifactAndManifestSignatures(t *testing.T) {
+	t.Parallel()
+
+	manifest, publicKey := signedPromotion(t, "candidate")
+	store, err := NewTrustStore(map[string]ed25519.PublicKey{"release-root-1": publicKey})
+	if err != nil {
+		t.Fatalf("NewTrustStore() error = %v", err)
+	}
+
+	t.Run("artifact signature", func(t *testing.T) {
+		tampered := cloneManifest(manifest)
+		artifact := workerdArtifact(t, &tampered)
+		artifact.ExtractedExecutableSHA256 = strings.Repeat("e", 64)
+		if err := store.VerifyPromotion(tampered); err == nil {
+			t.Fatal("VerifyPromotion(extracted digest tamper) error = nil")
+		}
+	})
+
+	t.Run("manifest signature", func(t *testing.T) {
+		tampered := cloneManifest(manifest)
+		artifact := workerdArtifact(t, &tampered)
+		artifact.ExtractedExecutableSHA256 = strings.Repeat("f", 64)
+
+		privateKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+		digest, err := ArtifactSigningDigest(
+			tampered.Release,
+			workerdComponent(t, &tampered),
+			*artifact,
+		)
+		if err != nil {
+			t.Fatalf("ArtifactSigningDigest() error = %v", err)
+		}
+		artifact.Signature = &Signature{
+			Algorithm: "ed25519",
+			KeyID:     "release-root-1",
+			Value: base64.StdEncoding.EncodeToString(
+				ed25519.Sign(privateKey, []byte(digest)),
+			),
+		}
+		if err := store.VerifyPromotion(tampered); err == nil {
+			t.Fatal("VerifyPromotion(re-signed provenance tamper) error = nil")
+		}
+	})
+}
+
 func signedPromotion(t *testing.T, status string) (Manifest, ed25519.PublicKey) {
 	t.Helper()
 
@@ -224,4 +270,30 @@ func signedPromotion(t *testing.T, status string) (Manifest, ed25519.PublicKey) 
 		),
 	}}
 	return manifest, privateKey.Public().(ed25519.PublicKey)
+}
+
+func workerdComponent(t *testing.T, manifest *Manifest) Component {
+	t.Helper()
+
+	for _, component := range manifest.Components {
+		if component.Name == "workerd" {
+			return component
+		}
+	}
+	t.Fatal("workerd component is missing")
+	return Component{}
+}
+
+func workerdArtifact(t *testing.T, manifest *Manifest) *Artifact {
+	t.Helper()
+
+	for componentIndex := range manifest.Components {
+		component := &manifest.Components[componentIndex]
+		if component.Name != "workerd" || len(component.Artifacts) == 0 {
+			continue
+		}
+		return &component.Artifacts[0]
+	}
+	t.Fatal("workerd artifact is missing")
+	return nil
 }

@@ -14,6 +14,11 @@ import (
 const (
 	maxManifestBytes = 4 << 20
 	maxJSONInteger   = uint64(9_007_199_254_740_991)
+
+	// ExtractionRecipeGzipSingleFileV1 identifies byte-for-byte decompression
+	// of one complete gzip stream into one executable, without member selection
+	// or content transformation.
+	ExtractionRecipeGzipSingleFileV1 = "gzip-single-file-v1"
 )
 
 var (
@@ -70,11 +75,14 @@ type Component struct {
 }
 
 type Artifact struct {
-	Architecture string     `json:"architecture"`
-	Name         string     `json:"name"`
-	SHA256       string     `json:"sha256"`
-	SizeBytes    *uint64    `json:"sizeBytes,omitempty"`
-	Signature    *Signature `json:"signature,omitempty"`
+	Architecture string `json:"architecture"`
+	Name         string `json:"name"`
+	// SHA256 covers the exact archive bytes before extraction.
+	SHA256                    string     `json:"sha256"`
+	ExtractionRecipe          string     `json:"extractionRecipe,omitempty"`
+	ExtractedExecutableSHA256 string     `json:"extractedExecutableSha256,omitempty"`
+	SizeBytes                 *uint64    `json:"sizeBytes,omitempty"`
+	Signature                 *Signature `json:"signature,omitempty"`
 }
 
 type ProtocolVersion struct {
@@ -217,7 +225,16 @@ func (manifest Manifest) Validate() error {
 			}
 			coveredArchitectures[artifact.Architecture] = struct{}{}
 			if !digestPattern.MatchString(artifact.SHA256) {
-				return fmt.Errorf("component %q artifact %q has an invalid SHA-256 digest", component.Name, artifact.Name)
+				return fmt.Errorf("component %q artifact %q has an invalid archive SHA-256 digest", component.Name, artifact.Name)
+			}
+			hasExtractionProvenance := artifact.ExtractionRecipe != "" || artifact.ExtractedExecutableSHA256 != ""
+			if component.Name == "workerd" || hasExtractionProvenance {
+				if artifact.ExtractionRecipe != ExtractionRecipeGzipSingleFileV1 {
+					return fmt.Errorf("component %q artifact %q has an invalid extraction recipe", component.Name, artifact.Name)
+				}
+				if !digestPattern.MatchString(artifact.ExtractedExecutableSHA256) {
+					return fmt.Errorf("component %q artifact %q has an invalid extracted executable SHA-256 digest", component.Name, artifact.Name)
+				}
 			}
 			if artifact.SizeBytes != nil && *artifact.SizeBytes > maxJSONInteger {
 				return fmt.Errorf("component %q artifact %q size exceeds the JSON safe-integer range", component.Name, artifact.Name)

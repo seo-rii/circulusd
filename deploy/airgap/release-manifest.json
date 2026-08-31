@@ -38,12 +38,16 @@
         {
           "architecture": "x86_64",
           "name": "workerd-linux-64.gz",
-          "sha256": "45fb5f0e630c224884311d7321c477cbabab1951ba0d894bd8c6ea6f99ad5143"
+          "sha256": "45fb5f0e630c224884311d7321c477cbabab1951ba0d894bd8c6ea6f99ad5143",
+          "extractionRecipe": "gzip-single-file-v1",
+          "extractedExecutableSha256": "b805ed481caa643953357d38146b82c118addcb525eb87e3d190b5617c82bc75"
         },
         {
           "architecture": "aarch64",
           "name": "workerd-linux-arm64.gz",
-          "sha256": "c66f93f5b524c9b091e7298d9f02360331c4bcdc9489734d868810a6478f076f"
+          "sha256": "c66f93f5b524c9b091e7298d9f02360331c4bcdc9489734d868810a6478f076f",
+          "extractionRecipe": "gzip-single-file-v1",
+          "extractedExecutableSha256": "126035f8d7308219461bc2779bf05375a929bf69c041f3533e575e332ae6f2a0"
         }
       ]
     },

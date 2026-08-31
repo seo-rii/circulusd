@@ -41,6 +41,13 @@ not silently included in Unit 10.
   count. Strict JSON tests reject duplicate/unknown members and any
   caller-controlled digest, version, argv, or child environment. Package race
   tests and vet pass; the external runner remains unimplemented.
+- 2026-08-31: each workerd release artifact now pins its archive digest,
+  `gzip-single-file-v1` extraction recipe, and extracted executable digest.
+  Artifact and manifest signatures cover both new provenance fields, and the
+  repository pins were checked against the official x86_64 and aarch64 assets.
+  Release/package race tests, the API schema contract, and the complete Go test
+  suite pass. Runtime extraction/opened-executable verification remains in the
+  external-runner slice.
 
 ### Outcome
 

@@ -41,6 +41,13 @@ func ArtifactSigningDigest(release Release, component Component, artifact Artifa
 	if artifact.SizeBytes != nil {
 		size = *artifact.SizeBytes
 	}
+	artifactFields := canonical.Map{
+		"architecture": artifact.Architecture,
+		"name":         artifact.Name,
+		"sha256":       artifact.SHA256,
+		"sizeBytes":    size,
+	}
+	addArtifactExtractionProvenance(artifactFields, artifact)
 
 	return canonical.StructuredDigest(
 		artifactSignatureDomain,
@@ -52,12 +59,7 @@ func ArtifactSigningDigest(release Release, component Component, artifact Artifa
 				"version": component.Version,
 				"commit":  component.Commit,
 			},
-			"artifact": canonical.Map{
-				"architecture": artifact.Architecture,
-				"name":         artifact.Name,
-				"sha256":       artifact.SHA256,
-				"sizeBytes":    size,
-			},
+			"artifact": artifactFields,
 		},
 	)
 }
@@ -94,13 +96,15 @@ func ManifestSigningDigest(manifest Manifest) (string, error) {
 				}
 			}
 
-			artifacts[artifactIndex] = canonical.Map{
+			artifactFields := canonical.Map{
 				"architecture": artifact.Architecture,
 				"name":         artifact.Name,
 				"sha256":       artifact.SHA256,
 				"sizeBytes":    size,
 				"signature":    signature,
 			}
+			addArtifactExtractionProvenance(artifactFields, artifact)
+			artifacts[artifactIndex] = artifactFields
 		}
 
 		components[componentIndex] = canonical.Map{
@@ -152,6 +156,14 @@ func ManifestSigningDigest(manifest Manifest) (string, error) {
 			"unresolvedArtifacts":   unresolved,
 		},
 	)
+}
+
+func addArtifactExtractionProvenance(fields canonical.Map, artifact Artifact) {
+	if artifact.ExtractionRecipe == "" && artifact.ExtractedExecutableSHA256 == "" {
+		return
+	}
+	fields["extractionRecipe"] = artifact.ExtractionRecipe
+	fields["extractedExecutableSha256"] = artifact.ExtractedExecutableSHA256
 }
 
 func (store *TrustStore) VerifyPromotion(manifest Manifest) error {

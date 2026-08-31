@@ -77,6 +77,77 @@ func TestManifestRejectsMalformedArtifactDigest(t *testing.T) {
 	}
 }
 
+func TestWorkerdArtifactsRequireCanonicalExtractionProvenance(t *testing.T) {
+	t.Parallel()
+
+	valid := workerdProvenanceManifest()
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate(valid) error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Artifact)
+		want   string
+	}{
+		{
+			name: "missing archive digest",
+			mutate: func(artifact *Artifact) {
+				artifact.SHA256 = ""
+			},
+			want: "archive SHA-256",
+		},
+		{
+			name: "noncanonical archive digest",
+			mutate: func(artifact *Artifact) {
+				artifact.SHA256 = strings.Repeat("A", 64)
+			},
+			want: "archive SHA-256",
+		},
+		{
+			name: "missing extraction recipe",
+			mutate: func(artifact *Artifact) {
+				artifact.ExtractionRecipe = ""
+			},
+			want: "extraction recipe",
+		},
+		{
+			name: "unsupported extraction recipe",
+			mutate: func(artifact *Artifact) {
+				artifact.ExtractionRecipe = "gzip"
+			},
+			want: "extraction recipe",
+		},
+		{
+			name: "missing extracted executable digest",
+			mutate: func(artifact *Artifact) {
+				artifact.ExtractedExecutableSHA256 = ""
+			},
+			want: "extracted executable SHA-256",
+		},
+		{
+			name: "noncanonical extracted executable digest",
+			mutate: func(artifact *Artifact) {
+				artifact.ExtractedExecutableSHA256 = "sha256:" + strings.Repeat("a", 64)
+			},
+			want: "extracted executable SHA-256",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			manifest := workerdProvenanceManifest()
+			test.mutate(&manifest.Components[0].Artifacts[0])
+			err := manifest.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestManifestRejectsDuplicateComponent(t *testing.T) {
 	t.Parallel()
 
@@ -230,6 +301,17 @@ func completeRelease(status string) Manifest {
 	components := make([]Component, 0, len(requiredProductionComponents))
 	for _, name := range requiredProductionComponents {
 		size := uint64(12)
+		artifact := Artifact{
+			Architecture: "any",
+			Name:         name + ".tar.zst",
+			SHA256:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			SizeBytes:    &size,
+			Signature:    &signature,
+		}
+		if name == "workerd" {
+			artifact.ExtractionRecipe = ExtractionRecipeGzipSingleFileV1
+			artifact.ExtractedExecutableSHA256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+		}
 		components = append(components, Component{
 			Name:          name,
 			Version:       "0.3.0",
@@ -237,13 +319,7 @@ func completeRelease(status string) Manifest {
 			License:       "Apache-2.0",
 			Source:        "https://example.invalid/" + name,
 			Qualification: "conformance-pass",
-			Artifacts: []Artifact{{
-				Architecture: "any",
-				Name:         name + ".tar.zst",
-				SHA256:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-				SizeBytes:    &size,
-				Signature:    &signature,
-			}},
+			Artifacts:     []Artifact{artifact},
 		})
 	}
 
@@ -268,6 +344,33 @@ func completeRelease(status string) Manifest {
 		Components:            components,
 		ProtocolCompatibility: pairs,
 		Signatures:            []Signature{signature},
+	}
+}
+
+func workerdProvenanceManifest() Manifest {
+	return Manifest{
+		SchemaVersion: 1,
+		Release: Release{
+			Version:       "0.3.0",
+			Status:        "development",
+			Architectures: []string{"x86_64"},
+		},
+		Toolchains: developmentToolchains(),
+		Components: []Component{{
+			Name:          "workerd",
+			Version:       "1.20260825.1",
+			Commit:        "0123456789abcdef0123456789abcdef01234567",
+			License:       "Apache-2.0",
+			Source:        "https://example.invalid/workerd",
+			Qualification: "phase-0-required",
+			Artifacts: []Artifact{{
+				Architecture:              "x86_64",
+				Name:                      "workerd-linux-64.gz",
+				SHA256:                    strings.Repeat("a", 64),
+				ExtractionRecipe:          ExtractionRecipeGzipSingleFileV1,
+				ExtractedExecutableSHA256: strings.Repeat("b", 64),
+			}},
+		}},
 	}
 }
 

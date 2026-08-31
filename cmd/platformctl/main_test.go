@@ -339,6 +339,10 @@ func TestDefaultReleaseProbeVerifiesProductionAgainstOfflineRoots(t *testing.T) 
 				SizeBytes:    &artifactSize,
 			}},
 		}
+		if componentName == "workerd" {
+			component.Artifacts[0].ExtractionRecipe = release.ExtractionRecipeGzipSingleFileV1
+			component.Artifacts[0].ExtractedExecutableSHA256 = strings.Repeat("3", 64)
+		}
 		digest, err := release.ArtifactSigningDigest(
 			manifest.Release,
 			component,

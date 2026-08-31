@@ -303,7 +303,28 @@
             "$ref": "#/$defs/artifact"
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "workerd"
+              }
+            },
+            "required": ["name"]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "items": {
+                  "required": ["extractionRecipe", "extractedExecutableSha256"]
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "artifact": {
       "type": "object",
@@ -320,6 +341,13 @@
           "pattern": "^[^/\\\\]+$"
         },
         "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "extractionRecipe": {
+          "type": "string",
+          "enum": ["gzip-single-file-v1"]
+        },
+        "extractedExecutableSha256": {
           "$ref": "#/$defs/sha256"
         },
         "sizeBytes": {
