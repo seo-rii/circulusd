@@ -180,6 +180,18 @@ not silently included in Unit 10.
   complete agent 10-pass race/shuffle gates, repository tests, and vet pass.
   The serialized producer, process-token attachment, and lifecycle delivery
   remain.
+- 2026-09-01: the Linux process-identity owner primitive now opens a pidfd
+  before publishing an immutable `(pid,startTicks)` token and keeps the
+  existing before/after `/proc` start-time checks around every RSS sample.
+  Only an error tree made entirely of `ENOSYS` leaves is classified as pidfd
+  unavailable; permission, policy, stale-process, invalid-operation, and mixed
+  failures remain fail-closed. A borrow/quiescence gate rejects new samples
+  after closing begins, waits for active samples without holding its mutex,
+  closes the pidfd exactly once, and replays one cached terminal close error to
+  concurrent callers without retrying a possibly reused descriptor. Focused
+  100-pass race/shuffle and complete agent race gates pass. This is an
+  unattached primitive: launcher capture/order, stop ownership, and observer
+  lifecycle integration remain and no admission or external PASS is claimed.
 
 ### Outcome
 
@@ -593,12 +605,11 @@ remains in U10.4.
 #### U10.2 — Generation-bound resource observation
 
 Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
-generation baselines, `(pid,startTicks)` RSS reads, permission/read-only
+generation baselines, pidfd-owning `(pid,startTicks)` RSS primitives, permission/read-only
 dominance, operation-scoped host absence versus post-provision path loss,
 controller availability versus enablement, and the Manager observation
-identity/sequence endpoint are implemented. pidfd ownership, launcher
-attachment, serialized producer delivery, and evidence-artifact status mapping
-remain.
+identity/sequence endpoint are implemented. Launcher process-token attachment,
+serialized producer delivery, and evidence-artifact status mapping remain.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include

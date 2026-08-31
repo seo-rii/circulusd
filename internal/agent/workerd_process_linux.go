@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,9 +23,11 @@ const (
 )
 
 var (
-	errWorkerdProcessContract       = errors.New("workerd process contract violation")
-	errInvalidWorkerdProcessRequest = errors.New("invalid workerd process request")
-	errStaleWorkerdProcessIdentity  = errors.New("stale workerd process identity")
+	errWorkerdProcessContract            = errors.New("workerd process contract violation")
+	errInvalidWorkerdProcessRequest      = errors.New("invalid workerd process request")
+	errStaleWorkerdProcessIdentity       = errors.New("stale workerd process identity")
+	errWorkerdPIDFDUnsupported           = errors.New("workerd pidfd unsupported")
+	errWorkerdProcessIdentityUnavailable = errors.New("workerd process identity unavailable")
 )
 
 type workerdProcessToken struct {
@@ -36,6 +39,32 @@ type workerdProcessSample struct {
 	PID        int
 	StartTicks uint64
 	RSSBytes   uint64
+}
+
+type workerdPIDFDBackend interface {
+	openPIDFD(pid int) (int, error)
+	closeFD(fd int) error
+}
+
+type linuxWorkerdPIDFDBackend struct{}
+
+type workerdProcessIdentityCloseOperation struct {
+	done chan struct{}
+	err  error
+}
+
+type workerdProcessIdentity struct {
+	mu sync.Mutex
+
+	token   workerdProcessToken
+	pidfd   int
+	backend workerdPIDFDBackend
+
+	borrows         int
+	borrowQuiescent chan struct{}
+	closing         bool
+	closed          bool
+	closeOperation  *workerdProcessIdentityCloseOperation
 }
 
 type workerdProcessRawSnapshot struct {
@@ -50,6 +79,124 @@ type workerdProcessReader interface {
 }
 
 type linuxWorkerdProcessReader struct{}
+
+func (linuxWorkerdPIDFDBackend) openPIDFD(pid int) (int, error) {
+	return unix.PidfdOpen(pid, 0)
+}
+
+func (linuxWorkerdPIDFDBackend) closeFD(fd int) error {
+	return unix.Close(fd)
+}
+
+func captureWorkerdProcessIdentity(reader workerdProcessReader, backend workerdPIDFDBackend, pid int) (*workerdProcessIdentity, error) {
+	if reader == nil || backend == nil || pid <= 0 {
+		return nil, fmt.Errorf("%w: reader, pidfd backend, and positive PID are required", errInvalidWorkerdProcessRequest)
+	}
+	pidfd, err := backend.openPIDFD(pid)
+	if err != nil {
+		openErr := fmt.Errorf("open workerd pidfd: %w", err)
+		if isOnlyWorkerdPIDFDUnsupported(err) {
+			return nil, errors.Join(errWorkerdPIDFDUnsupported, openErr)
+		}
+		return nil, openErr
+	}
+	if pidfd < 0 {
+		return nil, fmt.Errorf("%w: pidfd backend returned an invalid descriptor", errWorkerdProcessContract)
+	}
+	token, tokenErr := captureWorkerdProcessToken(reader, pid)
+	if tokenErr != nil {
+		closeErr := backend.closeFD(pidfd)
+		if closeErr != nil {
+			tokenErr = errors.Join(tokenErr, fmt.Errorf("close workerd pidfd after token capture failure: %w", closeErr))
+		}
+		return nil, tokenErr
+	}
+	return &workerdProcessIdentity{token: token, pidfd: pidfd, backend: backend}, nil
+}
+
+func isOnlyWorkerdPIDFDUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isOnlyWorkerdPIDFDUnsupported(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isOnlyWorkerdPIDFDUnsupported(wrapped.Unwrap())
+	}
+	return err == unix.ENOSYS
+}
+
+func (identity *workerdProcessIdentity) sample(reader workerdProcessReader, pageSize uint64) (sample workerdProcessSample, resultErr error) {
+	if identity == nil {
+		return workerdProcessSample{}, fmt.Errorf("%w: process identity is required", errInvalidWorkerdProcessRequest)
+	}
+	identity.mu.Lock()
+	if identity.closing || identity.closed {
+		identity.mu.Unlock()
+		return workerdProcessSample{}, errWorkerdProcessIdentityUnavailable
+	}
+	if identity.borrows == 0 {
+		identity.borrowQuiescent = make(chan struct{})
+	}
+	identity.borrows++
+	token := identity.token
+	identity.mu.Unlock()
+	defer func() {
+		identity.mu.Lock()
+		identity.borrows--
+		if identity.borrows == 0 {
+			close(identity.borrowQuiescent)
+			identity.borrowQuiescent = nil
+		}
+		identity.mu.Unlock()
+	}()
+	return sampleWorkerdProcess(reader, token, pageSize)
+}
+
+func (identity *workerdProcessIdentity) close() error {
+	if identity == nil {
+		return fmt.Errorf("%w: process identity is required", errInvalidWorkerdProcessRequest)
+	}
+	identity.mu.Lock()
+	if identity.closeOperation != nil {
+		operation := identity.closeOperation
+		identity.mu.Unlock()
+		<-operation.done
+		return operation.err
+	}
+	operation := &workerdProcessIdentityCloseOperation{done: make(chan struct{})}
+	identity.closeOperation = operation
+	identity.closing = true
+	borrowQuiescent := identity.borrowQuiescent
+	pidfd := identity.pidfd
+	backend := identity.backend
+	identity.mu.Unlock()
+
+	if borrowQuiescent != nil {
+		<-borrowQuiescent
+	}
+	closeErr := backend.closeFD(pidfd)
+	if closeErr != nil {
+		closeErr = errors.Join(fmt.Errorf("close workerd pidfd: %w", closeErr), ErrTerminalShardCleanup)
+	}
+	identity.mu.Lock()
+	identity.pidfd = -1
+	identity.closed = true
+	operation.err = closeErr
+	close(operation.done)
+	identity.mu.Unlock()
+	return closeErr
+}
 
 func parseWorkerdProcStat(value string, expectedPID int) (workerdProcessToken, error) {
 	if expectedPID <= 0 {
