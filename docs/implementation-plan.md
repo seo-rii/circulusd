@@ -129,6 +129,12 @@ not silently included in Unit 10.
   callbacks, so history cannot accumulate across boots. Exact mismatch,
   lock-free callback, first-bind race, and cgroup integration tests pass under
   full repository race and vet gates.
+- 2026-09-01: cgroup error classification now reserves `NOT_RUN` for genuine
+  host absence or unsupported kernel operations. Permission denial,
+  insufficient privilege, and a read-only provisioned root fail the cgroup
+  contract; those failures dominate an unavailable member in a joined error
+  instead of being laundered into `NOT_RUN`. Constructor, direct-classifier,
+  mixed-error, availability, agent, and conformance race tests pass.
 
 ### Outcome
 
@@ -371,7 +377,7 @@ status:
 |---|---|
 | The resource runner is not implemented, the explicit gate was not selected, or the qualification config is absent | `NOT_RUN` |
 | The validated release artifact, required kernel feature, cgroup-v2 mount, or controller delegation is genuinely absent on the target host | `UNAVAILABLE` |
-| The supplied document is malformed, the release/binary identity mismatches, or a provisioned path/root violates its ownership, mode, emptiness, controller, or identity contract | `FAIL` |
+| The supplied document is malformed, the release/binary identity mismatches, or a provisioned path/root is inaccessible, read-only, or violates its ownership, mode, emptiness, controller, or identity contract; any such failure dominates a joined unavailable error | `FAIL` |
 | A probe assertion, readiness check, internal deadline, cleanup join, evidence write/read-back, or leak check fails | `FAIL` |
 | The enclosing caller cancels before completion and cleanup succeeds without another observed failure | `NOT_RUN` |
 | Cancellation also exposes cleanup, identity, assertion, or evidence failure | `FAIL` |
@@ -519,7 +525,9 @@ binary/cgroup external `PASS`.
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include
    controller write/readback tests for the canonical quota/period and
-   process-RSS tests pinned to the process token/PID start identity.
+   process-RSS tests pinned to the process token/PID start identity. Add
+   classification tests that distinguish genuine absence/unsupported errors
+   from permission, read-only, and mixed provisioned-root failures.
 2. Add failing race tests for stale cgroup identity, duplicate/decreasing
    observation sequence, delayed old low-memory samples, and cumulative-counter
    baseline replacement.

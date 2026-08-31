@@ -96,8 +96,9 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 		wantErr error
 	}{
 		{name: "missing", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.ENOENT }, wantErr: errWorkerdCgroupUnavailable},
-		{name: "permission", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EACCES }, wantErr: errWorkerdCgroupUnavailable},
-		{name: "readonly", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EROFS }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "permission denied", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EACCES }, wantErr: errWorkerdCgroupContract},
+		{name: "operation not permitted", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EPERM }, wantErr: errWorkerdCgroupContract},
+		{name: "readonly", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EROFS }, wantErr: errWorkerdCgroupContract},
 		{name: "unsupported syscall", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.ENOSYS }, wantErr: errWorkerdCgroupUnavailable},
 		{name: "symlink escape", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspectErr = unix.EXDEV }, wantErr: errWorkerdCgroupContract},
 		{name: "foreign intermediate", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.Components[1].UID = 2001 }, wantErr: errWorkerdCgroupContract},
@@ -127,6 +128,38 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 			}
 			if backend.openFileDescriptors() != 0 {
 				t.Fatalf("open file descriptors after rejected root = %d, want 0", backend.openFileDescriptors())
+			}
+		})
+	}
+}
+
+func TestClassifyWorkerdCgroupErrorSeparatesUnavailableHostFeaturesFromProvisioningFailures(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		errno   error
+		wantErr error
+	}{
+		{name: "missing path", errno: unix.ENOENT, wantErr: errWorkerdCgroupUnavailable},
+		{name: "missing device", errno: unix.ENODEV, wantErr: errWorkerdCgroupUnavailable},
+		{name: "unsupported syscall", errno: unix.ENOSYS, wantErr: errWorkerdCgroupUnavailable},
+		{name: "unsupported operation", errno: unix.EOPNOTSUPP, wantErr: errWorkerdCgroupUnavailable},
+		{name: "permission denied", errno: unix.EACCES, wantErr: errWorkerdCgroupContract},
+		{name: "operation not permitted", errno: unix.EPERM, wantErr: errWorkerdCgroupContract},
+		{name: "readonly provisioned root", errno: unix.EROFS, wantErr: errWorkerdCgroupContract},
+		{name: "permission dominates missing path", errno: errors.Join(unix.ENOENT, unix.EACCES), wantErr: errWorkerdCgroupContract},
+		{name: "readonly dominates unsupported syscall", errno: errors.Join(unix.ENOSYS, unix.EROFS), wantErr: errWorkerdCgroupContract},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := classifyWorkerdCgroupError("test cgroup operation", test.errno)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("classifyWorkerdCgroupError(%v) = %v, want %v", test.errno, err, test.wantErr)
+			}
+			other := errWorkerdCgroupContract
+			if test.wantErr == errWorkerdCgroupContract {
+				other = errWorkerdCgroupUnavailable
+			}
+			if errors.Is(err, other) {
+				t.Fatalf("classifyWorkerdCgroupError(%v) also matches %v", test.errno, other)
 			}
 		})
 	}
@@ -1372,6 +1405,23 @@ func TestWorkerdCgroupAvailabilityIsNotRunWithoutMutatingHost(t *testing.T) {
 	}
 	if _, err := os.Stat(rootPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("post-probe stat(%q) error = %v, want absent", rootPath, err)
+	}
+}
+
+func TestWorkerdCgroupAvailabilityDoesNotLaunderProvisioningFailuresAsNotRun(t *testing.T) {
+	evidence := workerdCgroupEvidence{ReferenceOnly: true}
+	for name, classified := range map[string]error{
+		"permission denied":           classifyWorkerdCgroupError("inspect delegated root", unix.EACCES),
+		"operation not permitted":     classifyWorkerdCgroupError("inspect delegated root", unix.EPERM),
+		"readonly root":               classifyWorkerdCgroupError("inspect delegated root", unix.EROFS),
+		"joined contract unavailable": errors.Join(errWorkerdCgroupContract, errWorkerdCgroupUnavailable),
+	} {
+		t.Run(name, func(t *testing.T) {
+			availability := workerdCgroupAvailabilityForError(classified, evidence)
+			if availability.Status != "FAILED" || availability.Available || availability.Evidence != evidence {
+				t.Fatalf("availability = %+v, want reference-only FAILED", availability)
+			}
+		})
 	}
 }
 

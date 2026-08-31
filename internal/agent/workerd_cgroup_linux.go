@@ -300,19 +300,25 @@ func probeWorkerdCgroupAvailability(config workerdCgroupConfig) workerdCgroupAva
 	evidence := workerdCgroupEvidence{ReferenceOnly: true}
 	controller, err := newWorkerdCgroupController(config)
 	if err != nil {
-		status := "FAILED"
-		reason := "delegated cgroup root violates the required contract"
-		if errors.Is(err, errWorkerdCgroupUnavailable) {
-			status = "NOT_RUN"
-			reason = "delegated cgroup v2 root is unavailable"
-		}
-		return workerdCgroupAvailability{Status: status, Reason: reason, Evidence: evidence}
+		return workerdCgroupAvailabilityForError(err, evidence)
 	}
 	evidence = controller.evidence()
 	if err := controller.close(); err != nil {
 		return workerdCgroupAvailability{Status: "FAILED", Reason: "delegated cgroup root descriptor could not be closed", Evidence: evidence}
 	}
 	return workerdCgroupAvailability{Status: "REFERENCE_ONLY", Available: true, Reason: "mechanical attachment is implemented but production cgroup authority isolation is not", Evidence: evidence}
+}
+
+func workerdCgroupAvailabilityForError(err error, evidence workerdCgroupEvidence) workerdCgroupAvailability {
+	status := "FAILED"
+	reason := "delegated cgroup root violates the required contract"
+	if errors.Is(err, errWorkerdCgroupUnavailable) &&
+		!errors.Is(err, errInvalidWorkerdCgroupConfig) &&
+		!errors.Is(err, errWorkerdCgroupContract) {
+		status = "NOT_RUN"
+		reason = "delegated cgroup v2 root is unavailable"
+	}
+	return workerdCgroupAvailability{Status: status, Reason: reason, Evidence: evidence}
 }
 
 func (controller *workerdCgroupController) notifyAuthorityChangedLocked() {
@@ -1079,6 +1085,9 @@ func classifyWorkerdCgroupError(operation string, err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EROFS) {
+		return fmt.Errorf("%s: %w", operation, errWorkerdCgroupContract)
+	}
 	if errors.Is(err, errInvalidWorkerdCgroupConfig) || errors.Is(err, errInvalidWorkerdCgroupRequest) ||
 		errors.Is(err, errWorkerdCgroupUnavailable) || errors.Is(err, errWorkerdCgroupContract) ||
 		errors.Is(err, errWorkerdCgroupCapacity) || errors.Is(err, errWorkerdCgroupClosed) ||
@@ -1086,7 +1095,7 @@ func classifyWorkerdCgroupError(operation string, err error) error {
 		errors.Is(err, errWorkerdCgroupDrainTimeout) || errors.Is(err, errWorkerdCgroupPoisoned) {
 		return fmt.Errorf("%s: %w", operation, err)
 	}
-	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EROFS) || errors.Is(err, unix.ENOSYS) {
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
 		return fmt.Errorf("%s: %w", operation, errWorkerdCgroupUnavailable)
 	}
 	return fmt.Errorf("%s: %w", operation, errWorkerdCgroupContract)
