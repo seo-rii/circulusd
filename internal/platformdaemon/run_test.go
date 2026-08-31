@@ -21,17 +21,22 @@ func (runtime *testRuntime) Close() {
 }
 
 type testServer struct {
-	name       string
-	mu         *sync.Mutex
-	events     *[]string
-	waitFor    <-chan struct{}
-	started    chan struct{}
-	closed     chan struct{}
-	serveError error
-	closeOnce  sync.Once
+	name                       string
+	mu                         *sync.Mutex
+	events                     *[]string
+	waitFor                    <-chan struct{}
+	started                    chan struct{}
+	closed                     chan struct{}
+	serveError                 error
+	serveContext               context.Context
+	contextCanceledBeforeClose bool
+	closeOnce                  sync.Once
 }
 
-func (server *testServer) Serve(context.Context) error {
+func (server *testServer) Serve(ctx context.Context) error {
+	server.mu.Lock()
+	server.serveContext = ctx
+	server.mu.Unlock()
 	close(server.started)
 	if server.waitFor != nil {
 		<-server.waitFor
@@ -46,11 +51,24 @@ func (server *testServer) Serve(context.Context) error {
 func (server *testServer) Close() error {
 	server.closeOnce.Do(func() {
 		server.mu.Lock()
+		server.contextCanceledBeforeClose = server.serveContext != nil && server.serveContext.Err() != nil
 		*server.events = append(*server.events, server.name+".close")
 		server.mu.Unlock()
 		close(server.closed)
 	})
 	return nil
+}
+
+func (server *testServer) sawCanceledContextBeforeClose() bool {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.contextCanceledBeforeClose
+}
+
+func (server *testServer) serveContextCanceled() bool {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.serveContext != nil && server.serveContext.Err() != nil
 }
 
 func TestServeClosesApplicationControlAndRuntimeInOrder(t *testing.T) {
@@ -78,6 +96,12 @@ func TestServeClosesApplicationControlAndRuntimeInOrder(t *testing.T) {
 	mu.Unlock()
 	if got != "application.close,control.close,runtime.close" {
 		t.Fatalf("close events = %q", got)
+	}
+	if application.sawCanceledContextBeforeClose() || control.sawCanceledContextBeforeClose() {
+		t.Fatal("listener context was canceled before ordered Close calls completed")
+	}
+	if !application.serveContextCanceled() || !control.serveContextCanceled() {
+		t.Fatal("listener contexts remained active after Serve returned")
 	}
 }
 
@@ -121,6 +145,12 @@ func TestServeCancellationClosesBlockedApplicationControlAndRuntime(t *testing.T
 	if got != "application.close,control.close,runtime.close" {
 		t.Fatalf("close events = %q", got)
 	}
+	if application.sawCanceledContextBeforeClose() || control.sawCanceledContextBeforeClose() {
+		t.Fatal("listener context was canceled before ordered Close calls completed")
+	}
+	if !application.serveContextCanceled() || !control.serveContextCanceled() {
+		t.Fatal("listener contexts remained active after Serve returned")
+	}
 }
 
 func TestServeCancellationClosesBlockedDiagnosticControlAndRuntime(t *testing.T) {
@@ -154,6 +184,12 @@ func TestServeCancellationClosesBlockedDiagnosticControlAndRuntime(t *testing.T)
 	mu.Unlock()
 	if got != "control.close,runtime.close" {
 		t.Fatalf("close events = %q", got)
+	}
+	if control.sawCanceledContextBeforeClose() {
+		t.Fatal("diagnostic listener context was canceled before its Close call completed")
+	}
+	if !control.serveContextCanceled() {
+		t.Fatal("diagnostic listener context remained active after Serve returned")
 	}
 }
 

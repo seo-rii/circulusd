@@ -77,26 +77,34 @@ func Serve(ctx context.Context, control Server, application Server, runtime Runt
 		return err
 	}
 	if applicationNil {
+		// The coordinator translates caller cancellation into Close so a
+		// server's context watcher cannot race and discard its Close error.
+		serveContext, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
 		results := make(chan serveResult, 1)
 		go func() {
-			results <- serveResult{err: control.Serve(ctx)}
+			results <- serveResult{err: control.Serve(serveContext)}
 		}()
 		select {
 		case served := <-results:
+			controlError := control.Close()
+			controlClosed = true
+			cancelServe()
 			if contextErr := ctx.Err(); contextErr != nil {
-				return errors.Join(contextErr, served.err)
+				return errors.Join(contextErr, served.err, controlError)
 			}
-			return served.err
+			return errors.Join(served.err, controlError)
 		case <-ctx.Done():
 			controlError := control.Close()
 			controlClosed = true
 			served := <-results
+			cancelServe()
 			return errors.Join(ctx.Err(), served.err, controlError)
 		}
 	}
 
-	serveContext, cancelServe := context.WithCancel(ctx)
-	defer cancelServe()
+	// Detaching cancellation preserves context values while making the
+	// application -> control shutdown order observable to both servers.
+	serveContext, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
 	results := make(chan serveResult, 2)
 	go func() {
 		results <- serveResult{err: control.Serve(serveContext)}
@@ -112,7 +120,6 @@ func Serve(ctx context.Context, control Server, application Server, runtime Runt
 	case <-ctx.Done():
 		first.err = ctx.Err()
 	}
-	cancelServe()
 	applicationError := application.Close()
 	applicationClosed = true
 	controlError := control.Close()
@@ -127,6 +134,7 @@ func Serve(ctx context.Context, control Server, application Server, runtime Runt
 		}
 		servedErrors = append(servedErrors, served.err)
 	}
+	cancelServe()
 	if !runtimeClosed {
 		runtime.Close()
 		runtimeClosed = true
