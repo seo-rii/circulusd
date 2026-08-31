@@ -3614,6 +3614,14 @@ Effect state = externally_committed
   → external effect 재실행 금지, settlement만 재개
 ```
 
+subordinate ledger의 terminal fact를 Session에 반영하는 reconciler는 provider
+start API를 갖지 않는다. 먼저 현재 Session recovery decision을 얻고,
+`settle_only`일 때에만 exact dispatch attempt, external commit ID, result/error와
+settlement digest를 대조한 뒤 settle한다. 이미 settled인 exact replay는 최초
+durable receipt만 반환하며 provider 조회나 호출, 두 번째 settlement transition을
+수행하지 않는다. generation이 회전된 stale reconciler는 이 경로에서도 거부되고,
+fresh recovery actor가 보존된 subordinate fact로 settlement만 재개한다.
+
 ### 35.8 Model effect
 
 모델 호출도 같은 기본 구조를 따르되 partial stream은 자동 재실행에 특히 주의한다. provider가 durable request/result retrieval을 지원하지 않으면 partial-response crash는 일반적으로 uncertain effect다.

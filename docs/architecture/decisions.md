@@ -51,6 +51,13 @@ start authority. A subordinate ledger is selected by the Session-bound service
 and every result, including `absent` and `unknown`, must repeat the complete
 effect, invocation, request, attempt, platform request, and route identity.
 
+A terminal reconciler never receives provider-start authority. It first asks
+the Session coordinator for the current recovery decision and may issue a
+settlement only for `settle_only` with the exact subordinate attempt, external
+commit, result, and settlement digest. Once Session is already settled, that
+same operation may only replay the original durable receipt; it cannot create
+a second transition or consult the provider again.
+
 ## ADR-003: Turn status and effect state are separate
 
 Turn status is one of `queued`, `active`, `needs_confirmation`, `completed`, `failed`, or `aborted`.
