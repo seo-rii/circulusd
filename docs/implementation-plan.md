@@ -86,6 +86,15 @@ not silently included in Unit 10.
   writer from racing an active descriptor borrower. Focused and complete
   repeated race tests pass. The fixed-configuration Manager adapter, process
   token/RSS, serialized observation sequence, and Manager delivery remain.
+- 2026-09-01: the Linux Manager adapter now binds every start to one
+  construction-time snapshot of the release-derived workerd argument vector,
+  validates the Manager-owned process/shard generation boundary, and gives
+  each concurrent low-level `Ensure` call an unaliased copy. It forwards no
+  placement generation or caller process arguments, rejects nil launchers and
+  handles, and does not enter the low-level launcher for an already-canceled
+  caller. Repeated adapter and complete agent race/shuffle tests pass. The
+  boot-scoped agent identity still must be carried through the low-level
+  request/readiness/cgroup identity tuple before observation is wired.
 
 ### Outcome
 
