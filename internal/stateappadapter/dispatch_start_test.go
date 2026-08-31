@@ -120,7 +120,10 @@ func (starter *adapterTestDispatchStarter) RouteDigest() broker.Digest {
 	return starter.routeDigest
 }
 
-func (starter *adapterTestDispatchStarter) Start(context.Context, broker.DispatchStartPermit) error {
+func (starter *adapterTestDispatchStarter) Start(_ context.Context, claim broker.ClaimedDispatchStart) error {
+	if _, opened := claim.Open(); !opened {
+		return errors.New("test dispatch starter received an unsealed claim")
+	}
 	starter.mu.Lock()
 	defer starter.mu.Unlock()
 	starter.calls++

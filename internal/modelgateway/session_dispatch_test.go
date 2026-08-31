@@ -167,6 +167,36 @@ func TestReferenceSessionDispatchRejectsIdentityGenerationRouteAndCommandMismatc
 	}
 }
 
+func TestReferenceSessionDispatchRejectsEveryForeignClaimGenerationBeforeProviderIO(t *testing.T) {
+	t.Parallel()
+	mutations := []struct {
+		name   string
+		mutate func(*broker.Generations)
+	}{
+		{name: "turn lease", mutate: func(generations *broker.Generations) { generations.TurnLease++ }},
+		{name: "placement", mutate: func(generations *broker.Generations) { generations.Placement++ }},
+		{name: "sandbox", mutate: func(generations *broker.Generations) { generations.Sandbox++ }},
+		{name: "authorization", mutate: func(generations *broker.Generations) { generations.Authorization++ }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			test := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{completedSessionProviderEvent()}}, nil, true)
+			digest, err := test.starter.Prepare(context.Background(), test.dispatch, test.transition)
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			mutation.mutate(&test.dispatch.Generations)
+			consumer, _ := test.consumer(t, digest)
+			if _, err := consumer.StartExactAttempt(context.Background(), test.startRequest(digest)); !errors.Is(err, broker.ErrDispatchStartUnknown) {
+				t.Fatalf("StartExactAttempt(foreign generation) error = %v", err)
+			}
+			if _, calls := test.provider.snapshot(); calls != 0 {
+				t.Fatalf("foreign generation reached provider %d times", calls)
+			}
+		})
+	}
+}
+
 func TestReferenceSessionDispatchRecordsAcceptedThenUnknownWithoutRetry(t *testing.T) {
 	t.Parallel()
 	test := newSessionDispatchTest(t, &scriptedSessionProviderStream{
