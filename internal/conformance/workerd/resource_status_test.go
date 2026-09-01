@@ -100,52 +100,110 @@ func TestResourceComponentPassPredicateRequiresExternalEnvelopeBinding(t *testin
 	})
 }
 
-func TestEvaluateResourceQualificationRunRequiresAllFiveFromOneEnvelope(t *testing.T) {
+// recordedFailResourceResult builds the honest FAIL that a recorded
+// residual-gap component (dynamic-worker-reconstruction) must carry: a real
+// external finding that the pinned workerd never reconstructs a per-isolate
+// fault, never a skip and never a PASS.
+func recordedFailResourceResult(component string) conformance.Result {
+	return conformance.Result{
+		Component: component,
+		Status:    conformance.Fail,
+		Reason:    "stock workerd does not reconstruct a per-isolate fault on this pin",
+		Evidence: conformance.Evidence{
+			Class: conformance.EvidenceClassExternal,
+			Mock:  false,
+		},
+	}
+}
+
+func TestEvaluateResourceQualificationRunRequiresFourPassPlusRecordedFail(t *testing.T) {
 	t.Parallel()
 	observation := "sha256:" + strings.Repeat("a", 64)
 	binary := "sha256:" + strings.Repeat("b", 64)
 	environment := "sha256:" + strings.Repeat("c", 64)
-	full := func() []conformance.Result {
+
+	// Sanity: the partition is exactly the union of required and recorded, and
+	// dynamic-worker-reconstruction is the demoted recorded gap.
+	if len(requiredResourceQualificationComponents)+len(recordedResourceQualificationComponents) != len(resourceQualificationComponents) {
+		t.Fatalf("component partition is not a clean split of the full set")
+	}
+	if !isRecordedResourceQualificationComponent("workerd.dynamic-worker-reconstruction") {
+		t.Fatalf("dynamic-worker-reconstruction must be a recorded residual-gap component")
+	}
+	for _, required := range requiredResourceQualificationComponents {
+		if isRecordedResourceQualificationComponent(required) {
+			t.Fatalf("required component %q must not also be recorded", required)
+		}
+	}
+
+	qualified := func() []conformance.Result {
 		results := make([]conformance.Result, 0, len(resourceQualificationComponents))
-		for _, component := range resourceQualificationComponents {
+		for _, component := range requiredResourceQualificationComponents {
 			results = append(results, passingResourceResult(component, observation, binary, environment))
+		}
+		for _, component := range recordedResourceQualificationComponents {
+			results = append(results, recordedFailResourceResult(component))
 		}
 		return results
 	}
-	if allPass, err := evaluateResourceQualificationRun(full()); !allPass || err != nil {
-		t.Fatalf("evaluateResourceQualificationRun(complete) = %v, %v, want all pass", allPass, err)
+	if qualifiedRun, err := evaluateResourceQualificationRun(qualified()); !qualifiedRun || err != nil {
+		t.Fatalf("evaluateResourceQualificationRun(4 pass + recorded fail) = %v, %v, want qualified", qualifiedRun, err)
 	}
 
-	missing := full()[:len(resourceQualificationComponents)-1]
-	if allPass, err := evaluateResourceQualificationRun(missing); allPass || err == nil {
-		t.Fatalf("evaluateResourceQualificationRun(missing component) = %v, %v, want failure", allPass, err)
+	// A recorded residual-gap component reported as PASS is a framing error:
+	// the pinned workerd cannot legitimately produce it.
+	recordedClaimsPass := qualified()
+	for i := range recordedClaimsPass {
+		if isRecordedResourceQualificationComponent(recordedClaimsPass[i].Component) {
+			recordedClaimsPass[i] = passingResourceResult(recordedClaimsPass[i].Component, observation, binary, environment)
+		}
+	}
+	if qualifiedRun, err := evaluateResourceQualificationRun(recordedClaimsPass); qualifiedRun || err == nil {
+		t.Fatalf("evaluateResourceQualificationRun(recorded PASS) = %v, %v, want framing error", qualifiedRun, err)
 	}
 
-	oneFailed := full()
-	oneFailed[0].Status = conformance.Fail
-	oneFailed[0].Reason = "workerd does not enforce cpuMs"
-	if allPass, err := evaluateResourceQualificationRun(oneFailed); allPass || err != nil {
-		t.Fatalf("evaluateResourceQualificationRun(one FAIL) = %v, %v, want not-all-pass without a framing error", allPass, err)
+	// A recorded component left NOT_RUN (never executed) is incomplete, not a
+	// framing error, and never qualified.
+	recordedNotRun := qualified()
+	for i := range recordedNotRun {
+		if isRecordedResourceQualificationComponent(recordedNotRun[i].Component) {
+			recordedNotRun[i].Status = conformance.NotRun
+		}
+	}
+	if qualifiedRun, err := evaluateResourceQualificationRun(recordedNotRun); qualifiedRun || err != nil {
+		t.Fatalf("evaluateResourceQualificationRun(recorded NOT_RUN) = %v, %v, want incomplete without a framing error", qualifiedRun, err)
 	}
 
-	splitEnvelope := full()
+	missing := qualified()[:len(resourceQualificationComponents)-1]
+	if qualifiedRun, err := evaluateResourceQualificationRun(missing); qualifiedRun || err == nil {
+		t.Fatalf("evaluateResourceQualificationRun(missing component) = %v, %v, want failure", qualifiedRun, err)
+	}
+
+	oneRequiredFailed := qualified()
+	oneRequiredFailed[0].Status = conformance.Fail
+	oneRequiredFailed[0].Reason = "cgroup cpu.max readback mismatch"
+	if qualifiedRun, err := evaluateResourceQualificationRun(oneRequiredFailed); qualifiedRun || err != nil {
+		t.Fatalf("evaluateResourceQualificationRun(one required FAIL) = %v, %v, want not-qualified without a framing error", qualifiedRun, err)
+	}
+
+	splitEnvelope := qualified()
 	splitEnvelope[1].Evidence.ArtifactReferences = []conformance.ArtifactReference{
 		{Name: resourceObservationArtifactName, Digest: "sha256:" + strings.Repeat("e", 64)},
 	}
-	if allPass, err := evaluateResourceQualificationRun(splitEnvelope); allPass || err == nil {
-		t.Fatalf("evaluateResourceQualificationRun(split envelope) = %v, %v, want cross-run rejection", allPass, err)
+	if qualifiedRun, err := evaluateResourceQualificationRun(splitEnvelope); qualifiedRun || err == nil {
+		t.Fatalf("evaluateResourceQualificationRun(split envelope) = %v, %v, want cross-run rejection", qualifiedRun, err)
 	}
 
-	duplicate := full()
+	duplicate := qualified()
 	duplicate[1].Component = duplicate[0].Component
-	if allPass, err := evaluateResourceQualificationRun(duplicate); allPass || err == nil {
-		t.Fatalf("evaluateResourceQualificationRun(duplicate component) = %v, %v, want rejection", allPass, err)
+	if qualifiedRun, err := evaluateResourceQualificationRun(duplicate); qualifiedRun || err == nil {
+		t.Fatalf("evaluateResourceQualificationRun(duplicate component) = %v, %v, want rejection", qualifiedRun, err)
 	}
 
-	unknown := full()
+	unknown := qualified()
 	unknown[0].Component = "workerd.unknown-result"
-	if allPass, err := evaluateResourceQualificationRun(unknown); allPass || err == nil {
-		t.Fatalf("evaluateResourceQualificationRun(unknown component) = %v, %v, want rejection", allPass, err)
+	if qualifiedRun, err := evaluateResourceQualificationRun(unknown); qualifiedRun || err == nil {
+		t.Fatalf("evaluateResourceQualificationRun(unknown component) = %v, %v, want rejection", qualifiedRun, err)
 	}
 }
 

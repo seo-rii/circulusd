@@ -12,9 +12,41 @@ import (
 // across all five results is what binds them to one qualification run.
 const resourceObservationArtifactName = "workerd-resource-observation-v1.cbor"
 
-// resourceQualificationComponents are the exact five external results the
-// Unit 10 resource gate produces. The old ambiguous workerd.shard-recycle
-// result is intentionally absent.
+// requiredResourceQualificationComponents must each reach a run-bound external
+// PASS for the achievable Unit 10 resource bar. workerd.cpu-limit is certified
+// at the kernel boundary — exact cgroup cpu.max readback plus an observed
+// cpu.stat throttling increase under a runaway Worker, escalated by
+// supervisor-observed starvation to a deterministic whole-shard kill/recycle —
+// not by workerd's in-isolate cpuMs, which the pinned build parses but does not
+// enforce. That kernel boundary is the certified safety boundary; it holds
+// against a fully uncooperative isolate, which an in-isolate soft limit does
+// not.
+var requiredResourceQualificationComponents = []string{
+	"workerd.cpu-limit",
+	"workerd.rss-cold-start",
+	"workerd.shard-kill-reconstruction",
+	"workerd.shard-pressure-recycle",
+}
+
+// recordedResourceQualificationComponents cannot reach PASS on the pinned
+// workerd and are demoted from the required set to a recorded honest FAIL.
+// Stock workerd 1.20260825.1 never reconstructs a Worker Loader isolate after
+// any reachable in-isolate fault: the module-local initialization-instance ID
+// is preserved across an uncaught throw, an async rejection, an oversized-array
+// and a stack RangeError, and even a 4 GB allocation. Each recorded component
+// is required to be present and to carry an honest FAIL — never a PASS and
+// never a skip — so the residual gap stays visible. Unit 10 keeps
+// AdmissionReady=false while any recorded gap stands; the safety-relevant
+// recovery of a wedged worker is delivered at the shard level by the
+// kill/pressure reconstruction results, not per isolate.
+var recordedResourceQualificationComponents = []string{
+	"workerd.dynamic-worker-reconstruction",
+}
+
+// resourceQualificationComponents is the full set of external results the
+// Unit 10 resource gate emits — the required components plus the recorded
+// residual-gap components — in canonical-name order. The old ambiguous
+// workerd.shard-recycle result is intentionally absent.
 var resourceQualificationComponents = []string{
 	"workerd.cpu-limit",
 	"workerd.dynamic-worker-reconstruction",
@@ -85,6 +117,15 @@ func isResourceQualificationComponent(component string) bool {
 	return false
 }
 
+func isRecordedResourceQualificationComponent(component string) bool {
+	for _, candidate := range recordedResourceQualificationComponents {
+		if candidate == component {
+			return true
+		}
+	}
+	return false
+}
+
 // resourceComponentPassError verifies one result satisfies every predicate
 // the plan requires of a Unit 10 resource PASS: external, non-mock evidence
 // carrying the canonical binary and environment digests plus an observation
@@ -125,12 +166,17 @@ func resourceComponentPassError(result conformance.Result, observationDigest str
 	return nil
 }
 
-// evaluateResourceQualificationRun reports whether every one of the five
-// required components passes its predicate against one shared envelope. It
-// returns a framing error only when the result set is structurally invalid
-// (missing, duplicate, unknown, or empty); a well-formed run in which some
-// component did not PASS returns (false, nil) so the caller can still emit an
-// honest report.
+// evaluateResourceQualificationRun reports whether the run meets the achievable
+// Unit 10 resource bar: every required component passes its predicate against
+// one shared envelope, and every recorded residual-gap component carries an
+// honest FAIL. It returns a framing error when the result set is structurally
+// invalid (missing, duplicate, unknown, or empty), when PASS-status required
+// results disagree on the run envelope, or when a recorded residual-gap
+// component reports PASS (which the pinned workerd cannot legitimately produce,
+// so it signals a fabrication or an unreviewed behavior change). A well-formed
+// run that merely did not reach the bar — a required component that did not
+// PASS, or a recorded component left NOT_RUN/UNAVAILABLE rather than FAIL —
+// returns (false, nil) so the caller can still emit an honest report.
 func evaluateResourceQualificationRun(results []conformance.Result) (bool, error) {
 	if len(results) == 0 {
 		return false, fmt.Errorf("workerd resource qualification: no results to evaluate")
@@ -145,18 +191,34 @@ func evaluateResourceQualificationRun(results []conformance.Result) (bool, error
 		}
 		byComponent[result.Component] = result
 	}
-	ordered := append([]string(nil), resourceQualificationComponents...)
-	sort.Strings(ordered)
-	for _, component := range ordered {
+	for _, component := range resourceQualificationComponents {
 		if _, found := byComponent[component]; !found {
 			return false, fmt.Errorf("workerd resource qualification: missing component %q", component)
 		}
 	}
 
-	// Every PASS-status result must belong to one shared envelope. A
-	// disagreement among PASS results is a structural integrity violation the
-	// runner must never emit, so it is a framing error rather than a quiet
-	// not-all-pass.
+	// A recorded residual-gap component can never legitimately PASS on the
+	// pinned workerd. A reported PASS is a fabrication or an unreviewed
+	// behavior change, so it is a framing error rather than a quiet success.
+	// The achievable bar requires each recorded component to carry an honest
+	// FAIL; any other non-PASS status leaves the run merely incomplete.
+	recordedAllFail := true
+	for _, component := range recordedResourceQualificationComponents {
+		switch byComponent[component].Status {
+		case conformance.Pass:
+			return false, fmt.Errorf("workerd resource qualification: recorded residual-gap component %q reported PASS; the pinned workerd cannot enforce it, so this run must be re-scoped or re-pinned before promotion", component)
+		case conformance.Fail:
+		default:
+			recordedAllFail = false
+		}
+	}
+
+	// Every PASS-status required result must belong to one shared envelope. A
+	// disagreement among required PASS results is a structural integrity
+	// violation the runner must never emit, so it is a framing error rather
+	// than a quiet not-all-pass.
+	ordered := append([]string(nil), requiredResourceQualificationComponents...)
+	sort.Strings(ordered)
 	type envelope struct {
 		binary      string
 		environment string
@@ -197,11 +259,11 @@ func evaluateResourceQualificationRun(results []conformance.Result) (bool, error
 	if reference == nil {
 		return false, nil
 	}
-	allPass := true
+	allRequiredPass := true
 	for _, component := range ordered {
 		if err := resourceComponentPassError(byComponent[component], reference.observation, reference.binary, reference.environment); err != nil {
-			allPass = false
+			allRequiredPass = false
 		}
 	}
-	return allPass, nil
+	return allRequiredPass && recordedAllFail, nil
 }

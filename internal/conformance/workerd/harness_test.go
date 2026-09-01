@@ -211,7 +211,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 		case "workerd.cpu-limit":
 			resourceResults[result.Component] = result
 			wantStatus = conformance.NotRun
-			wantReason = "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured"
+			wantReason = "agentd-managed cgroup cpu.max throttle enforcement and supervisor-observed starvation recycle are not configured"
 		case "workerd.outbound-denial":
 			wantStatus = conformance.Fail
 			wantReason = "stock workerd probe returned a non-zero exit status"
@@ -221,7 +221,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			wantReason = "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured"
 		case "workerd.dynamic-worker-reconstruction":
 			wantStatus = conformance.NotRun
-			wantReason = "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured"
+			wantReason = "agentd-managed destructive Worker Loader fault probe is not configured; on the pinned workerd this result records a documented FAIL because no in-isolate fault reconstructs the isolate"
 		case "workerd.shard-kill-reconstruction":
 			wantStatus = conformance.NotRun
 			wantReason = "agentd-managed whole-shard kill cleanup and checkpoint reconstruction probe is not configured"
@@ -241,7 +241,7 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 		}
 	}
 	for component, reason := range map[string]string{
-		"workerd.cpu-limit":      "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.cpu-limit":      "agentd-managed cgroup cpu.max throttle enforcement and supervisor-observed starvation recycle are not configured",
 		"workerd.rss-cold-start": "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
 	} {
 		result, found := resourceResults[component]
@@ -279,9 +279,9 @@ func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
 		t.Fatalf("stableBrokerBinding component = %q, want real workerd binding probe", got)
 	}
 	wantNotRun := map[string]string{
-		"workerd.cpu-limit":                     "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.cpu-limit":                     "agentd-managed cgroup cpu.max throttle enforcement and supervisor-observed starvation recycle are not configured",
 		"workerd.rss-cold-start":                "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
-		"workerd.dynamic-worker-reconstruction": "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured",
+		"workerd.dynamic-worker-reconstruction": "agentd-managed destructive Worker Loader fault probe is not configured; on the pinned workerd this result records a documented FAIL because no in-isolate fault reconstructs the isolate",
 		"workerd.shard-kill-reconstruction":     "agentd-managed whole-shard kill cleanup and checkpoint reconstruction probe is not configured",
 		"workerd.shard-pressure-recycle":        "agentd-managed cgroup pressure drain and checkpoint reconstruction probe is not configured",
 	}

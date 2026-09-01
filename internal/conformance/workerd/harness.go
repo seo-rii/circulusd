@@ -69,9 +69,9 @@ type probe struct {
 var requiredProbes = []probe{
 	{component: "workerd.agent-engine", entrypoint: "agentEngine"},
 	{component: "workerd.content-addressed-replacement", entrypoint: "contentAddressedReplacement"},
-	{component: "workerd.cpu-limit", notRunReason: "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured"},
+	{component: "workerd.cpu-limit", notRunReason: "agentd-managed cgroup cpu.max throttle enforcement and supervisor-observed starvation recycle are not configured"},
 	{component: "workerd.dynamic-worker", entrypoint: "dynamicWorker"},
-	{component: "workerd.dynamic-worker-reconstruction", notRunReason: "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured"},
+	{component: "workerd.dynamic-worker-reconstruction", notRunReason: "agentd-managed destructive Worker Loader fault probe is not configured; on the pinned workerd this result records a documented FAIL because no in-isolate fault reconstructs the isolate"},
 	{component: "workerd.extension-order", entrypoint: "extensionOrder"},
 	{component: "workerd.isolate-separation", entrypoint: "isolateSeparation"},
 	{component: "workerd.outbound-denial", entrypoint: "outboundDenial"},
