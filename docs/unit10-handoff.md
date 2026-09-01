@@ -13,21 +13,30 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `45cb691` (`feat(agent): attach pidfd owners to
-  workerd launches`), created on the Windows transfer host on 2026-09-01. This
-  handoff update is committed immediately after it with subject
-  `docs: update unit ten handoff checkpoint`.
+- Last implementation commit: `de83aec` (`feat(agent): serialize
+  generation-bound shard observation`), created on the Windows transfer host
+  on 2026-09-01 after `45cb691` (`feat(agent): attach pidfd owners to workerd
+  launches`). This handoff update is committed immediately after it with
+  subject `docs: update unit ten handoff checkpoint`.
 - At original preparation time `origin/main` was `9ab2104`; the implementation
-  commits `5aa7fa5`, `be0e0af`, `f6e9f80`, and `45cb691` plus the two handoff
-  documentation commits are local, making the branch six commits ahead. No
-  push was performed.
-- The Windows transfer host has no Linux kernel boundary (no WSL) and a tight
-  per-user disk quota, so `go test` for the linux-tagged packages cannot run
-  there. Its verification for `45cb691` was limited to cross-compiled
-  `GOOS=linux go vet ./internal/agent`, gofmt on CR-stripped copies, and
-  `git diff --check`. The checkout uses `core.autocrlf=true`; the working tree
-  is CRLF while the index stays LF, so a plain `gofmt -l` flags every file on
-  that host and is not evidence of a formatting change.
+  commits `5aa7fa5`, `be0e0af`, `f6e9f80`, `45cb691`, and `de83aec` plus the
+  handoff documentation commits are local, making the branch eight commits
+  ahead. No push was performed.
+- The Windows transfer host now has a WSL2 Ubuntu 26.04 boundary with Go
+  1.25.3 at `/home/seohyun/go/bin/go` and gcc for `-race`. Run linux-tagged
+  package gates from `/mnt/c/Users/seohyun/Documents/dev/circulusd` with
+  `TMPDIR`/`GOTMPDIR`/`GOCACHE` pointed at `/dev/shm` (recreate those
+  directories after every WSL restart) and `CGO_ENABLED=1`. The `/mnt/c`
+  working tree is CRLF (`core.autocrlf=true`) on a drvfs mount, which breaks
+  only environment-sensitive tests elsewhere in the repository: workerd
+  conformance fixture digests (CRLF content) and dependency evidence
+  parent-mode checks (drvfs permissions). The canonical full-suite gate on
+  this machine is therefore a native clone:
+  `git clone /mnt/c/Users/seohyun/Documents/dev/circulusd ~/circulusd` (or
+  `git -C ~/circulusd fetch origin && git -C ~/circulusd reset --hard
+  origin/main` on later rounds), then `go test ./...` and `go vet ./...`
+  there. A plain `gofmt -l` on the CRLF tree flags every file and is not
+  evidence of a formatting change; check CR-stripped copies instead.
 - `RISK_REGISTER.md` is intentionally local and untracked by repository policy.
   Its `ARCH-003` entry is summarized below so a fresh clone does not lose the
   risk.
@@ -91,9 +100,13 @@ is no numeric-PID-only fallback.
 
 ## Current verification evidence
 
-This evidence was produced on the original Linux machine for `f6e9f80` and
-does not cover `45cb691`, whose test execution is still pending on a Linux
-host. The final implementation checks before the machine transfer passed:
+For `45cb691` and `de83aec`, the WSL2 boundary on this machine executed and
+passed: focused 50-repetition identity and observer race/shuffle runs, the
+10-repetition complete `internal/agent` race/shuffle gate, package and
+repo-wide vet, and the complete `go test ./...` suite from the native WSL
+clone at each commit. The evidence below was produced on the original Linux
+machine for `f6e9f80`; its final implementation checks before the machine
+transfer passed:
 
 - observation-focused race/shuffle: 50 repetitions;
 - pidfd-owner-focused race/shuffle: 100 repetitions;
@@ -147,53 +160,53 @@ the real `/proc`-and-pidfd capture, tests inject a fake built on the existing
 proc-reader/pidfd fakes, and the real-child launcher integration test
 exercises the production capture path end to end.
 
-Before starting the next unit on a Linux host, first execute the deferred
-gates for this slice and record the results:
+The deferred gates for this slice were executed on the WSL boundary on
+2026-09-01 and passed: 50-repetition identity-focused race/shuffle,
+10-repetition complete `internal/agent` race/shuffle, repo-wide
+`GOOS=linux go vet ./...`, and `go test ./...` from the native WSL clone.
 
-```sh
-go test -race -shuffle=on -count=50 -run 'Identity' ./internal/agent
-go test -race -shuffle=on -count=10 ./internal/agent
-go test ./...
-go vet ./...
-```
+## Completed 2026-09-01: serialized observation lifecycle
 
-## Exact next TDD work unit: serialized observation lifecycle
+Implemented in `internal/agent/workerd_observer_linux.go`, its test file, and
+narrow launcher wiring. One launcher-owned observer per published shard
+generation:
 
-Only after the launcher-attachment race gates are green on a Linux host, add
-exactly one observer owner for each adopted shard generation. The producer
-must:
+- obtains a complete pinned cgroup sample and exact pidfd-verified process-RSS
+  sample before allocating the next strictly increasing generation-local
+  sequence, and fails closed before `uint64` exhaustion;
+- classifies OOM and heap pressure from `memory.events` deltas against that
+  exact generation's baseline;
+- delivers an immutable `ShardObservation` carrying the exact
+  boot/shard/generation tuple to a required `WorkerdObservationSink`
+  (`Manager` satisfies it statically) with no launcher, instance, cgroup, or
+  process-identity locks held;
+- suppresses a sample whose cancellation wins after I/O but before delivery;
+- ends only the producer, never the shard, on sample or sink failure.
 
-- obtain a complete pinned cgroup sample and exact process-RSS sample before
-  allocating the next sequence;
-- compare cumulative `memory.events` and `cpu.stat` values with baselines from
-  that exact generation;
-- deliver an immutable `ShardObservation` with the exact boot/shard/generation
-  tuple;
-- serialize sequence assignment, allow gaps only after a fully formed sample,
-  never wrap `uint64`, and recycle or fail closed before exhaustion;
-- suppress a sample if cancellation wins after I/O but before sink delivery;
-- call the Manager sink without launcher, instance, cgroup, process-owner, or
-  Manager locks held;
-- cancel and join before the generation's final cleanup closes its process and
-  cgroup owners.
+The self-stop cycle is resolved by ownership transfer, not a joining stop:
+stop epochs cancel the observer and complete without joining it, so a sink
+that synchronously stops its own shard returns first, and `Launcher.Close`
+performs the final observer join before releasing the executable. A deliberate
+join-before-epoch mutation reproduces the deadlock and fails
+`TestWorkerdObserverSelfStopDrainDoesNotDeadlock`, which is the recorded RED
+evidence for this boundary. Focused observer race runs, the 50-repetition
+focused and 10-repetition complete agent race/shuffle gates, and package vet
+passed on the WSL boundary.
 
-Beware the self-stop cycle: `Manager.Observe` can drain a zero-session shard.
-If `ShardProcess.Stop` synchronously cancels and joins the observer that is
-currently blocked inside the Manager sink, it deadlocks. A preceding RED must
-prove that observation-triggered cleanup is transferred to a detached cleanup
-owner so the sink returns before observer join. Caller cancellation may stop a
-wait, but it must not abandon that cleanup owner.
-
-## Work after observation delivery
+## Exact next TDD work unit: U10.3 reconstruction and recycle contracts
 
 Continue the numbered plan without widening the cut line:
 
 1. U10.3: distinct Dynamic Worker reconstruction, cgroup pressure recycle, and
    explicit pinned-process `SIGKILL` reconstruction, all from an externally
-   acknowledged checkpoint.
+   acknowledged checkpoint. Follow `docs/implementation-plan.md` §U10.3: the
+   three result names are non-substitutable, the deterministic checkpoint
+   store lives outside the workerd process and acknowledges commits before any
+   destructive fault, and the initialization-instance ID is created inside the
+   Dynamic Worker module during real module initialization.
 2. U10.4: release-snapshot-to-launcher composition, persistent private socket,
-   real CPU/RSS/reconstruction probes, status mapping, canonical artifacts, and
-   atomic evidence retention.
+   real CPU/RSS/reconstruction probes, live Manager sink composition, status
+   mapping, canonical artifacts, and atomic evidence retention.
 3. U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
    leak finalization, acceptance ledger, and operator documentation.
 4. Units 11 and 12 remain queued after Unit 10. Private
