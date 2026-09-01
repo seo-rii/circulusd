@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -490,6 +491,23 @@ type fakeWorkerdPIDFDBackend struct {
 	closeFDs     []int
 	closeEntered chan struct{}
 	closeGate    <-chan struct{}
+	signalErr    error
+	signalFDs    []int
+	signalValues []syscall.Signal
+}
+
+func (backend *fakeWorkerdPIDFDBackend) sendSignal(fd int, signal syscall.Signal) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.signalFDs = append(backend.signalFDs, fd)
+	backend.signalValues = append(backend.signalValues, signal)
+	return backend.signalErr
+}
+
+func (backend *fakeWorkerdPIDFDBackend) sentSignals() ([]int, []syscall.Signal) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return append([]int(nil), backend.signalFDs...), append([]syscall.Signal(nil), backend.signalValues...)
 }
 
 func (backend *fakeWorkerdPIDFDBackend) openPIDFD(pid int) (int, error) {

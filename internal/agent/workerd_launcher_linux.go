@@ -64,7 +64,13 @@ const (
 // ObservationInterval are set together or not at all; a sink requires the
 // cgroup boundary because every observation carries a complete cgroup sample.
 type WorkerdLauncherConfig struct {
-	ExecutablePath      string
+	ExecutablePath string
+	// Executable optionally supplies an already-opened verified executable
+	// instead of ExecutablePath; exactly one of the two must be set. The
+	// launcher takes ownership of the descriptor once the input pair is
+	// accepted, snapshots and digest-checks its bytes into its own sealed
+	// memfd, and closes it before the constructor returns.
+	Executable          *os.File
 	ExecutableDigest    string
 	Environment         map[string]string
 	ReadinessTimeout    time.Duration
@@ -363,9 +369,13 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		config.StopGracePeriod <= 0 || config.StopGracePeriod > maximumWorkerdStopGracePeriod ||
 		config.OutputLimitBytes <= 0 || config.OutputLimitBytes > maximumWorkerdOutputLimitBytes ||
 		config.HistoryCapacity <= 0 || config.HistoryCapacity > maximumWorkerdHistoryCapacity ||
-		!filepath.IsAbs(config.ExecutablePath) || filepath.Clean(config.ExecutablePath) != config.ExecutablePath ||
-		config.ExecutablePath == string(filepath.Separator) ||
+		(config.Executable == nil) == (config.ExecutablePath == "") ||
 		!validDigest(config.ExecutableDigest) || createMemfd == nil || captureIdentity == nil {
+		return nil, ErrInvalidWorkerdLauncherConfig
+	}
+	if config.Executable == nil &&
+		(!filepath.IsAbs(config.ExecutablePath) || filepath.Clean(config.ExecutablePath) != config.ExecutablePath ||
+			config.ExecutablePath == string(filepath.Separator)) {
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
 	if (config.ObservationSink == nil) != (config.ObservationInterval == 0) ||
@@ -395,35 +405,44 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 	}
 	sort.Strings(environment)
 
-	rootFD, err := unix.Open(string(filepath.Separator), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("%w: open filesystem root: %v", ErrUnsafeWorkerdExecutable, err)
-	}
-	currentFD := rootFD
-	components := strings.Split(strings.TrimPrefix(config.ExecutablePath, string(filepath.Separator)), string(filepath.Separator))
-	for index, component := range components {
-		flags := uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC)
-		if index == len(components)-1 {
-			flags = uint64(unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW)
+	var sourceExecutable *os.File
+	if config.Executable != nil {
+		sourceExecutable = config.Executable
+		if _, err := sourceExecutable.Seek(0, io.SeekStart); err != nil {
+			_ = sourceExecutable.Close()
+			return nil, fmt.Errorf("%w: rewind supplied executable: %v", ErrUnsafeWorkerdExecutable, err)
 		}
-		nextFD, openErr := unix.Openat2(currentFD, component, &unix.OpenHow{
-			Flags:   flags,
-			Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS),
-		})
-		_ = unix.Close(currentFD)
-		if openErr != nil {
-			return nil, fmt.Errorf("%w: open %q: %v", ErrUnsafeWorkerdExecutable, config.ExecutablePath, openErr)
+	} else {
+		rootFD, err := unix.Open(string(filepath.Separator), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, fmt.Errorf("%w: open filesystem root: %v", ErrUnsafeWorkerdExecutable, err)
 		}
-		currentFD = nextFD
-	}
-	sourceExecutable := os.NewFile(uintptr(currentFD), config.ExecutablePath)
-	if sourceExecutable == nil {
-		_ = unix.Close(currentFD)
-		return nil, fmt.Errorf("%w: wrap opened executable", ErrUnsafeWorkerdExecutable)
+		currentFD := rootFD
+		components := strings.Split(strings.TrimPrefix(config.ExecutablePath, string(filepath.Separator)), string(filepath.Separator))
+		for index, component := range components {
+			flags := uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC)
+			if index == len(components)-1 {
+				flags = uint64(unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW)
+			}
+			nextFD, openErr := unix.Openat2(currentFD, component, &unix.OpenHow{
+				Flags:   flags,
+				Resolve: uint64(unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS),
+			})
+			_ = unix.Close(currentFD)
+			if openErr != nil {
+				return nil, fmt.Errorf("%w: open %q: %v", ErrUnsafeWorkerdExecutable, config.ExecutablePath, openErr)
+			}
+			currentFD = nextFD
+		}
+		sourceExecutable = os.NewFile(uintptr(currentFD), config.ExecutablePath)
+		if sourceExecutable == nil {
+			_ = unix.Close(currentFD)
+			return nil, fmt.Errorf("%w: wrap opened executable", ErrUnsafeWorkerdExecutable)
+		}
 	}
 	defer sourceExecutable.Close()
 	var stat unix.Stat_t
-	if err := unix.Fstat(currentFD, &stat); err != nil {
+	if err := unix.Fstat(int(sourceExecutable.Fd()), &stat); err != nil {
 		return nil, fmt.Errorf("%w: stat opened executable: %v", ErrUnsafeWorkerdExecutable, err)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o111 == 0 || stat.Mode&0o022 != 0 ||
@@ -1507,6 +1526,120 @@ func (handle *WorkerdShardHandle) Output() WorkerdOutput {
 		Stdout: stdout, Stderr: stderr,
 		StdoutTruncated: stdoutTruncated, StderrTruncated: stderrTruncated,
 	}
+}
+
+// WorkerdMemoryEventCounters mirrors cgroup-v2 memory.events for
+// qualification evidence consumers outside this package.
+type WorkerdMemoryEventCounters struct {
+	Low          uint64
+	High         uint64
+	Max          uint64
+	OOM          uint64
+	OOMKill      uint64
+	OOMGroupKill uint64
+}
+
+// WorkerdCPUStatCounters mirrors cgroup-v2 cpu.stat for qualification
+// evidence consumers outside this package.
+type WorkerdCPUStatCounters struct {
+	UsageMicros      uint64
+	UserMicros       uint64
+	SystemMicros     uint64
+	Periods          uint64
+	ThrottledPeriods uint64
+	ThrottledMicros  uint64
+}
+
+// WorkerdShardResourceSample is one immutable qualification-facing resource
+// sample: a complete pinned-identity cgroup read plus the exact
+// pidfd-verified process RSS for one shard generation. Cgroup memory charge
+// and process RSS remain distinct values; deltas are relative to the
+// generation baseline captured before process attachment.
+type WorkerdShardResourceSample struct {
+	AgentInstanceID    identity.ID
+	ShardID            string
+	ShardGeneration    ShardGeneration
+	PID                int
+	ProcessStartTicks  uint64
+	ProcessRSSBytes    uint64
+	CPUMax             CPUMax
+	MemoryCurrentBytes uint64
+	MemoryEvents       WorkerdMemoryEventCounters
+	MemoryEventsDelta  WorkerdMemoryEventCounters
+	CPUStat            WorkerdCPUStatCounters
+	CPUStatDelta       WorkerdCPUStatCounters
+	PIDsCurrent        uint64
+}
+
+func exportWorkerdMemoryEvents(events workerdCgroupMemoryEvents) WorkerdMemoryEventCounters {
+	return WorkerdMemoryEventCounters{
+		Low: events.Low, High: events.High, Max: events.Max,
+		OOM: events.OOM, OOMKill: events.OOMKill, OOMGroupKill: events.OOMGroupKill,
+	}
+}
+
+func exportWorkerdCPUStat(stat workerdCgroupCPUStat) WorkerdCPUStatCounters {
+	return WorkerdCPUStatCounters{
+		UsageMicros: stat.UsageMicros, UserMicros: stat.UserMicros, SystemMicros: stat.SystemMicros,
+		Periods: stat.Periods, ThrottledPeriods: stat.ThrottledPeriods, ThrottledMicros: stat.ThrottledMicros,
+	}
+}
+
+// SampleResources takes one complete pinned cgroup sample and one exact
+// pidfd-verified process-RSS sample for this shard generation. It is a
+// qualification evidence read: it performs no state mutation and fails
+// closed once the generation's cgroup or process identity is gone.
+func (handle *WorkerdShardHandle) SampleResources(ctx context.Context) (WorkerdShardResourceSample, error) {
+	if handle == nil || handle.launcher == nil || handle.instance == nil || ctx == nil {
+		return WorkerdShardResourceSample{}, ErrInvalidWorkerdEnsureRequest
+	}
+	instance := handle.instance
+	if instance.cgroup == nil || instance.processIdentity == nil {
+		return WorkerdShardResourceSample{}, fmt.Errorf("%w: resource sampling requires the cgroup and process identity boundaries", ErrInvalidWorkerdEnsureRequest)
+	}
+	cgroupSample, err := instance.cgroup.sampleResources(ctx)
+	if err != nil {
+		return WorkerdShardResourceSample{}, err
+	}
+	rssSample, err := instance.processIdentity.sampleRSS(handle.launcher.observationPageSize)
+	if err != nil {
+		return WorkerdShardResourceSample{}, err
+	}
+	if cgroupSample.AgentInstanceID != instance.key.agentInstanceID ||
+		cgroupSample.ShardID != instance.key.shardID ||
+		cgroupSample.Generation != instance.key.generation {
+		return WorkerdShardResourceSample{}, fmt.Errorf("%w: cgroup sample identity does not match the shard generation", errWorkerdCgroupContract)
+	}
+	return WorkerdShardResourceSample{
+		AgentInstanceID:    instance.key.agentInstanceID,
+		ShardID:            instance.key.shardID,
+		ShardGeneration:    instance.key.generation,
+		PID:                rssSample.PID,
+		ProcessStartTicks:  rssSample.StartTicks,
+		ProcessRSSBytes:    rssSample.RSSBytes,
+		CPUMax:             cgroupSample.CPUMax,
+		MemoryCurrentBytes: cgroupSample.MemoryCurrentBytes,
+		MemoryEvents:       exportWorkerdMemoryEvents(cgroupSample.MemoryEvents),
+		MemoryEventsDelta:  exportWorkerdMemoryEvents(cgroupSample.MemoryEventsDelta),
+		CPUStat:            exportWorkerdCPUStat(cgroupSample.CPUStat),
+		CPUStatDelta:       exportWorkerdCPUStat(cgroupSample.CPUStatDelta),
+		PIDsCurrent:        cgroupSample.PIDsCurrent,
+	}, nil
+}
+
+// KillProcessInstance delivers SIGKILL to the exact pinned process instance
+// through its owned pidfd, so a recycled numeric PID can never be signaled.
+// It performs no cleanup; the natural exit path and stop epochs retain
+// cleanup ownership of the killed generation.
+func (handle *WorkerdShardHandle) KillProcessInstance() error {
+	if handle == nil || handle.instance == nil {
+		return ErrInvalidWorkerdEnsureRequest
+	}
+	identityOwner := handle.instance.processIdentity
+	if identityOwner == nil {
+		return errWorkerdProcessIdentityUnavailable
+	}
+	return identityOwner.kill(syscall.SIGKILL)
 }
 
 // Evidence reports implemented controls and returns a fresh capability slice.

@@ -2634,6 +2634,139 @@ func TestWorkerdOldGenerationIdentityCannotActOnReplacement(t *testing.T) {
 	}
 }
 
+func newWorkerdSealedExecutableForTest(t *testing.T, content []byte) *os.File {
+	t.Helper()
+	fd, err := unix.MemfdCreate("test-sealed-workerd", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	if err != nil {
+		t.Fatalf("MemfdCreate() error = %v", err)
+	}
+	file := os.NewFile(uintptr(fd), "test-sealed-workerd")
+	if _, err := file.Write(content); err != nil {
+		t.Fatalf("Write(sealed executable) error = %v", err)
+	}
+	if err := unix.Fchmod(fd, 0o500); err != nil {
+		t.Fatalf("Fchmod() error = %v", err)
+	}
+	if _, err := file.Seek(3, io.SeekStart); err != nil {
+		t.Fatalf("Seek() error = %v", err)
+	}
+	return file
+}
+
+func TestWorkerdLauncherAcceptsSealedExecutableHandoffWithoutPathAuthority(t *testing.T) {
+	t.Parallel()
+	content := []byte("sealed-snapshot-workerd")
+	digest := sha256.Sum256(content)
+	probe := WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil })
+	starter := &recordingWorkerdStarter{}
+	config := WorkerdLauncherConfig{
+		Executable:       newWorkerdSealedExecutableForTest(t, content),
+		ExecutableDigest: fmt.Sprintf("sha256:%x", digest),
+		ReadinessTimeout: time.Second,
+		StopGracePeriod:  20 * time.Millisecond,
+		OutputLimitBytes: 1024,
+		HistoryCapacity:  128,
+		ReadinessProbe:   probe,
+	}
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher from sealed executable: %v", err)
+	}
+	_ = capture
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(10), ShardID: "sealed-handoff", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure() error = %v", ensureErr)
+	}
+	commands := starter.commandSnapshot()
+	if len(commands) != 1 || string(commands[0].executableContent) != string(content) {
+		t.Fatalf("started executable content = %q, want the sealed snapshot bytes", commands[0].executableContent)
+	}
+	if stopErr := handle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+func TestWorkerdLauncherRejectsIncoherentExecutableHandoff(t *testing.T) {
+	t.Parallel()
+	content := []byte("sealed-snapshot-workerd")
+	digest := sha256.Sum256(content)
+	probe := WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil })
+	t.Run("both path and file", func(t *testing.T) {
+		t.Parallel()
+		config := newWorkerdLauncherConfigForTest(t, probe)
+		config.Executable = newWorkerdSealedExecutableForTest(t, content)
+		launcher, err := newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+		if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
+			t.Fatalf("constructor = %#v, %v, want exactly one executable input", launcher, err)
+		}
+	})
+	t.Run("neither path nor file", func(t *testing.T) {
+		t.Parallel()
+		config := newWorkerdLauncherConfigForTest(t, probe)
+		config.ExecutablePath = ""
+		launcher, err := newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+		if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
+			t.Fatalf("constructor = %#v, %v, want exactly one executable input", launcher, err)
+		}
+	})
+	t.Run("digest mismatch", func(t *testing.T) {
+		t.Parallel()
+		config := newWorkerdLauncherConfigForTest(t, probe)
+		config.ExecutablePath = ""
+		config.Executable = newWorkerdSealedExecutableForTest(t, content)
+		config.ExecutableDigest = "sha256:" + strings.Repeat("0", sha256.Size*2)
+		launcher, err := newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+		if launcher != nil || !errors.Is(err, ErrWorkerdDigestMismatch) {
+			t.Fatalf("constructor = %#v, %v, want digest mismatch", launcher, err)
+		}
+	})
+	_ = digest
+}
+
+func TestWorkerdShardHandleKillsExactPinnedProcessInstance(t *testing.T) {
+	t.Parallel()
+	process := newFakeWorkerdProcess(31_020, false)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(11), ShardID: "pinned-kill", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure() error = %v", ensureErr)
+	}
+	captured := capture.capturedForPID(31_020)
+	if captured == nil {
+		t.Fatal("identity was not captured for pid 31020")
+	}
+	if killErr := handle.KillProcessInstance(); killErr != nil {
+		t.Fatalf("KillProcessInstance() error = %v", killErr)
+	}
+	sentFD, sentSignals := captured.backend.sentSignals()
+	if len(sentSignals) != 1 || sentSignals[0] != syscall.SIGKILL || sentFD[0] != captured.backend.openFD {
+		t.Fatalf("pidfd signals = fds %v signals %v, want one SIGKILL through the owned pidfd", sentFD, sentSignals)
+	}
+	if signals := process.signalSnapshot(); len(signals) != 0 {
+		t.Fatalf("process-group signals = %v, want the pinned-instance kill to bypass numeric group signaling", signals)
+	}
+	process.finishGroup(errors.New("killed"))
+	waitUntilWorkerdCondition(t, 2*time.Second, func() bool {
+		_, closeFDs := captured.backend.calls()
+		return len(closeFDs) == 1
+	}, "identity owner was not closed after the killed process exited")
+	if killErr := handle.KillProcessInstance(); !errors.Is(killErr, errWorkerdProcessIdentityUnavailable) {
+		t.Fatalf("KillProcessInstance(closed identity) error = %v, want identity unavailable", killErr)
+	}
+	if _, sentSignals := captured.backend.sentSignals(); len(sentSignals) != 1 {
+		t.Fatalf("pidfd signals after close = %d, want no signal to a recycled descriptor", len(sentSignals))
+	}
+}
+
 func TestWorkerdLauncherHoldsNoLockAcrossIdentityCaptureAndClose(t *testing.T) {
 	t.Parallel()
 	processA := newFakeWorkerdProcess(31_009, true)

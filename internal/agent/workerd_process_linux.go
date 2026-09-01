@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -43,6 +44,7 @@ type workerdProcessSample struct {
 
 type workerdPIDFDBackend interface {
 	openPIDFD(pid int) (int, error)
+	sendSignal(fd int, signal syscall.Signal) error
 	closeFD(fd int) error
 }
 
@@ -86,6 +88,10 @@ type linuxWorkerdProcessReader struct{}
 
 func (linuxWorkerdPIDFDBackend) openPIDFD(pid int) (int, error) {
 	return unix.PidfdOpen(pid, 0)
+}
+
+func (linuxWorkerdPIDFDBackend) sendSignal(fd int, signal syscall.Signal) error {
+	return unix.PidfdSendSignal(fd, signal, nil, 0)
 }
 
 func (linuxWorkerdPIDFDBackend) closeFD(fd int) error {
@@ -173,6 +179,40 @@ func (identity *workerdProcessIdentity) sample(reader workerdProcessReader, page
 		identity.mu.Unlock()
 	}()
 	return sampleWorkerdProcess(reader, token, pageSize)
+}
+
+// kill delivers one signal through the owned pidfd so it can never reach a
+// recycled PID. It borrows the descriptor like a sample: once closing has
+// begun the signal is refused instead of racing the close syscall.
+func (identity *workerdProcessIdentity) kill(signal syscall.Signal) error {
+	if identity == nil {
+		return fmt.Errorf("%w: process identity is required", errInvalidWorkerdProcessRequest)
+	}
+	identity.mu.Lock()
+	if identity.closing || identity.closed {
+		identity.mu.Unlock()
+		return errWorkerdProcessIdentityUnavailable
+	}
+	if identity.borrows == 0 {
+		identity.borrowQuiescent = make(chan struct{})
+	}
+	identity.borrows++
+	pidfd := identity.pidfd
+	backend := identity.backend
+	identity.mu.Unlock()
+	defer func() {
+		identity.mu.Lock()
+		identity.borrows--
+		if identity.borrows == 0 {
+			close(identity.borrowQuiescent)
+			identity.borrowQuiescent = nil
+		}
+		identity.mu.Unlock()
+	}()
+	if err := backend.sendSignal(pidfd, signal); err != nil {
+		return fmt.Errorf("signal workerd pidfd: %w", err)
+	}
+	return nil
 }
 
 func (identity *workerdProcessIdentity) close() error {

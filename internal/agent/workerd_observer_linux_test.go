@@ -449,6 +449,70 @@ func TestWorkerdObserverSinkErrorEndsProducerWithoutStoppingShard(t *testing.T) 
 	}
 }
 
+func TestWorkerdShardHandleSamplesResourcesWithExactIdentity(t *testing.T) {
+	baselineMemory := workerdCgroupMemoryEvents{Low: 1, High: 2, Max: 3, OOM: 4, OOMKill: 5, OOMGroupKill: 6}
+	baselineCPU := workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2}
+	process := newFakeWorkerdProcess(32_010, true)
+	cgroupConfig, backend, cgroups := newWorkerdCgroupLauncherController(t)
+	backend.initialMemoryEvents = formatFakeWorkerdCgroupMemoryEvents(baselineMemory)
+	backend.initialCPUStat = formatFakeWorkerdCgroupCPUStat(baselineCPU)
+	installWorkerdObserverKillOrder(backend, []*fakeWorkerdProcess{process})
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	sink := newRecordingWorkerdObservationSink()
+	launcher, capture := newWorkerdObserverLauncherForTest(t, starter, backend, cgroups,
+		WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }),
+		sink, 2*time.Millisecond)
+	agentID := workerdTestAgentInstanceID(8)
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: agentID, ShardID: "resource-sample", ShardGeneration: 7,
+	})
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	currentMemory := workerdCgroupMemoryEvents{Low: 2, High: 4, Max: 6, OOM: 8, OOMKill: 10, OOMGroupKill: 12}
+	currentCPU := workerdCgroupCPUStat{UsageMicros: 30, UserMicros: 14, SystemMicros: 16, Periods: 18, ThrottledPeriods: 8, ThrottledMicros: 7}
+	backend.setOnlyChildControl(t, "memory.current", "67108864\n")
+	backend.setOnlyChildControl(t, "memory.events", formatFakeWorkerdCgroupMemoryEvents(currentMemory))
+	backend.setOnlyChildControl(t, "cpu.stat", formatFakeWorkerdCgroupCPUStat(currentCPU))
+	backend.setOnlyChildControl(t, "pids.current", "17\n")
+	sample, sampleErr := handle.SampleResources(context.Background())
+	if sampleErr != nil {
+		t.Fatalf("SampleResources() error = %v", sampleErr)
+	}
+	captured := capture.capturedForPID(32_010)
+	if captured == nil {
+		t.Fatal("identity was not captured for pid 32010")
+	}
+	want := WorkerdShardResourceSample{
+		AgentInstanceID:    agentID,
+		ShardID:            "resource-sample",
+		ShardGeneration:    7,
+		PID:                32_010,
+		ProcessStartTicks:  captured.ticks,
+		ProcessRSSBytes:    2 * launcher.observationPageSize,
+		CPUMax:             cgroupConfig.CPUMax,
+		MemoryCurrentBytes: 67_108_864,
+		MemoryEvents:       WorkerdMemoryEventCounters{Low: 2, High: 4, Max: 6, OOM: 8, OOMKill: 10, OOMGroupKill: 12},
+		MemoryEventsDelta:  WorkerdMemoryEventCounters{Low: 1, High: 2, Max: 3, OOM: 4, OOMKill: 5, OOMGroupKill: 6},
+		CPUStat:            WorkerdCPUStatCounters{UsageMicros: 30, UserMicros: 14, SystemMicros: 16, Periods: 18, ThrottledPeriods: 8, ThrottledMicros: 7},
+		CPUStatDelta:       WorkerdCPUStatCounters{UsageMicros: 20, UserMicros: 10, SystemMicros: 10, Periods: 10, ThrottledPeriods: 5, ThrottledMicros: 5},
+		PIDsCurrent:        17,
+	}
+	if sample != want {
+		t.Fatalf("SampleResources() = %+v, want %+v", sample, want)
+	}
+	if stopErr := handle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if _, closedErr := handle.SampleResources(context.Background()); closedErr == nil {
+		t.Fatal("SampleResources(after stop) error = nil, want closed resource boundary")
+	}
+	var nilHandle *WorkerdShardHandle
+	if _, nilErr := nilHandle.SampleResources(context.Background()); !errors.Is(nilErr, ErrInvalidWorkerdEnsureRequest) {
+		t.Fatalf("SampleResources(nil handle) error = %v, want invalid request", nilErr)
+	}
+}
+
 func TestWorkerdObserverLifecycleJoinsOnCloseAndSkipsFailedLaunches(t *testing.T) {
 	t.Run("close joins every observer", func(t *testing.T) {
 		processes := []*fakeWorkerdProcess{newFakeWorkerdProcess(32_007, true), newFakeWorkerdProcess(32_008, true)}
