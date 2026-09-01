@@ -13,15 +13,16 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `d392cb8` (`feat(conformance): add the resource
-  qualification status and evidence spine`), created on the Windows transfer
-  host on 2026-09-01. The 2026-09-01 transfer-host implementation commits are,
-  in order: `45cb691` (launcher pidfd attachment), `de83aec` (serialized
-  observation), `8d11098` (distinct reconstruction results), `c5eabaf`
-  (external checkpoint store), `08eb353` (dynamic-worker initialization
-  instances), `cb3f5f7` (launcher qualification surface), `96cbd69`
-  (private-socket fixture), and `d392cb8` (status + evidence spine). This
-  handoff update is committed immediately after `d392cb8`.
+- Last implementation commit: `e03543b` (`feat(agent): expose cgroup
+  provisioning preflight and fix real root scan`), created on the Windows
+  transfer host on 2026-09-01. The 2026-09-01 transfer-host implementation
+  commits are, in order: `45cb691` (launcher pidfd attachment), `de83aec`
+  (serialized observation), `8d11098` (distinct reconstruction results),
+  `c5eabaf` (external checkpoint store), `08eb353` (dynamic-worker
+  initialization instances), `cb3f5f7` (launcher qualification surface),
+  `96cbd69` (private-socket fixture), `d392cb8` (status + evidence spine), and
+  `e03543b` (cgroup provisioning preflight + inspectRoot fix). This handoff
+  update is committed immediately after `e03543b`.
 - At original preparation time `origin/main` was `9ab2104`; all implementation
   and handoff documentation commits are local. No push was performed.
 - The release-pinned stock workerd binary is installed inside WSL at
@@ -307,8 +308,13 @@ Already implemented and host-independently tested, usable on any decision path:
 
 ### Remaining U10.4 work (after the blocker decision)
 
-1. The provisioning preflight (operator cgroup-root ownership/mode/emptiness/
-   controller checks) and the pinned-binary CLI preflight.
+Done since: `e03543b` added `ProbeWorkerdCgroupProvisioning` (the cgroup
+provisioning preflight), live-verified against a real WSL2 cgroup-v2 root, and
+fixed a latent `inspectRoot` scan bug that had made the real cgroup path fail
+on every host (the fake backend never exercised it).
+
+1. The pinned-binary CLI preflight (golden `serve` argv preflight against the
+   sealed executable).
 2. The external RED run showing the `workerd test` fixture plus three
    caller-supplied binary env vars cannot satisfy the resource gate (retain
    the command/result).
@@ -316,10 +322,19 @@ Already implemented and host-independently tested, usable on any decision path:
    sink → checkpoint-store probe composition, wiring the achievable three real
    probes plus the honest FAIL recording for the two blocked results, and the
    U10.3 mock placement rotation (reference-only).
-4. The full external gate needs the provisioned cgroup-v2 host contract from
-   the plan; WSL cgroup delegation must be provisioned per the operator
-   contract before any external result can be recorded, and only a
-   provisioned-host run can promote results.
+4. Only a provisioned-host run can promote results.
+
+Live cgroup provisioning recipe (WSL2): manually-created cgroups do NOT
+survive across separate `wsl.exe` invocations — provision and run in one
+invocation. As root in one shell: enable controllers in the parent
+(`echo '+cpu +memory +pids' > /sys/fs/cgroup/cgroup.subtree_control`), create
+the domain (`mkdir /sys/fs/cgroup/<root>`), own it to the runner uid/gid at
+mode 0700, enable controllers in ITS subtree_control
+(`echo '+cpu +memory +pids' > /sys/fs/cgroup/<root>/cgroup.subtree_control`),
+then run the probe with the runner's effective uid matching the owner (running
+the whole invocation as root, root-owned root, works for a smoke). Passwordless
+sudo is unavailable; use `wsl -u root`. Root-run Go tests leave root-owned
+files in a shared GOCACHE — use a separate GOCACHE for root vs user runs.
 
 ### U10.5 and beyond
 

@@ -338,6 +338,22 @@ not silently included in Unit 10.
   in-isolate fault destroys a Worker Loader isolate, so
   `dynamic-worker-reconstruction` is blocked independently of `cpuMs`. Full
   repository tests, package race, and vet pass on the WSL boundary.
+- 2026-09-01: `internal/agent` now exports `ProbeWorkerdCgroupProvisioning`,
+  the qualification runner's cgroup preflight. It reuses the controller
+  construction contract to validate an operator-provisioned delegated
+  cgroup-v2 root without launching a process, captures the pinned root
+  device/inode and enabled controllers for evidence, and separates a genuine
+  host-unavailable boundary (UNAVAILABLE) from an ownership/mode/emptiness/
+  controller contract violation (FAIL). Exercising it against a real
+  provisioned cgroup surfaced and fixed a latent bug in the shared
+  `inspectRoot` emptiness scan — `DirEntry.Info` lstat'd a working-directory-
+  relative path built from the directory File's synthetic name, ENOENTing on
+  every real cgroup entry and mislabeling a valid root as unavailable; the
+  scan now resolves entry type via `fstatat` against the pinned directory FD.
+  This is the first time the real (non-fake) cgroup discovery path ran on a
+  live cgroup-v2 host. Verified `Satisfied` against a provisioned WSL2 root
+  with real device/inode and cpu/memory/pids enabled; fake-backend
+  classification cases and full agent race/shuffle and vet pass.
 
 ### Outcome
 
@@ -831,9 +847,9 @@ private-socket serve fixture and its digest-binding materializer exist. The
 status classification, component PASS predicates, run-level evaluator, and the
 canonical CBOR evidence envelope with atomic no-clobber retention and read-back
 revalidation exist and are host-independently tested. Remaining: the
-provisioning preflight (operator cgroup-root ownership/mode/emptiness/
-controller checks), the pinned-binary CLI preflight, the external RED run
-(item 2), the release-resolver-to-launcher-to-Manager probe composition
+provisioning preflight is implemented (`ProbeWorkerdCgroupProvisioning`,
+live-verified). Remaining: the pinned-binary CLI preflight, the external RED
+run (item 2), the release-resolver-to-launcher-to-Manager probe composition
 (item 3), and result promotion. The runner consumes a preinstalled executable;
 archive extraction remains owned by the separate release/install workflow.
 
