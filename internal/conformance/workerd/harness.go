@@ -35,7 +35,7 @@ var (
 	compatibilityDatePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 	compatibilityFlagPattern = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 
-	//go:embed fixture/phase0.capnp.tmpl fixture/session-host.mjs fixture/pi-worker.mjs fixture/fake-broker.mjs
+	//go:embed fixture/phase0.capnp.tmpl fixture/session-host.mjs fixture/phase0-worker-entry.mjs fixture/pi-worker.mjs fixture/fake-broker.mjs
 	fixtureFiles embed.FS
 )
 
@@ -147,6 +147,7 @@ func New(config Config) (*Harness, error) {
 		strings.Join(config.CompatibilityFlags, "\x00"),
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
+		"fixture/phase0-worker-entry.mjs",
 		"fixture/pi-worker.mjs",
 		"fixture/fake-broker.mjs",
 	} {
@@ -168,6 +169,7 @@ func New(config Config) (*Harness, error) {
 	for _, path := range []string{
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
+		"fixture/phase0-worker-entry.mjs",
 		"fixture/pi-worker.mjs",
 		"fixture/fake-broker.mjs",
 	} {
@@ -317,6 +319,7 @@ func (harness *Harness) Run(ctx context.Context) conformance.Report {
 			defer os.RemoveAll(directory)
 			template, templateErr := fixtureFiles.ReadFile("fixture/phase0.capnp.tmpl")
 			host, hostErr := fixtureFiles.ReadFile("fixture/session-host.mjs")
+			workerEntry, workerEntryErr := fixtureFiles.ReadFile("fixture/phase0-worker-entry.mjs")
 			worker, workerErr := fixtureFiles.ReadFile("fixture/pi-worker.mjs")
 			broker, brokerErr := fixtureFiles.ReadFile("fixture/fake-broker.mjs")
 			flags := make([]string, len(harness.config.CompatibilityFlags))
@@ -327,11 +330,12 @@ func (harness *Harness) Run(ctx context.Context) conformance.Report {
 			configuration = strings.ReplaceAll(configuration, "@COMPATIBILITY_FLAGS@", strings.Join(flags, ", "))
 			hostSource := strings.ReplaceAll(string(host), "@COMPATIBILITY_DATE@", harness.config.CompatibilityDate)
 			hostSource = strings.ReplaceAll(hostSource, "@COMPATIBILITY_FLAGS@", strings.Join(flags, ", "))
-			writeErrors := []error{templateErr, hostErr, workerErr, brokerErr}
+			writeErrors := []error{templateErr, hostErr, workerEntryErr, workerErr, brokerErr}
 			if templateErr == nil {
 				writeErrors = append(writeErrors,
 					os.WriteFile(filepath.Join(directory, "phase0.capnp"), []byte(configuration), 0o600),
 					os.WriteFile(filepath.Join(directory, "session-host.mjs"), []byte(hostSource), 0o600),
+					os.WriteFile(filepath.Join(directory, "phase0-worker-entry.mjs"), workerEntry, 0o600),
 					os.WriteFile(filepath.Join(directory, "pi-worker.mjs"), worker, 0o600),
 					os.WriteFile(filepath.Join(directory, "fake-broker.mjs"), broker, 0o600),
 				)

@@ -278,6 +278,25 @@ not silently included in Unit 10.
   race/shuffle tests pass on the WSL boundary. This store is reference test
   infrastructure for the three reconstruction probes, not durable production
   state.
+- 2026-09-01: the Dynamic Worker fixture now boots through a handwritten
+  `phase0-worker-entry.mjs` main module that keeps the pinned Pi worker
+  bundle byte-identical and owns the initialization-instance identity in
+  module-local state. The state transitions from null to one 128-bit
+  identity at most once per module-graph initialization, so a changed value
+  proves a demonstrably new initialization for the same content-addressed
+  Worker ID; stock workerd forbids drawing entropy in module global scope,
+  so the single `crypto.getRandomValues` draw executes on the first handler
+  call into each instance. The session host cannot inject, rotate, or
+  synthesize the identity, and the runnable `dynamicWorker` probe now proves
+  pre-fault stability across two calls, the identity format, and
+  distinctness across sibling isolates. The capnp template, embedded-fixture
+  set, environment digest, and materialization all bind the new module.
+  Contract tests and the complete conformance package pass, including the
+  live `TestStockWorkerdFixture` gate against the release-pinned
+  workerd 1.20260825.1 binary (archive and extracted digests verified
+  against the manifest) on the WSL boundary. The post-fault
+  initialization-instance change remains owned by the U10.4 external runner,
+  which launches `workerd serve` without `--predictable`.
 
 ### Outcome
 
@@ -730,9 +749,11 @@ from both. The runner-side deterministic checkpoint store exists outside the
 workerd process: it acknowledges canonical bytes/digest commits per
 content-addressed Worker ID, reverifies digests on reload, never serves
 unacknowledged or foreign state, fails closed before sequence exhaustion,
-and gates fault injection on the exact acknowledged digest. Fixture
-initialization-instance identity, the fault paths, probe composition against
-the store, and the mock placement rotation remain.
+and gates fault injection on the exact acknowledged digest. The Dynamic
+Worker fixture now carries the module-local initialization-instance identity
+with its pre-fault stability proven under the pinned stock workerd binary.
+The destructive fault paths, probe composition against the store, and the
+mock placement rotation remain.
 
 1. Add failing host-independent contract tests for all three new reconstruction
    result names, their non-substitutability, checkpoint commit/ack ordering,

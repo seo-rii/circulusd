@@ -419,6 +419,7 @@ func TestEnvironmentDigestBindsTheFakeBrokerFixture(t *testing.T) {
 		strings.Join(config.CompatibilityFlags, "\x00"),
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
+		"fixture/phase0-worker-entry.mjs",
 		"fixture/pi-worker.mjs",
 		"fixture/fake-broker.mjs",
 	} {
@@ -440,6 +441,7 @@ func TestEnvironmentDigestBindsTheFakeBrokerFixture(t *testing.T) {
 	for _, path := range []string{
 		"fixture/phase0.capnp.tmpl",
 		"fixture/session-host.mjs",
+		"fixture/phase0-worker-entry.mjs",
 		"fixture/pi-worker.mjs",
 		"fixture/fake-broker.mjs",
 	} {
@@ -718,6 +720,58 @@ func TestColdPiReconstructionExposesEveryExtensionLifecycle(t *testing.T) {
 		if got := bytes.Count(host, []byte(hook)); got != want {
 			t.Fatalf("session host occurrences of %s = %d, want %d", hook, got, want)
 		}
+	}
+}
+
+func TestDynamicWorkerFixtureCreatesModuleLocalInitializationInstance(t *testing.T) {
+	t.Parallel()
+
+	entry, err := fixtureFiles.ReadFile("fixture/phase0-worker-entry.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(worker entry) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte(`import worker from "./pi-worker.js"`),
+		[]byte("let initializationInstance = null"),
+		[]byte("if (initializationInstance === null)"),
+		[]byte("crypto.getRandomValues(bytes)"),
+		[]byte(`path === "/initialization-instance"`),
+	} {
+		if !bytes.Contains(entry, required) {
+			t.Errorf("worker entry does not contain %q", required)
+		}
+	}
+	draw := []byte("crypto.getRandomValues")
+	if bytes.Count(entry, draw) != 1 {
+		t.Errorf("worker entry draws its initialization instance %d times, want exactly one module-local draw", bytes.Count(entry, draw))
+	}
+
+	host, err := fixtureFiles.ReadFile("fixture/session-host.mjs")
+	if err != nil {
+		t.Fatalf("ReadFile(session host) error = %v", err)
+	}
+	for _, required := range [][]byte{
+		[]byte(`import entrySource from "phase0-entry-source"`),
+		[]byte(`mainModule: "phase0-entry.js"`),
+		[]byte(`"phase0-entry.js": { js: entrySource }`),
+		[]byte(`"pi-worker.js": { js: workerSource }`),
+		[]byte("first.initializationInstance === second.initializationInstance"),
+		[]byte("siblingResult.initializationInstance !== first.initializationInstance"),
+	} {
+		if !bytes.Contains(host, required) {
+			t.Errorf("session host does not contain %q", required)
+		}
+	}
+	if bytes.Contains(host, []byte("initializationInstance:")) {
+		t.Error("session host synthesizes an initialization instance; only the Dynamic Worker module may create it")
+	}
+
+	template, err := fixtureFiles.ReadFile("fixture/phase0.capnp.tmpl")
+	if err != nil {
+		t.Fatalf("ReadFile(template) error = %v", err)
+	}
+	if !bytes.Contains(template, []byte(`(name = "phase0-entry-source", text = embed "phase0-worker-entry.mjs")`)) {
+		t.Error("workerd configuration does not embed the Dynamic Worker entry module source")
 	}
 }
 

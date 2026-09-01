@@ -1,4 +1,5 @@
 import workerSource from "pi-worker-source";
+import entrySource from "phase0-entry-source";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -9,8 +10,11 @@ function definition(marker, limits = { cpuMs: 1000, subRequests: 0 }, bindings =
     compatibilityDate: "@COMPATIBILITY_DATE@",
     compatibilityFlags: [@COMPATIBILITY_FLAGS@],
     limits,
-    mainModule: "pi-worker.js",
-    modules: { "pi-worker.js": { js: workerSource } },
+    mainModule: "phase0-entry.js",
+    modules: {
+      "phase0-entry.js": { js: entrySource },
+      "pi-worker.js": { js: workerSource },
+    },
     env: { MARKER: marker, ...bindings },
     globalOutbound: null,
   };
@@ -27,6 +31,14 @@ export const dynamicWorker = {
     const worker = env.LOADER.get("dynamic/sha256-a", () => definition("dynamic"));
     const result = await invoke(worker, "/identity");
     assert(result.marker === "dynamic", "dynamic Worker did not receive its scoped binding");
+    const first = await invoke(worker, "/initialization-instance");
+    const second = await invoke(worker, "/initialization-instance");
+    assert(/^[0-9a-f]{32}$/.test(first.initializationInstance), "initialization instance is not a module-local 128-bit identity");
+    assert(first.marker === "dynamic" && second.marker === "dynamic", "initialization instance did not come from the scoped dynamic Worker");
+    assert(first.initializationInstance === second.initializationInstance, "initialization instance changed between two pre-fault calls");
+    const sibling = env.LOADER.get("dynamic/sha256-b", () => definition("dynamic-sibling"));
+    const siblingResult = await invoke(sibling, "/initialization-instance");
+    assert(siblingResult.initializationInstance !== first.initializationInstance, "distinct isolate initializations shared one initialization instance");
   },
 };
 

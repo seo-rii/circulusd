@@ -9,6 +9,7 @@ const phase0 :Workerd.Config = (
         compatibilityFlags = [@COMPATIBILITY_FLAGS@],
         modules = [
           (name = "session-host.mjs", esModule = embed "session-host.mjs"),
+          (name = "phase0-entry-source", text = embed "phase0-worker-entry.mjs"),
           (name = "pi-worker-source", text = embed "pi-worker.mjs")
         ],
         bindings = [
