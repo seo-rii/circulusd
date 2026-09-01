@@ -223,25 +223,79 @@ The destructive Loader/CPU fault, real pressure/OOM, and pinned-process
 `SIGKILL` paths deliberately stay out of the bounded embedded fixture (its
 contract test forbids a spin route); they belong to the external runner.
 
-## Exact next TDD work unit: U10.4 external runner composition
+## In progress 2026-09-01: U10.4 external runner composition
 
-Continue the numbered plan without widening the cut line:
+Two commits advanced U10.4:
 
-1. U10.4: release-snapshot-to-launcher composition, the persistent
-   private-socket fixture, real CPU/RSS probes and the three reconstruction
-   probes composed over Manager, launcher, cgroups, the observer sink, and
-   the external checkpoint store, the U10.3 mock placement rotation
-   (reference-only), status mapping, canonical CBOR evidence, and atomic
-   retention. The full external gate needs the provisioned cgroup-v2 host
-   contract from the plan; on this machine the pinned binary and WSL boundary
-   support development of the composition, but WSL cgroup delegation must be
-   provisioned per the operator contract before any external result can be
-   recorded, and only a provisioned host run can promote results.
-2. U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
-   leak finalization, acceptance ledger, and operator documentation.
-3. Units 11 and 12 remain queued after Unit 10. Private
-   `platformd`-to-`agentd` workload composition and Phase 1A NsJail work are
-   later, separately planned cuts.
+- `cb3f5f7`: the launcher exposes the narrow qualification surface —
+  `Executable` handoff of a pre-opened verified snapshot (so the release
+  resolver's sealed snapshot needs no path authority),
+  `Handle.KillProcessInstance` (SIGKILL through the owned pidfd, borrow-gated),
+  and `Handle.SampleResources` (one immutable exported sample joining the
+  pinned cgroup read and the exact pidfd-verified process RSS).
+- `96cbd69`: the persistent private-socket serve fixture and its materializer
+  (`phase0-resource.capnp.tmpl`, `session-host-resource.mjs`,
+  `phase0-resource-entry.mjs`), digest-bound and placeholder-checked, with the
+  bounded `workerd test` fixture provably free of the spin/allocate routes.
+
+### BLOCKER — stock workerd does not enforce `cpuMs` (must be resolved first)
+
+Live probing of the pinned `workerd 1.20260825.1` binary in the exact
+qualification shape (dynamic Worker via Worker Loader, invoked through the
+serve SessionHost) established that `limits.cpuMs` is **parsed but not
+enforced**: infinite invocations that yield on microtasks and on timers both
+ran unbounded past 20x the 1000ms limit and starved the shard's request
+handling. The binary contains only Python-Worker CPU-limit machinery and a
+`ResourceLimits{cpuMs, subRequests}` wrapper; no generic per-isolate abort
+fired. To reproduce: `workerd serve` the resource fixture against the pinned
+binary, then `curl --max-time 20 --unix-socket <sock>
+'http://q/worker/spin?worker=w/a'` — the request never returns and no isolate
+fault is logged, for synchronous, microtask-yielding, and timer-yielding spin
+loops alike.
+
+Consequence for the plan's own PASS predicates:
+
+- `workerd.cpu-limit` requires the Loader `cpuMs` failure half → cannot PASS
+  on this pin.
+- `workerd.dynamic-worker-reconstruction` triggers its destructive isolate
+  fault via that same `cpuMs` limit → cannot PASS on this pin (and the plan
+  forbids the whole-shard probe from substituting).
+
+The other three results (`workerd.rss-cold-start`,
+`workerd.shard-pressure-recycle`, `workerd.shard-kill-reconstruction`) depend
+only on cgroup mechanics, real OOM, and pinned-process `SIGKILL`, all of which
+the built primitives already cover, and remain achievable.
+
+Because Unit 10's exit criteria require all five results to be non-mock
+external `PASS` from one envelope, Unit 10 cannot be closed — and Unit 11
+cannot legitimately begin — until this is resolved. This is a decision for
+the maintainer, not something the runner may paper over: options are
+(a) accept a No-Go for the two CPU-limit results and re-scope Unit 10's exit
+to the three achievable results plus a recorded FAIL, (b) find an alternative
+pinned per-isolate destructive fault that stock workerd actually enforces and
+re-tie `dynamic-worker-reconstruction` to it, or (c) re-pin workerd to a
+release/build that enforces `cpuMs` for Worker Loader isolates in serve mode.
+The runner must in all cases record the honest FAIL, never a skip-as-PASS.
+
+### Remaining U10.4 work (after the blocker decision)
+
+1. Release-snapshot-to-launcher composition, the three achievable real probes
+   over Manager/launcher/cgroups/observer-sink/checkpoint-store, the U10.3
+   mock placement rotation (reference-only), the fixed status table and
+   component PASS predicates, canonical CBOR evidence, and atomic
+   `renameat2(RENAME_NOREPLACE)` retention with read-back revalidation.
+2. The full external gate also needs the provisioned cgroup-v2 host contract
+   from the plan; WSL cgroup delegation must be provisioned per the operator
+   contract before any external result can be recorded, and only a
+   provisioned-host run can promote results.
+
+### U10.5 and beyond
+
+- U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
+  leak finalization, acceptance ledger, and operator documentation.
+- Units 11 and 12 remain queued after Unit 10. Private
+  `platformd`-to-`agentd` workload composition and Phase 1A NsJail work are
+  later, separately planned cuts.
 
 ## Open constraints that must remain explicit
 
