@@ -13,12 +13,21 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `f6e9f80` (`feat(agent): own pidfd process identities`)
-- This handoff is committed immediately after that implementation commit with
-  subject `docs: record unit ten handoff`.
-- At preparation time `origin/main` is `9ab2104`; the three implementation
-  commits `5aa7fa5`, `be0e0af`, and `f6e9f80` are local, and this documentation
-  commit makes the local branch four commits ahead. No push was performed.
+- Last implementation commit: `45cb691` (`feat(agent): attach pidfd owners to
+  workerd launches`), created on the Windows transfer host on 2026-09-01. This
+  handoff update is committed immediately after it with subject
+  `docs: update unit ten handoff checkpoint`.
+- At original preparation time `origin/main` was `9ab2104`; the implementation
+  commits `5aa7fa5`, `be0e0af`, `f6e9f80`, and `45cb691` plus the two handoff
+  documentation commits are local, making the branch six commits ahead. No
+  push was performed.
+- The Windows transfer host has no Linux kernel boundary (no WSL) and a tight
+  per-user disk quota, so `go test` for the linux-tagged packages cannot run
+  there. Its verification for `45cb691` was limited to cross-compiled
+  `GOOS=linux go vet ./internal/agent`, gofmt on CR-stripped copies, and
+  `git diff --check`. The checkout uses `core.autocrlf=true`; the working tree
+  is CRLF while the index stays LF, so a plain `gofmt -l` flags every file on
+  that host and is not evidence of a formatting change.
 - `RISK_REGISTER.md` is intentionally local and untracked by repository policy.
   Its `ARCH-003` entry is summarized below so a fresh clone does not lose the
   risk.
@@ -82,7 +91,9 @@ is no numeric-PID-only fallback.
 
 ## Current verification evidence
 
-The final implementation checks before this handoff passed:
+This evidence was produced on the original Linux machine for `f6e9f80` and
+does not cover `45cb691`, whose test execution is still pending on a Linux
+host. The final implementation checks before the machine transfer passed:
 
 - observation-focused race/shuffle: 50 repetitions;
 - pidfd-owner-focused race/shuffle: 100 repetitions;
@@ -106,47 +117,51 @@ git diff --check
 Run these as independent commands. A yielded command must be joined by its
 session identifier before treating it as evidence.
 
-## Exact next TDD work unit: launcher process-token attachment
+## Completed 2026-09-01: launcher process-token attachment
 
-Do not begin with the serialized observer. First attach the completed pidfd
-owner to `WorkerdProcessLauncher` and prove its lifecycle independently.
+Commit `45cb691` implemented this unit as one coherent commit in
+`internal/agent/workerd_launcher_linux.go`, its test file, and the cgroup
+launcher test helpers (`workerd_process_linux.go` needed no change). All
+eight planned boundaries are covered by focused tests:
 
-Expected implementation scope:
-
-- `internal/agent/workerd_launcher_linux.go`
-- `internal/agent/workerd_launcher_linux_test.go`
-- `internal/agent/workerd_cgroup_launcher_linux_test.go` only where fake PIDs
-  require an injected identity capturer
-- `internal/agent/workerd_process_linux.go` and its tests only for a minimal
-  attachment API correction discovered by a preceding RED
-- `docs/implementation-plan.md`
-
-Write focused failing tests first for all of these boundaries:
-
-1. After `starter.Start` succeeds, capture the exact pidfd/start-time owner
-   before starting `Wait`, readiness, observation, or handle publication.
-2. Capture failure starts exactly one process/cgroup cleanup owner, calls no
-   readiness callback, and publishes no handle.
-3. Store the exact owner on `workerdInstance`; never reconstruct identity from
-   a later numeric PID lookup.
-4. A retryable process-group timeout or pre-removal cgroup failure retains the
-   identity owner for the next cleanup epoch.
-5. Natural exit, readiness failure, replacement, successful `Handle.Stop`, and
-   `Launcher.Close` each close the owner exactly once only after process and
-   observation borrows are quiescent.
-6. pidfd close failure is terminal and replayed without another close syscall.
-7. No launcher or instance mutex is held across pidfd capture, `/proc` I/O,
-   borrow quiescence, close, readiness callbacks, or process cleanup waits.
-8. An old generation owner cannot sample, close, or otherwise act on its
+1. capture of the exact pidfd/start-time owner after `starter.Start` and
+   before `Wait`, readiness, observation, or handle publication;
+2. capture failure producing exactly one process/cgroup cleanup owner with no
+   readiness callback and no handle, preserving pidfd-unsupported
+   classification;
+3. the exact owner stored on `workerdInstance` with no numeric-PID
+   reconstruction and stale rejection on PID reuse;
+4. retryable process-group timeout retaining the open owner for the next
+   cleanup epoch;
+5. natural exit, readiness failure, replacement, `Handle.Stop`, and
+   `Launcher.Close` each closing the owner exactly once after quiescence;
+6. terminal pidfd close failure cached and replayed without another close
+   syscall, surfacing in the launcher close result;
+7. no launcher or instance mutex held across capture, proc I/O, borrow
+   quiescence, close, readiness callbacks, or cleanup waits;
+8. an old generation owner unable to sample, close, or otherwise act on its
    replacement.
 
-Keep process-token attachment as one coherent commit. Do not add the observer
-loop in the same commit.
+The identity capturer is a required constructor input; production paths bind
+the real `/proc`-and-pidfd capture, tests inject a fake built on the existing
+proc-reader/pidfd fakes, and the real-child launcher integration test
+exercises the production capture path end to end.
 
-## Following TDD work unit: serialized observation lifecycle
+Before starting the next unit on a Linux host, first execute the deferred
+gates for this slice and record the results:
 
-Only after launcher attachment is green, add exactly one observer owner for
-each adopted shard generation. The producer must:
+```sh
+go test -race -shuffle=on -count=50 -run 'Identity' ./internal/agent
+go test -race -shuffle=on -count=10 ./internal/agent
+go test ./...
+go vet ./...
+```
+
+## Exact next TDD work unit: serialized observation lifecycle
+
+Only after the launcher-attachment race gates are green on a Linux host, add
+exactly one observer owner for each adopted shard generation. The producer
+must:
 
 - obtain a complete pinned cgroup sample and exact process-RSS sample before
   allocating the next sequence;
