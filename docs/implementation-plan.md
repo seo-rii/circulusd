@@ -298,6 +298,29 @@ not silently included in Unit 10.
   initialization-instance change remains owned by the U10.4 external runner,
   which launches `workerd serve` without `--predictable`.
 
+- 2026-09-01: the persistent private-socket qualification fixture exists:
+  `phase0-resource.capnp.tmpl` serves the new `session-host-resource.mjs`
+  over one directory-derived Unix socket, and `phase0-resource-entry.mjs`
+  carries the qualification-only Dynamic Worker routes (module-local
+  initialization instance, unbounded `/spin`, checkpointable retained state)
+  while forwarding everything else to the byte-identical pinned Pi bundle.
+  The materializer renders the fixed compiled compatibility inputs, binds
+  the unrendered SessionHost artifact digest and rendered configuration
+  digest into the readiness envelope, and rejects unrendered placeholders;
+  the bounded `workerd test` fixture provably gains no spin or allocate
+  route. Live probing against the pinned binary verified socket readiness,
+  nonce rejection, worker state init/read/load, and produced a decisive
+  finding: stock workerd 1.20260825.1 parses `limits.cpuMs` for dynamic
+  Workers (the `ResourceLimits{cpuMs, subRequests}` wrapper exists) but
+  never enforces it — synchronous, microtask-yielding, and timer-yielding
+  infinite invocations all ran unbounded past twentyfold the limit and
+  starved the shard's request handling. Per this plan's own predicates,
+  `workerd.cpu-limit` (its Loader-failure half) and
+  `workerd.dynamic-worker-reconstruction` (its destructive fault trigger)
+  cannot reach `PASS` on this release pin; the runner must record that
+  failure honestly and the probes must deterministically recycle the
+  starved shard.
+
 ### Outcome
 
 Complete the Phase 0A process, cgroup, and Worker Loader gates against the
