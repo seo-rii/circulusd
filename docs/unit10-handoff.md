@@ -261,6 +261,20 @@ Consequence for the plan's own PASS predicates:
   fault via that same `cpuMs` limit → cannot PASS on this pin (and the plan
   forbids the whole-shard probe from substituting).
 
+A follow-up experiment (2026-09-01, deferred-decision, at the maintainer's
+request) tested every alternative per-isolate destructive fault reachable
+from JS in the serve + Worker Loader shape. None destroys the isolate: an
+uncaught `throw`, an async promise rejection, a `RangeError` from a
+9e9-length `Array`, and a stack-overflow `RangeError` all leave the
+module-local initialization-instance ID **identical** before and after, so
+the isolate keeps its state; a 4 GB `Uint8Array` allocation even succeeded
+(no per-isolate memory cap); and memory/CPU exhaustion loops starve the shard
+exactly like `cpuMs`. The only observed way to force re-initialization is to
+destroy the whole process, which the plan forbids as a substitute. So
+`workerd.dynamic-worker-reconstruction` is blocked independently of `cpuMs`:
+stock workerd on this pin never reconstructs a faulted isolate for a fixed
+content-addressed Worker ID.
+
 The other three results (`workerd.rss-cold-start`,
 `workerd.shard-pressure-recycle`, `workerd.shard-kill-reconstruction`) depend
 only on cgroup mechanics, real OOM, and pinned-process `SIGKILL`, all of which
