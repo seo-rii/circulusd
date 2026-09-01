@@ -81,7 +81,10 @@ func TestConformanceProfileSelectsOnlyTheConfiguredBackendGates(t *testing.T) {
 				"object-store.concurrent-cas",
 				"workerd.cpu-limit",
 				"workerd.dynamic-worker",
+				"workerd.dynamic-worker-reconstruction",
 				"workerd.rss-cold-start",
+				"workerd.shard-kill-reconstruction",
+				"workerd.shard-pressure-recycle",
 				"workerd.stable-broker-binding",
 				"effect-recovery.boundary-matrix",
 				"auth.durable-credentials",
@@ -92,6 +95,9 @@ func TestConformanceProfileSelectsOnlyTheConfiguredBackendGates(t *testing.T) {
 				if !slices.Contains(profile.Required, component) {
 					t.Errorf("ConformanceProfile().Required lacks common gate %q", component)
 				}
+			}
+			if slices.Contains(profile.Required, "workerd.shard-recycle") {
+				t.Error("ConformanceProfile().Required still contains the ambiguous workerd.shard-recycle result")
 			}
 			for _, component := range test.included {
 				if !slices.Contains(profile.Required, component) {

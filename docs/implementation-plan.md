@@ -255,6 +255,16 @@ not silently included in Unit 10.
   complete agent race/shuffle gates, and package vet pass on the WSL
   boundary. Composition of the sink into a live Manager and evidence-artifact
   status mapping remain with U10.4.
+- 2026-09-01: the workerd probe inventory and every doctor install profile
+  migrated from the ambiguous `workerd.shard-recycle` result to the three
+  distinct reconstruction results. Each of
+  `workerd.dynamic-worker-reconstruction`, `workerd.shard-kill-reconstruction`,
+  and `workerd.shard-pressure-recycle` is a required non-mock external
+  result with its own NOT_RUN reason and no runnable fixture substitute;
+  contract tests reject a shared reason, a runnable entrypoint for any of the
+  three, or the old name reappearing, and the runnable `workerd.dynamic-worker`
+  probe cannot stand in for the reconstruction result. Conformance and doctor
+  package tests pass; the external gate itself remains NOT_RUN until U10.4.
 
 ### Outcome
 
@@ -700,7 +710,11 @@ evidence-artifact status mapping remain with U10.4.
 
 #### U10.3 — Distinct reconstruction and recycle contracts
 
-Status: queued.
+Status: in progress. The probe inventory and doctor profile now carry the
+three distinct reconstruction results with separate NOT_RUN reasons and no
+runnable substitute, and the ambiguous `workerd.shard-recycle` name is gone
+from both. The checkpoint store, fixture initialization-instance identity,
+fault paths, and the mock placement rotation remain.
 
 1. Add failing host-independent contract tests for all three new reconstruction
    result names, their non-substitutability, checkpoint commit/ack ordering,

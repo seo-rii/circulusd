@@ -71,11 +71,13 @@ var requiredProbes = []probe{
 	{component: "workerd.content-addressed-replacement", entrypoint: "contentAddressedReplacement"},
 	{component: "workerd.cpu-limit", notRunReason: "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured"},
 	{component: "workerd.dynamic-worker", entrypoint: "dynamicWorker"},
+	{component: "workerd.dynamic-worker-reconstruction", notRunReason: "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured"},
 	{component: "workerd.extension-order", entrypoint: "extensionOrder"},
 	{component: "workerd.isolate-separation", entrypoint: "isolateSeparation"},
 	{component: "workerd.outbound-denial", entrypoint: "outboundDenial"},
 	{component: "workerd.rss-cold-start", notRunReason: "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured"},
-	{component: "workerd.shard-recycle", notRunReason: "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"},
+	{component: "workerd.shard-kill-reconstruction", notRunReason: "agentd-managed whole-shard kill cleanup and checkpoint reconstruction probe is not configured"},
+	{component: "workerd.shard-pressure-recycle", notRunReason: "agentd-managed cgroup pressure drain and checkpoint reconstruction probe is not configured"},
 	{component: "workerd.stable-broker-binding", entrypoint: "stableBrokerBinding", mock: true},
 }
 

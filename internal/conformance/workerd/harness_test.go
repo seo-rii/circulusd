@@ -219,9 +219,15 @@ func TestRunExecutesPinnedStockWorkerdProbesAndPreservesIndependentFailures(t *t
 			resourceResults[result.Component] = result
 			wantStatus = conformance.NotRun
 			wantReason = "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured"
-		case "workerd.shard-recycle":
+		case "workerd.dynamic-worker-reconstruction":
 			wantStatus = conformance.NotRun
-			wantReason = "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured"
+			wantReason = "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured"
+		case "workerd.shard-kill-reconstruction":
+			wantStatus = conformance.NotRun
+			wantReason = "agentd-managed whole-shard kill cleanup and checkpoint reconstruction probe is not configured"
+		case "workerd.shard-pressure-recycle":
+			wantStatus = conformance.NotRun
+			wantReason = "agentd-managed cgroup pressure drain and checkpoint reconstruction probe is not configured"
 		case "workerd.stable-broker-binding":
 			wantMock = true
 		}
@@ -264,19 +270,63 @@ func TestProbeInventoryDoesNotOverstateTheEmbeddedFixture(t *testing.T) {
 	if _, found := notRunReasons["workerd.agent-engine"]; found {
 		t.Fatal("real Pi engine is still marked NOT_RUN")
 	}
-	if got := componentsByEntrypoint["shardRecycle"]; got != "" {
-		t.Fatalf("shardRecycle component = %q, want no runnable substitute for the agentd cgroup gate", got)
+	for _, entrypoint := range []string{"shardRecycle", "dynamicWorkerReconstruction", "shardPressureRecycle", "shardKillReconstruction"} {
+		if got := componentsByEntrypoint[entrypoint]; got != "" {
+			t.Fatalf("%s component = %q, want no runnable substitute for the agentd cgroup gate", entrypoint, got)
+		}
 	}
 	if got := componentsByEntrypoint["stableBrokerBinding"]; got != "workerd.stable-broker-binding" {
 		t.Fatalf("stableBrokerBinding component = %q, want real workerd binding probe", got)
 	}
 	wantNotRun := map[string]string{
-		"workerd.cpu-limit":      "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
-		"workerd.rss-cold-start": "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
-		"workerd.shard-recycle":  "agentd-managed cgroup pressure and same-identity Worker reconstruction probe is not configured",
+		"workerd.cpu-limit":                     "agentd-managed cgroup CPU enforcement and Worker process-failure observation are not configured",
+		"workerd.rss-cold-start":                "agentd-managed cgroup RSS attribution and cold-start process measurement are not configured",
+		"workerd.dynamic-worker-reconstruction": "agentd-managed destructive Worker Loader fault and initialization-instance reconstruction probe is not configured",
+		"workerd.shard-kill-reconstruction":     "agentd-managed whole-shard kill cleanup and checkpoint reconstruction probe is not configured",
+		"workerd.shard-pressure-recycle":        "agentd-managed cgroup pressure drain and checkpoint reconstruction probe is not configured",
 	}
 	if !reflect.DeepEqual(notRunReasons, wantNotRun) {
 		t.Fatalf("NOT_RUN checks = %#v, want %#v", notRunReasons, wantNotRun)
+	}
+}
+
+func TestReconstructionResultsAreDistinctAndNonSubstitutable(t *testing.T) {
+	t.Parallel()
+
+	components := make(map[string]probe)
+	for _, candidate := range requiredProbes {
+		components[candidate.component] = candidate
+	}
+	if _, found := components["workerd.shard-recycle"]; found {
+		t.Fatal("ambiguous workerd.shard-recycle result is still in the probe inventory")
+	}
+	wanted := []string{
+		"workerd.dynamic-worker-reconstruction",
+		"workerd.shard-kill-reconstruction",
+		"workerd.shard-pressure-recycle",
+	}
+	reasons := make(map[string]string)
+	for _, component := range wanted {
+		candidate, found := components[component]
+		if !found {
+			t.Fatalf("probe inventory lacks the distinct result %q", component)
+		}
+		if candidate.entrypoint != "" {
+			t.Fatalf("%q has runnable entrypoint %q, want an external-boundary NOT_RUN result", component, candidate.entrypoint)
+		}
+		if candidate.mock {
+			t.Fatalf("%q is marked mock", component)
+		}
+		if candidate.notRunReason == "" {
+			t.Fatalf("%q has no NOT_RUN reason", component)
+		}
+		if previous, duplicated := reasons[candidate.notRunReason]; duplicated {
+			t.Fatalf("%q and %q share one NOT_RUN reason; neither result may substitute for the other", previous, component)
+		}
+		reasons[candidate.notRunReason] = component
+	}
+	if dynamicWorker := components["workerd.dynamic-worker"]; dynamicWorker.entrypoint == "" {
+		t.Fatal("workerd.dynamic-worker lost its runnable probe; it cannot be replaced by the reconstruction result")
 	}
 }
 
@@ -720,7 +770,8 @@ func TestStockWorkerdFixture(t *testing.T) {
 	report := harness.Run(t.Context())
 	for _, result := range report.Results {
 		switch result.Component {
-		case "workerd.cpu-limit", "workerd.rss-cold-start", "workerd.shard-recycle":
+		case "workerd.cpu-limit", "workerd.rss-cold-start", "workerd.dynamic-worker-reconstruction",
+			"workerd.shard-kill-reconstruction", "workerd.shard-pressure-recycle":
 			if result.Status != conformance.NotRun {
 				t.Fatalf("external-boundary result = %+v, want NOT_RUN", result)
 			}

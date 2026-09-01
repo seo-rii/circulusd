@@ -84,11 +84,13 @@ func ConformanceProfile(
 		"workerd.content-addressed-replacement",
 		"workerd.cpu-limit",
 		"workerd.dynamic-worker",
+		"workerd.dynamic-worker-reconstruction",
 		"workerd.extension-order",
 		"workerd.isolate-separation",
 		"workerd.outbound-denial",
 		"workerd.rss-cold-start",
-		"workerd.shard-recycle",
+		"workerd.shard-kill-reconstruction",
+		"workerd.shard-pressure-recycle",
 		"workerd.stable-broker-binding",
 	} {
 		required[component] = struct{}{}
