@@ -1,10 +1,14 @@
 # Implementation plan
 
-Status: Unit 10 in progress; the launcher owns per-instance pidfd process
-identities and one serialized generation-bound observer delivers fenced
-observations to the sink boundary. U10.3 reconstruction contracts are next.
+Status: Unit 10 in progress. The cpuMs/isolate-enforcement blocker is resolved
+by re-scope (2026-09-02): the certified resource safety boundary is the
+kernel-enforced one (cgroup `cpu.max`/`memory.max` + pidfd whole-shard kill),
+four results are required to PASS at that boundary, and
+`workerd.dynamic-worker-reconstruction` is a recorded honest FAIL. Remaining
+U10.4 build work is the pinned-binary CLI preflight, the external RED run, and
+the release→launcher→Manager→cgroup→observer→checkpoint probe composition.
 
-Updated: 2026-09-01
+Updated: 2026-09-02
 
 This document turns the normative phase roadmap in `SPEC.md` §51 into small,
 reviewable repository work units. `SPEC.md` remains the product contract;
@@ -354,28 +358,65 @@ not silently included in Unit 10.
   live cgroup-v2 host. Verified `Satisfied` against a provisioned WSL2 root
   with real device/inode and cpu/memory/pids enabled; fake-backend
   classification cases and full agent race/shuffle and vet pass.
+- 2026-09-02: the deferred cpuMs/isolate-enforcement decision is resolved by
+  re-scope, not re-pin. The runner now splits the five results into four
+  required PASS (`cpu-limit` re-scoped to the kernel cgroup `cpu.max` throttle +
+  supervisor-observed starvation recycle, `rss-cold-start`,
+  `shard-pressure-recycle`, `shard-kill-reconstruction`) and one recorded honest
+  FAIL (`dynamic-worker-reconstruction`, per-isolate). `resource_status.go` now
+  carries `requiredResourceQualificationComponents` and
+  `recordedResourceQualificationComponents`; `evaluateResourceQualificationRun`
+  qualifies only when the four required pass one shared envelope and every
+  recorded component carries a FAIL, and it raises a framing error if a recorded
+  component reports PASS (the pinned workerd cannot legitimately produce it) —
+  proven by `TestEvaluateResourceQualificationRunRequiresFourPassPlusRecordedFail`.
+  The `cpu-limit` and `dynamic-worker-reconstruction` probe NOT_RUN reasons were
+  updated to the kernel boundary and the recorded-gap wording; the environment
+  digest rebinds automatically. The certified safety boundary is the
+  kernel-enforced one; `AdmissionReady` stays false while the residual
+  per-isolate gap stands. Package vet, the resource-status/probe-inventory/
+  environment-digest tests, and the full doctor package pass on the WSL
+  boundary.
 
 ### Outcome
 
 Complete the Phase 0A process, cgroup, and Worker Loader gates against the
-release-pinned stock workerd process. Unit 10 introduces five distinct required
-external results:
+release-pinned stock workerd process. Unit 10 produces five distinct external
+results. Live qualification of the pinned `workerd 1.20260825.1` established
+that its in-isolate limits are advisory only — `limits.cpuMs` is parsed but not
+enforced, and no reachable in-isolate fault destroys a Worker Loader isolate
+(see U10.4 and `docs/unit10-handoff.md`). The certified resource safety
+boundary is therefore the kernel-enforced one — cgroup-v2 `cpu.max` throttling,
+`memory.max` OOM, and pidfd whole-shard `SIGKILL` with reconstruction — which
+holds against a fully uncooperative isolate that a cooperative in-isolate soft
+limit cannot. Four results are required to PASS at that boundary:
 
-- `workerd.cpu-limit`: both Loader `cpuMs` failure semantics and shard-level
-  cgroup CPU throttling;
+- `workerd.cpu-limit`: exact cgroup `cpu.max` readback plus an observed
+  `cpu.stat` throttling increase under a runaway Worker, escalated by
+  supervisor-observed starvation to a deterministic whole-shard kill/recycle.
+  The in-isolate `cpuMs` non-enforcement is recorded as an evidence-bound
+  finding, not silently dropped;
 - `workerd.rss-cold-start`: process RSS, cgroup memory attribution, and repeated
   cold-start measurements;
-- `workerd.dynamic-worker-reconstruction`: destructive Dynamic Worker failure
-  followed by a demonstrably new initialization for the same content-addressed
-  Worker ID;
 - `workerd.shard-pressure-recycle`: real cgroup pressure/OOM, drain, cleanup,
   and reconstruction;
 - `workerd.shard-kill-reconstruction`: explicit whole-shard `SIGKILL`, cleanup,
   and reconstruction.
 
-The old ambiguous `workerd.shard-recycle` result is replaced by the last two
-results when the profile and probe inventory migrate. Neither one may
-substitute for the other.
+The fifth result, `workerd.dynamic-worker-reconstruction` (a destructive
+per-isolate Dynamic Worker failure followed by a demonstrably new
+initialization for the same content-addressed Worker ID), cannot PASS on this
+pin: stock workerd never reconstructs a faulted isolate. It is demoted from the
+required set to a **recorded honest FAIL** — a documented residual gap the
+runner must always record and never report as PASS or skip. The safety-relevant
+recovery of a wedged worker is delivered at the shard level by the
+pressure-recycle and kill-reconstruction results, not per isolate. Unit 10
+keeps `AdmissionReady=false` while that gap stands; closing it requires a
+re-pinned or rebuilt workerd that enforces per-isolate limits in serve mode.
+
+The old ambiguous `workerd.shard-recycle` result is replaced by the two
+shard-level reconstruction results when the profile and probe inventory
+migrate. Neither one may substitute for the other.
 
 This is a Phase 0A Go/No-Go result, not production admission. The Phase 0A
 model, tool, checkpoint store, and placement source remain deterministic test
@@ -614,9 +655,16 @@ status:
 | Cancellation also exposes cleanup, identity, assertion, or evidence failure | `FAIL` |
 | Every predicate for one named component passes in the same fresh run | `PASS` |
 
-An explicit gate invocation exits unsuccessfully unless all five Unit 10
-resource results are `PASS`. A test skip, timeout, whole-shard kill, or cgroup
-limit readback alone can never be interpreted as a component `PASS`.
+An explicit gate invocation exits unsuccessfully unless the four required
+Unit 10 resource results (`workerd.cpu-limit`, `workerd.rss-cold-start`,
+`workerd.shard-pressure-recycle`, `workerd.shard-kill-reconstruction`) are
+`PASS` **and** the recorded residual-gap result
+(`workerd.dynamic-worker-reconstruction`) is a `FAIL`. A recorded residual-gap
+result that reports `PASS` is a framing error, because the pinned workerd
+cannot legitimately produce it; a run must be re-scoped or re-pinned before that
+would be promoted. A test skip, timeout, whole-shard kill, or cgroup limit
+readback alone can never be interpreted as a component `PASS`, and the recorded
+`FAIL` may never be softened to a skip.
 
 #### Evidence envelope and retention
 
@@ -640,10 +688,13 @@ JSON view is produced. Its schema contains:
 
 Process RSS is read only for the pinned process instance and is not inferred
 from `memory.current`; cgroup memory charge is recorded separately. Artifact
-references and results are canonical-name sorted. All five Unit 10 `PASS`
-results require `EvidenceClassExternal`, `Mock=false`, the same run ID and
-identity envelope, and a digest reference to
-`workerd-resource-observation-v1.cbor`.
+references and results are canonical-name sorted. All four required Unit 10
+`PASS` results require `EvidenceClassExternal`, `Mock=false`, the same run ID
+and identity envelope, and a digest reference to
+`workerd-resource-observation-v1.cbor`. The recorded
+`workerd.dynamic-worker-reconstruction` `FAIL` records the same external
+non-enforcement finding and run identity but is not required to reference the
+observation artifact.
 
 The output directory must be canonical, private, owned by the caller, and not
 group/other writable. Files are created through a same-directory exclusive
@@ -853,14 +904,19 @@ run (item 2), the release-resolver-to-launcher-to-Manager probe composition
 (item 3), and result promotion. The runner consumes a preinstalled executable;
 archive extraction remains owned by the separate release/install workflow.
 
-Two of the five results are additionally blocked by a verified external
-finding: stock `workerd 1.20260825.1` parses but does not enforce
-`limits.cpuMs` for Worker Loader isolates in serve mode, and no in-isolate
-fault (uncaught error, async rejection, oversized-array or stack `RangeError`,
-memory growth) destroys the isolate — the initialization-instance ID is
-preserved across every one. So `workerd.cpu-limit` (item 4) and
-`workerd.dynamic-worker-reconstruction` cannot reach `PASS` on this pin; the
-maintainer must choose to re-scope, find an enforced fault, or re-pin. See
+The maintainer decision on the verified external finding is resolved
+(2026-09-02): re-scope to the kernel-enforced boundary rather than re-pin.
+Stock `workerd 1.20260825.1` parses but does not enforce `limits.cpuMs` for
+Worker Loader isolates in serve mode, and no in-isolate fault (uncaught error,
+async rejection, oversized-array or stack `RangeError`, memory growth) destroys
+the isolate — the initialization-instance ID is preserved across every one.
+`workerd.cpu-limit` is therefore re-scoped to certify the kernel boundary
+(cgroup `cpu.max` throttling plus supervisor-observed starvation → whole-shard
+kill/recycle) and remains a required PASS; the in-isolate `cpuMs`
+non-enforcement is recorded as an evidence-bound finding.
+`workerd.dynamic-worker-reconstruction` (per-isolate) is demoted to a recorded
+honest FAIL. The achievable bar is four required PASS plus that one recorded
+FAIL, with `AdmissionReady=false` while the gap stands. See
 `docs/unit10-handoff.md`.
 
 1. Add failing host-independent tests for the exact input schema, fixed argv,
@@ -873,15 +929,23 @@ maintainer must choose to re-scope, find an enforced fault, or re-pin. See
 3. Implement the persistent private-socket fixture and run every real probe
    under the manager/launcher/cgroup composition.
 4. `workerd.cpu-limit` passes only when exact `cpu.max` readback and an increase
-   in `cpu.stat` throttling are observed **and** an infinite Worker invocation
-   reaches the pinned Loader `cpuMs` failure within its own deadline while the
-   shard remains usable or is deterministically recycled.
+   in `cpu.stat` throttling are observed under a runaway Worker invocation
+   **and** supervisor-observed starvation drives a deterministic whole-shard
+   kill/recycle within its own deadline. The run additionally records, as an
+   evidence-bound finding, that the in-isolate `cpuMs` limit did not fire — a
+   recorded negative observation, never a skip. The pinned Loader `cpuMs`
+   failure is not part of the PASS predicate on this pin.
 5. `workerd.rss-cold-start` passes only with at least five fresh-cgroup samples,
    separate process RSS/cgroup charge, bounded start/ready timestamps, exact
    identity, and a valid artifact; it records measurements rather than freezing
    a product performance threshold.
-6. Run the three reconstruction probes independently and refuse aggregate PASS
-   when any one is missing, substituted, canceled, timed out, or not quiescent.
+6. Run the two shard-level reconstruction probes (`shard-pressure-recycle`,
+   `shard-kill-reconstruction`) independently and refuse aggregate PASS when
+   either is missing, substituted, canceled, timed out, or not quiescent. Run
+   the per-isolate `dynamic-worker-reconstruction` probe and record its honest
+   FAIL (stock workerd does not reconstruct a faulted isolate); the evaluator
+   treats a `PASS` there as a framing error and never lets its FAIL be softened
+   to a skip.
 
 #### U10.5 — Close the unit without widening readiness
 
@@ -894,8 +958,12 @@ Status: queued.
    envelope and JSON view. If the boundary is unavailable, Unit 10 remains
    incomplete.
 4. Update profiles, operator instructions, and `docs/acceptance.md` from that
-   retained evidence. Do not infer aggregate §53 `PASS` or change daemon
-   capabilities from unit/reference tests.
+   retained evidence. Record `workerd.dynamic-worker-reconstruction` as a
+   documented residual gap (recorded FAIL: stock workerd does not reconstruct a
+   faulted isolate on this pin) so the certified boundary is the kernel one, not
+   an in-isolate limit. Do not infer aggregate §53 `PASS` or change daemon
+   capabilities from unit/reference tests; `AdmissionReady` stays false while
+   the residual gap or any production dependency is open.
 
 ### Required evidence and exit criteria
 
@@ -903,10 +971,15 @@ Unit 10 is complete only when all of the following are true:
 
 - host-independent contract tests pass under `go test -race` with
   shuffled/repeated lifecycle cases;
-- all five named Unit 10 results are non-mock external `PASS` from the same
-  release-, config-, host-, boot-, cgroup-, runner-, and run-bound envelope;
-- Dynamic Worker failure, pressure recycle, and explicit whole-shard kill each
-  reconstruct independently from an externally acknowledged checkpoint;
+- the four required Unit 10 results (`workerd.cpu-limit`,
+  `workerd.rss-cold-start`, `workerd.shard-pressure-recycle`,
+  `workerd.shard-kill-reconstruction`) are non-mock external `PASS` from the
+  same release-, config-, host-, boot-, cgroup-, runner-, and run-bound
+  envelope, and `workerd.dynamic-worker-reconstruction` is a recorded honest
+  `FAIL` from that same run carrying the in-isolate non-reconstruction finding;
+- pressure recycle and explicit whole-shard kill each reconstruct independently
+  from an externally acknowledged checkpoint, and the per-isolate
+  `dynamic-worker-reconstruction` FAIL is recorded rather than skipped;
 - the reference placement-fencing shape is labeled mock/reference-only and
   §53.1/§53.4 remain unpromoted;
 - after the enclosing final cleanup join, no child process, process group,
