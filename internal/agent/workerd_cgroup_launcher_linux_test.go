@@ -19,6 +19,87 @@ import (
 
 var errWorkerdCgroupIntegrationStart = errors.New("test: workerd cgroup start failure")
 
+func exportedWorkerdCgroupConfig(config workerdCgroupConfig) WorkerdCgroupConfig {
+	return WorkerdCgroupConfig{
+		RootPath:       config.RootPath,
+		MaximumShards:  config.MaximumShards,
+		DrainTimeout:   config.DrainTimeout,
+		MemoryMaxBytes: config.MemoryMaxBytes,
+		SwapMaxBytes:   config.SwapMaxBytes,
+		CPUMax:         config.CPUMax,
+		PIDsMax:        config.PIDsMax,
+	}
+}
+
+func TestProbeWorkerdCgroupProvisioningClassifiesTheOperatorRoot(t *testing.T) {
+	config := exportedWorkerdCgroupConfig(validWorkerdCgroupConfig())
+
+	t.Run("satisfied root", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+		if !provisioning.Satisfied || provisioning.HostUnavailable {
+			t.Fatalf("provisioning = %+v, want satisfied", provisioning)
+		}
+		if provisioning.RootDevice != 2 || provisioning.RootInode != 4 {
+			t.Fatalf("root identity = dev %d ino %d, want dev 2 ino 4", provisioning.RootDevice, provisioning.RootInode)
+		}
+		if !reflect.DeepEqual(provisioning.EnabledControllers, []string{"cpu", "memory", "pids"}) {
+			t.Fatalf("enabled controllers = %#v, want cpu/memory/pids", provisioning.EnabledControllers)
+		}
+		if descriptors := backend.openFileDescriptors(); descriptors != 0 {
+			t.Fatalf("open descriptors after probe = %d, want the root closed", descriptors)
+		}
+	})
+
+	t.Run("wrong ownership is a FAIL not unavailable", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		target := &backend.inspection.Components[len(backend.inspection.Components)-1]
+		target.UID = 0
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+		if provisioning.Satisfied || provisioning.HostUnavailable || provisioning.Reason == "" {
+			t.Fatalf("provisioning = %+v, want unsatisfied contract failure", provisioning)
+		}
+	})
+
+	t.Run("not empty is a FAIL not unavailable", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		backend.inspection.ChildDirectories = 1
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+		if provisioning.Satisfied || provisioning.HostUnavailable {
+			t.Fatalf("provisioning = %+v, want unsatisfied contract failure", provisioning)
+		}
+	})
+
+	t.Run("missing controller is host unavailable", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		backend.inspection.Controllers = "cpu pids\n"
+		backend.inspection.SubtreeControl = "cpu pids\n"
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+		if provisioning.Satisfied || !provisioning.HostUnavailable {
+			t.Fatalf("provisioning = %+v, want host unavailable", provisioning)
+		}
+	})
+
+	t.Run("available but disabled controller is a FAIL", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		backend.inspection.SubtreeControl = "cpu pids\n"
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+		if provisioning.Satisfied || provisioning.HostUnavailable {
+			t.Fatalf("provisioning = %+v, want unsatisfied controller-enablement failure", provisioning)
+		}
+	})
+
+	t.Run("invalid config is not host unavailable", func(t *testing.T) {
+		backend := newFakeWorkerdCgroupBackend()
+		invalid := config
+		invalid.RootPath = "relative"
+		provisioning := probeWorkerdCgroupProvisioningWithBackend(invalid, backend)
+		if provisioning.Satisfied || provisioning.HostUnavailable {
+			t.Fatalf("provisioning = %+v, want unsatisfied config rejection", provisioning)
+		}
+	})
+}
+
 type firstWorkerdContextErrObserver struct {
 	context.Context
 	once     sync.Once

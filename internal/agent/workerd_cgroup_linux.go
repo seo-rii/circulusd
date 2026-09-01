@@ -182,6 +182,10 @@ type workerdCgroupController struct {
 	closed                  bool
 	closeDone               chan struct{}
 	closeErr                error
+
+	rootDevice         uint64
+	rootInode          uint64
+	enabledControllers []string
 }
 
 type workerdCgroupDestroyOperation struct {
@@ -296,12 +300,74 @@ func newWorkerdCgroupControllerWithBackend(config workerdCgroupConfig, backend w
 		_ = backend.closeFD(inspection.DirectoryFD)
 		return nil, rootErr
 	}
+	target := inspection.Components[len(inspection.Components)-1]
+	enabledControllers := make([]string, 0, 3)
+	for _, controllerName := range []string{"cpu", "memory", "pids"} {
+		for _, enabled := range strings.Fields(inspection.SubtreeControl) {
+			if enabled == controllerName {
+				enabledControllers = append(enabledControllers, controllerName)
+				break
+			}
+		}
+	}
 	return &workerdCgroupController{
-		config:           config,
-		backend:          backend,
-		rootFD:           inspection.DirectoryFD,
-		authorityChanged: make(chan struct{}),
+		config:             config,
+		backend:            backend,
+		rootFD:             inspection.DirectoryFD,
+		authorityChanged:   make(chan struct{}),
+		rootDevice:         target.Device,
+		rootInode:          target.Inode,
+		enabledControllers: enabledControllers,
 	}, nil
+}
+
+// WorkerdCgroupProvisioning is the external qualification preflight verdict for
+// an operator-provisioned delegated cgroup-v2 root. Satisfied means the root
+// meets the full ownership, mode, emptiness, and controller contract.
+// HostUnavailable distinguishes a genuine absence of cgroup-v2 or controller
+// delegation (an UNAVAILABLE outcome) from a contract violation (a FAIL).
+type WorkerdCgroupProvisioning struct {
+	Satisfied          bool
+	HostUnavailable    bool
+	Reason             string
+	RootDevice         uint64
+	RootInode          uint64
+	EnabledControllers []string
+}
+
+// ProbeWorkerdCgroupProvisioning validates the operator-provisioned delegated
+// cgroup root without launching any process. It reuses the exact controller
+// construction contract and never mutates the root.
+func ProbeWorkerdCgroupProvisioning(config WorkerdCgroupConfig) WorkerdCgroupProvisioning {
+	return probeWorkerdCgroupProvisioningWithBackend(config, linuxWorkerdCgroupBackend{})
+}
+
+func probeWorkerdCgroupProvisioningWithBackend(config WorkerdCgroupConfig, backend workerdCgroupBackend) WorkerdCgroupProvisioning {
+	controller, err := newWorkerdCgroupControllerWithBackend(workerdCgroupConfig{
+		RootPath:       config.RootPath,
+		MaximumShards:  config.MaximumShards,
+		DrainTimeout:   config.DrainTimeout,
+		MemoryMaxBytes: config.MemoryMaxBytes,
+		SwapMaxBytes:   config.SwapMaxBytes,
+		CPUMax:         config.CPUMax,
+		PIDsMax:        config.PIDsMax,
+	}, backend)
+	if err != nil {
+		unavailable := errors.Is(err, errWorkerdCgroupUnavailable) &&
+			!errors.Is(err, errWorkerdCgroupContract) &&
+			!errors.Is(err, errInvalidWorkerdCgroupConfig)
+		return WorkerdCgroupProvisioning{HostUnavailable: unavailable, Reason: err.Error()}
+	}
+	provisioning := WorkerdCgroupProvisioning{
+		Satisfied:          true,
+		RootDevice:         controller.rootDevice,
+		RootInode:          controller.rootInode,
+		EnabledControllers: append([]string(nil), controller.enabledControllers...),
+	}
+	if closeErr := controller.close(); closeErr != nil {
+		return WorkerdCgroupProvisioning{Reason: closeErr.Error()}
+	}
+	return provisioning
 }
 
 func (controller *workerdCgroupController) evidence() workerdCgroupEvidence {
@@ -1232,12 +1298,17 @@ func (backend linuxWorkerdCgroupBackend) inspectRoot(rootPath string) (workerdCg
 			}
 			break
 		}
-		info, infoErr := entries[0].Info()
-		if infoErr != nil {
-			scanErr = infoErr
+		// Resolve the entry type through the pinned directory descriptor. The
+		// DirEntry.Info accessor lstats a path built from this File's synthetic
+		// name relative to the current working directory, which fails on every
+		// real cgroup entry; fstatat against the directory FD is both correct
+		// and unaffected by an unreliable getdents d_type.
+		var entryStat unix.Stat_t
+		if statErr := unix.Fstatat(directoryFD, entries[0].Name(), &entryStat, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+			scanErr = statErr
 			break
 		}
-		if info.IsDir() {
+		if entryStat.Mode&unix.S_IFMT == unix.S_IFDIR {
 			childDirectories = 1
 			break
 		}
