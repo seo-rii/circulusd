@@ -320,6 +320,24 @@ not silently included in Unit 10.
   cannot reach `PASS` on this release pin; the runner must record that
   failure honestly and the probes must deterministically recycle the
   starved shard.
+- 2026-09-01: the decision-independent U10.4 spine is implemented and
+  host-independently tested. The launcher gained a pre-opened `Executable`
+  handoff (sealing and digest-checking a supplied snapshot without path
+  authority), `Handle.KillProcessInstance` (pidfd SIGKILL, borrow-gated), and
+  `Handle.SampleResources` (exported pinned-cgroup + pidfd-RSS sample). The
+  status layer encodes the fixed classification table (FAIL dominates a joined
+  UNAVAILABLE) and the component PASS predicate (external, non-mock, run-bound
+  binary/environment/observation digests), and the run-level evaluator
+  requires all five distinct results from one shared envelope while still
+  reporting an honest not-all-pass for a real component FAIL. The evidence
+  layer validates and deterministically CBOR-encodes the versioned observation
+  envelope through `internal/canonical` and retains it atomically with a
+  same-directory 0600 temp file, fsync, no-clobber `renameat2`/`linkat`,
+  directory fsync, and read-back digest revalidation into a caller-owned
+  private directory. A follow-up experiment confirmed no stock-workerd
+  in-isolate fault destroys a Worker Loader isolate, so
+  `dynamic-worker-reconstruction` is blocked independently of `cpuMs`. Full
+  repository tests, package race, and vet pass on the WSL boundary.
 
 ### Outcome
 
@@ -806,12 +824,28 @@ mock placement rotation remain.
 #### U10.4 — External runner, status, and evidence
 
 Status: partially implemented. The bounded input schema, fixed argument
-renderer, release resolver, and sealed executable snapshot exist. The runner
-consumes a preinstalled executable; archive extraction remains owned by the
-separate release/install workflow. Pinned-binary CLI and provisioning
-preflights, status/PASS predicates, sealed snapshot-to-launcher handoff,
-persistent socket composition, real probes, canonical evidence retention, and
-result promotion remain.
+renderer, release resolver, and sealed executable snapshot exist. The launcher
+now accepts the sealed snapshot as a pre-opened executable and exposes
+`Handle.KillProcessInstance` and `Handle.SampleResources`. The persistent
+private-socket serve fixture and its digest-binding materializer exist. The
+status classification, component PASS predicates, run-level evaluator, and the
+canonical CBOR evidence envelope with atomic no-clobber retention and read-back
+revalidation exist and are host-independently tested. Remaining: the
+provisioning preflight (operator cgroup-root ownership/mode/emptiness/
+controller checks), the pinned-binary CLI preflight, the external RED run
+(item 2), the release-resolver-to-launcher-to-Manager probe composition
+(item 3), and result promotion. The runner consumes a preinstalled executable;
+archive extraction remains owned by the separate release/install workflow.
+
+Two of the five results are additionally blocked by a verified external
+finding: stock `workerd 1.20260825.1` parses but does not enforce
+`limits.cpuMs` for Worker Loader isolates in serve mode, and no in-isolate
+fault (uncaught error, async rejection, oversized-array or stack `RangeError`,
+memory growth) destroys the isolate — the initialization-instance ID is
+preserved across every one. So `workerd.cpu-limit` (item 4) and
+`workerd.dynamic-worker-reconstruction` cannot reach `PASS` on this pin; the
+maintainer must choose to re-scope, find an enforced fault, or re-pin. See
+`docs/unit10-handoff.md`.
 
 1. Add failing host-independent tests for the exact input schema, fixed argv,
    provisioning preflight, status table, component PASS predicates, evidence

@@ -13,16 +13,17 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `08eb353` (`feat(conformance): create
-  initialization instances inside dynamic workers`), created on the Windows
-  transfer host on 2026-09-01 after `45cb691` (launcher pidfd attachment),
-  `de83aec` (serialized observation), `8d11098` (distinct reconstruction
-  results), and `c5eabaf` (external checkpoint store). This handoff update is
-  committed immediately after it with subject
-  `docs: update unit ten handoff checkpoint`.
-- At original preparation time `origin/main` was `9ab2104`; the five original
-  and five transfer-host implementation commits plus handoff documentation
-  commits are local. No push was performed.
+- Last implementation commit: `d392cb8` (`feat(conformance): add the resource
+  qualification status and evidence spine`), created on the Windows transfer
+  host on 2026-09-01. The 2026-09-01 transfer-host implementation commits are,
+  in order: `45cb691` (launcher pidfd attachment), `de83aec` (serialized
+  observation), `8d11098` (distinct reconstruction results), `c5eabaf`
+  (external checkpoint store), `08eb353` (dynamic-worker initialization
+  instances), `cb3f5f7` (launcher qualification surface), `96cbd69`
+  (private-socket fixture), and `d392cb8` (status + evidence spine). This
+  handoff update is committed immediately after `d392cb8`.
+- At original preparation time `origin/main` was `9ab2104`; all implementation
+  and handoff documentation commits are local. No push was performed.
 - The release-pinned stock workerd binary is installed inside WSL at
   `/home/seohyun/workerd-1.20260825.1` with both manifest digests verified
   (archive `45fb5f0e…`, extracted `b805ed48…`). Run the live fixture gate
@@ -291,15 +292,32 @@ re-tie `dynamic-worker-reconstruction` to it, or (c) re-pin workerd to a
 release/build that enforces `cpuMs` for Worker Loader isolates in serve mode.
 The runner must in all cases record the honest FAIL, never a skip-as-PASS.
 
+### U10.4 spine landed (decision-independent), commits cb3f5f7, 96cbd69, d392cb8
+
+Already implemented and host-independently tested, usable on any decision path:
+
+- launcher qualification surface (`cb3f5f7`): pre-opened `Executable` handoff,
+  `Handle.KillProcessInstance`, `Handle.SampleResources`;
+- persistent private-socket serve fixture + digest-binding materializer
+  (`96cbd69`);
+- status classification table, component PASS predicate, run-level all-five
+  envelope evaluator, and the canonical CBOR observation envelope with atomic
+  no-clobber `renameat2`/`linkat` retention and read-back revalidation
+  (`d392cb8`).
+
 ### Remaining U10.4 work (after the blocker decision)
 
-1. Release-snapshot-to-launcher composition, the three achievable real probes
-   over Manager/launcher/cgroups/observer-sink/checkpoint-store, the U10.3
-   mock placement rotation (reference-only), the fixed status table and
-   component PASS predicates, canonical CBOR evidence, and atomic
-   `renameat2(RENAME_NOREPLACE)` retention with read-back revalidation.
-2. The full external gate also needs the provisioned cgroup-v2 host contract
-   from the plan; WSL cgroup delegation must be provisioned per the operator
+1. The provisioning preflight (operator cgroup-root ownership/mode/emptiness/
+   controller checks) and the pinned-binary CLI preflight.
+2. The external RED run showing the `workerd test` fixture plus three
+   caller-supplied binary env vars cannot satisfy the resource gate (retain
+   the command/result).
+3. The release-resolver-snapshot → launcher → Manager → cgroups → observer
+   sink → checkpoint-store probe composition, wiring the achievable three real
+   probes plus the honest FAIL recording for the two blocked results, and the
+   U10.3 mock placement rotation (reference-only).
+4. The full external gate needs the provisioned cgroup-v2 host contract from
+   the plan; WSL cgroup delegation must be provisioned per the operator
    contract before any external result can be recorded, and only a
    provisioned-host run can promote results.
 
