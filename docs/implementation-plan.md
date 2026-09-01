@@ -1,8 +1,8 @@
 # Implementation plan
 
-Status: Unit 10 resumed after machine transfer; the workerd launcher now owns
-per-instance pidfd process identities, with Linux-host race verification
-pending
+Status: Unit 10 in progress; the launcher owns per-instance pidfd process
+identities and one serialized generation-bound observer delivers fenced
+observations to the sink boundary. U10.3 reconstruction contracts are next.
 
 Updated: 2026-09-01
 
@@ -224,6 +224,37 @@ not silently included in Unit 10.
   kernel boundary, and the host user disk quota blocked repo-wide module
   downloads) and remain required on a Linux host before any further status
   claim.
+- 2026-09-01: the transfer host gained a WSL2 Ubuntu boundary, closing the
+  previous entry's deferred-verification caveat. The launcher-attachment
+  gates now pass on Linux: 50-repetition identity-focused and 10-repetition
+  complete `internal/agent` race/shuffle runs, package vet, repo-wide
+  cross-compiled vet, and the complete `go test ./...` suite from a native
+  ext4 clone of the attachment commit. Runs launched from the drvfs-mounted
+  CRLF working tree fail only on checkout/mount artifacts (CRLF fixture
+  digests in the workerd conformance harness and drvfs parent owner/mode
+  checks in dependency evidence tests), so native-clone runs are the
+  canonical full-suite evidence on this machine.
+- 2026-09-01: each published shard generation now owns exactly one serialized
+  observer. Every round obtains a complete pinned-identity cgroup sample and
+  an exact pidfd-verified process-RSS sample before allocating the next
+  strictly increasing generation-local sequence, compares cumulative
+  `memory.events` deltas against that exact generation's baseline for
+  OOM/pressure classification, and delivers an immutable `ShardObservation`
+  carrying the full boot/shard/generation tuple to a required
+  `WorkerdObservationSink` with no launcher, instance, cgroup, or
+  process-identity locks held; `Manager` satisfies the sink statically. The
+  sequence allocator fails closed before `uint64` exhaustion, cancellation
+  that wins after sample I/O but before delivery suppresses the sample, and
+  sample, sink, or identity failures end only the producer, never the shard.
+  Stop epochs cancel the observer without joining it, so a sink that
+  synchronously stops its own shard completes without deadlock — a deliberate
+  join-before-epoch mutation reproduces that deadlock and fails the self-stop
+  test — while launcher close performs the final observer join before
+  releasing the executable, and failed launches never start a producer.
+  Focused observer race runs, 50-repetition focused and 10-repetition
+  complete agent race/shuffle gates, and package vet pass on the WSL
+  boundary. Composition of the sink into a live Manager and evidence-artifact
+  status mapping remain with U10.4.
 
 ### Outcome
 
@@ -282,8 +313,10 @@ fixed-argument adapter joins their start boundaries. `AgentInstanceID` travels
 through ensure, readiness, process, and cgroup values, and the Manager checks
 the exact process tuple before publication. The Manager observation endpoint
 also requires that tuple plus a generation-scoped increasing sequence and
-rejects stale inputs before state changes. The remaining observation identity
-work is the serialized producer and its lifecycle-owned delivery wiring.
+rejects stale inputs before state changes. One launcher-owned serialized
+observer per published generation produces those observations against a
+required sink boundary that `Manager` satisfies; only the qualification
+composition that connects a live Manager remains.
 
 ### Cut line
 
@@ -636,14 +669,15 @@ remains in U10.4.
 
 #### U10.2 — Generation-bound resource observation
 
-Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
-generation baselines, pidfd-owning `(pid,startTicks)` RSS primitives, permission/read-only
-dominance, operation-scoped host absence versus post-provision path loss,
-controller availability versus enablement, the Manager observation
-identity/sequence endpoint, and launcher process-token attachment are
-implemented; the attachment slice still needs its focused race/shuffle gates
-executed on a Linux host. Serialized producer delivery and evidence-artifact
-status mapping remain.
+Status: implemented except artifact mapping. Bounded cgroup parsing/readback,
+pinned cgroup identity, generation baselines, pidfd-owning `(pid,startTicks)`
+RSS primitives, permission/read-only dominance, operation-scoped host absence
+versus post-provision path loss, controller availability versus enablement,
+the Manager observation identity/sequence endpoint, launcher process-token
+attachment, and the serialized per-generation observer producer are
+implemented with their race/shuffle gates executed on a Linux boundary.
+Wiring the sink to a live Manager inside the qualification composition and
+evidence-artifact status mapping remain with U10.4.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include

@@ -60,17 +60,21 @@ const (
 
 // WorkerdLauncherConfig seals the process-wide launch boundary. Environment
 // contains only explicit values selected from the fixed child allowlist; the
-// ambient agentd environment is never inherited.
+// ambient agentd environment is never inherited. ObservationSink and
+// ObservationInterval are set together or not at all; a sink requires the
+// cgroup boundary because every observation carries a complete cgroup sample.
 type WorkerdLauncherConfig struct {
-	ExecutablePath   string
-	ExecutableDigest string
-	Environment      map[string]string
-	ReadinessTimeout time.Duration
-	StopGracePeriod  time.Duration
-	OutputLimitBytes int
-	HistoryCapacity  int
-	ReadinessProbe   WorkerdReadinessProbe
-	Cgroup           *WorkerdCgroupConfig
+	ExecutablePath      string
+	ExecutableDigest    string
+	Environment         map[string]string
+	ReadinessTimeout    time.Duration
+	StopGracePeriod     time.Duration
+	OutputLimitBytes    int
+	HistoryCapacity     int
+	ReadinessProbe      WorkerdReadinessProbe
+	Cgroup              *WorkerdCgroupConfig
+	ObservationSink     WorkerdObservationSink
+	ObservationInterval time.Duration
 }
 
 // WorkerdCgroupConfig defines the delegated cgroup v2 boundary consumed by a
@@ -247,6 +251,10 @@ type workerdInstance struct {
 	// immutable after construction and nil only when identity capture failed,
 	// in which case the launch fails closed before readiness or publication.
 	processIdentity *workerdProcessIdentity
+	// observer is the single serialized observation producer for this
+	// published generation, set only inside the publication critical section
+	// and guarded by mu. Stop epochs cancel it without joining it.
+	observer *workerdShardObserver
 
 	mu                  sync.Mutex
 	exited              bool
@@ -275,6 +283,9 @@ type WorkerdProcessLauncher struct {
 	readinessProbe       WorkerdReadinessProbe
 	starter              workerdProcessStarter
 	captureIdentity      workerdProcessIdentityCapturer
+	observationSink      WorkerdObservationSink
+	observationInterval  time.Duration
+	observationPageSize  uint64
 	cgroups              *workerdCgroupController
 	boundAgentInstanceID identity.ID
 	pending              map[workerdLaunchKey]*workerdPendingLaunch
@@ -284,6 +295,7 @@ type WorkerdProcessLauncher struct {
 	retiredGenerations   map[workerdShardKey]ShardGeneration
 	launchIdentities     map[workerdLaunchKey]workerdLaunchIdentity
 	instances            map[*workerdInstance]struct{}
+	observers            map[*workerdShardObserver]struct{}
 	closed               bool
 	closeOperation       *workerdCloseOperation
 	cgroupsClosed        bool
@@ -354,6 +366,11 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		!filepath.IsAbs(config.ExecutablePath) || filepath.Clean(config.ExecutablePath) != config.ExecutablePath ||
 		config.ExecutablePath == string(filepath.Separator) ||
 		!validDigest(config.ExecutableDigest) || createMemfd == nil || captureIdentity == nil {
+		return nil, ErrInvalidWorkerdLauncherConfig
+	}
+	if (config.ObservationSink == nil) != (config.ObservationInterval == 0) ||
+		config.ObservationInterval < 0 || config.ObservationInterval > maximumWorkerdObservationInterval ||
+		(config.ObservationSink != nil && cgroups == nil) {
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
 	expectedDigest, err := hex.DecodeString(strings.TrimPrefix(config.ExecutableDigest, "sha256:"))
@@ -463,25 +480,29 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 
 	keepSealedExecutable = true
 	return &WorkerdProcessLauncher{
-		executable:         sealedExecutable,
-		executableProcPath: fmt.Sprintf("/proc/self/fd/%d", sealedFD),
-		executableDigest:   config.ExecutableDigest,
-		environment:        environment,
-		readinessTimeout:   config.ReadinessTimeout,
-		stopGracePeriod:    config.StopGracePeriod,
-		outputLimitBytes:   config.OutputLimitBytes,
-		historyCapacity:    config.HistoryCapacity,
-		readinessProbe:     config.ReadinessProbe,
-		starter:            starter,
-		captureIdentity:    captureIdentity,
-		cgroups:            cgroups,
-		pending:            make(map[workerdLaunchKey]*workerdPendingLaunch),
-		allocations:        make(map[*workerdCgroupLease]workerdCgroupAllocation),
-		current:            make(map[workerdShardKey]*workerdInstance),
-		latestGenerations:  make(map[workerdShardKey]ShardGeneration),
-		retiredGenerations: make(map[workerdShardKey]ShardGeneration),
-		launchIdentities:   make(map[workerdLaunchKey]workerdLaunchIdentity),
-		instances:          make(map[*workerdInstance]struct{}),
+		executable:          sealedExecutable,
+		executableProcPath:  fmt.Sprintf("/proc/self/fd/%d", sealedFD),
+		executableDigest:    config.ExecutableDigest,
+		environment:         environment,
+		readinessTimeout:    config.ReadinessTimeout,
+		stopGracePeriod:     config.StopGracePeriod,
+		outputLimitBytes:    config.OutputLimitBytes,
+		historyCapacity:     config.HistoryCapacity,
+		readinessProbe:      config.ReadinessProbe,
+		starter:             starter,
+		captureIdentity:     captureIdentity,
+		observationSink:     config.ObservationSink,
+		observationInterval: config.ObservationInterval,
+		observationPageSize: uint64(os.Getpagesize()),
+		cgroups:             cgroups,
+		pending:             make(map[workerdLaunchKey]*workerdPendingLaunch),
+		allocations:         make(map[*workerdCgroupLease]workerdCgroupAllocation),
+		current:             make(map[workerdShardKey]*workerdInstance),
+		latestGenerations:   make(map[workerdShardKey]ShardGeneration),
+		retiredGenerations:  make(map[workerdShardKey]ShardGeneration),
+		launchIdentities:    make(map[workerdLaunchKey]workerdLaunchIdentity),
+		instances:           make(map[*workerdInstance]struct{}),
+		observers:           make(map[*workerdShardObserver]struct{}),
 	}, nil
 }
 
@@ -1013,8 +1034,18 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	}
 	resultHandle = &WorkerdShardHandle{launcher: launcher, instance: instance}
 	launcher.current[shardKey] = instance
+	var observer *workerdShardObserver
+	if launcher.observationSink != nil && instance.stop == nil && !instance.handleStopRequested {
+		observerContext, cancelObserver := context.WithCancel(context.Background())
+		observer = &workerdShardObserver{ctx: observerContext, cancel: cancelObserver, done: make(chan struct{})}
+		instance.observer = observer
+		launcher.observers[observer] = struct{}{}
+	}
 	instance.mu.Unlock()
 	launcher.mu.Unlock()
+	if observer != nil {
+		go launcher.runWorkerdObserver(instance, observer)
+	}
 }
 
 // closeProcessIdentity closes the owned pidfd identity after its process is
@@ -1064,6 +1095,11 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 	instance.stop = stop
 	instance.mu.Unlock()
 	go func() {
+		// Cancel this generation's observer without joining it: the observer
+		// may be blocked inside a sink whose stop decision is waiting on this
+		// very epoch, so the epoch completes first and the sink return lets
+		// the observer exit. Launcher close performs the final join.
+		instance.cancelObserver()
 		if instance.cgroup != nil {
 			cleanupErr := instance.cgroup.destroy(context.Background())
 			destroyed := instance.cgroup.destroyedState()
@@ -1300,6 +1336,17 @@ func (launcher *WorkerdProcessLauncher) Close(ctx context.Context) error {
 				if cleanupErr != nil {
 					roundErr = errors.Join(roundErr, fmt.Errorf("clean residual workerd cgroup for shard %q generation %d: %w", residual.key.shardID, residual.key.generation, cleanupErr))
 				}
+			}
+
+			launcher.mu.Lock()
+			observers := make([]*workerdShardObserver, 0, len(launcher.observers))
+			for observer := range launcher.observers {
+				observers = append(observers, observer)
+			}
+			launcher.mu.Unlock()
+			for _, observer := range observers {
+				observer.cancel()
+				<-observer.done
 			}
 
 			launcher.mu.Lock()

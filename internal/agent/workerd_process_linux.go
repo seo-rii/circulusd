@@ -59,6 +59,10 @@ type workerdProcessIdentity struct {
 	token   workerdProcessToken
 	pidfd   int
 	backend workerdPIDFDBackend
+	// reader is the exact proc source that captured this identity. It is
+	// immutable after construction so a later RSS sample can never consult a
+	// different source for the same numeric PID.
+	reader workerdProcessReader
 
 	borrows         int
 	borrowQuiescent chan struct{}
@@ -111,7 +115,15 @@ func captureWorkerdProcessIdentity(reader workerdProcessReader, backend workerdP
 		}
 		return nil, tokenErr
 	}
-	return &workerdProcessIdentity{token: token, pidfd: pidfd, backend: backend}, nil
+	return &workerdProcessIdentity{token: token, pidfd: pidfd, backend: backend, reader: reader}, nil
+}
+
+// sampleRSS samples through the capture-time reader and page size contract.
+func (identity *workerdProcessIdentity) sampleRSS(pageSize uint64) (workerdProcessSample, error) {
+	if identity == nil {
+		return workerdProcessSample{}, fmt.Errorf("%w: process identity is required", errInvalidWorkerdProcessRequest)
+	}
+	return identity.sample(identity.reader, pageSize)
 }
 
 func isOnlyWorkerdPIDFDUnsupported(err error) bool {
