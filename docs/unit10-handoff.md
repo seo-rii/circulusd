@@ -13,15 +13,23 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `de83aec` (`feat(agent): serialize
-  generation-bound shard observation`), created on the Windows transfer host
-  on 2026-09-01 after `45cb691` (`feat(agent): attach pidfd owners to workerd
-  launches`). This handoff update is committed immediately after it with
-  subject `docs: update unit ten handoff checkpoint`.
-- At original preparation time `origin/main` was `9ab2104`; the implementation
-  commits `5aa7fa5`, `be0e0af`, `f6e9f80`, `45cb691`, and `de83aec` plus the
-  handoff documentation commits are local, making the branch eight commits
-  ahead. No push was performed.
+- Last implementation commit: `08eb353` (`feat(conformance): create
+  initialization instances inside dynamic workers`), created on the Windows
+  transfer host on 2026-09-01 after `45cb691` (launcher pidfd attachment),
+  `de83aec` (serialized observation), `8d11098` (distinct reconstruction
+  results), and `c5eabaf` (external checkpoint store). This handoff update is
+  committed immediately after it with subject
+  `docs: update unit ten handoff checkpoint`.
+- At original preparation time `origin/main` was `9ab2104`; the five original
+  and five transfer-host implementation commits plus handoff documentation
+  commits are local. No push was performed.
+- The release-pinned stock workerd binary is installed inside WSL at
+  `/home/seohyun/workerd-1.20260825.1` with both manifest digests verified
+  (archive `45fb5f0e…`, extracted `b805ed48…`). Run the live fixture gate
+  from the native clone with:
+  `CIRCULUSD_WORKERD_PATH=/home/seohyun/workerd-1.20260825.1`,
+  `CIRCULUSD_WORKERD_SHA256=sha256:b805ed481caa643953357d38146b82c118addcb525eb87e3d190b5617c82bc75`,
+  `CIRCULUSD_WORKERD_VERSION='workerd 2026-08-25'`.
 - The Windows transfer host now has a WSL2 Ubuntu 26.04 boundary with Go
   1.25.3 at `/home/seohyun/go/bin/go` and gcc for `-race`. Run linux-tagged
   package gates from `/mnt/c/Users/seohyun/Documents/dev/circulusd` with
@@ -193,23 +201,45 @@ evidence for this boundary. Focused observer race runs, the 50-repetition
 focused and 10-repetition complete agent race/shuffle gates, and package vet
 passed on the WSL boundary.
 
-## Exact next TDD work unit: U10.3 reconstruction and recycle contracts
+## Completed 2026-09-01: U10.3 host-independent contracts
+
+Three commits delivered the host-independent U10.3 scope:
+
+- `8d11098`: the probe inventory and every doctor profile carry the three
+  distinct reconstruction results with separate NOT_RUN reasons and no
+  runnable substitute; `workerd.shard-recycle` is gone.
+- `c5eabaf`: the deterministic checkpoint store lives in the runner process,
+  acknowledges canonical bytes/digest commits per content-addressed Worker
+  ID, and gates fault injection on the exact acknowledged digest.
+- `08eb353`: every Dynamic Worker boots through `phase0-worker-entry.mjs`,
+  whose module-local initialization-instance identity proves a new
+  initialization when it changes; pre-fault stability, format, and sibling
+  distinctness run live against the pinned workerd binary. workerd forbids
+  entropy in module global scope, so the single draw happens on the first
+  handler call while the null-to-value transition stays bound to module
+  initialization.
+
+The destructive Loader/CPU fault, real pressure/OOM, and pinned-process
+`SIGKILL` paths deliberately stay out of the bounded embedded fixture (its
+contract test forbids a spin route); they belong to the external runner.
+
+## Exact next TDD work unit: U10.4 external runner composition
 
 Continue the numbered plan without widening the cut line:
 
-1. U10.3: distinct Dynamic Worker reconstruction, cgroup pressure recycle, and
-   explicit pinned-process `SIGKILL` reconstruction, all from an externally
-   acknowledged checkpoint. Follow `docs/implementation-plan.md` §U10.3: the
-   three result names are non-substitutable, the deterministic checkpoint
-   store lives outside the workerd process and acknowledges commits before any
-   destructive fault, and the initialization-instance ID is created inside the
-   Dynamic Worker module during real module initialization.
-2. U10.4: release-snapshot-to-launcher composition, persistent private socket,
-   real CPU/RSS/reconstruction probes, live Manager sink composition, status
-   mapping, canonical artifacts, and atomic evidence retention.
-3. U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
+1. U10.4: release-snapshot-to-launcher composition, the persistent
+   private-socket fixture, real CPU/RSS probes and the three reconstruction
+   probes composed over Manager, launcher, cgroups, the observer sink, and
+   the external checkpoint store, the U10.3 mock placement rotation
+   (reference-only), status mapping, canonical CBOR evidence, and atomic
+   retention. The full external gate needs the provisioned cgroup-v2 host
+   contract from the plan; on this machine the pinned binary and WSL boundary
+   support development of the composition, but WSL cgroup delegation must be
+   provisioned per the operator contract before any external result can be
+   recorded, and only a provisioned host run can promote results.
+2. U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
    leak finalization, acceptance ledger, and operator documentation.
-4. Units 11 and 12 remain queued after Unit 10. Private
+3. Units 11 and 12 remain queued after Unit 10. Private
    `platformd`-to-`agentd` workload composition and Phase 1A NsJail work are
    later, separately planned cuts.
 
