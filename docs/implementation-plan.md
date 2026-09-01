@@ -265,6 +265,19 @@ not silently included in Unit 10.
   three, or the old name reappearing, and the runnable `workerd.dynamic-worker`
   probe cannot stand in for the reconstruction result. Conformance and doctor
   package tests pass; the external gate itself remains NOT_RUN until U10.4.
+- 2026-09-01: the deterministic reconstruction checkpoint store now lives in
+  the runner process, outside workerd. It records canonical checkpoint bytes
+  and their `sha256:` digest per content-addressed Worker ID, returns an
+  acknowledgement only for durably recorded state, replaces acknowledged
+  state in commit order under one serialized sequence that fails closed
+  before `uint64` exhaustion, reverifies the digest on every reload, returns
+  only unaliased payload copies, and never serves unacknowledged, foreign-
+  worker, or foreign-store state. `requireAcknowledged` gates destructive
+  fault injection on the exact acknowledged digest, so a probe cannot inject
+  a fault before its checkpoint commit is acknowledged. Focused 20-repetition
+  race/shuffle tests pass on the WSL boundary. This store is reference test
+  infrastructure for the three reconstruction probes, not durable production
+  state.
 
 ### Outcome
 
@@ -713,8 +726,13 @@ evidence-artifact status mapping remain with U10.4.
 Status: in progress. The probe inventory and doctor profile now carry the
 three distinct reconstruction results with separate NOT_RUN reasons and no
 runnable substitute, and the ambiguous `workerd.shard-recycle` name is gone
-from both. The checkpoint store, fixture initialization-instance identity,
-fault paths, and the mock placement rotation remain.
+from both. The runner-side deterministic checkpoint store exists outside the
+workerd process: it acknowledges canonical bytes/digest commits per
+content-addressed Worker ID, reverifies digests on reload, never serves
+unacknowledged or foreign state, fails closed before sequence exhaustion,
+and gates fault injection on the exact acknowledged digest. Fixture
+initialization-instance identity, the fault paths, probe composition against
+the store, and the mock placement rotation remain.
 
 1. Add failing host-independent contract tests for all three new reconstruction
    result names, their non-substitutability, checkpoint commit/ack ordering,
