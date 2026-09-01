@@ -41,6 +41,7 @@ func TestWorkerdCgroupLauncherConstructorFailureClosesController(t *testing.T) {
 	_, backend, cgroups := newWorkerdCgroupLauncherController(t)
 	launcher, err := newWorkerdProcessLauncherWithCgroup(
 		WorkerdLauncherConfig{}, &recordingWorkerdStarter{}, unix.MemfdCreate, cgroups,
+		newFakeWorkerdIdentityCapture().capture,
 	)
 	if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
 		t.Fatalf("newWorkerdProcessLauncherWithCgroup(invalid) = %#v, %v, want nil, invalid config", launcher, err)
@@ -1027,7 +1028,7 @@ func newWorkerdCgroupLauncherWithProbeForTest(t *testing.T, starter workerdProce
 		OutputLimitBytes: 1024, HistoryCapacity: 128,
 		ReadinessProbe: probe,
 	}
-	launcher, err := newWorkerdProcessLauncherWithCgroup(config, starter, unix.MemfdCreate, cgroups)
+	launcher, err := newWorkerdProcessLauncherWithCgroup(config, starter, unix.MemfdCreate, cgroups, newFakeWorkerdIdentityCapture().capture)
 	if err != nil {
 		t.Fatalf("newWorkerdProcessLauncherWithCgroup() error = %v", err)
 	}

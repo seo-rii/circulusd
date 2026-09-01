@@ -1,7 +1,8 @@
 # Implementation plan
 
-Status: Unit 10 paused for machine transfer after the Manager observation fence
-and unattached pidfd process-identity owner
+Status: Unit 10 resumed after machine transfer; the workerd launcher now owns
+per-instance pidfd process identities, with Linux-host race verification
+pending
 
 Updated: 2026-09-01
 
@@ -195,6 +196,34 @@ not silently included in Unit 10.
   100-pass race/shuffle and complete agent race gates pass. This is an
   unattached primitive: launcher capture/order, stop ownership, and observer
   lifecycle integration remain and no admission or external PASS is claimed.
+- 2026-09-01: the low-level launcher now captures one pidfd-owning process
+  identity for every successful OS start, after `starter.Start` returns and
+  before the exit waiter, readiness probe, or handle publication can act on
+  that process. The identity capturer is a required constructor input;
+  production paths bind the real /proc-and-pidfd capture while tests inject a
+  fake built on the existing proc-reader/pidfd fakes. Capture failure fails
+  the launch closed through exactly one graceful process/cgroup cleanup owner,
+  calls no readiness callback, publishes no handle, and preserves the
+  pidfd-unsupported classification for later host-availability mapping. The
+  exact owner is stored immutably on the instance; identity is never
+  reconstructed from a later numeric PID lookup, and a capture-time token
+  rejects PID reuse as stale. Natural exit, readiness failure, replacement,
+  handle stop, and launcher close each close the owner exactly once, only
+  after the process group is gone or the cgroup generation is destroyed and
+  after sample-borrow quiescence; a retryable stop timeout or pre-removal
+  cgroup failure retains the open owner for the next cleanup epoch. A pidfd
+  close failure is terminal: it is cached on the stop epoch, replayed without
+  another close syscall, and surfaces in the launcher close result. No
+  launcher or instance mutex is held across capture, proc I/O, borrow
+  quiescence, close, readiness callbacks, or cleanup waits, and an old
+  generation's owner cannot sample, close, or otherwise act on its
+  replacement. Verification on this Windows transfer host is limited to
+  cross-compiled `GOOS=linux go vet ./internal/agent`, gofmt on CR-stripped
+  copies, and `git diff --check`; the focused race/shuffle gates, the full
+  repository test run, and repo-wide vet could not execute here (no Linux
+  kernel boundary, and the host user disk quota blocked repo-wide module
+  downloads) and remain required on a Linux host before any further status
+  claim.
 
 ### Outcome
 
@@ -610,9 +639,11 @@ remains in U10.4.
 Status: in progress. Bounded cgroup parsing/readback, pinned cgroup identity,
 generation baselines, pidfd-owning `(pid,startTicks)` RSS primitives, permission/read-only
 dominance, operation-scoped host absence versus post-provision path loss,
-controller availability versus enablement, and the Manager observation
-identity/sequence endpoint are implemented. Launcher process-token attachment,
-serialized producer delivery, and evidence-artifact status mapping remain.
+controller availability versus enablement, the Manager observation
+identity/sequence endpoint, and launcher process-token attachment are
+implemented; the attachment slice still needs its focused race/shuffle gates
+executed on a Linux host. Serialized producer delivery and evidence-artifact
+status mapping remain.
 
 1. Add failing bounded-parser tests for `memory.current`, `memory.events`,
    `cpu.stat`, exact two-token finite `cpu.max`, and `pids.current`; include

@@ -1709,7 +1709,7 @@ type workerdEnsureResult struct {
 	err    error
 }
 
-func newWorkerdLauncherFixture(t *testing.T, starter workerdProcessStarter, probe WorkerdReadinessProbe) (WorkerdLauncherConfig, *WorkerdProcessLauncher) {
+func newWorkerdLauncherConfigForTest(t *testing.T, probe WorkerdReadinessProbe) WorkerdLauncherConfig {
 	t.Helper()
 	executablePath := filepath.Join(t.TempDir(), "workerd")
 	content := []byte("verified-workerd-inode")
@@ -1717,7 +1717,7 @@ func newWorkerdLauncherFixture(t *testing.T, starter workerdProcessStarter, prob
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(content)
-	config := WorkerdLauncherConfig{
+	return WorkerdLauncherConfig{
 		ExecutablePath:   executablePath,
 		ExecutableDigest: fmt.Sprintf("sha256:%x", digest),
 		ReadinessTimeout: time.Second,
@@ -1726,6 +1726,11 @@ func newWorkerdLauncherFixture(t *testing.T, starter workerdProcessStarter, prob
 		HistoryCapacity:  128,
 		ReadinessProbe:   probe,
 	}
+}
+
+func newWorkerdLauncherFixture(t *testing.T, starter workerdProcessStarter, probe WorkerdReadinessProbe) (WorkerdLauncherConfig, *WorkerdProcessLauncher) {
+	t.Helper()
+	config := newWorkerdLauncherConfigForTest(t, probe)
 	launcher, err := newWorkerdProcessLauncherForTest(t, config, starter)
 	if err != nil {
 		t.Fatalf("newWorkerdProcessLauncher() error = %v", err)
@@ -1735,11 +1740,18 @@ func newWorkerdLauncherFixture(t *testing.T, starter workerdProcessStarter, prob
 
 func newWorkerdProcessLauncherForTest(t *testing.T, config WorkerdLauncherConfig, starter workerdProcessStarter) (*WorkerdProcessLauncher, error) {
 	t.Helper()
-	launcher, err := newWorkerdProcessLauncher(config, starter)
+	launcher, _, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	return launcher, err
+}
+
+func newWorkerdProcessLauncherWithIdentityForTest(t *testing.T, config WorkerdLauncherConfig, starter workerdProcessStarter) (*WorkerdProcessLauncher, *fakeWorkerdIdentityCapture, error) {
+	t.Helper()
+	capture := newFakeWorkerdIdentityCapture()
+	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, unix.MemfdCreate, nil, capture.capture)
 	if err == nil {
 		closeWorkerdLauncherForTest(t, launcher)
 	}
-	return launcher, err
+	return launcher, capture, err
 }
 
 func closeWorkerdLauncherForTest(t *testing.T, launcher *WorkerdProcessLauncher) {
@@ -2058,4 +2070,651 @@ func (process *fakeWorkerdProcess) signalSnapshot() []syscall.Signal {
 	process.mu.Lock()
 	defer process.mu.Unlock()
 	return slices.Clone(process.signals)
+}
+
+const workerdFakeIdentityStatm = "8 2 1 1 0 1 0\n"
+
+func workerdFakeIdentityStartTicks(pid int) uint64 {
+	return uint64(pid)*3 + 11
+}
+
+type fakeWorkerdCapturedIdentity struct {
+	pid     int
+	ticks   uint64
+	reader  *fakeWorkerdProcessReader
+	backend *fakeWorkerdPIDFDBackend
+	owner   *workerdProcessIdentity
+}
+
+// fakeWorkerdIdentityCapture builds one real workerdProcessIdentity owner per
+// captured PID on top of injected proc/pidfd fakes, so launcher tests with
+// fake PIDs never touch the live /proc boundary.
+type fakeWorkerdIdentityCapture struct {
+	mu          sync.Mutex
+	nextFD      int
+	captureErrs map[int]error
+	closeErrs   map[int]error
+	gatePID     int
+	entered     chan int
+	gate        <-chan struct{}
+	captured    []*fakeWorkerdCapturedIdentity
+}
+
+func newFakeWorkerdIdentityCapture() *fakeWorkerdIdentityCapture {
+	return &fakeWorkerdIdentityCapture{
+		captureErrs: make(map[int]error),
+		closeErrs:   make(map[int]error),
+	}
+}
+
+func (capture *fakeWorkerdIdentityCapture) setCaptureErr(pid int, err error) {
+	capture.mu.Lock()
+	capture.captureErrs[pid] = err
+	capture.mu.Unlock()
+}
+
+func (capture *fakeWorkerdIdentityCapture) setCloseErr(pid int, err error) {
+	capture.mu.Lock()
+	capture.closeErrs[pid] = err
+	capture.mu.Unlock()
+}
+
+func (capture *fakeWorkerdIdentityCapture) gateCapture(pid int, entered chan int, gate <-chan struct{}) {
+	capture.mu.Lock()
+	capture.gatePID = pid
+	capture.entered = entered
+	capture.gate = gate
+	capture.mu.Unlock()
+}
+
+func (capture *fakeWorkerdIdentityCapture) capture(pid int) (*workerdProcessIdentity, error) {
+	capture.mu.Lock()
+	entered := capture.entered
+	gate := capture.gate
+	gated := capture.gatePID == pid
+	captureErr := capture.captureErrs[pid]
+	closeErr := capture.closeErrs[pid]
+	capture.nextFD++
+	fd := 40_000 + capture.nextFD
+	capture.mu.Unlock()
+	if gated && entered != nil {
+		entered <- pid
+	}
+	if gated && gate != nil {
+		<-gate
+	}
+	if captureErr != nil {
+		return nil, captureErr
+	}
+	ticks := workerdFakeIdentityStartTicks(pid)
+	stat := validWorkerdProcStat(pid, "workerd", ticks)
+	reader := &fakeWorkerdProcessReader{
+		stat:     stat,
+		snapshot: workerdProcessRawSnapshot{StatBefore: stat, Statm: workerdFakeIdentityStatm, StatAfter: stat},
+	}
+	backend := &fakeWorkerdPIDFDBackend{openFD: fd, closeErr: closeErr}
+	owner, err := captureWorkerdProcessIdentity(reader, backend, pid)
+	if err != nil {
+		return nil, err
+	}
+	capture.mu.Lock()
+	capture.captured = append(capture.captured, &fakeWorkerdCapturedIdentity{
+		pid: pid, ticks: ticks, reader: reader, backend: backend, owner: owner,
+	})
+	capture.mu.Unlock()
+	return owner, nil
+}
+
+func (capture *fakeWorkerdIdentityCapture) capturedSnapshot() []*fakeWorkerdCapturedIdentity {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	return slices.Clone(capture.captured)
+}
+
+func (capture *fakeWorkerdIdentityCapture) capturedForPID(pid int) *fakeWorkerdCapturedIdentity {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	for index := len(capture.captured) - 1; index >= 0; index-- {
+		if capture.captured[index].pid == pid {
+			return capture.captured[index]
+		}
+	}
+	return nil
+}
+
+type workerdStarterFunc func(workerdLaunchCommand) (workerdStartedProcess, error)
+
+func (start workerdStarterFunc) Start(command workerdLaunchCommand) (workerdStartedProcess, error) {
+	return start(command)
+}
+
+type waitEntryWorkerdProcess struct {
+	*fakeWorkerdProcess
+	waitEntered chan struct{}
+	waitOnce    sync.Once
+}
+
+func (process *waitEntryWorkerdProcess) Wait() error {
+	process.waitOnce.Do(func() { close(process.waitEntered) })
+	return process.fakeWorkerdProcess.Wait()
+}
+
+func waitUntilWorkerdCondition(t *testing.T, timeout time.Duration, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal(message)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestWorkerdLauncherProcessIdentityAttachmentContract(t *testing.T) {
+	t.Parallel()
+	instanceField, found := reflect.TypeOf(workerdInstance{}).FieldByName("processIdentity")
+	if !found || instanceField.Type != reflect.TypeOf((*workerdProcessIdentity)(nil)) {
+		t.Errorf("workerdInstance.processIdentity = %#v, want *workerdProcessIdentity", instanceField)
+	}
+	launcherField, found := reflect.TypeOf(WorkerdProcessLauncher{}).FieldByName("captureIdentity")
+	if !found || launcherField.Type != reflect.TypeOf(workerdProcessIdentityCapturer(nil)) {
+		t.Errorf("WorkerdProcessLauncher.captureIdentity = %#v, want workerdProcessIdentityCapturer", launcherField)
+	}
+}
+
+func TestNewWorkerdProcessLauncherRejectsNilIdentityCapturer(t *testing.T) {
+	t.Parallel()
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, err := newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, nil)
+	if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
+		t.Fatalf("newWorkerdProcessLauncherWithResources(nil capturer) = %#v, %v, want nil, invalid config", launcher, err)
+	}
+}
+
+func TestWorkerdEnsureCapturesIdentityBeforeWaitReadinessAndPublication(t *testing.T) {
+	t.Parallel()
+	inner := newFakeWorkerdProcess(31_001, true)
+	process := &waitEntryWorkerdProcess{fakeWorkerdProcess: inner, waitEntered: make(chan struct{})}
+	starter := workerdStarterFunc(func(workerdLaunchCommand) (workerdStartedProcess, error) { return process, nil })
+	probeCalls := make(chan WorkerdProcessInfo, 1)
+	probe := WorkerdReadinessProbeFunc(func(_ context.Context, info WorkerdProcessInfo) error {
+		probeCalls <- info
+		return nil
+	})
+	config := newWorkerdLauncherConfigForTest(t, probe)
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	entered := make(chan int, 1)
+	gate := make(chan struct{})
+	capture.gateCapture(31_001, entered, gate)
+	results := make(chan workerdEnsureResult, 1)
+	go func() {
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+			AgentInstanceID: workerdTestAgentInstanceID(1), ShardID: "identity-order", ShardGeneration: 1,
+		})
+		results <- workerdEnsureResult{handle: handle, err: ensureErr}
+	}()
+	select {
+	case pid := <-entered:
+		if pid != 31_001 {
+			t.Fatalf("captured pid = %d, want 31001", pid)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("identity capture was not entered after start")
+	}
+	select {
+	case <-process.waitEntered:
+		t.Fatal("Wait started before identity capture completed")
+	case info := <-probeCalls:
+		t.Fatalf("readiness probe ran before identity capture completed: %+v", info)
+	case result := <-results:
+		t.Fatalf("Ensure returned before identity capture completed: %#v, %v", result.handle, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gate)
+	var result workerdEnsureResult
+	select {
+	case result = <-results:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ensure did not complete after capture gate release")
+	}
+	if result.err != nil || result.handle == nil {
+		t.Fatalf("Ensure() = %#v, %v", result.handle, result.err)
+	}
+	select {
+	case info := <-probeCalls:
+		if info.PID != 31_001 {
+			t.Fatalf("readiness PID = %d, want 31001", info.PID)
+		}
+	default:
+		t.Fatal("readiness probe was not called for the published shard")
+	}
+	select {
+	case <-process.waitEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait was not started after identity capture")
+	}
+	captured := capture.capturedForPID(31_001)
+	if captured == nil || len(capture.capturedSnapshot()) != 1 {
+		t.Fatalf("captured identities = %#v, want exactly one for pid 31001", capture.capturedSnapshot())
+	}
+	if result.handle.instance.processIdentity != captured.owner {
+		t.Fatal("published instance does not store the exact captured identity owner")
+	}
+	sample, sampleErr := captured.owner.sample(captured.reader, 4096)
+	if sampleErr != nil || sample.PID != 31_001 || sample.StartTicks != captured.ticks {
+		t.Fatalf("owner sample = %+v, %v, want capture-time identity", sample, sampleErr)
+	}
+	if stopErr := result.handle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+	if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("identity close calls = %d, want exactly one after stop", len(closeFDs))
+	}
+}
+
+func TestWorkerdEnsureIdentityCaptureFailureFailsClosedWithOneCleanupOwner(t *testing.T) {
+	t.Parallel()
+	captureFailure := errors.New("test: identity capture failure")
+	process := newFakeWorkerdProcess(31_002, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	probeCalls := make(chan WorkerdProcessInfo, 4)
+	probe := WorkerdReadinessProbeFunc(func(_ context.Context, info WorkerdProcessInfo) error {
+		probeCalls <- info
+		return nil
+	})
+	config := newWorkerdLauncherConfigForTest(t, probe)
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	capture.setCaptureErr(31_002, captureFailure)
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(2), ShardID: "identity-capture-failure", ShardGeneration: 1,
+	})
+	if handle != nil || !errors.Is(ensureErr, ErrWorkerdIdentityCaptureFailed) || !errors.Is(ensureErr, captureFailure) {
+		t.Fatalf("Ensure() = %#v, %v, want nil handle and wrapped identity capture failure", handle, ensureErr)
+	}
+	select {
+	case info := <-probeCalls:
+		t.Fatalf("readiness probe ran after identity capture failure: %+v", info)
+	default:
+	}
+	if signals := process.signalSnapshot(); !reflect.DeepEqual(signals, []syscall.Signal{syscall.SIGTERM}) {
+		t.Fatalf("capture-failure cleanup signals = %#v, want exactly one graceful stop owner", signals)
+	}
+	launcher.mu.Lock()
+	tracked := len(launcher.instances)
+	launcher.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("tracked instances after capture failure = %d, want 0", tracked)
+	}
+
+	unsupported := errors.Join(errWorkerdPIDFDUnsupported, errors.New("open workerd pidfd: functionality not supported"))
+	capture.setCaptureErr(10_001, unsupported)
+	_, unsupportedErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(2), ShardID: "identity-capture-failure", ShardGeneration: 2,
+	})
+	if !errors.Is(unsupportedErr, ErrWorkerdIdentityCaptureFailed) || !errors.Is(unsupportedErr, errWorkerdPIDFDUnsupported) {
+		t.Fatalf("Ensure(unsupported pidfd) error = %v, want preserved unsupported classification", unsupportedErr)
+	}
+
+	retryHandle, retryErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(2), ShardID: "identity-capture-failure", ShardGeneration: 3,
+	})
+	if retryErr != nil || retryHandle == nil {
+		t.Fatalf("Ensure(fresh generation after capture failures) = %#v, %v", retryHandle, retryErr)
+	}
+	if stopErr := retryHandle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop(retry) error = %v", stopErr)
+	}
+}
+
+func TestWorkerdInstanceIdentityRejectsPIDReuseWithoutReconstruction(t *testing.T) {
+	t.Parallel()
+	process := newFakeWorkerdProcess(31_003, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(3), ShardID: "identity-pid-reuse", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure() error = %v", ensureErr)
+	}
+	captured := capture.capturedForPID(31_003)
+	if captured == nil {
+		t.Fatal("identity was not captured for pid 31003")
+	}
+	if token := captured.owner.token; token.PID != 31_003 || token.StartTicks != captured.ticks {
+		t.Fatalf("owner token = %+v, want capture-time identity", token)
+	}
+	reusedStat := validWorkerdProcStat(31_003, "workerd", captured.ticks+9)
+	captured.reader.mu.Lock()
+	captured.reader.snapshot = workerdProcessRawSnapshot{StatBefore: reusedStat, Statm: workerdFakeIdentityStatm, StatAfter: reusedStat}
+	captured.reader.mu.Unlock()
+	if _, sampleErr := captured.owner.sample(captured.reader, 4096); !errors.Is(sampleErr, errStaleWorkerdProcessIdentity) {
+		t.Fatalf("sample(reused pid) error = %v, want stale process identity", sampleErr)
+	}
+	if stopErr := handle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+func TestWorkerdRetryableStopRetainsIdentityOwnerForNextCleanupEpoch(t *testing.T) {
+	t.Parallel()
+	process := newFakeWorkerdProcess(31_004, false)
+	process.killClearsGroup = []bool{false}
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(4), ShardID: "identity-retryable-stop", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure() error = %v", ensureErr)
+	}
+	captured := capture.capturedForPID(31_004)
+	if captured == nil {
+		t.Fatal("identity was not captured for pid 31004")
+	}
+	stopErr := handle.Stop(context.Background())
+	if !errors.Is(stopErr, ErrWorkerdStopTimeout) || errors.Is(stopErr, ErrTerminalShardCleanup) {
+		t.Fatalf("Stop(timeout) error = %v, want retryable stop timeout", stopErr)
+	}
+	if _, closeFDs := captured.backend.calls(); len(closeFDs) != 0 {
+		t.Fatalf("identity closes after retryable stop = %d, want retained open owner", len(closeFDs))
+	}
+	if _, sampleErr := captured.owner.sample(captured.reader, 4096); sampleErr != nil {
+		t.Fatalf("sample(retained owner) error = %v, want owner usable for next epoch", sampleErr)
+	}
+	if retryErr := handle.Stop(context.Background()); retryErr != nil {
+		t.Fatalf("Stop(retry epoch) error = %v", retryErr)
+	}
+	if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("identity closes after successful epoch = %d, want exactly one", len(closeFDs))
+	}
+}
+
+func TestWorkerdIdentityOwnerClosesExactlyOncePerLifecyclePath(t *testing.T) {
+	t.Parallel()
+	t.Run("natural exit", func(t *testing.T) {
+		t.Parallel()
+		process := newFakeWorkerdProcess(31_005, true)
+		starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+		config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+		launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+		if err != nil {
+			t.Fatalf("construct launcher: %v", err)
+		}
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+			AgentInstanceID: workerdTestAgentInstanceID(5), ShardID: "identity-natural-exit", ShardGeneration: 1,
+		})
+		if ensureErr != nil {
+			t.Fatalf("Ensure() error = %v", ensureErr)
+		}
+		captured := capture.capturedForPID(31_005)
+		if captured == nil {
+			t.Fatal("identity was not captured for pid 31005")
+		}
+		process.finishGroup(nil)
+		waitUntilWorkerdCondition(t, 2*time.Second, func() bool {
+			_, closeFDs := captured.backend.calls()
+			return len(closeFDs) == 1
+		}, "identity owner was not closed after natural exit")
+		if stopErr := handle.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("Stop(after natural exit) error = %v", stopErr)
+		}
+		if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+			t.Fatalf("identity closes = %d, want exactly one", len(closeFDs))
+		}
+	})
+	t.Run("readiness failure", func(t *testing.T) {
+		t.Parallel()
+		readinessFailure := errors.New("test: readiness failure")
+		process := newFakeWorkerdProcess(31_015, true)
+		starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+		config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return readinessFailure }))
+		launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+		if err != nil {
+			t.Fatalf("construct launcher: %v", err)
+		}
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+			AgentInstanceID: workerdTestAgentInstanceID(5), ShardID: "identity-readiness-failure", ShardGeneration: 1,
+		})
+		if handle != nil || !errors.Is(ensureErr, ErrWorkerdNotReady) {
+			t.Fatalf("Ensure() = %#v, %v, want readiness failure", handle, ensureErr)
+		}
+		captured := capture.capturedForPID(31_015)
+		if captured == nil {
+			t.Fatal("identity was not captured for pid 31015")
+		}
+		if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+			t.Fatalf("identity closes after readiness failure = %d, want exactly one", len(closeFDs))
+		}
+	})
+	t.Run("launcher close", func(t *testing.T) {
+		t.Parallel()
+		processes := []*fakeWorkerdProcess{newFakeWorkerdProcess(31_016, true), newFakeWorkerdProcess(31_017, true)}
+		starter := &recordingWorkerdStarter{processes: processes}
+		config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+		launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+		if err != nil {
+			t.Fatalf("construct launcher: %v", err)
+		}
+		for _, shard := range []string{"identity-close-a", "identity-close-b"} {
+			if _, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+				AgentInstanceID: workerdTestAgentInstanceID(5), ShardID: shard, ShardGeneration: 1,
+			}); ensureErr != nil {
+				t.Fatalf("Ensure(%s) error = %v", shard, ensureErr)
+			}
+		}
+		if closeErr := launcher.Close(context.Background()); closeErr != nil {
+			t.Fatalf("Close() error = %v", closeErr)
+		}
+		for _, pid := range []int{31_016, 31_017} {
+			captured := capture.capturedForPID(pid)
+			if captured == nil {
+				t.Fatalf("identity was not captured for pid %d", pid)
+			}
+			if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+				t.Fatalf("identity closes for pid %d = %d, want exactly one", pid, len(closeFDs))
+			}
+		}
+	})
+}
+
+func TestWorkerdIdentityCloseFailureIsTerminalAndReplayedWithoutSecondSyscall(t *testing.T) {
+	t.Parallel()
+	process := newFakeWorkerdProcess(31_006, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	capture := newFakeWorkerdIdentityCapture()
+	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, unix.MemfdCreate, nil, capture.capture)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if closeErr := launcher.Close(closeCtx); !errors.Is(closeErr, ErrTerminalShardCleanup) {
+			t.Errorf("Close() error = %v, want remembered terminal identity close failure", closeErr)
+		}
+	})
+	capture.setCloseErr(31_006, unix.EIO)
+	handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(6), ShardID: "identity-close-failure", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure() error = %v", ensureErr)
+	}
+	captured := capture.capturedForPID(31_006)
+	if captured == nil {
+		t.Fatal("identity was not captured for pid 31006")
+	}
+	stopErr := handle.Stop(context.Background())
+	if !errors.Is(stopErr, ErrTerminalShardCleanup) || !errors.Is(stopErr, unix.EIO) {
+		t.Fatalf("Stop(close failure) error = %v, want terminal identity close failure", stopErr)
+	}
+	if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("identity closes = %d, want exactly one syscall", len(closeFDs))
+	}
+	replayErr := handle.Stop(context.Background())
+	if !errors.Is(replayErr, ErrTerminalShardCleanup) || !errors.Is(replayErr, unix.EIO) {
+		t.Fatalf("Stop(replay) error = %v, want replayed terminal close failure", replayErr)
+	}
+	if _, closeFDs := captured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("replayed terminal close performed another close syscall: %d", len(closeFDs))
+	}
+}
+
+func TestWorkerdOldGenerationIdentityCannotActOnReplacement(t *testing.T) {
+	t.Parallel()
+	oldProcess := newFakeWorkerdProcess(31_007, true)
+	newProcess := newFakeWorkerdProcess(31_008, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{oldProcess, newProcess}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	agentID := workerdTestAgentInstanceID(7)
+	oldHandle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: agentID, ShardID: "identity-replacement", ShardGeneration: 1,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure(generation 1) error = %v", ensureErr)
+	}
+	newHandle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: agentID, ShardID: "identity-replacement", ShardGeneration: 2,
+	})
+	if ensureErr != nil {
+		t.Fatalf("Ensure(generation 2) error = %v", ensureErr)
+	}
+	oldCaptured := capture.capturedForPID(31_007)
+	newCaptured := capture.capturedForPID(31_008)
+	if oldCaptured == nil || newCaptured == nil {
+		t.Fatalf("captured identities = %#v, want both generations captured", capture.capturedSnapshot())
+	}
+	if _, closeFDs := oldCaptured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("old generation identity closes = %d, want exactly one after replacement", len(closeFDs))
+	}
+	if _, sampleErr := oldCaptured.owner.sample(oldCaptured.reader, 4096); !errors.Is(sampleErr, errWorkerdProcessIdentityUnavailable) {
+		t.Fatalf("sample(closed old owner) error = %v, want identity unavailable", sampleErr)
+	}
+	if replayErr := oldCaptured.owner.close(); replayErr != nil {
+		t.Fatalf("close(old owner replay) error = %v", replayErr)
+	}
+	if _, closeFDs := oldCaptured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("old owner replay performed another close syscall: %d", len(closeFDs))
+	}
+	if _, closeFDs := newCaptured.backend.calls(); len(closeFDs) != 0 {
+		t.Fatalf("replacement owner was closed by old generation cleanup: %d", len(closeFDs))
+	}
+	sample, sampleErr := newCaptured.owner.sample(newCaptured.reader, 4096)
+	if sampleErr != nil || sample.PID != 31_008 {
+		t.Fatalf("sample(replacement owner) = %+v, %v, want live replacement identity", sample, sampleErr)
+	}
+	if stopErr := oldHandle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop(retired old handle) error = %v", stopErr)
+	}
+	if stopErr := newHandle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop(replacement) error = %v", stopErr)
+	}
+	if _, closeFDs := newCaptured.backend.calls(); len(closeFDs) != 1 {
+		t.Fatalf("replacement identity closes = %d, want exactly one", len(closeFDs))
+	}
+}
+
+func TestWorkerdLauncherHoldsNoLockAcrossIdentityCaptureAndClose(t *testing.T) {
+	t.Parallel()
+	processA := newFakeWorkerdProcess(31_009, true)
+	processB := newFakeWorkerdProcess(31_010, true)
+	processC := newFakeWorkerdProcess(31_011, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{processA, processB, processC}}
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	launcher, capture, err := newWorkerdProcessLauncherWithIdentityForTest(t, config, starter)
+	if err != nil {
+		t.Fatalf("construct launcher: %v", err)
+	}
+	agentID := workerdTestAgentInstanceID(9)
+	entered := make(chan int, 1)
+	gate := make(chan struct{})
+	capture.gateCapture(31_009, entered, gate)
+	results := make(chan workerdEnsureResult, 1)
+	go func() {
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+			AgentInstanceID: agentID, ShardID: "lock-a", ShardGeneration: 1,
+		})
+		results <- workerdEnsureResult{handle: handle, err: ensureErr}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("identity capture was not entered")
+	}
+	ensureCtx, cancelEnsure := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelEnsure()
+	handleB, ensureBErr := launcher.Ensure(ensureCtx, WorkerdEnsureRequest{
+		AgentInstanceID: agentID, ShardID: "lock-b", ShardGeneration: 1,
+	})
+	if ensureBErr != nil {
+		t.Fatalf("Ensure(lock-b) during gated capture error = %v, want independent progress", ensureBErr)
+	}
+	close(gate)
+	var resultA workerdEnsureResult
+	select {
+	case resultA = <-results:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ensure(lock-a) did not complete")
+	}
+	if resultA.err != nil || resultA.handle == nil {
+		t.Fatalf("Ensure(lock-a) = %#v, %v", resultA.handle, resultA.err)
+	}
+
+	capturedA := capture.capturedForPID(31_009)
+	if capturedA == nil {
+		t.Fatal("identity was not captured for pid 31009")
+	}
+	closeEntered := make(chan struct{})
+	closeGate := make(chan struct{})
+	capturedA.backend.mu.Lock()
+	capturedA.backend.closeEntered = closeEntered
+	capturedA.backend.closeGate = closeGate
+	capturedA.backend.mu.Unlock()
+	stopResults := make(chan error, 1)
+	go func() { stopResults <- resultA.handle.Stop(context.Background()) }()
+	select {
+	case <-closeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("identity close was not entered")
+	}
+	handleC, ensureCErr := launcher.Ensure(ensureCtx, WorkerdEnsureRequest{
+		AgentInstanceID: agentID, ShardID: "lock-c", ShardGeneration: 1,
+	})
+	if ensureCErr != nil {
+		t.Fatalf("Ensure(lock-c) during gated close error = %v, want independent progress", ensureCErr)
+	}
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWait()
+	if waitErr := resultA.handle.Stop(waitCtx); !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("Stop(waiter during gated close) error = %v, want caller-local deadline", waitErr)
+	}
+	close(closeGate)
+	if stopErr := <-stopResults; stopErr != nil {
+		t.Fatalf("Stop(lock-a) error = %v", stopErr)
+	}
+	for _, handle := range []*WorkerdShardHandle{handleB, handleC} {
+		if stopErr := handle.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("cleanup Stop() error = %v", stopErr)
+		}
+	}
 }

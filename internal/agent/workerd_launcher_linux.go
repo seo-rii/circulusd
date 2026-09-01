@@ -40,6 +40,7 @@ var (
 	ErrWorkerdLauncherClosed        = errors.New("agent: workerd process launcher is closed")
 	ErrWorkerdHistoryCapacity       = errors.New("agent: workerd launcher history capacity exhausted")
 	ErrWorkerdAgentInstanceMismatch = errors.New("agent: workerd launcher is bound to a different agent instance")
+	ErrWorkerdIdentityCaptureFailed = errors.New("agent: workerd process identity capture failed")
 )
 
 var errTerminalStaleWorkerdGeneration = errors.Join(ErrStaleWorkerdGeneration, ErrTerminalShardCleanup)
@@ -171,6 +172,16 @@ type workerdProcessStarter interface {
 	Start(workerdLaunchCommand) (workerdStartedProcess, error)
 }
 
+// workerdProcessIdentityCapturer opens one owned pidfd/start-ticks identity for
+// a freshly started leader PID. It is called without launcher or instance
+// mutexes held, immediately after a successful start and before Wait,
+// readiness, observation, or handle publication can act on that process.
+type workerdProcessIdentityCapturer func(pid int) (*workerdProcessIdentity, error)
+
+func captureLinuxWorkerdProcessIdentity(pid int) (*workerdProcessIdentity, error) {
+	return captureWorkerdProcessIdentity(linuxWorkerdProcessReader{}, linuxWorkerdPIDFDBackend{}, pid)
+}
+
 type workerdMemfdCreator func(string, int) (int, error)
 
 type workerdStartedProcess interface {
@@ -232,6 +243,10 @@ type workerdInstance struct {
 	stderr   *boundedWorkerdWriter
 	exitDone chan struct{}
 	cgroup   *workerdCgroupLease
+	// processIdentity owns the pidfd/start-ticks token captured at start. It is
+	// immutable after construction and nil only when identity capture failed,
+	// in which case the launch fails closed before readiness or publication.
+	processIdentity *workerdProcessIdentity
 
 	mu                  sync.Mutex
 	exited              bool
@@ -259,6 +274,7 @@ type WorkerdProcessLauncher struct {
 	historyCapacity      int
 	readinessProbe       WorkerdReadinessProbe
 	starter              workerdProcessStarter
+	captureIdentity      workerdProcessIdentityCapturer
 	cgroups              *workerdCgroupController
 	boundAgentInstanceID identity.ID
 	pending              map[workerdLaunchKey]*workerdPendingLaunch
@@ -307,7 +323,7 @@ func NewWorkerdProcessLauncher(config WorkerdLauncherConfig) (*WorkerdProcessLau
 	if err != nil {
 		return nil, err
 	}
-	return newWorkerdProcessLauncherWithCgroup(config, osWorkerdProcessStarter{}, unix.MemfdCreate, cgroups)
+	return newWorkerdProcessLauncherWithCgroup(config, osWorkerdProcessStarter{}, unix.MemfdCreate, cgroups, captureLinuxWorkerdProcessIdentity)
 }
 
 func newWorkerdProcessLauncher(config WorkerdLauncherConfig, starter workerdProcessStarter) (*WorkerdProcessLauncher, error) {
@@ -315,21 +331,21 @@ func newWorkerdProcessLauncher(config WorkerdLauncherConfig, starter workerdProc
 }
 
 func newWorkerdProcessLauncherWithMemfd(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator) (*WorkerdProcessLauncher, error) {
-	return newWorkerdProcessLauncherWithResources(config, starter, createMemfd, nil)
+	return newWorkerdProcessLauncherWithResources(config, starter, createMemfd, nil, captureLinuxWorkerdProcessIdentity)
 }
 
-func newWorkerdProcessLauncherWithCgroup(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController) (*WorkerdProcessLauncher, error) {
+func newWorkerdProcessLauncherWithCgroup(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController, captureIdentity workerdProcessIdentityCapturer) (*WorkerdProcessLauncher, error) {
 	if cgroups == nil {
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
-	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, createMemfd, cgroups)
+	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, createMemfd, cgroups, captureIdentity)
 	if err != nil {
 		return nil, errors.Join(err, cgroups.close())
 	}
 	return launcher, nil
 }
 
-func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController) (*WorkerdProcessLauncher, error) {
+func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController, captureIdentity workerdProcessIdentityCapturer) (*WorkerdProcessLauncher, error) {
 	if starter == nil || config.ReadinessProbe == nil || config.ReadinessTimeout <= 0 ||
 		config.ReadinessTimeout > maximumWorkerdReadinessTimeout ||
 		config.StopGracePeriod <= 0 || config.StopGracePeriod > maximumWorkerdStopGracePeriod ||
@@ -337,7 +353,7 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		config.HistoryCapacity <= 0 || config.HistoryCapacity > maximumWorkerdHistoryCapacity ||
 		!filepath.IsAbs(config.ExecutablePath) || filepath.Clean(config.ExecutablePath) != config.ExecutablePath ||
 		config.ExecutablePath == string(filepath.Separator) ||
-		!validDigest(config.ExecutableDigest) || createMemfd == nil {
+		!validDigest(config.ExecutableDigest) || createMemfd == nil || captureIdentity == nil {
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
 	expectedDigest, err := hex.DecodeString(strings.TrimPrefix(config.ExecutableDigest, "sha256:"))
@@ -457,6 +473,7 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		historyCapacity:    config.HistoryCapacity,
 		readinessProbe:     config.ReadinessProbe,
 		starter:            starter,
+		captureIdentity:    captureIdentity,
 		cgroups:            cgroups,
 		pending:            make(map[workerdLaunchKey]*workerdPendingLaunch),
 		allocations:        make(map[*workerdCgroupLease]workerdCgroupAllocation),
@@ -810,9 +827,14 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		resultErr = fmt.Errorf("%w: shard %q generation %d: %w", ErrWorkerdLaunchFailed, pending.key.shardID, pending.key.generation, startErr)
 		return
 	}
+	identityOwner, identityErr := launcher.captureIdentity(process.PID())
+	if identityErr == nil && identityOwner == nil {
+		identityErr = fmt.Errorf("%w: identity capture returned no owner", errWorkerdProcessContract)
+	}
 	instance := &workerdInstance{
 		key: pending.key, identity: pending.identity, process: process,
 		stdout: stdout, stderr: stderr, exitDone: make(chan struct{}), cgroup: cgroupLease,
+		processIdentity: identityOwner,
 	}
 	launcher.mu.Lock()
 	if cgroupLease != nil {
@@ -820,6 +842,10 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		if !registered || allocation.key != pending.key {
 			launcher.mu.Unlock()
 			resultErr = fmt.Errorf("%w: cgroup allocation ownership was lost before process publication", errWorkerdCgroupContract)
+			if closeErr := instance.closeProcessIdentity(); closeErr != nil {
+				launcher.rememberWorkerdTerminalCloseError(closeErr)
+				resultErr = errors.Join(resultErr, closeErr)
+			}
 			return
 		}
 		delete(launcher.allocations, cgroupLease)
@@ -845,6 +871,15 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 		stop := launcher.beginWorkerdStop(instance, true)
 		_ = launcher.waitWorkerdStop(context.Background(), stop)
 	}()
+
+	if identityErr != nil {
+		resultErr = fmt.Errorf("%w: shard %q generation %d: %w", ErrWorkerdIdentityCaptureFailed, pending.key.shardID, pending.key.generation, identityErr)
+		stop := launcher.beginWorkerdStop(instance, false)
+		if stopErr := launcher.waitWorkerdStop(context.Background(), stop); stopErr != nil {
+			resultErr = errors.Join(resultErr, stopErr)
+		}
+		return
+	}
 
 	probeResult := make(chan error, 1)
 	go func() {
@@ -982,6 +1017,18 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	launcher.mu.Unlock()
 }
 
+// closeProcessIdentity closes the owned pidfd identity after its process is
+// gone and sample borrows are quiescent. It is called without launcher or
+// instance mutexes held; the identity owner serializes concurrent closes and
+// replays one cached terminal close result without another close syscall.
+func (instance *workerdInstance) closeProcessIdentity() error {
+	identityOwner := instance.processIdentity
+	if identityOwner == nil {
+		return nil
+	}
+	return identityOwner.close()
+}
+
 func (launcher *WorkerdProcessLauncher) forgetWorkerdCgroupAllocation(lease *workerdCgroupLease) {
 	launcher.mu.Lock()
 	delete(launcher.allocations, lease)
@@ -1002,7 +1049,7 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 	if instance.stop != nil {
 		select {
 		case <-instance.stop.done:
-			if instance.stop.err == nil || (instance.cgroup != nil && instance.cgroup.destroyedState()) {
+			if instance.stop.err == nil || instance.groupGone || (instance.cgroup != nil && instance.cgroup.destroyedState()) {
 				stop := instance.stop
 				instance.mu.Unlock()
 				return stop
@@ -1037,6 +1084,10 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 				}
 				instance.mu.Unlock()
 				launcher.mu.Unlock()
+				if identityErr := instance.closeProcessIdentity(); identityErr != nil {
+					launcher.rememberWorkerdTerminalCloseError(identityErr)
+					cleanupErr = errors.Join(cleanupErr, identityErr)
+				}
 			}
 			stop.err = cleanupErr
 			close(stop.done)
@@ -1112,7 +1163,11 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 			}
 			instance.mu.Unlock()
 			launcher.mu.Unlock()
-			stop.err = nil
+			closeErr := instance.closeProcessIdentity()
+			if closeErr != nil {
+				launcher.rememberWorkerdTerminalCloseError(closeErr)
+			}
+			stop.err = closeErr
 		} else {
 			stop.err = errors.Join(roundErr, ErrWorkerdStopTimeout)
 		}
