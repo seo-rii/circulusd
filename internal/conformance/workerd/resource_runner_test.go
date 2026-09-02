@@ -343,6 +343,43 @@ func TestRunResourceQualificationRejectsRecordedComponentClaimingPass(t *testing
 	}
 }
 
+// TestResourceGateIsNotSatisfiedByTheWorkerdTestPath is the retained negative
+// control: the older workerd-test conformance path (selected by the three binary
+// environment variables) and an unconfigured resource gate can never produce a
+// resource PASS. Only the fully configured, provisioned gate does.
+func TestResourceGateIsNotSatisfiedByTheWorkerdTestPath(t *testing.T) {
+	t.Parallel()
+
+	resourceComponents := make(map[string]struct{}, len(resourceQualificationComponents))
+	for _, component := range resourceQualificationComponents {
+		resourceComponents[component] = struct{}{}
+	}
+	found := 0
+	for _, candidate := range requiredProbes {
+		if _, ok := resourceComponents[candidate.component]; !ok {
+			continue
+		}
+		found++
+		if candidate.entrypoint != "" {
+			t.Fatalf("resource component %q must have no workerd-test entrypoint", candidate.component)
+		}
+		if candidate.notRunReason == "" {
+			t.Fatalf("resource component %q must carry a NOT_RUN reason on the workerd-test path", candidate.component)
+		}
+	}
+	if found != len(resourceQualificationComponents) {
+		t.Fatalf("probe inventory has %d resource components, want %d", found, len(resourceQualificationComponents))
+	}
+
+	deps := fakeResourceRunnerDeps(t, &stubResourceProbeRunner{})
+	report := runResourceQualification(context.Background(), deps, filepath.Join(t.TempDir(), "absent.json"))
+	for _, result := range report.Results {
+		if result.Status == conformance.Pass {
+			t.Fatalf("an unconfigured resource gate produced a PASS for %q", result.Component)
+		}
+	}
+}
+
 func TestRunResourceQualificationRejectsMalformedConfigAndBadConfigPath(t *testing.T) {
 	deps := fakeResourceRunnerDeps(t, &stubResourceProbeRunner{})
 
