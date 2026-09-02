@@ -1,12 +1,17 @@
 # Implementation plan
 
-Status: Unit 10 in progress. The cpuMs/isolate-enforcement blocker is resolved
-by re-scope (2026-09-02): the certified resource safety boundary is the
-kernel-enforced one (cgroup `cpu.max`/`memory.max` + pidfd whole-shard kill),
-four results are required to PASS at that boundary, and
-`workerd.dynamic-worker-reconstruction` is a recorded honest FAIL. Remaining
-U10.4 build work is the pinned-binary CLI preflight, the external RED run, and
-the release→launcher→Manager→cgroup→observer→checkpoint probe composition.
+Status: Unit 10 external resource gate executes green on a provisioned host. The
+cpuMs/isolate-enforcement blocker is resolved by re-scope (2026-09-02): the
+certified resource safety boundary is the kernel-enforced one (cgroup
+`cpu.max`/`memory.max` + pidfd whole-shard kill). The live probe runner is built
+and `TestStockWorkerdResourceQualification` reaches its achievable bar on a
+provisioned WSL2 cgroup-v2 host against the pinned workerd — four required PASS
+(cpu-limit kernel throttle, rss-cold-start, shard-pressure-recycle OOM,
+shard-kill-reconstruction) plus a recorded honest FAIL
+(dynamic-worker-reconstruction) from one bound envelope. `AdmissionReady` stays
+false; the acceptance ledger and `docs/unit10-operator.md` record it without
+promoting §53. Remaining: a production install-profile run (this is a
+development host) and the final acceptance close.
 
 Updated: 2026-09-02
 
@@ -890,19 +895,25 @@ mock placement rotation remain.
 
 #### U10.4 — External runner, status, and evidence
 
-Status: partially implemented. The bounded input schema, fixed argument
-renderer, release resolver, and sealed executable snapshot exist. The launcher
-now accepts the sealed snapshot as a pre-opened executable and exposes
-`Handle.KillProcessInstance` and `Handle.SampleResources`. The persistent
-private-socket serve fixture and its digest-binding materializer exist. The
-status classification, component PASS predicates, run-level evaluator, and the
-canonical CBOR evidence envelope with atomic no-clobber retention and read-back
-revalidation exist and are host-independently tested. Remaining: the
-provisioning preflight is implemented (`ProbeWorkerdCgroupProvisioning`,
-live-verified). Remaining: the pinned-binary CLI preflight, the external RED
-run (item 2), the release-resolver-to-launcher-to-Manager probe composition
-(item 3), and result promotion. The runner consumes a preinstalled executable;
-archive extraction remains owned by the separate release/install workflow.
+Status: implemented and green on a provisioned host. The bounded input schema,
+fixed argument renderer, release resolver, sealed executable snapshot,
+private-socket serve fixture and materializer, status classification, component
+PASS predicates, run-level evaluator, canonical-CBOR evidence envelope with
+atomic retention, and `ProbeWorkerdCgroupProvisioning` preflight all exist and
+are host-independently tested. The runner (`runResourceQualification`) composes
+config → release → cgroup preflight → fixture → probes → evidence → evaluate
+behind `TestStockWorkerdResourceQualification`, gated on
+`CIRCULUSD_WORKERD_QUALIFICATION_CONFIG`. The live probe runner
+(`liveResourceProbeRunner`) drives the launcher directly against the provisioned
+cgroup with the digest-bound SessionHost readiness probe and implements all five
+probes; the external RED negative control is retained
+(`TestResourceGateIsNotSatisfiedByTheWorkerdTestPath`). Live-verified on a WSL2
+cgroup-v2 host against the pinned workerd: the gate reaches its achievable bar
+(four required PASS + one recorded FAIL). The runner consumes a preinstalled
+executable; archive extraction remains owned by the separate release/install
+workflow. Remaining before production promotion: a run on a production install
+profile (the current evidence is a development host) and the final acceptance
+close.
 
 The maintainer decision on the verified external finding is resolved
 (2026-09-02): re-scope to the kernel-enforced boundary rather than re-pin.
@@ -949,7 +960,12 @@ FAIL, with `AdmissionReady=false` while the gap stands. See
 
 #### U10.5 — Close the unit without widening readiness
 
-Status: queued.
+Status: in progress. The explicit external gate ran on a provisioned WSL2 host
+and reached its achievable bar (four required PASS + one recorded FAIL);
+`docs/unit10-operator.md` and the acceptance ledger record it, and
+`docs/acceptance.md` keeps §53.1/§53.3/§53.4 `NOT_RUN` with `AdmissionReady`
+false. Remaining: the full race/vet + TypeScript gates and a production
+install-profile run before the unit closes.
 
 1. Run focused race/shuffle/repetition tests for `internal/agent`, the workerd
    conformance harness, and `cmd/agentd`.

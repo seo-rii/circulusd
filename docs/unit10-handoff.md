@@ -13,17 +13,22 @@ next TDD boundary only.
 - Go module: `github.com/hancomac/circulusd`
 - Branch: `main`
 - Go version: `1.25.0`
-- Last implementation commit: `c0a86eb` (`feat(conformance): re-scope Unit 10
-  resource gate to required PASS + recorded FAIL`), created on the Windows
-  transfer host on 2026-09-02. The transfer-host implementation commits are, in
-  order: `45cb691` (launcher pidfd attachment), `de83aec` (serialized
-  observation), `8d11098` (distinct reconstruction results), `c5eabaf`
-  (external checkpoint store), `08eb353` (dynamic-worker initialization
-  instances), `cb3f5f7` (launcher qualification surface), `96cbd69`
-  (private-socket fixture), `d392cb8` (status + evidence spine), `e03543b`
-  (cgroup provisioning preflight + inspectRoot fix), and `c0a86eb` (resource
-  gate re-scope: four required PASS + one recorded FAIL). This handoff update
-  is committed immediately after `c0a86eb`.
+- Last implementation commit: `2a53f22` (`docs(conformance): U10.5 acceptance
+  ledger, operator guide, and RED negative control`), on 2026-09-02. The
+  Unit 10 arc, in order: `45cb691` (launcher pidfd attachment), `de83aec`
+  (serialized observation), `8d11098` (distinct reconstruction results),
+  `c5eabaf` (external checkpoint store), `08eb353` (dynamic-worker
+  initialization instances), `cb3f5f7` (launcher qualification surface),
+  `96cbd69` (private-socket fixture), `d392cb8` (status + evidence spine),
+  `e03543b` (cgroup provisioning preflight + inspectRoot fix), `c0a86eb`
+  (resource gate re-scope: four required PASS + one recorded FAIL), `8824ed0`
+  (external runner + gate orchestration), `294b10a` (SessionHost readiness
+  probe), `c0aca58` (live probe composition + rss-cold-start),
+  `6051819` (cpu-limit kernel-boundary probe), `e13ded2` (pressure-recycle +
+  kill-reconstruction), `3cf30e8` (recorded dynamic-worker-reconstruction FAIL;
+  gate qualifies), and `2a53f22` (U10.5 acceptance ledger + operator guide +
+  RED control). The live gate reaches its achievable bar on a provisioned WSL2
+  host. This handoff update is committed immediately after `2a53f22`.
 - At original preparation time `origin/main` was `9ab2104`; all implementation
   and handoff documentation commits are local. No push was performed.
 - The release-pinned stock workerd binary is installed inside WSL at
@@ -337,25 +342,41 @@ Already implemented and host-independently tested, usable on any decision path:
   no-clobber `renameat2`/`linkat` retention and read-back revalidation
   (`d392cb8`).
 
-### Remaining U10.4 work (after the blocker decision)
+### U10.4 complete — live gate qualifies (2026-09-02)
 
-Done since: `e03543b` added `ProbeWorkerdCgroupProvisioning` (the cgroup
-provisioning preflight), live-verified against a real WSL2 cgroup-v2 root, and
-fixed a latent `inspectRoot` scan bug that had made the real cgroup path fail
-on every host (the fake backend never exercised it).
+The external runner and all five probes are built and live-verified. Key
+implementation facts learned on the live boundary:
 
-1. The pinned-binary CLI preflight (golden `serve` argv preflight against the
-   sealed executable).
-2. The external RED run showing the `workerd test` fixture plus three
-   caller-supplied binary env vars cannot satisfy the resource gate (retain
-   the command/result).
-3. The release-resolver-snapshot → launcher → Manager → cgroups → observer
-   sink → checkpoint-store probe composition, wiring the four required real
-   probes (`cpu-limit` at the kernel boundary, `rss-cold-start`,
-   `shard-pressure-recycle`, `shard-kill-reconstruction`) plus the honest FAIL
-   recording for the one recorded result (`dynamic-worker-reconstruction`), and
-   the U10.3 mock placement rotation (reference-only).
-4. Only a provisioned-host run can promote results.
+- The runner composes the launcher DIRECTLY via `Ensure` (pull-based
+  `Handle.SampleResources`), no `ObservationSink`, sidestepping the
+  Manager↔launcher circular sink wiring. The agent instance identity is one
+  fresh 128-bit value seeded into both `identity.New(Process)` and the evidence
+  hex id.
+- Stock workerd does NOT unlink its listening Unix socket on exit, so the
+  harness removes the stale socket before each `Ensure` (the prior generation is
+  stopped first, so no race).
+- The `cpu-limit` probe fires the fixture `/spin` and keeps the request open;
+  the kernel throttles it (cpu.stat), then supervisor SIGKILL + recycle. Live
+  result: cpu.max 50000/100000 enforced, ~20 throttled periods over a 2 s
+  window; in-isolate cpuMs confirmed not firing.
+- WSL2 DOES enforce `memory.max` with OOM (verified: `memory.events.oom_kill`
+  increments, `memory.peak` capped). The `pressure-recycle` probe allocates via
+  `/allocate` in 16 MiB steps to OOM; with `swap.max=0` the terminal OOM is
+  fast, so it is inferred from the failed request/sample corroborated by
+  `memory.current` climbing to ≥ 3/4 of the cap. Use `memoryMaxBytes` ≈ 256 MiB.
+- Reconstruction (kill and pressure) commits worker state to the acknowledged
+  checkpoint store, faults, then requires a NEW initialization instance (a fresh
+  isolate — only whole-shard destruction yields one on this pin) plus a replayed
+  checkpoint value.
+- `dynamic-worker-reconstruction` records FAIL: `/spin` is never aborted within
+  its window (cpuMs unenforced), so no per-isolate reconstruction. It returns
+  PASS only on a genuine reconstruction (impossible here), which trips the
+  evaluator's framing error.
+
+The external RED negative control is retained
+(`TestResourceGateIsNotSatisfiedByTheWorkerdTestPath`). Remaining before
+production promotion: a run on a production install profile (the current
+evidence is a development WSL2 host) and the final acceptance close.
 
 Live cgroup provisioning recipe (WSL2): manually-created cgroups do NOT
 survive across separate `wsl.exe` invocations — provision and run in one
@@ -371,8 +392,11 @@ files in a shared GOCACHE — use a separate GOCACHE for root vs user runs.
 
 ### U10.5 and beyond
 
-- U10.5: complete race/vet/TypeScript gates, provisioned-host external run,
-  leak finalization, acceptance ledger, and operator documentation.
+- U10.5: the provisioned-host external run is done (dev host); the acceptance
+  ledger (`docs/acceptance.md`) and operator guide (`docs/unit10-operator.md`)
+  record it without promoting §53 or `AdmissionReady`. Remaining: the full
+  race/vet + TypeScript gates and a production install-profile run before the
+  unit closes.
 - Units 11 and 12 remain queued after Unit 10. Private
   `platformd`-to-`agentd` workload composition and Phase 1A NsJail work are
   later, separately planned cuts.
