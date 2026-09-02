@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -103,8 +104,8 @@ func (liveResourceProbeRunner) Run(ctx context.Context, input resourceProbeRunIn
 	steps := []probeStep{
 		{component: "workerd.rss-cold-start", run: runRSSColdStartProbe},
 		{component: "workerd.cpu-limit", run: runCPULimitProbe},
-		{component: "workerd.shard-pressure-recycle", run: notYetImplementedProbe},
-		{component: "workerd.shard-kill-reconstruction", run: notYetImplementedProbe},
+		{component: "workerd.shard-pressure-recycle", run: runShardPressureRecycleProbe},
+		{component: "workerd.shard-kill-reconstruction", run: runShardKillReconstructionProbe},
 		{component: "workerd.dynamic-worker-reconstruction", run: notYetImplementedProbe},
 	}
 	observations := make([]resourceProbeObservation, 0, len(steps))
@@ -164,6 +165,48 @@ func (harness *resourceProbeHarness) socketClient() *http.Client {
 			DisableKeepAlives: true,
 		},
 	}
+}
+
+// workerStateResponse is the bounded JSON the fixture's Dynamic Worker routes
+// return. Only the fields the reconstruction probes read are decoded.
+type workerStateResponse struct {
+	InitializationInstance string `json:"initializationInstance"`
+	CheckpointBase64       string `json:"checkpointBase64"`
+	RestoredValue          string `json:"restoredValue"`
+}
+
+const maximumResourceProbeBodyBytes = 1 << 20
+
+// call performs one bounded request to a fixture probe route and returns the
+// body and status. It is used for the state, initialization-instance, and
+// allocate routes; the long-lived /spin request is driven separately.
+func (harness *resourceProbeHarness) call(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+	client := harness.socketClient()
+	defer client.CloseIdleConnections()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		request.Header.Set("content-type", "application/json")
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, maximumResourceProbeBodyBytes+1))
+	if err != nil {
+		return nil, response.StatusCode, err
+	}
+	if len(data) > maximumResourceProbeBodyBytes {
+		return nil, response.StatusCode, fmt.Errorf("worker response exceeds %d bytes", maximumResourceProbeBodyBytes)
+	}
+	return data, response.StatusCode, nil
 }
 
 func observationNow(component string, status conformance.Status, reason string, started time.Time, samples uint64) resourceProbeObservation {
@@ -307,6 +350,203 @@ func runCPULimitProbe(ctx context.Context, input resourceProbeRunInput, harness 
 	reason := fmt.Sprintf("cpu.max %d/%d enforced by the kernel: %d throttled periods (%d us) under the runaway worker; in-isolate cpuMs did not fire (recorded non-enforcement); supervisor SIGKILL + recycle recovered the shard",
 		before.CPUMax.QuotaMicros, before.CPUMax.PeriodMicros, throttledPeriods, throttledMicros)
 	return observationNow(component, conformance.Pass, reason, started, throttledPeriods)
+}
+
+// runReconstructionProbe is the shared destructive-fault reconstruction proof
+// for the shard-level probes. It commits the worker's retained state to the
+// external acknowledged checkpoint store, gates the fault on acknowledgement,
+// injects the caller's destructive fault, drains the faulted shard, then brings
+// up a fresh generation and requires (a) a genuinely new initialization instance
+// — a new isolate, which only whole-shard destruction produces on this pin —
+// and (b) that the acknowledged checkpoint replays the exact committed state.
+func runReconstructionProbe(
+	ctx context.Context,
+	input resourceProbeRunInput,
+	harness *resourceProbeHarness,
+	component, worker, faultLabel string,
+	injectFault func(context.Context, *agent.WorkerdShardHandle) (string, error),
+) resourceProbeObservation {
+	started := time.Now().UTC()
+	fail := func(reason string) resourceProbeObservation {
+		return observationNow(component, conformance.Fail, reason, started, 0)
+	}
+	store := newWorkerdCheckpointStore()
+
+	probeCtx, cancel := context.WithTimeout(ctx, input.config.Timeouts.Probe)
+	defer cancel()
+
+	handle, err := harness.ensure(probeCtx)
+	if err != nil {
+		return fail("ensure: " + err.Error())
+	}
+
+	initData, status, err := harness.call(probeCtx, http.MethodPost, "/worker/state-init?worker="+worker, nil)
+	if err != nil || status != http.StatusOK {
+		_ = handle.Stop(probeCtx)
+		return fail(fmt.Sprintf("state-init (status %d): %v", status, err))
+	}
+	var initResp workerStateResponse
+	if jsonErr := json.Unmarshal(initData, &initResp); jsonErr != nil ||
+		initResp.InitializationInstance == "" || initResp.CheckpointBase64 == "" {
+		_ = handle.Stop(probeCtx)
+		return fail("state-init response is malformed")
+	}
+	firstInstance := initResp.InitializationInstance
+	expectedValue := "state-" + firstInstance
+
+	ack, err := store.commit(worker, []byte(initResp.CheckpointBase64))
+	if err != nil {
+		_ = handle.Stop(probeCtx)
+		return fail("commit checkpoint: " + err.Error())
+	}
+	if ackErr := store.requireAcknowledged(worker, ack.Digest); ackErr != nil {
+		_ = handle.Stop(probeCtx)
+		return fail("checkpoint not acknowledged before fault: " + ackErr.Error())
+	}
+
+	faultDetail, faultErr := injectFault(probeCtx, handle)
+	if faultErr != nil {
+		_ = handle.Stop(probeCtx)
+		return fail(faultLabel + ": " + faultErr.Error())
+	}
+	if stopErr := handle.Stop(probeCtx); stopErr != nil {
+		return fail("drain after " + faultLabel + ": " + stopErr.Error())
+	}
+
+	reconCtx, cancelRecon := context.WithTimeout(ctx, input.config.Timeouts.Probe)
+	defer cancelRecon()
+	recon, err := harness.ensure(reconCtx)
+	if err != nil {
+		return fail("reconstruct ensure: " + err.Error())
+	}
+	stopRecon := func() { _ = recon.Stop(reconCtx) }
+
+	instData, status, err := harness.call(reconCtx, http.MethodGet, "/worker/initialization-instance?worker="+worker, nil)
+	if err != nil || status != http.StatusOK {
+		stopRecon()
+		return fail(fmt.Sprintf("read reconstructed initialization instance (status %d): %v", status, err))
+	}
+	var instResp workerStateResponse
+	if jsonErr := json.Unmarshal(instData, &instResp); jsonErr != nil || instResp.InitializationInstance == "" {
+		stopRecon()
+		return fail("reconstructed initialization instance response is malformed")
+	}
+	if instResp.InitializationInstance == firstInstance {
+		stopRecon()
+		return fail(fmt.Sprintf("initialization instance %s unchanged after %s; no reconstruction", firstInstance, faultLabel))
+	}
+
+	acknowledged, err := store.acknowledged(worker)
+	if err != nil {
+		stopRecon()
+		return fail("reload acknowledged checkpoint: " + err.Error())
+	}
+	loadBody, _ := json.Marshal(map[string]string{"checkpointBase64": string(acknowledged.Payload)})
+	loadData, status, err := harness.call(reconCtx, http.MethodPost, "/worker/state-load?worker="+worker, loadBody)
+	if err != nil || status != http.StatusOK {
+		stopRecon()
+		return fail(fmt.Sprintf("state-load (status %d): %v", status, err))
+	}
+	var loadResp workerStateResponse
+	if jsonErr := json.Unmarshal(loadData, &loadResp); jsonErr != nil {
+		stopRecon()
+		return fail("state-load response is malformed")
+	}
+	if loadResp.RestoredValue != expectedValue {
+		stopRecon()
+		return fail(fmt.Sprintf("restored value %q does not match the committed state %q", loadResp.RestoredValue, expectedValue))
+	}
+	stopRecon()
+
+	detailSuffix := ""
+	if faultDetail != "" {
+		detailSuffix = " [" + faultDetail + "]"
+	}
+	return observationNow(component, conformance.Pass,
+		fmt.Sprintf("%s%s forced a new isolate (init %s->%s); acknowledged checkpoint seq %d replayed value %q",
+			faultLabel, detailSuffix, firstInstance, instResp.InitializationInstance, acknowledged.Sequence, loadResp.RestoredValue),
+		started, 1)
+}
+
+// runShardKillReconstructionProbe injects an explicit whole-shard SIGKILL as the
+// destructive fault, then reconstructs from the acknowledged checkpoint.
+func runShardKillReconstructionProbe(ctx context.Context, input resourceProbeRunInput, harness *resourceProbeHarness) resourceProbeObservation {
+	return runReconstructionProbe(ctx, input, harness,
+		"workerd.shard-kill-reconstruction", "w/kill", "whole-shard SIGKILL",
+		func(_ context.Context, handle *agent.WorkerdShardHandle) (string, error) {
+			return "", handle.KillProcessInstance()
+		})
+}
+
+// runShardPressureRecycleProbe drives real cgroup memory pressure into an OOM by
+// growing SessionHost memory through /allocate until the kernel reclaims at
+// memory.max and OOM-kills the shard, then reconstructs from the acknowledged
+// checkpoint. Allocation proceeds in bounded increments with a sample after
+// each, so the climb toward memory.max and the terminal OOM are observed on the
+// live process before its death is inferred from the failed request/sample.
+func runShardPressureRecycleProbe(ctx context.Context, input resourceProbeRunInput, harness *resourceProbeHarness) resourceProbeObservation {
+	const (
+		worker         = "w/pressure"
+		allocationStep = 16 // MiB per /allocate call
+		maxAllocations = 512
+	)
+	return runReconstructionProbe(ctx, input, harness,
+		"workerd.shard-pressure-recycle", worker, "cgroup OOM",
+		func(faultCtx context.Context, handle *agent.WorkerdShardHandle) (string, error) {
+			baseline, err := handle.SampleResources(faultCtx)
+			if err != nil {
+				return "", fmt.Errorf("baseline sample: %w", err)
+			}
+			memoryMax := input.config.Limits.MemoryMaxBytes
+			peakCurrent := baseline.MemoryCurrentBytes
+			maxPressureDelta := uint64(0)
+			oomObserved := false
+			body, _ := json.Marshal(map[string]int{"mebibytes": allocationStep})
+			for allocation := 0; allocation < maxAllocations; allocation++ {
+				if faultCtx.Err() != nil {
+					return "", faultCtx.Err()
+				}
+				_, status, callErr := harness.call(faultCtx, http.MethodPost, "/allocate", body)
+				if callErr != nil {
+					oomObserved = true // the request died mid-allocation: OOM-killed
+					break
+				}
+				if status != http.StatusOK {
+					return "", fmt.Errorf("allocate rejected: status %d", status)
+				}
+				sample, sampleErr := handle.SampleResources(faultCtx)
+				if sampleErr != nil {
+					oomObserved = true // the process is gone: OOM-killed
+					break
+				}
+				if sample.MemoryCurrentBytes > peakCurrent {
+					peakCurrent = sample.MemoryCurrentBytes
+				}
+				if delta := sample.MemoryEvents.Max - baseline.MemoryEvents.Max; delta > maxPressureDelta {
+					maxPressureDelta = delta
+				}
+				if sample.MemoryEvents.OOMKill > baseline.MemoryEvents.OOMKill ||
+					sample.MemoryEvents.OOM > baseline.MemoryEvents.OOM {
+					oomObserved = true
+					break
+				}
+			}
+			// Require genuine pressure: either counted reclaim events at the
+			// limit, or an OOM corroborated by memory.current having climbed to
+			// at least three quarters of the cap (so a transient early failure
+			// is never mislabeled as OOM).
+			climbedNearMax := peakCurrent >= memoryMax/4*3
+			if maxPressureDelta == 0 && !(oomObserved && climbedNearMax) {
+				return "", fmt.Errorf("insufficient cgroup memory pressure: peak memory.current %d of max %d, events.max +%d, oom=%v",
+					peakCurrent, memoryMax, maxPressureDelta, oomObserved)
+			}
+			// The faulted process may already be dead (OOM) or still alive after
+			// reclaim pressure; force the whole-shard kill so the drain+recycle
+			// deterministically yields a fresh isolate either way.
+			_ = handle.KillProcessInstance()
+			return fmt.Sprintf("peak memory.current %d of max %d bytes, memory.events.max +%d, oom-killed=%v",
+				peakCurrent, memoryMax, maxPressureDelta, oomObserved), nil
+		})
 }
 
 // runRSSColdStartProbe performs config.ColdStartSamples independent cold starts
