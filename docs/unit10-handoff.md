@@ -394,9 +394,12 @@ files in a shared GOCACHE — use a separate GOCACHE for root vs user runs.
 
 - U10.5: the provisioned-host external run is done (dev host); the acceptance
   ledger (`docs/acceptance.md`) and operator guide (`docs/unit10-operator.md`)
-  record it without promoting §53 or `AdmissionReady`. Remaining: the full
-  race/vet + TypeScript gates and a production install-profile run before the
-  unit closes.
+  record it without promoting §53 or `AdmissionReady`. The full local gate suite
+  ran green on 2026-09-03 (native clone at `d05c9a7`): `go vet ./...` clean,
+  `go test ./...` all ok, `go test -race` clean on `internal/agent`, the workerd
+  conformance harness, `internal/doctor`, `internal/broker`, `internal/controlrpc`;
+  TypeScript `pnpm check` 5/5, `pnpm lint` clean, `pnpm test:unit` 507 passed.
+  Remaining: a production install-profile run before the unit closes.
 - Units 11 and 12 remain queued after Unit 10. Private
   `platformd`-to-`agentd` workload composition and Phase 1A NsJail work are
   later, separately planned cuts.
