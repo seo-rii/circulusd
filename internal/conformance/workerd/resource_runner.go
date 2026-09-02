@@ -483,7 +483,7 @@ func liveResourceRunnerDeps() resourceRunnerDeps {
 		},
 		provisionCgroup: agent.ProbeWorkerdCgroupProvisioning,
 		makeFixtureDir:  makePrivateResourceFixtureDir,
-		probeRunner:     notImplementedResourceProbeRunner{},
+		probeRunner:     liveResourceProbeRunner{},
 		binding:         defaultResourceRunnerBinding(),
 	}
 }
