@@ -6,6 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -19,6 +22,12 @@ const (
 	resourceProbeStopGracePeriod  = 10 * time.Second
 	resourceProbeOutputLimitBytes = 64 << 10
 	resourceProbeHistoryCapacity  = 16
+	// resourceCPUThrottleWindow is how long the runaway worker is left to spin
+	// under the cpu.max cap so the kernel accrues observable throttling.
+	resourceCPUThrottleWindow = 2 * time.Second
+	// resourceRunawayWorker is the content-addressed worker id the cpu-limit
+	// probe drives into an unbounded /spin.
+	resourceRunawayWorker = "w/a"
 )
 
 // liveResourceProbeRunner drives the real qualification probes against the
@@ -93,7 +102,7 @@ func (liveResourceProbeRunner) Run(ctx context.Context, input resourceProbeRunIn
 
 	steps := []probeStep{
 		{component: "workerd.rss-cold-start", run: runRSSColdStartProbe},
-		{component: "workerd.cpu-limit", run: notYetImplementedProbe},
+		{component: "workerd.cpu-limit", run: runCPULimitProbe},
 		{component: "workerd.shard-pressure-recycle", run: notYetImplementedProbe},
 		{component: "workerd.shard-kill-reconstruction", run: notYetImplementedProbe},
 		{component: "workerd.dynamic-worker-reconstruction", run: notYetImplementedProbe},
@@ -143,6 +152,20 @@ func (harness *resourceProbeHarness) ensure(ctx context.Context) (*agent.Workerd
 	})
 }
 
+// socketClient returns an HTTP client that dials the fixture's private Unix
+// socket, for the probe routes (/worker/spin, /allocate, /worker/state-*).
+func (harness *resourceProbeHarness) socketClient() *http.Client {
+	socket := harness.socketPath
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+}
+
 func observationNow(component string, status conformance.Status, reason string, started time.Time, samples uint64) resourceProbeObservation {
 	return resourceProbeObservation{
 		Component:      component,
@@ -168,6 +191,122 @@ func notYetImplementedProbe(_ context.Context, _ resourceProbeRunInput, _ *resou
 		FinishedAt:     now,
 		RawSampleCount: 0,
 	}
+}
+
+// runCPULimitProbe certifies the kernel-enforced CPU boundary. It launches one
+// shard under the configured cpu.max, verifies the exact readback, drives a
+// content-addressed worker into an unbounded /spin, and observes the kernel
+// accrue cpu.stat throttling while the runaway is capped at the quota. It then
+// confirms the runaway does not self-terminate (the pinned in-isolate cpuMs is
+// parsed but not enforced — a recorded negative finding, never a skip), and
+// that supervisor-observed starvation drives a whole-shard SIGKILL followed by a
+// clean recycle. The in-isolate cpuMs "abort" the fixture comment expects is
+// intentionally not part of the PASS predicate on this pin.
+func runCPULimitProbe(ctx context.Context, input resourceProbeRunInput, harness *resourceProbeHarness) resourceProbeObservation {
+	const component = "workerd.cpu-limit"
+	started := time.Now().UTC()
+	fail := func(reason string) resourceProbeObservation {
+		return observationNow(component, conformance.Fail, reason, started, 0)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, input.config.Timeouts.Probe)
+	defer cancel()
+
+	handle, err := harness.ensure(probeCtx)
+	if err != nil {
+		return fail("ensure: " + err.Error())
+	}
+	stopHandle := func() { _ = handle.Stop(probeCtx) }
+
+	before, err := handle.SampleResources(probeCtx)
+	if err != nil {
+		stopHandle()
+		return fail("sample before: " + err.Error())
+	}
+	if before.CPUMax.QuotaMicros != input.config.Limits.CPUMaxQuotaMicros ||
+		before.CPUMax.PeriodMicros != input.config.Limits.CPUMaxPeriodMicros {
+		stopHandle()
+		return fail(fmt.Sprintf("cpu.max readback %d/%d does not match configured %d/%d",
+			before.CPUMax.QuotaMicros, before.CPUMax.PeriodMicros,
+			input.config.Limits.CPUMaxQuotaMicros, input.config.Limits.CPUMaxPeriodMicros))
+	}
+
+	// Fire the runaway worker and keep the request open so the isolate keeps
+	// spinning under the cap while the kernel throttles it.
+	spinCtx, cancelSpin := context.WithCancel(probeCtx)
+	spinDone := make(chan struct{})
+	go func() {
+		defer close(spinDone)
+		client := harness.socketClient()
+		defer client.CloseIdleConnections()
+		request, requestErr := http.NewRequestWithContext(spinCtx, http.MethodGet,
+			"http://unix/worker/spin?worker="+resourceRunawayWorker, nil)
+		if requestErr != nil {
+			return
+		}
+		response, doErr := client.Do(request)
+		if doErr == nil {
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}
+	}()
+	stopSpin := func() { cancelSpin(); <-spinDone }
+
+	spinSelfTerminated := false
+	timer := time.NewTimer(resourceCPUThrottleWindow)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-spinDone:
+		spinSelfTerminated = true
+	case <-probeCtx.Done():
+		stopSpin()
+		stopHandle()
+		return fail("canceled during the runaway spin")
+	}
+
+	after, sampleErr := handle.SampleResources(probeCtx)
+	stopSpin()
+	if sampleErr != nil {
+		stopHandle()
+		return fail("sample after: " + sampleErr.Error())
+	}
+	if spinSelfTerminated {
+		stopHandle()
+		return fail("the runaway worker request ended before the observation window; on this pin the in-isolate limit is expected not to fire, so re-evaluate the pin before promotion")
+	}
+
+	throttledPeriods := after.CPUStat.ThrottledPeriods - before.CPUStat.ThrottledPeriods
+	throttledMicros := after.CPUStat.ThrottledMicros - before.CPUStat.ThrottledMicros
+	if throttledPeriods == 0 && throttledMicros == 0 {
+		stopHandle()
+		return fail("no cgroup cpu.stat throttling observed under the runaway worker")
+	}
+
+	// Supervisor-observed starvation drives a whole-shard SIGKILL, then cleanup.
+	if killErr := handle.KillProcessInstance(); killErr != nil {
+		stopHandle()
+		return fail("supervisor kill: " + killErr.Error())
+	}
+	if stopErr := handle.Stop(probeCtx); stopErr != nil {
+		return fail("cleanup after supervisor kill: " + stopErr.Error())
+	}
+
+	// Recycle: a fresh generation must reach digest-bound readiness, proving the
+	// shard recovers from the runaway.
+	recycleCtx, cancelRecycle := context.WithTimeout(ctx, input.config.Timeouts.Probe)
+	defer cancelRecycle()
+	recycled, err := harness.ensure(recycleCtx)
+	if err != nil {
+		return fail("recycle ensure: " + err.Error())
+	}
+	if stopErr := recycled.Stop(recycleCtx); stopErr != nil {
+		return fail("recycle stop: " + stopErr.Error())
+	}
+
+	reason := fmt.Sprintf("cpu.max %d/%d enforced by the kernel: %d throttled periods (%d us) under the runaway worker; in-isolate cpuMs did not fire (recorded non-enforcement); supervisor SIGKILL + recycle recovered the shard",
+		before.CPUMax.QuotaMicros, before.CPUMax.PeriodMicros, throttledPeriods, throttledMicros)
+	return observationNow(component, conformance.Pass, reason, started, throttledPeriods)
 }
 
 // runRSSColdStartProbe performs config.ColdStartSamples independent cold starts
