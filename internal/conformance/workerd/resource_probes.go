@@ -29,6 +29,10 @@ const (
 	// resourceRunawayWorker is the content-addressed worker id the cpu-limit
 	// probe drives into an unbounded /spin.
 	resourceRunawayWorker = "w/a"
+	// resourceInIsolateFaultWindow bounds how long the recorded-gap probe waits
+	// for the pinned in-isolate cpuMs limit to abort a runaway isolate. On this
+	// pin it never does, which is the recorded FAIL.
+	resourceInIsolateFaultWindow = 4 * time.Second
 )
 
 // liveResourceProbeRunner drives the real qualification probes against the
@@ -106,7 +110,7 @@ func (liveResourceProbeRunner) Run(ctx context.Context, input resourceProbeRunIn
 		{component: "workerd.cpu-limit", run: runCPULimitProbe},
 		{component: "workerd.shard-pressure-recycle", run: runShardPressureRecycleProbe},
 		{component: "workerd.shard-kill-reconstruction", run: runShardKillReconstructionProbe},
-		{component: "workerd.dynamic-worker-reconstruction", run: notYetImplementedProbe},
+		{component: "workerd.dynamic-worker-reconstruction", run: runDynamicWorkerReconstructionProbe},
 	}
 	observations := make([]resourceProbeObservation, 0, len(steps))
 	for _, step := range steps {
@@ -175,6 +179,26 @@ type workerStateResponse struct {
 	RestoredValue          string `json:"restoredValue"`
 }
 
+// readInitInstance returns the worker's current module-local initialization
+// instance, lazily initializing the isolate on first call.
+func (harness *resourceProbeHarness) readInitInstance(ctx context.Context, worker string) (string, error) {
+	data, status, err := harness.call(ctx, http.MethodGet, "/worker/initialization-instance?worker="+worker, nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", fmt.Errorf("status %d", status)
+	}
+	var response workerStateResponse
+	if jsonErr := json.Unmarshal(data, &response); jsonErr != nil {
+		return "", jsonErr
+	}
+	if response.InitializationInstance == "" {
+		return "", fmt.Errorf("empty initialization instance")
+	}
+	return response.InitializationInstance, nil
+}
+
 const maximumResourceProbeBodyBytes = 1 << 20
 
 // call performs one bounded request to a fixture probe route and returns the
@@ -217,22 +241,6 @@ func observationNow(component string, status conformance.Status, reason string, 
 		StartedAt:      started,
 		FinishedAt:     time.Now().UTC(),
 		RawSampleCount: samples,
-	}
-}
-
-// notYetImplementedProbe is the honest placeholder for probes not yet wired in
-// this slice. It records NOT_RUN so the runner never fabricates a PASS; the
-// loop stamps the component name. The recorded residual-gap probe uses this too
-// until its slice lands, so the gate stays honestly not-qualified in the
-// meantime.
-func notYetImplementedProbe(_ context.Context, _ resourceProbeRunInput, _ *resourceProbeHarness) resourceProbeObservation {
-	now := time.Now().UTC()
-	return resourceProbeObservation{
-		Status:         conformance.NotRun,
-		Reason:         "live probe not yet implemented in this runner slice",
-		StartedAt:      now,
-		FinishedAt:     now,
-		RawSampleCount: 0,
 	}
 }
 
@@ -547,6 +555,74 @@ func runShardPressureRecycleProbe(ctx context.Context, input resourceProbeRunInp
 			return fmt.Sprintf("peak memory.current %d of max %d bytes, memory.events.max +%d, oom-killed=%v",
 				peakCurrent, memoryMax, maxPressureDelta, oomObserved), nil
 		})
+}
+
+// runDynamicWorkerReconstructionProbe records the documented residual gap: stock
+// workerd does not reconstruct a Worker Loader isolate after an in-isolate
+// fault. It initializes one worker, captures its initialization instance, then
+// drives the designated in-isolate destructive fault — the cpuMs runaway that a
+// compliant runtime would abort and reconstruct. On this pin the runaway is
+// never aborted within its window (cpuMs is parsed but not enforced) and no
+// reconstruction occurs, so the probe records FAIL. It returns FAIL for every
+// non-reconstruction outcome and only ever returns PASS if the isolate is
+// genuinely reconstructed with a new instance — which cannot happen on this pin
+// and deliberately triggers the run-level evaluator's framing error so a human
+// re-scopes or re-pins rather than silently promoting.
+func runDynamicWorkerReconstructionProbe(ctx context.Context, input resourceProbeRunInput, harness *resourceProbeHarness) resourceProbeObservation {
+	const component = "workerd.dynamic-worker-reconstruction"
+	const worker = "w/dwr"
+	started := time.Now().UTC()
+	fail := func(reason string) resourceProbeObservation {
+		return observationNow(component, conformance.Fail, reason, started, 0)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, input.config.Timeouts.Probe)
+	defer cancel()
+
+	handle, err := harness.ensure(probeCtx)
+	if err != nil {
+		return fail("ensure: " + err.Error())
+	}
+	defer func() {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), resourceProbeStopGracePeriod+2*time.Second)
+		_ = handle.Stop(stopCtx)
+		cancelStop()
+	}()
+
+	firstInstance, err := harness.readInitInstance(probeCtx, worker)
+	if err != nil {
+		return fail("read initialization instance: " + err.Error())
+	}
+
+	// Attempt the designated in-isolate destructive fault: the cpuMs runaway.
+	faultCtx, cancelFault := context.WithTimeout(probeCtx, resourceInIsolateFaultWindow)
+	_, status, spinErr := harness.call(faultCtx, http.MethodGet, "/worker/spin?worker="+worker, nil)
+	faultTimedOut := faultCtx.Err() != nil
+	cancelFault()
+
+	if spinErr != nil {
+		if faultTimedOut {
+			return fail(fmt.Sprintf("stock workerd did not enforce the in-isolate cpuMs limit: the runaway worker %q was not aborted within %s, so the isolate is never destroyed or reconstructed (pre-fault initialization instance %s)",
+				worker, resourceInIsolateFaultWindow, firstInstance))
+		}
+		return fail("in-isolate fault request failed: " + spinErr.Error())
+	}
+
+	// The runaway returned — unexpected on this pin. Check for reconstruction.
+	secondInstance, err := harness.readInitInstance(probeCtx, worker)
+	if err != nil {
+		return fail(fmt.Sprintf("runaway returned (status %d) but reading the post-fault initialization instance failed: %v", status, err))
+	}
+	if secondInstance != firstInstance {
+		// A genuine per-isolate reconstruction, impossible on this pin. Report
+		// PASS so evaluateResourceQualificationRun raises its framing error.
+		return observationNow(component, conformance.Pass,
+			fmt.Sprintf("UNEXPECTED on this pin: the in-isolate fault reconstructed the isolate for worker %q (initialization instance %s->%s); Unit 10 must be re-scoped or re-pinned",
+				worker, firstInstance, secondInstance),
+			started, 1)
+	}
+	return fail(fmt.Sprintf("the in-isolate fault returned (status %d) but the isolate survived with an identical initialization instance %s; stock workerd does not reconstruct a faulted isolate",
+		status, firstInstance))
 }
 
 // runRSSColdStartProbe performs config.ColdStartSamples independent cold starts
