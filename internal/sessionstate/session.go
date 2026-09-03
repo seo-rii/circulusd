@@ -59,6 +59,9 @@ const (
 	commandDispatchTool  = "dispatch_tool_effect"
 	commandCommitTool    = "commit_tool_effect"
 	commandSettleTool    = "settle_tool_effect"
+
+	commandRotatePlacement = "rotate_placement_generation"
+	commandRotatePolicy    = "rotate_policy_generation"
 )
 
 var (
@@ -84,6 +87,15 @@ var (
 	// ErrStaleGeneration is returned when a command carries a turn-lease
 	// generation older than the state's fenced generation.
 	ErrStaleGeneration = errors.New("sessionstate: stale turn-lease generation")
+	// ErrStalePlacementGeneration is returned when a dispatch carries a placement
+	// generation older than the session's rotated placement generation (§53.4).
+	ErrStalePlacementGeneration = errors.New("sessionstate: stale placement generation")
+	// ErrStalePolicyGeneration is returned when a prepare carries a policy
+	// generation older than the session's rotated policy generation (§53.4).
+	ErrStalePolicyGeneration = errors.New("sessionstate: stale policy generation")
+	// ErrInvalidRotation is returned when a generation rotation does not strictly
+	// advance the current generation.
+	ErrInvalidRotation = errors.New("sessionstate: generation rotation must advance")
 )
 
 // SessionState is the durable Session-DO turn/effect state. The zero value (an
@@ -254,6 +266,20 @@ func transition(state SessionState, cmd command) (SessionState, error) {
 		state.TurnPhase = phaseToolSettled
 		return state, nil
 
+	case commandRotatePlacement:
+		if cmd.PlacementGeneration <= state.PlacementGeneration {
+			return SessionState{}, fmt.Errorf("%w: placement %d <= %d", ErrInvalidRotation, cmd.PlacementGeneration, state.PlacementGeneration)
+		}
+		state.PlacementGeneration = cmd.PlacementGeneration
+		return state, nil
+
+	case commandRotatePolicy:
+		if cmd.PolicyGeneration <= state.PolicyGeneration {
+			return SessionState{}, fmt.Errorf("%w: policy %d <= %d", ErrInvalidRotation, cmd.PolicyGeneration, state.PolicyGeneration)
+		}
+		state.PolicyGeneration = cmd.PolicyGeneration
+		return state, nil
+
 	default:
 		return SessionState{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
 	}
@@ -271,6 +297,11 @@ func prepareEffect(state SessionState, cmd command, kind, fromPhase, toPhase str
 	if state.TurnPhase != fromPhase {
 		return SessionState{}, fmt.Errorf("%w: prepare %s from %q", ErrInvalidTransition, kind, state.TurnPhase)
 	}
+	// A prepare minted under a policy generation the session has since rotated
+	// past is fenced out (§53.4).
+	if cmd.PolicyGeneration < state.PolicyGeneration {
+		return SessionState{}, fmt.Errorf("%w: %d < %d", ErrStalePolicyGeneration, cmd.PolicyGeneration, state.PolicyGeneration)
+	}
 	state.TurnPhase = toPhase
 	state.EffectID = cmd.EffectID
 	state.EffectKind = kind
@@ -282,6 +313,11 @@ func prepareEffect(state SessionState, cmd command, kind, fromPhase, toPhase str
 func dispatchEffect(state SessionState, cmd command, kind, fromPhase, toPhase string) (SessionState, error) {
 	if err := requireActiveEffect(state, cmd, kind, effectPhasePrepared, fromPhase); err != nil {
 		return SessionState{}, err
+	}
+	// A dispatch minted under a placement generation the session has since
+	// rotated past is fenced out (§53.4).
+	if cmd.PlacementGeneration < state.PlacementGeneration {
+		return SessionState{}, fmt.Errorf("%w: %d < %d", ErrStalePlacementGeneration, cmd.PlacementGeneration, state.PlacementGeneration)
 	}
 	state.TurnPhase = toPhase
 	state.EffectPhase = effectPhaseDispatched
@@ -375,6 +411,40 @@ func EncodeSettleToolEffect(turnID, effectID string, turnLeaseGeneration int64) 
 	return encodeCommand(command{
 		Kind: commandSettleTool, TurnID: turnID, EffectID: effectID,
 		TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+// EncodeDispatchModelEffectAt is EncodeDispatchModelEffect bound to a placement
+// generation, so a dispatch minted under a rotated-out placement is fenced.
+func EncodeDispatchModelEffectAt(turnID, effectID, providerRequestID string, placementGeneration, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandDispatchModel, TurnID: turnID, EffectID: effectID,
+		ProviderRequestID: providerRequestID, PlacementGeneration: placementGeneration,
+		TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+// EncodePrepareModelEffectAt is EncodePrepareModelEffect bound to a policy
+// generation, so a prepare minted under a rotated-out policy is fenced.
+func EncodePrepareModelEffectAt(turnID, effectID, requestDigest string, policyGeneration, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandPrepareModel, TurnID: turnID, EffectID: effectID,
+		RequestDigest: requestDigest, PolicyGeneration: policyGeneration,
+		TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeRotatePlacement(turnID string, placementGeneration, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandRotatePlacement, TurnID: turnID,
+		PlacementGeneration: placementGeneration, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeRotatePolicy(turnID string, policyGeneration, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandRotatePolicy, TurnID: turnID,
+		PolicyGeneration: policyGeneration, TurnLeaseGeneration: turnLeaseGeneration,
 	})
 }
 
@@ -552,6 +622,14 @@ func validateCommandShape(cmd command) error {
 	case commandSettleTool:
 		if cmd.EffectID == "" {
 			return fmt.Errorf("%w: settle requires effect id", ErrInvalidCommand)
+		}
+	case commandRotatePlacement:
+		if cmd.PlacementGeneration <= 0 {
+			return fmt.Errorf("%w: rotate placement requires a positive generation", ErrInvalidCommand)
+		}
+	case commandRotatePolicy:
+		if cmd.PolicyGeneration <= 0 {
+			return fmt.Errorf("%w: rotate policy requires a positive generation", ErrInvalidCommand)
 		}
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
