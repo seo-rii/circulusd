@@ -32,8 +32,8 @@ The machine-transfer resume checkpoint for the current unit is
 | 8 | complete | Fail-closed production bootstrap boundary and separate diagnostic-only development daemon |
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
-| 11 | queued | Phase 0B real-process celld Session/effect/placement authority and kill/restart fault matrix |
-| 12 | queued | Durable public idempotency and API/SSE disconnect/replay recovery |
+| 11 | planned | Phase 0B durable turn/effect state machine and celld authority: reference-first kill/restart matrix lands now; real-process celld durability is external-gated |
+| 12 | planned | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 suite lands now; durable celld-backed serving is external-gated |
 
 After Unit 12, the private `platformd`-to-`agentd` workload composition and the
 Phase 1A NsJail single-node vertical slice receive separate work-unit plans.
@@ -1031,3 +1031,276 @@ Each implementation commit includes its preceding failing tests and the green
 result for that one work package. Cross-package changes are combined only when
 splitting them would leave an invalid protocol, identity, or lifecycle
 contract.
+
+## Unit 11: Phase 0B durable turn/effect state machine and celld authority
+
+Status: planned (2026-09-03). Reference-first slices land now; the real-process
+celld durability conformance is external-gated, exactly as Unit 10's external
+resource gate was gated on a provisioned workerd host.
+
+### Outcome
+
+Turn `SPEC.md` §51.2 (Phase 0B) into a real, durable Session-DO turn/effect state
+machine: sequential turn admission with active-turn lease fencing, the effect
+ladder `accepted → model_prepared → model_dispatched → model_settled →
+tool_prepared → tool_dispatched → tool_external_commit → tool_settled →
+completed` (§15.2–15.4), a durable event cursor, placement/policy generation
+fencing (§53.4), and a kill/restart fault matrix that injects a crash before and
+after every durable transition (§51.2). The completion criteria are §51.2's: no
+duplicate external mutation, no unsafe replay, stale-agent-request rejection, and
+a deterministic recovery outcome per crash window. `SPEC.md:5787` forbids cutting
+the §53.2 (single durable state machine) and §53.5 (effect recovery) durable
+tests from any phase.
+
+Unit 11 does not promote §53. The reference-first state machine runs against a
+fault-injecting reference `celld.Storage` that models durability and
+crash/restart in process but is not a production durable substrate. §53.2/§53.5
+stay `NOT_RUN` until the reference matrix is composed with the real-process celld
+durability gate; §53.4 and §53.9 stay `NOT_RUN`; `state.celld` stays `NOT_WIRED`;
+`AdmissionReady` stays false.
+
+### Current implemented baseline
+
+- `internal/celld` already provides the trusted host boundary: `Host.Execute`
+  runs one command through an `Aggregate` inside a `Storage.Transaction` and an
+  explicit `Storage.DurabilityBarrier`, seals permits only after the barrier, and
+  exposes a `FaultInjector` at `before_commit`/`after_commit`/`before_barrier`/
+  `after_barrier`/`before_response`. It has no concrete Session aggregate or
+  Storage outside tests.
+- `internal/broker` `Coordinator` orchestrates a `DurableStore` (the turn/effect
+  program counter: `AcquireEngineStep`, `CommitEngineStep`, `MarkDispatched`,
+  `ClaimDispatchStart`, `MarkExternallyCommitted`, `SettleEffect`, `BlockEffect`,
+  `PrepareRetry`, `SettleRecovery`). No non-test `DurableStore` implementation
+  exists.
+- `internal/effectledger` is the subordinate invocation ledger (reference,
+  in-process only). `internal/stateappclient` wires only `ReadSessionEvents` and
+  `ClaimDispatchStart` to the authenticated state-app; the full turn/effect
+  surface is not wired.
+
+### Reference-first vs external-evidence split
+
+Reference-first (lands now, host-independent):
+- a concrete Session-DO `celld.Aggregate` (the turn/effect state machine) and a
+  reusable fault-injecting reference `celld.Storage`, driven through the existing
+  `celld.Host`;
+- the subordinate effect-ledger transition surface implemented against
+  celld-authoritative single-start claims (building on `broker`/`effectledger`);
+- the kill/restart fault matrix over every durable transition, asserting
+  idempotent replay, no duplicate external mutation, and deterministic recovery.
+
+External-evidence (gated on a provisioned celld process; deferred):
+- `internal/conformance/celld`: a celld durability conformance probe analogous to
+  `internal/conformance/workerd`, proving the pinned celld process provides
+  single-writer with late-write rejection, atomic+durable commit
+  (fsync-equivalent before ack), the commit-before-dispatch durability-barrier API
+  (§15.8), and object-store conditional-write/ETag CAS (§16.1). Without a fresh
+  non-mock PASS from a provisioned host, §53.2/§53.5 stay `NOT_RUN`;
+- wiring the real `broker.DurableStore` to the celld-backed state-app client and
+  composing it in `cmd/platformd`'s production graph (replacing the
+  `errProductionGraphIncomplete` stub).
+
+### Work packages and strict TDD order
+
+Every behavioral slice follows RED → GREEN → focused race/shuffle verification.
+The reference Storage/Aggregate specify host-independent contracts only; they can
+never replace a real celld-process PASS.
+
+#### U11.1 — Session-DO turn-admission aggregate and reference durable storage
+
+Status: in progress (first reference-first slice).
+
+1. RED: failing `celld.Aggregate` tests for a canonical-CBOR `SessionState` and an
+   `OpenTurn` command — sequential turn admission with a monotone event sequence,
+   at most one active turn, idempotent re-execution of the same `CommandID`, and
+   rejection of a stale turn-lease generation.
+2. RED: a reusable fault-injecting reference `celld.Storage` whose committed bytes
+   persist across a simulated restart (a fresh `Host` over the same storage), with
+   a kill/restart matrix injecting each `celld.FaultPoint` around admission.
+3. GREEN: implement the Session aggregate (`ValidateCommand`/`ValidateState`/
+   `Authorize`/`Apply`) and the reference Storage; prove admission is durable,
+   idempotent, and recovers deterministically after a crash at every fault point.
+4. Focused race/shuffle over concurrent admissions of distinct and duplicate
+   `CommandID`s against one shared reference Storage.
+
+#### U11.2 — Model effect ladder: prepare/dispatch/settle transitions
+
+Extend the aggregate with the model sub-ladder (`model_prepared →
+model_dispatched → model_settled`) driven by celld-authoritative single-start
+claims; RED tests for the durable single-start claim, at-most-once dispatch, and
+settlement fencing, then GREEN over the aggregate + reference Storage.
+
+#### U11.3 — Tool effect ladder and serial-effect invariant
+
+Add `tool_prepared → tool_dispatched → tool_external_commit → tool_settled` with
+the §15.3 invariant of at most one external effect between prepared and settled,
+and the `replayPolicy` handling from `EffectRecord` (§15.4).
+
+#### U11.4 — Placement/policy generation authority and rotation rejection
+
+Make placement and policy generation celld-authoritative; RED tests for
+stale-generation admission/settlement rejection and generation rotation (§53.4),
+composing with `authority.ValidateAdmission`/`ValidateSettlement`.
+
+#### U11.5 — Kill/restart fault matrix over the full ladder (§53.5)
+
+Inject a crash before and after every durable transition across the full ladder;
+assert no duplicate external mutation, no unsafe replay, stale-agent rejection,
+and a deterministic recovery outcome for every crash window, under `-race` with
+shuffled/repeated windows.
+
+#### U11.6 — Real-process celld durability conformance probe (external, gated)
+
+Build `internal/conformance/celld` and run it against a provisioned, pinned celld
+process for single-writer/late-write rejection, atomic-durable commit, the
+durability-barrier API (§15.8), and object-store CAS (§16.1). If the host is
+unavailable, record `UNAVAILABLE` and leave Unit 11 incomplete. This is the
+§53.2/§53.5 promotion gate.
+
+### Required evidence and exit criteria
+
+Unit 11 is complete only when all of the following are true:
+
+- the reference kill/restart fault matrix passes under `go test -race` with
+  shuffled/repeated crash-window cases across every durable transition;
+- the real-process celld durability conformance probe returns a fresh non-mock
+  PASS for single-writer, atomic-durable commit, the durability-barrier API, and
+  object-store CAS from one release-, host-, and run-bound envelope (else record
+  `UNAVAILABLE` and leave Unit 11 incomplete);
+- no duplicate external mutation, no unsafe replay, and a deterministic recovery
+  outcome are demonstrated for every crash window;
+- unit/reference tests do not promote §53.2/§53.5; the full `broker.DurableStore`
+  composition and `state.celld` promotion are recorded honestly;
+- `cmd/agentd`/`platformd` capabilities stay `NOT_WIRED` and `AdmissionReady`
+  stays false until the real celld gate and production composition close;
+- `docs/acceptance.md` records exactly what ran without promoting reference
+  evidence.
+
+### Unit 11 commit boundaries
+
+1. Session aggregate + reference durable storage contracts (U11.1);
+2. model effect ladder transitions (U11.2);
+3. tool effect ladder and serial-effect invariant (U11.3);
+4. placement/policy generation authority (U11.4);
+5. kill/restart fault matrix (U11.5);
+6. celld durability conformance probe and acceptance/operator docs (U11.6).
+
+## Unit 12: Durable public idempotency and API/SSE disconnect/replay recovery
+
+Status: planned (2026-09-03). The public turn API, its `Idempotency-Key`
+handling, and the SSE durable-replay handler already exist as a race-safe
+reference in `internal/platformapi` against a non-durable `MemoryStore`; they are
+excluded from `cmd/platformd` (enforced by
+`TestPlatformdProductionDependenciesExcludeReferenceProviders`) and the public
+listener is a stub. Unit 12's reference-first slices consolidate the §53.16
+idempotency/replay suite and pin the durable `Repository` contract; serving the
+API and backing it with durable celld records is gated on Unit 11.
+
+### Outcome
+
+Turn `SPEC.md` §36 / §53.16 into a proven durable public idempotency and
+event-replay boundary: exactly one turn per `Idempotency-Key`, same-key/
+different-body conflict, SSE reconnect that resends durable events after
+`Last-Event-ID` plus the current turn snapshot with no duplication, and
+ephemeral-event loss that never corrupts durable turn state (§36.6, §53.16). The
+durable `platformapi.Repository` records are celld-backed; the SSE replay source
+is the celld-backed `sessionevent.SessionEventPageReader` (`stateappadapter`).
+
+Unit 12 does not promote §53. The reference-first suite runs against
+`platformapi.MemoryStore` (`CrashDurable:false`) and cannot satisfy §53.16, which
+requires the durable Repository and a served public listener; §53.16 stays
+`NOT_RUN`, the public API stays unwired, and `AdmissionReady` stays false.
+
+### Current implemented baseline
+
+- `internal/platformapi` already serves `POST /v1/sessions/{id}/turns` (exactly
+  one `Idempotency-Key`, strict JSON, `idempotency.DigestKey` +
+  `canonical.StructuredDigest` request digest) and `GET /v1/sessions/{id}/events`
+  (SSE with `Last-Event-ID` cursor, `retry:` + `session.snapshot` + per-event
+  frames). `Service` rejects a non-durable repository unless it is the reference
+  `MemoryStore`. `Repository`/`RepositoryDurability` pin the durable contract;
+  `MemoryStore.Durability()` returns `CrashDurable:false`.
+- `internal/idempotency` is an in-memory creation-saga registry (scope-keyed,
+  request-digest conflict, `Reserved → TargetInitialized → Finalized`).
+- `internal/sessionevent` is the shared read-only durable event contract
+  (`SessionEventPageReader`, cursor `AfterSequence`), implemented for production
+  by the celld-backed `stateappadapter.Reader` and consumed by the public API.
+
+### Reference-first vs external-evidence split
+
+Reference-first (lands now, host-independent):
+- consolidate the §53.16 acceptance suite against `platformapi.MemoryStore` and
+  `internal/idempotency`: duplicate `Idempotency-Key` ⇒ one turn; same key +
+  different body ⇒ conflict; SSE disconnect/reconnect ⇒ durable events restored
+  after `Last-Event-ID` with a current-turn snapshot and no duplication; ephemeral
+  delta loss ⇒ durable turn state unchanged;
+- pin the durable `Repository`/idempotency contract (`RepositoryDurability`
+  all-true) with a reference conformance wrapper asserting the atomic idempotency,
+  sequence, replay-subscribe, and authorization fences.
+
+External-evidence (gated on Unit 11 + public-API admission; deferred):
+- a durable celld-backed `platformapi.Repository` (idempotency records + durable
+  event cursor persisted through celld), replacing `MemoryStore` in the served
+  path;
+- serving the public HTTP/SSE listener from `cmd/platformd` (replacing the
+  `listenPublic` `errProductionGraphIncomplete` stub) behind authenticated
+  admission, with the celld-backed `sessionevent` reader as the durable replay
+  source.
+
+### Work packages and strict TDD order
+
+#### U12.1 — §53.16 idempotency concurrency suite (reference)
+
+Status: in-process reference only.
+
+1. RED: concurrent duplicate and distinct `Idempotency-Key` create-turn calls
+   against `MemoryStore`; exactly one turn is created per key, same-key/
+   different-body yields a conflict, and distinct keys create distinct turns.
+2. GREEN: assert the existing reference already satisfies the invariant, or fix
+   it; run under `-race` with high fan-out.
+
+#### U12.2 — SSE disconnect/reconnect durable replay suite (reference)
+
+Reconnect after `Last-Event-ID` resends exactly the durable events after the
+cursor plus the current turn snapshot, with no duplication; ephemeral delta loss
+between reconnects leaves durable turn state unchanged.
+
+#### U12.3 — Durable Repository contract and conformance wrapper (reference)
+
+Pin the `RepositoryDurability` all-true contract and add a reference conformance
+checker that any celld-backed `Repository` must pass (atomic idempotency,
+sequence fencing, replay+subscribe atomicity, authorization fence).
+
+#### U12.4 — Durable celld-backed Repository (external, gated on Unit 11)
+
+Implement a celld-backed `platformapi.Repository` reporting `CrashDurable:true`;
+gated on Unit 11's celld authority; deferred.
+
+#### U12.5 — Served public HTTP/SSE listener wiring (external, gated)
+
+Replace the `listenPublic` stub in `cmd/platformd`, wire the celld-backed
+`sessionevent` reader as the durable replay source behind authenticated
+admission; deferred.
+
+### Required evidence and exit criteria
+
+Unit 12 is complete only when all of the following are true:
+
+- the §53.16 reference suite passes under `go test -race` (idempotency
+  concurrency + durable replay + disconnect/reconnect + ephemeral-loss isolation);
+- a durable celld-backed `Repository` reports `CrashDurable:true` and passes the
+  durable Repository conformance wrapper against a real celld substrate (gated on
+  Unit 11's celld gate; else `NOT_RUN`);
+- the public HTTP/SSE listener is served from the production graph behind
+  authenticated admission and the `listenPublic` stub is removed;
+- §53.16 is promoted only from the durable, served composition — never from the
+  `MemoryStore` reference; `AdmissionReady` stays false until that closes;
+- `docs/acceptance.md` records exactly what ran without promoting reference
+  evidence.
+
+### Unit 12 commit boundaries
+
+1. §53.16 idempotency concurrency suite (U12.1);
+2. SSE disconnect/reconnect durable replay suite (U12.2);
+3. durable Repository contract and conformance wrapper (U12.3);
+4. durable celld-backed Repository (U12.4, gated);
+5. served public listener wiring and acceptance docs (U12.5, gated).
