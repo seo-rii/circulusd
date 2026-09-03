@@ -967,13 +967,16 @@ and reached its achievable bar (four required PASS + one recorded FAIL);
 false. On 2026-09-03 the full gate suite ran green on the native ext4 clone at
 `d05c9a7`: `go vet ./...` clean, `go test ./...` all packages ok, `go test
 -race` (CGO_ENABLED=1) clean on `internal/agent`, the workerd conformance
-harness, `internal/doctor`, `internal/broker`, and `internal/controlrpc`; the
+harness, `internal/doctor`, `internal/broker`, and `internal/controlrpc`, and
+the host-independent contract packages (`internal/agent`, the workerd harness,
+`cmd/agentd`) additionally green under `-race -shuffle=on -count=5`; the
 TypeScript gates green as well (`pnpm check` 5/5 projects, `pnpm lint` clean,
 `pnpm test:unit` 507 passed). Remaining: a production install-profile run before
 the unit closes.
 
 1. Run focused race/shuffle/repetition tests for `internal/agent`, the workerd
-   conformance harness, and `cmd/agentd`.
+   conformance harness, and `cmd/agentd`. (Done 2026-09-03: `go test -race
+   -shuffle=on -count=5` green on all three.)
 2. Run the complete Go race/vet and TypeScript check/lint/unit gates. (Done
    2026-09-03, all green — see the status note above.)
 3. Run the explicit external gate on a provisioned host and retain the fresh
