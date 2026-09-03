@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/conformance"
 	"github.com/hancomac/circulusd/internal/daemonshell"
@@ -50,15 +51,63 @@ func TestDefaultQueryPassesAgainstRealDaemonshellServers(t *testing.T) {
 	}
 }
 
+// TestRealDaemonshellServerRejectsUnauthorizedProbeRole starts a real agentd
+// control server through daemonshell.Execute that authorizes the current UID
+// only as platformd — not as platformctl. The uds.protocol probe (and any
+// platformctl client) presents the platformctl role, so the real daemon's
+// peer-UID authority must reject the handshake. This is an end-to-end negative
+// test of the actual daemon's authorization boundary, and it confirms the probe
+// surfaces the failure with a generic, non-sensitive reason.
+func TestRealDaemonshellServerRejectsUnauthorizedProbeRole(t *testing.T) {
+	directory := shortSocketDirectory(t)
+	agentd := startDaemonshellServerAuthorizing(
+		t, directory, Agentd, daemonshell.AgentdProfile(), "--allow-platformd-uid",
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if response, err := ControlRPCQuery(ctx, agentd); response != nil ||
+		connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("ControlRPCQuery(unauthorized role) response=%v code=%v, want permission_denied",
+			response, connect.CodeOf(err))
+	}
+
+	platformd := startIntegrationServer(
+		t, directory, Platformd,
+		v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD,
+		[]v1.ProtocolPeer{v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL},
+		staticCapabilities(Platformd), nil,
+	)
+	executord := startDaemonshellServer(t, directory, Executord, daemonshell.ExecutordProfile())
+	probe, err := BuildProbe(Config{
+		Endpoints: []Endpoint{platformd, agentd, executord},
+		Timeout:   5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("BuildProbe() error = %v", err)
+	}
+	result := probe.Run(context.Background())
+	if result.Status != conformance.Fail || result.Reason != "daemon protocol verification failed" {
+		t.Fatalf("probe result = %+v, want generic FAIL", result)
+	}
+	assertNoSensitiveReason(t, result.Reason)
+}
+
 // startDaemonshellServer runs a real agentd/executord control server through
-// daemonshell.Execute on a private socket and returns its probe Endpoint once
-// the socket is bound.
+// daemonshell.Execute on a private socket, authorizing the current UID as
+// platformctl, and returns its probe Endpoint once the socket is bound.
 func startDaemonshellServer(t *testing.T, directory, name string, profile daemonshell.Profile) Endpoint {
+	return startDaemonshellServerAuthorizing(t, directory, name, profile, "--allow-platformctl-uid")
+}
+
+// startDaemonshellServerAuthorizing is startDaemonshellServer with an explicit
+// peer-UID authority flag so tests can grant or withhold the platformctl role.
+func startDaemonshellServerAuthorizing(t *testing.T, directory, name string, profile daemonshell.Profile, authorityFlag string) Endpoint {
 	t.Helper()
 	path := filepath.Join(directory, name+".sock")
 	arguments := []string{
 		"--socket", path,
-		"--allow-platformctl-uid", fmt.Sprint(os.Geteuid()),
+		authorityFlag, fmt.Sprint(os.Geteuid()),
 	}
 	serveContext, cancelServe := context.WithCancel(context.Background())
 	var stderr bytes.Buffer
