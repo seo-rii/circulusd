@@ -38,15 +38,12 @@ runAsGroup: 65532
 # the containers via an in-pod emptyDir so the sockets are mutually reachable.
 socketDir: /run/pi-platform
 
-# The daemons refuse to bind a socket whose parent directory is not owned by
-# their own UID or is group/other-writable (internal/controlrpc
-# validateSocketDirectory). A Kubernetes emptyDir mount point is created
-# root-owned and world-writable, so a tiny root init container must chmod 0700
-# and chown the shared directory to runAsUser before the daemons start. Without
-# this the pods would CrashLoop. Mirror the image for air-gapped installs.
-socketDirInit:
-  image: busybox:1.37
-  imagePullPolicy: IfNotPresent
+# A root init container (the same image, which ships a shell) chmod 0700 + chown
+# the shared socket dir to runAsUser before the daemons start. This is required:
+# the daemons refuse to bind a socket whose parent directory is not owned by
+# their UID or is group/other-writable (internal/controlrpc
+# validateSocketDirectory), and a Kubernetes emptyDir mount point is created
+# root-owned and world-writable. Without it the pods would CrashLoop.
 
 # Peer UID authorities placed on the agentd/executord control sockets. Keep the
 # pod's own UID here so probes work; add platformd's UID if it runs elsewhere.

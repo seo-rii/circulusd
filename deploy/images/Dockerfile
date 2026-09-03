@@ -17,9 +17,11 @@
 # was available); treat it as unverified reference scaffolding.
 
 ARG GO_VERSION=1.25.3
-# Repoint RUNTIME_BASE at an air-gapped mirror as needed; the default is pulled
-# from gcr.io and must be mirrored for offline installs.
-ARG RUNTIME_BASE=gcr.io/distroless/static-debian12:nonroot
+# busybox provides a shell so the entrypoint can clear a stale control socket
+# after an ungraceful restart (the daemons fail-closed on a pre-existing socket
+# and only unlink on graceful shutdown) and so the socket-dir init step has
+# chmod/chown. Repoint RUNTIME_BASE at an air-gapped mirror as needed.
+ARG RUNTIME_BASE=busybox:1.37
 
 FROM golang:${GO_VERSION}-bookworm AS build
 # The daemons need no cgo (they use golang.org/x/sys, not cgo); build static.
@@ -50,7 +52,8 @@ LABEL org.opencontainers.image.title="circulusd-node" \
 COPY --from=build \
      /out/platformd /out/platformd-dev /out/agentd /out/executord /out/platformctl \
      /usr/local/bin/
-# distroless "nonroot" is uid/gid 65532; the Helm chart authorizes this UID on
-# the control sockets so exec probes and inter-daemon peers can authenticate.
+# Run as a fixed non-root uid/gid (65532 is the conventional non-root id the
+# Helm chart authorizes on the control sockets). The daemons resolve identity
+# via geteuid(2), not a passwd entry, so no /etc/passwd user is required.
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/platformd-dev"]

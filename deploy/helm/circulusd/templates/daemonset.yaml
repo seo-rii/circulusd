@@ -65,11 +65,15 @@ spec:
         # owned by their UID with no group/other write bits. chmod first (root
         # owns the fresh dir, so no CAP_FOWNER), then chown (needs CAP_CHOWN).
         - name: socket-dir-init
-          image: {{ .Values.socketDirInit.image | quote }}
-          imagePullPolicy: {{ .Values.socketDirInit.imagePullPolicy }}
-          command: ["sh", "-c"]
+          image: {{ $img | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
           args:
-            - "set -eu; chmod 0700 '{{ $sockDir }}'; chown {{ $uid }}:{{ .Values.runAsGroup }} '{{ $sockDir }}'"
+            - 'set -eu; chmod 0700 "$1"; chown "${2}:${3}" "$1"'
+            - "circulusd"
+            - {{ $sockDir | quote }}
+            - {{ $uid | quote }}
+            - {{ .Values.runAsGroup | quote }}
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -89,27 +93,25 @@ spec:
         - name: platformd
           image: {{ $img | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Remove a socket left by an ungraceful prior restart (the daemon
+          # fail-closes on a pre-existing path), then exec so the daemon becomes
+          # PID 1 and receives SIGTERM directly for graceful shutdown.
+          command: ["/bin/sh", "-c"]
           {{- if $devProfile }}
-          command: ["/usr/local/bin/platformd-dev"]
           args:
-            - "-listen"
-            - {{ .Values.platformdDev.listen | quote }}
-            - "-socket"
+            - 'set -eu; rm -f "$1"; exec /usr/local/bin/platformd-dev -listen "$3" -socket "$1" -allow-uid "$2"'
+            - "circulusd"
             - {{ $cpSock | quote }}
-            - "-allow-uid"
             - {{ $uid | quote }}
+            - {{ .Values.platformdDev.listen | quote }}
           {{- else }}
-          command: ["/usr/local/bin/platformd"]
           args:
-            - "-socket"
+            - 'set -eu; rm -f "$1"; exec /usr/local/bin/platformd -socket "$1" -config "$2" -release-manifest "$3" -release-trust-roots "$4" -allow-uid "$5"'
+            - "circulusd"
             - {{ $cpSock | quote }}
-            - "-config"
             - {{ .Values.production.configPath | quote }}
-            - "-release-manifest"
             - {{ .Values.production.releaseManifestPath | quote }}
-            - "-release-trust-roots"
             - {{ .Values.production.releaseTrustRootsPath | quote }}
-            - "-allow-uid"
             - {{ $uid | quote }}
           {{- end }}
           securityContext:
@@ -149,13 +151,11 @@ spec:
         - name: agentd
           image: {{ $img | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/usr/local/bin/agentd"]
+          command: ["/bin/sh", "-c"]
           args:
-            - "-socket"
+            - 'set -eu; rm -f "$1"; s="$1"; p="$2"; shift 2; exec /usr/local/bin/agentd -socket "$s" -allow-platformd-uid "$p" -allow-platformctl-uid "$p" "$@"'
+            - "circulusd"
             - {{ $agentdSock | quote }}
-            - "-allow-platformd-uid"
-            - {{ $peer | quote }}
-            - "-allow-platformctl-uid"
             - {{ $peer | quote }}
             {{- with .Values.daemons.agentd.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -183,13 +183,11 @@ spec:
         - name: executord
           image: {{ $img | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/usr/local/bin/executord"]
+          command: ["/bin/sh", "-c"]
           args:
-            - "-socket"
+            - 'set -eu; rm -f "$1"; s="$1"; p="$2"; shift 2; exec /usr/local/bin/executord -socket "$s" -allow-platformd-uid "$p" -allow-platformctl-uid "$p" "$@"'
+            - "circulusd"
             - {{ $executordSock | quote }}
-            - "-allow-platformd-uid"
-            - {{ $peer | quote }}
-            - "-allow-platformctl-uid"
             - {{ $peer | quote }}
             {{- with .Values.daemons.executord.extraArgs }}
             {{- toYaml . | nindent 12 }}

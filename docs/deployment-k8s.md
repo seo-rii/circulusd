@@ -40,12 +40,21 @@ probe (`platformctl capabilities -socket <path>`); the probe exercises the real
 credentialed control handshake, so a passing probe means the daemon completed
 the v1α role/capability exchange over its socket.
 
-A small root init container (`busybox`, `CAP_CHOWN` only) runs first to `chmod
-0700` and `chown` the shared socket directory to the daemon UID. This is
+A small root init container (the same image, `CAP_CHOWN` only) runs first to
+`chmod 0700` and `chown` the shared socket directory to the daemon UID. This is
 required: the daemons refuse to bind a socket whose parent directory is not
 owned by them or is group/other-writable (`internal/controlrpc`
 `validateSocketDirectory`), and a Kubernetes `emptyDir` mount point is created
 root-owned and world-writable. Without this step the pods would CrashLoop.
+
+Init runs once per pod, not per container restart, and an `emptyDir` persists
+across in-place restarts — so after an ungraceful kill (OOM, force-delete) a
+stale socket would remain and the daemon (which fail-closes on a pre-existing
+socket) could not rebind. To self-heal, each daemon runs under a shell that
+`rm -f`s its own socket and then `exec`s the daemon (so the daemon becomes PID 1
+and still receives `SIGTERM` for graceful shutdown). This is why the runtime
+base is `busybox` (a shell) rather than distroless/static; it is a slightly
+larger attack surface accepted for this reference deployment.
 
 ### What it deliberately does NOT deploy
 
@@ -72,14 +81,17 @@ From the repository root (the Dockerfile expects the repo as its build context):
 
 ```sh
 docker build -f deploy/images/Dockerfile -t circulusd:0.3.0-dev .
-# air-gapped: repoint the runtime base at your mirror
+# air-gapped: repoint the runtime base at your mirror (must ship a shell, e.g.
+# busybox, for the entrypoint's stale-socket cleanup)
 docker build -f deploy/images/Dockerfile \
-  --build-arg RUNTIME_BASE=registry.internal/distroless/static-debian12:nonroot \
+  --build-arg RUNTIME_BASE=registry.internal/busybox:1.37 \
   -t registry.internal/circulusd:0.3.0-dev .
 ```
 
 The image builds only the pure-Go daemons (`CGO_ENABLED=0`, static) onto a
-distroless nonroot base (uid/gid `65532`). It bundles no runtime backends.
+minimal `busybox` base, running as uid/gid `65532`. It bundles no runtime
+backends. (`busybox` is used instead of distroless/static so the entrypoint has
+a shell for stale-socket self-healing; see below.)
 
 ## Install
 
@@ -167,9 +179,10 @@ Do not move any of these onto the `platformd` container — that would violate
 
 ## Air-gap notes
 
-- Mirror the runtime base image (`RUNTIME_BASE`), the built circulusd image, and
-  the socket-dir init image (`socketDirInit.image`, default `busybox`) into your
-  offline registry; set `image.repository`/`image.pullSecrets` accordingly.
+- Mirror the runtime base image (`RUNTIME_BASE`, default `busybox`) and the built
+  circulusd image into your offline registry; set
+  `image.repository`/`image.pullSecrets` accordingly. The init container reuses
+  the circulusd image, so there is no separate init image to mirror.
 - A production image would additionally layer the digest-pinned workerd, celld,
   and nsjail binaries from `deploy/airgap/release-manifest.json`. This reference
   image intentionally does not, because those capabilities are not wired.
