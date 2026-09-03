@@ -17,11 +17,30 @@
 ## Verification status
 
 - `helm lint` and `helm template` (both profiles, and with the privilege
-  toggles on) pass; the rendered manifests parse as valid YAML.
-- The container image has **not** been built and the chart has **not** been
-  applied to a cluster in this workspace — no container runtime or cluster was
-  available here. Treat both as unverified reference scaffolding and validate
-  them in your own cluster before relying on them.
+  toggles on) pass; the rendered manifests parse as valid YAML, and each
+  daemon's rendered `sh -c` wrapper was executed with `exec`/`rm`/`chmod`/`chown`
+  stubbed to confirm it produces the exact intended command line (including the
+  `extraArgs` shift path).
+- **Real-cluster smoke test (k3s v1.36 on WSL2, 2026-09-03), partial.** The image
+  was built (the runtime image matching the Dockerfile's runtime stage; the full
+  multi-stage build's compile step was separately verified) and imported into
+  k3s's containerd. `helm install` succeeded, the `DaemonSet` was accepted by the
+  apiserver, the image resolved locally under `imagePullPolicy: Never` (no
+  `ImagePullBackOff`), the pod was scheduled, and kubelet created the
+  `socket-dir-init` init container followed by the `platformd`/`agentd`/`executord`
+  containers in the intended order. This validates the chart at the
+  API/scheduling/image level on a live cluster.
+- **What that test could not exercise:** no pod reached `Running` — the test
+  host's containerd shim died on every pod sandbox (`ttrpc: closed`), and k3s's
+  own `coredns` and `local-path-provisioner` `CrashLooped` identically. That is a
+  host-wide k3s/containerd incompatibility with that particular (very new) WSL2
+  kernel, not a chart defect, and the standard `cgroupfs` cgroup-driver remedy did
+  not change it. The pod-runtime behaviors (socket-dir ownership prep, the socket
+  self-heal wrappers, the `platformctl` probes) were validated by executing the
+  rendered scripts directly, but have not been observed as running pods.
+- Treat this as reference scaffolding that is API-valid on a real cluster but not
+  yet runtime-verified end-to-end; validate a full `Running` rollout on your own
+  (non-WSL) cluster before relying on it.
 
 ## What it deploys
 
