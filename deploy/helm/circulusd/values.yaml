@@ -19,8 +19,9 @@ profile: development-reference
 
 image:
   repository: circulusd
-  # Defaults to the chart appVersion when empty.
-  tag: ""
+  # Matches the tag built by deploy/images/Dockerfile. Falls back to the chart
+  # appVersion when set empty.
+  tag: "0.3.0-dev"
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -36,6 +37,16 @@ runAsGroup: 65532
 # Absolute directory that holds every daemon's control socket. Shared between
 # the containers via an in-pod emptyDir so the sockets are mutually reachable.
 socketDir: /run/pi-platform
+
+# The daemons refuse to bind a socket whose parent directory is not owned by
+# their own UID or is group/other-writable (internal/controlrpc
+# validateSocketDirectory). A Kubernetes emptyDir mount point is created
+# root-owned and world-writable, so a tiny root init container must chmod 0700
+# and chown the shared directory to runAsUser before the daemons start. Without
+# this the pods would CrashLoop. Mirror the image for air-gapped installs.
+socketDirInit:
+  image: busybox:1.37
+  imagePullPolicy: IfNotPresent
 
 # Peer UID authorities placed on the agentd/executord control sockets. Keep the
 # pod's own UID here so probes work; add platformd's UID if it runs elsewhere.
@@ -59,11 +70,13 @@ daemons:
 
 # production-diagnostic profile only: name of a pre-created Secret providing
 # config.yaml, release-manifest.json, and release-trust-roots.json. Empty means
-# no files are mounted and platformd serves the control socket alone.
+# no files are mounted and platformd serves the control socket alone. All three
+# paths must live under /etc/pi-platform, because that is the single directory
+# the Secret is mounted at.
 production:
   filesSecretName: ""
   configPath: /etc/pi-platform/config.yaml
-  releaseManifestPath: /usr/lib/pi-platform/release-manifest.json
+  releaseManifestPath: /etc/pi-platform/release-manifest.json
   releaseTrustRootsPath: /etc/pi-platform/release-trust-roots.json
 
 # Elevated privileges follow SPEC.md section 6.1: only executord may hold
@@ -128,7 +141,6 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
-# No Service is created by default: platformd-dev binds loopback only, so a
-# Service could not route to it. See docs/deployment-k8s.md.
-service:
-  enabled: false
+# No Service is provided: platformd-dev binds loopback only, so a Service could
+# not route to it. Reach /v1/status with `kubectl port-forward`, which connects
+# to the pod's loopback. See docs/deployment-k8s.md.

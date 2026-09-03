@@ -31,7 +31,11 @@ RUN go mod download
 COPY . .
 ARG TARGETARCH
 RUN set -eux; \
-    export GOOS=linux GOARCH="${TARGETARCH:-amd64}"; \
+    export GOOS=linux; \
+    # Honor buildx cross-builds via TARGETARCH; for a plain `docker build`
+    # (TARGETARCH unset) use the builder's native arch so the binary matches the
+    # runtime base image's arch.
+    if [ -n "${TARGETARCH:-}" ]; then export GOARCH="${TARGETARCH}"; fi; \
     mkdir -p /out; \
     for cmd in platformd platformd-dev agentd executord platformctl; do \
       go build -trimpath -ldflags='-s -w' -o "/out/${cmd}" "./cmd/${cmd}"; \

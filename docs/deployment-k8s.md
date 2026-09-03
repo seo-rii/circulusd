@@ -40,6 +40,13 @@ probe (`platformctl capabilities -socket <path>`); the probe exercises the real
 credentialed control handshake, so a passing probe means the daemon completed
 the v1α role/capability exchange over its socket.
 
+A small root init container (`busybox`, `CAP_CHOWN` only) runs first to `chmod
+0700` and `chown` the shared socket directory to the daemon UID. This is
+required: the daemons refuse to bind a socket whose parent directory is not
+owned by them or is group/other-writable (`internal/controlrpc`
+`validateSocketDirectory`), and a Kubernetes `emptyDir` mount point is created
+root-owned and world-writable. Without this step the pods would CrashLoop.
+
 ### What it deliberately does NOT deploy
 
 - **sandboxd** — it is launched *inside* a sandbox (NsJail/Docker/Firecracker)
@@ -160,9 +167,9 @@ Do not move any of these onto the `platformd` container — that would violate
 
 ## Air-gap notes
 
-- Mirror both the runtime base image (`RUNTIME_BASE`) and the built circulusd
-  image into your offline registry; set `image.repository`/`image.pullSecrets`
-  accordingly.
+- Mirror the runtime base image (`RUNTIME_BASE`), the built circulusd image, and
+  the socket-dir init image (`socketDirInit.image`, default `busybox`) into your
+  offline registry; set `image.repository`/`image.pullSecrets` accordingly.
 - A production image would additionally layer the digest-pinned workerd, celld,
   and nsjail binaries from `deploy/airgap/release-manifest.json`. This reference
   image intentionally does not, because those capabilities are not wired.
