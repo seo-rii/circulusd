@@ -55,6 +55,10 @@ const (
 	commandPrepareModel  = "prepare_model_effect"
 	commandDispatchModel = "dispatch_model_effect"
 	commandSettleModel   = "settle_model_effect"
+	commandPrepareTool   = "prepare_tool_effect"
+	commandDispatchTool  = "dispatch_tool_effect"
+	commandCommitTool    = "commit_tool_effect"
+	commandSettleTool    = "settle_tool_effect"
 )
 
 var (
@@ -224,6 +228,32 @@ func transition(state SessionState, cmd command) (SessionState, error) {
 		state.TurnPhase = phaseModelSettled
 		return state, nil
 
+	case commandPrepareTool:
+		return prepareEffect(state, cmd, effectKindTool, phaseModelSettled, phaseToolPrepared)
+
+	case commandDispatchTool:
+		return dispatchEffect(state, cmd, effectKindTool, phaseToolPrepared, phaseToolDispatched)
+
+	case commandCommitTool:
+		// The external commit is recorded before settlement (commit-before-settle
+		// ordering): a tool effect cannot settle until its external side effect is
+		// durably acknowledged.
+		if err := requireActiveEffect(state, cmd, effectKindTool, effectPhaseDispatched, phaseToolDispatched); err != nil {
+			return SessionState{}, err
+		}
+		state.TurnPhase = phaseToolExternalCommit
+		state.EffectPhase = effectPhaseCommitted
+		state.EffectExternalID = cmd.ExternalCommitID
+		return state, nil
+
+	case commandSettleTool:
+		if err := requireActiveEffect(state, cmd, effectKindTool, effectPhaseCommitted, phaseToolExternalCommit); err != nil {
+			return SessionState{}, err
+		}
+		clearEffect(&state)
+		state.TurnPhase = phaseToolSettled
+		return state, nil
+
 	default:
 		return SessionState{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
 	}
@@ -317,6 +347,34 @@ func EncodeSettleModelEffect(turnID, effectID, externalCommitID string, turnLeas
 	return encodeCommand(command{
 		Kind: commandSettleModel, TurnID: turnID, EffectID: effectID,
 		ExternalCommitID: externalCommitID, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodePrepareToolEffect(turnID, effectID, requestDigest string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandPrepareTool, TurnID: turnID, EffectID: effectID,
+		RequestDigest: requestDigest, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeDispatchToolEffect(turnID, effectID, providerRequestID string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandDispatchTool, TurnID: turnID, EffectID: effectID,
+		ProviderRequestID: providerRequestID, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeCommitToolEffect(turnID, effectID, externalCommitID string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandCommitTool, TurnID: turnID, EffectID: effectID,
+		ExternalCommitID: externalCommitID, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeSettleToolEffect(turnID, effectID string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandSettleTool, TurnID: turnID, EffectID: effectID,
+		TurnLeaseGeneration: turnLeaseGeneration,
 	})
 }
 
@@ -478,6 +536,22 @@ func validateCommandShape(cmd command) error {
 	case commandSettleModel:
 		if cmd.EffectID == "" || cmd.ExternalCommitID == "" {
 			return fmt.Errorf("%w: settle requires effect id and external commit id", ErrInvalidCommand)
+		}
+	case commandPrepareTool:
+		if cmd.EffectID == "" || cmd.RequestDigest == "" {
+			return fmt.Errorf("%w: prepare requires effect id and request digest", ErrInvalidCommand)
+		}
+	case commandDispatchTool:
+		if cmd.EffectID == "" || cmd.ProviderRequestID == "" {
+			return fmt.Errorf("%w: dispatch requires effect id and provider request id", ErrInvalidCommand)
+		}
+	case commandCommitTool:
+		if cmd.EffectID == "" || cmd.ExternalCommitID == "" {
+			return fmt.Errorf("%w: commit requires effect id and external commit id", ErrInvalidCommand)
+		}
+	case commandSettleTool:
+		if cmd.EffectID == "" {
+			return fmt.Errorf("%w: settle requires effect id", ErrInvalidCommand)
 		}
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
