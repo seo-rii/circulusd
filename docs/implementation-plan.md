@@ -32,7 +32,7 @@ The machine-transfer resume checkpoint for the current unit is
 | 8 | complete | Fail-closed production bootstrap boundary and separate diagnostic-only development daemon |
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
-| 11 | planned | Phase 0B durable turn/effect state machine and celld authority: reference-first kill/restart matrix lands now; real-process celld durability is external-gated |
+| 11 | in progress | Phase 0B durable turn/effect state machine and celld authority: reference-first slices U11.1-U11.5 landed and the U11.6 celld conformance probe scaffold; the real-process celld durability PASS remains external-gated |
 | 12 | planned | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 suite lands now; durable celld-backed serving is external-gated |
 
 After Unit 12, the private `platformd`-to-`agentd` workload composition and the
@@ -1034,9 +1034,13 @@ contract.
 
 ## Unit 11: Phase 0B durable turn/effect state machine and celld authority
 
-Status: planned (2026-09-03). Reference-first slices land now; the real-process
-celld durability conformance is external-gated, exactly as Unit 10's external
-resource gate was gated on a provisioned workerd host.
+Status: in progress (2026-09-03). Reference-first slices U11.1-U11.5 landed in
+`internal/sessionstate` (the durable Session-DO turn/effect state machine and its
+kill/restart fault matrix), and U11.6's celld durability conformance probe
+scaffold landed in `internal/conformance/celld` returning `UNAVAILABLE` without a
+provisioned celld. The real-process celld durability PASS remains external-gated,
+exactly as Unit 10's external resource gate was gated on a provisioned workerd
+host; §53.2/§53.4/§53.5 stay `NOT_RUN` and `state.celld` stays `NOT_WIRED`.
 
 ### Outcome
 
@@ -1107,7 +1111,8 @@ never replace a real celld-process PASS.
 
 #### U11.1 — Session-DO turn-admission aggregate and reference durable storage
 
-Status: in progress (first reference-first slice).
+Status: complete (reference-first). Implemented in `internal/sessionstate`
+(`session.go`, `refstorage.go`); U11.2-U11.5 extended the same aggregate.
 
 1. RED: failing `celld.Aggregate` tests for a canonical-CBOR `SessionState` and an
    `OpenTurn` command — sequential turn admission with a monotone event sequence,
@@ -1149,6 +1154,11 @@ and a deterministic recovery outcome for every crash window, under `-race` with
 shuffled/repeated windows.
 
 #### U11.6 — Real-process celld durability conformance probe (external, gated)
+
+Status: scaffold complete (`internal/conformance/celld`); the external PASS is
+gated on a provisioned celld host. The probe enumerates the required §15.8/§16.1
+durability checks and returns `UNAVAILABLE` without a `DurabilityProbe`; a
+reference/mock probe produces only reference-only, non-promotable evidence.
 
 Build `internal/conformance/celld` and run it against a provisioned, pinned celld
 process for single-writer/late-write rejection, atomic-durable commit, the
