@@ -1,10 +1,16 @@
-// Package sessionstate implements the durable Session-DO turn state machine as a
-// celld.Aggregate (SPEC.md §15.2–15.3, Phase 0B / Unit 11). This first increment
-// covers sequential turn admission with a monotone event sequence, at most one
-// active turn, and turn-lease generation fencing. The aggregate is pure and
-// deterministic; durability, idempotency, and the crash barrier come from the
-// celld.Host it runs under. It is host-independent reference work and does not
-// promote any §53 status.
+// Package sessionstate implements the durable Session-DO turn/effect state
+// machine as a celld.Aggregate (SPEC.md §15.2-15.4, Phase 0B / Unit 11). The
+// aggregate is pure and deterministic; durability, idempotency, and the crash
+// barrier come from the celld.Host it runs under. It is host-independent
+// reference work and does not promote any §53 status.
+//
+// The turn ladder is
+//
+//	idle → accepted → model_prepared → model_dispatched → model_settled →
+//	       tool_prepared → tool_dispatched → tool_external_commit → tool_settled → (idle)
+//
+// with the §15.3 serial-effect invariant: at most one effect is active (between
+// prepared and settled) at any time.
 package sessionstate
 
 import (
@@ -19,13 +25,36 @@ import (
 
 const stateSchemaVersion = int64(1)
 
+// Turn ladder phases.
 const (
-	commandOpenTurn     = "open_turn"
-	commandCompleteTurn = "complete_turn"
+	phaseIdle               = "idle"
+	phaseAccepted           = "accepted"
+	phaseModelPrepared      = "model_prepared"
+	phaseModelDispatched    = "model_dispatched"
+	phaseModelSettled       = "model_settled"
+	phaseToolPrepared       = "tool_prepared"
+	phaseToolDispatched     = "tool_dispatched"
+	phaseToolExternalCommit = "tool_external_commit"
+	phaseToolSettled        = "tool_settled"
+)
 
-	turnStatusIdle      = "idle"
-	turnStatusAccepted  = "accepted"
-	turnStatusCompleted = "completed"
+// Effect kinds and effect phases.
+const (
+	effectKindModel = "model"
+	effectKindTool  = "tool"
+
+	effectPhasePrepared   = "prepared"
+	effectPhaseDispatched = "dispatched"
+	effectPhaseCommitted  = "committed"
+)
+
+// Command kinds.
+const (
+	commandOpenTurn      = "open_turn"
+	commandCompleteTurn  = "complete_turn"
+	commandPrepareModel  = "prepare_model_effect"
+	commandDispatchModel = "dispatch_model_effect"
+	commandSettleModel   = "settle_model_effect"
 )
 
 var (
@@ -37,31 +66,57 @@ var (
 	ErrInvalidState = errors.New("sessionstate: invalid session state")
 	// ErrTurnActive is returned when a turn is opened while one is already active.
 	ErrTurnActive = errors.New("sessionstate: a turn is already active")
-	// ErrNoActiveTurn is returned when completing a turn that is not the active one.
+	// ErrNoActiveTurn is returned when acting on a turn that is not the active one.
 	ErrNoActiveTurn = errors.New("sessionstate: no such active turn")
+	// ErrInvalidTransition is returned when a command is not valid from the
+	// current turn phase (an out-of-order ladder step).
+	ErrInvalidTransition = errors.New("sessionstate: invalid turn transition")
+	// ErrEffectActive is returned when a new effect is prepared while one is
+	// already active, violating the §15.3 serial-effect invariant.
+	ErrEffectActive = errors.New("sessionstate: an effect is already active")
+	// ErrEffectMismatch is returned when a command targets an effect id, kind, or
+	// phase that does not match the active effect.
+	ErrEffectMismatch = errors.New("sessionstate: effect identity or phase mismatch")
 	// ErrStaleGeneration is returned when a command carries a turn-lease
 	// generation older than the state's fenced generation.
 	ErrStaleGeneration = errors.New("sessionstate: stale turn-lease generation")
 )
 
-// SessionState is the durable Session-DO turn state. The zero value (an empty
-// stored object) is the initial idle session.
+// SessionState is the durable Session-DO turn/effect state. The zero value (an
+// empty stored object) is the initial idle session.
 type SessionState struct {
 	SchemaVersion       int64
 	EventSequence       int64
 	TurnLeaseGeneration int64
+	PlacementGeneration int64
+	PolicyGeneration    int64
 	ActiveTurnID        string
-	TurnStatus          string
+	TurnPhase           string
+
+	// At most one effect is active (§15.3 serial-effect invariant). Empty
+	// EffectID means no active effect.
+	EffectID          string
+	EffectKind        string
+	EffectPhase       string
+	EffectRequestID   string
+	EffectProviderID  string
+	EffectExternalID  string
 }
 
 type command struct {
 	Kind                string
 	TurnID              string
+	EffectID            string
+	RequestDigest       string
+	ProviderRequestID   string
+	ExternalCommitID    string
 	TurnLeaseGeneration int64
+	PlacementGeneration int64
+	PolicyGeneration    int64
 }
 
-// Aggregate is the Session-DO turn state machine. It holds no fields: all state
-// crosses the boundary as canonical-CBOR bytes.
+// Aggregate is the Session-DO turn/effect state machine. It holds no fields: all
+// state crosses the boundary as canonical-CBOR bytes.
 type Aggregate struct{}
 
 // ValidateCommand rejects malformed or unknown commands before any state read.
@@ -93,8 +148,8 @@ func (Aggregate) Authorize(_ context.Context, stateBytes, commandBytes []byte) e
 	return nil
 }
 
-// Apply performs one deterministic turn transition and returns the next state
-// and a response. It never produces capability claims in this increment.
+// Apply performs one deterministic turn/effect transition and returns the next
+// state and a response.
 func (Aggregate) Apply(_ context.Context, stateBytes, commandBytes []byte) (celld.ApplyResult, error) {
 	state, err := decodeState(stateBytes)
 	if err != nil {
@@ -104,41 +159,138 @@ func (Aggregate) Apply(_ context.Context, stateBytes, commandBytes []byte) (cell
 	if err != nil {
 		return celld.ApplyResult{}, err
 	}
-	switch cmd.Kind {
-	case commandOpenTurn:
-		if state.ActiveTurnID != "" {
-			return celld.ApplyResult{}, fmt.Errorf("%w: %q is active", ErrTurnActive, state.ActiveTurnID)
-		}
-		state.ActiveTurnID = cmd.TurnID
-		state.TurnStatus = turnStatusAccepted
-	case commandCompleteTurn:
-		if state.ActiveTurnID != cmd.TurnID {
-			return celld.ApplyResult{}, fmt.Errorf("%w: active %q, requested %q", ErrNoActiveTurn, state.ActiveTurnID, cmd.TurnID)
-		}
-		state.ActiveTurnID = ""
-		state.TurnStatus = turnStatusCompleted
-	default:
-		return celld.ApplyResult{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
+	next, err := transition(state, cmd)
+	if err != nil {
+		return celld.ApplyResult{}, err
 	}
-	state.EventSequence++
-	state.TurnLeaseGeneration = cmd.TurnLeaseGeneration
+	next.EventSequence = state.EventSequence + 1
+	next.TurnLeaseGeneration = cmd.TurnLeaseGeneration
 
-	nextState, err := encodeState(state)
+	nextBytes, err := encodeState(next)
 	if err != nil {
 		return celld.ApplyResult{}, err
 	}
 	response, err := canonical.Encode(canonical.Map{
-		"admittedTurnId": cmd.TurnID,
-		"turnStatus":     state.TurnStatus,
-		"eventSequence":  state.EventSequence,
+		"turnId":        cmd.TurnID,
+		"turnPhase":     next.TurnPhase,
+		"eventSequence": next.EventSequence,
 	}, canonical.DefaultOptions())
 	if err != nil {
 		return celld.ApplyResult{}, err
 	}
-	return celld.ApplyResult{NextState: nextState, Response: response}, nil
+	return celld.ApplyResult{NextState: nextBytes, Response: response}, nil
 }
 
-// EncodeOpenTurn / EncodeCompleteTurn build canonical command bytes.
+// transition returns the next state for one command, enforcing the ladder order
+// and the serial-effect invariant. It does not touch EventSequence or the
+// turn-lease generation floor; Apply advances those.
+func transition(state SessionState, cmd command) (SessionState, error) {
+	switch cmd.Kind {
+	case commandOpenTurn:
+		if state.ActiveTurnID != "" {
+			return SessionState{}, fmt.Errorf("%w: %q is active", ErrTurnActive, state.ActiveTurnID)
+		}
+		state.ActiveTurnID = cmd.TurnID
+		state.TurnPhase = phaseAccepted
+		return state, nil
+
+	case commandCompleteTurn:
+		if err := requireActiveTurn(state, cmd.TurnID); err != nil {
+			return SessionState{}, err
+		}
+		if state.EffectID != "" {
+			return SessionState{}, fmt.Errorf("%w: cannot complete with active effect %q", ErrEffectActive, state.EffectID)
+		}
+		switch state.TurnPhase {
+		case phaseAccepted, phaseModelSettled, phaseToolSettled:
+		default:
+			return SessionState{}, fmt.Errorf("%w: cannot complete from %q", ErrInvalidTransition, state.TurnPhase)
+		}
+		state.ActiveTurnID = ""
+		state.TurnPhase = phaseIdle
+		return state, nil
+
+	case commandPrepareModel:
+		return prepareEffect(state, cmd, effectKindModel, phaseAccepted, phaseModelPrepared)
+
+	case commandDispatchModel:
+		return dispatchEffect(state, cmd, effectKindModel, phaseModelPrepared, phaseModelDispatched)
+
+	case commandSettleModel:
+		if err := requireActiveEffect(state, cmd, effectKindModel, effectPhaseDispatched, phaseModelDispatched); err != nil {
+			return SessionState{}, err
+		}
+		clearEffect(&state)
+		state.TurnPhase = phaseModelSettled
+		return state, nil
+
+	default:
+		return SessionState{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
+	}
+}
+
+func prepareEffect(state SessionState, cmd command, kind, fromPhase, toPhase string) (SessionState, error) {
+	if err := requireActiveTurn(state, cmd.TurnID); err != nil {
+		return SessionState{}, err
+	}
+	// The serial-effect invariant is checked first: no new effect may begin
+	// while one is still active (§15.3).
+	if state.EffectID != "" {
+		return SessionState{}, fmt.Errorf("%w: %q still active", ErrEffectActive, state.EffectID)
+	}
+	if state.TurnPhase != fromPhase {
+		return SessionState{}, fmt.Errorf("%w: prepare %s from %q", ErrInvalidTransition, kind, state.TurnPhase)
+	}
+	state.TurnPhase = toPhase
+	state.EffectID = cmd.EffectID
+	state.EffectKind = kind
+	state.EffectPhase = effectPhasePrepared
+	state.EffectRequestID = cmd.RequestDigest
+	return state, nil
+}
+
+func dispatchEffect(state SessionState, cmd command, kind, fromPhase, toPhase string) (SessionState, error) {
+	if err := requireActiveEffect(state, cmd, kind, effectPhasePrepared, fromPhase); err != nil {
+		return SessionState{}, err
+	}
+	state.TurnPhase = toPhase
+	state.EffectPhase = effectPhaseDispatched
+	state.EffectProviderID = cmd.ProviderRequestID
+	return state, nil
+}
+
+func requireActiveTurn(state SessionState, turnID string) error {
+	if state.ActiveTurnID == "" || state.ActiveTurnID != turnID {
+		return fmt.Errorf("%w: active %q, requested %q", ErrNoActiveTurn, state.ActiveTurnID, turnID)
+	}
+	return nil
+}
+
+func requireActiveEffect(state SessionState, cmd command, kind, effectPhase, turnPhase string) error {
+	if err := requireActiveTurn(state, cmd.TurnID); err != nil {
+		return err
+	}
+	if state.TurnPhase != turnPhase {
+		return fmt.Errorf("%w: expected %q, in %q", ErrInvalidTransition, turnPhase, state.TurnPhase)
+	}
+	if state.EffectID != cmd.EffectID || state.EffectKind != kind || state.EffectPhase != effectPhase {
+		return fmt.Errorf("%w: active %s/%s/%s, requested %s", ErrEffectMismatch,
+			state.EffectID, state.EffectKind, state.EffectPhase, cmd.EffectID)
+	}
+	return nil
+}
+
+func clearEffect(state *SessionState) {
+	state.EffectID = ""
+	state.EffectKind = ""
+	state.EffectPhase = ""
+	state.EffectRequestID = ""
+	state.EffectProviderID = ""
+	state.EffectExternalID = ""
+}
+
+// Command encoders. Each builds a canonical-CBOR command body.
+
 func EncodeOpenTurn(turnID string, turnLeaseGeneration int64) ([]byte, error) {
 	return encodeCommand(command{Kind: commandOpenTurn, TurnID: turnID, TurnLeaseGeneration: turnLeaseGeneration})
 }
@@ -147,8 +299,29 @@ func EncodeCompleteTurn(turnID string, turnLeaseGeneration int64) ([]byte, error
 	return encodeCommand(command{Kind: commandCompleteTurn, TurnID: turnID, TurnLeaseGeneration: turnLeaseGeneration})
 }
 
-// DecodeState decodes stored aggregate state (an empty slice is the initial
-// idle session). Exposed so tests and future readers can inspect a session.
+func EncodePrepareModelEffect(turnID, effectID, requestDigest string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandPrepareModel, TurnID: turnID, EffectID: effectID,
+		RequestDigest: requestDigest, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeDispatchModelEffect(turnID, effectID, providerRequestID string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandDispatchModel, TurnID: turnID, EffectID: effectID,
+		ProviderRequestID: providerRequestID, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+func EncodeSettleModelEffect(turnID, effectID, externalCommitID string, turnLeaseGeneration int64) ([]byte, error) {
+	return encodeCommand(command{
+		Kind: commandSettleModel, TurnID: turnID, EffectID: effectID,
+		ExternalCommitID: externalCommitID, TurnLeaseGeneration: turnLeaseGeneration,
+	})
+}
+
+// DecodeState decodes stored aggregate state (an empty slice is the initial idle
+// session). Exposed so tests and future readers can inspect a session.
 func DecodeState(encoded []byte) (SessionState, error) {
 	return decodeState(encoded)
 }
@@ -158,14 +331,22 @@ func encodeState(state SessionState) ([]byte, error) {
 		"schemaVersion":       state.SchemaVersion,
 		"eventSequence":       state.EventSequence,
 		"turnLeaseGeneration": state.TurnLeaseGeneration,
+		"placementGeneration": state.PlacementGeneration,
+		"policyGeneration":    state.PolicyGeneration,
 		"activeTurnId":        state.ActiveTurnID,
-		"turnStatus":          state.TurnStatus,
+		"turnPhase":           state.TurnPhase,
+		"effectId":            state.EffectID,
+		"effectKind":          state.EffectKind,
+		"effectPhase":         state.EffectPhase,
+		"effectRequestId":     state.EffectRequestID,
+		"effectProviderId":    state.EffectProviderID,
+		"effectExternalId":    state.EffectExternalID,
 	}, canonical.DefaultOptions())
 }
 
 func decodeState(encoded []byte) (SessionState, error) {
 	if len(encoded) == 0 {
-		return SessionState{SchemaVersion: stateSchemaVersion, TurnStatus: turnStatusIdle}, nil
+		return SessionState{SchemaVersion: stateSchemaVersion, TurnPhase: phaseIdle}, nil
 	}
 	value, err := canonical.Decode(encoded, canonical.DefaultOptions())
 	if err != nil {
@@ -176,36 +357,73 @@ func decodeState(encoded []byte) (SessionState, error) {
 		return SessionState{}, fmt.Errorf("%w: state is not a map", ErrInvalidState)
 	}
 	state := SessionState{}
-	if state.SchemaVersion, err = mapInt(fields, "schemaVersion"); err != nil {
-		return SessionState{}, err
+	ints := []struct {
+		key   string
+		field *int64
+	}{
+		{"schemaVersion", &state.SchemaVersion},
+		{"eventSequence", &state.EventSequence},
+		{"turnLeaseGeneration", &state.TurnLeaseGeneration},
+		{"placementGeneration", &state.PlacementGeneration},
+		{"policyGeneration", &state.PolicyGeneration},
+	}
+	for _, entry := range ints {
+		if *entry.field, err = reqInt(fields, entry.key); err != nil {
+			return SessionState{}, err
+		}
+	}
+	strs := []struct {
+		key   string
+		field *string
+	}{
+		{"activeTurnId", &state.ActiveTurnID},
+		{"turnPhase", &state.TurnPhase},
+		{"effectId", &state.EffectID},
+		{"effectKind", &state.EffectKind},
+		{"effectPhase", &state.EffectPhase},
+		{"effectRequestId", &state.EffectRequestID},
+		{"effectProviderId", &state.EffectProviderID},
+		{"effectExternalId", &state.EffectExternalID},
+	}
+	for _, entry := range strs {
+		if *entry.field, err = reqString(fields, entry.key); err != nil {
+			return SessionState{}, err
+		}
 	}
 	if state.SchemaVersion != stateSchemaVersion {
 		return SessionState{}, fmt.Errorf("%w: schema version %d", ErrInvalidState, state.SchemaVersion)
 	}
-	if state.EventSequence, err = mapInt(fields, "eventSequence"); err != nil {
-		return SessionState{}, err
-	}
-	if state.TurnLeaseGeneration, err = mapInt(fields, "turnLeaseGeneration"); err != nil {
-		return SessionState{}, err
-	}
-	if state.ActiveTurnID, err = mapString(fields, "activeTurnId"); err != nil {
-		return SessionState{}, err
-	}
-	if state.TurnStatus, err = mapString(fields, "turnStatus"); err != nil {
-		return SessionState{}, err
-	}
-	if state.EventSequence < 0 || state.TurnLeaseGeneration < 0 {
+	if state.EventSequence < 0 || state.TurnLeaseGeneration < 0 || state.PlacementGeneration < 0 || state.PolicyGeneration < 0 {
 		return SessionState{}, fmt.Errorf("%w: negative counter", ErrInvalidState)
 	}
 	return state, nil
 }
 
 func encodeCommand(cmd command) ([]byte, error) {
-	return canonical.Encode(canonical.Map{
+	fields := canonical.Map{
 		"kind":                cmd.Kind,
 		"turnId":              cmd.TurnID,
 		"turnLeaseGeneration": cmd.TurnLeaseGeneration,
-	}, canonical.DefaultOptions())
+	}
+	if cmd.EffectID != "" {
+		fields["effectId"] = cmd.EffectID
+	}
+	if cmd.RequestDigest != "" {
+		fields["requestDigest"] = cmd.RequestDigest
+	}
+	if cmd.ProviderRequestID != "" {
+		fields["providerRequestId"] = cmd.ProviderRequestID
+	}
+	if cmd.ExternalCommitID != "" {
+		fields["externalCommitId"] = cmd.ExternalCommitID
+	}
+	if cmd.PlacementGeneration != 0 {
+		fields["placementGeneration"] = cmd.PlacementGeneration
+	}
+	if cmd.PolicyGeneration != 0 {
+		fields["policyGeneration"] = cmd.PolicyGeneration
+	}
+	return canonical.Encode(fields, canonical.DefaultOptions())
 }
 
 func decodeCommand(encoded []byte) (command, error) {
@@ -218,28 +436,56 @@ func decodeCommand(encoded []byte) (command, error) {
 		return command{}, fmt.Errorf("%w: command is not a map", ErrInvalidCommand)
 	}
 	cmd := command{}
-	if cmd.Kind, err = mapString(fields, "kind"); err != nil {
+	if cmd.Kind, err = reqString(fields, "kind"); err != nil {
 		return command{}, err
 	}
-	if cmd.Kind != commandOpenTurn && cmd.Kind != commandCompleteTurn {
-		return command{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
-	}
-	if cmd.TurnID, err = mapString(fields, "turnId"); err != nil {
+	if cmd.TurnID, err = reqString(fields, "turnId"); err != nil {
 		return command{}, err
 	}
-	if cmd.TurnID == "" || !utf8.ValidString(cmd.TurnID) {
-		return command{}, fmt.Errorf("%w: empty or non-UTF-8 turn id", ErrInvalidCommand)
-	}
-	if cmd.TurnLeaseGeneration, err = mapInt(fields, "turnLeaseGeneration"); err != nil {
+	if cmd.TurnLeaseGeneration, err = reqInt(fields, "turnLeaseGeneration"); err != nil {
 		return command{}, err
 	}
-	if cmd.TurnLeaseGeneration <= 0 {
-		return command{}, fmt.Errorf("%w: turn-lease generation must be positive", ErrInvalidCommand)
+	cmd.EffectID = optString(fields, "effectId")
+	cmd.RequestDigest = optString(fields, "requestDigest")
+	cmd.ProviderRequestID = optString(fields, "providerRequestId")
+	cmd.ExternalCommitID = optString(fields, "externalCommitId")
+	cmd.PlacementGeneration = optInt(fields, "placementGeneration")
+	cmd.PolicyGeneration = optInt(fields, "policyGeneration")
+
+	if err := validateCommandShape(cmd); err != nil {
+		return command{}, err
 	}
 	return cmd, nil
 }
 
-func mapInt(fields canonical.Map, key string) (int64, error) {
+func validateCommandShape(cmd command) error {
+	if cmd.TurnID == "" || !utf8.ValidString(cmd.TurnID) {
+		return fmt.Errorf("%w: empty or non-UTF-8 turn id", ErrInvalidCommand)
+	}
+	if cmd.TurnLeaseGeneration <= 0 {
+		return fmt.Errorf("%w: turn-lease generation must be positive", ErrInvalidCommand)
+	}
+	switch cmd.Kind {
+	case commandOpenTurn, commandCompleteTurn:
+	case commandPrepareModel:
+		if cmd.EffectID == "" || cmd.RequestDigest == "" {
+			return fmt.Errorf("%w: prepare requires effect id and request digest", ErrInvalidCommand)
+		}
+	case commandDispatchModel:
+		if cmd.EffectID == "" || cmd.ProviderRequestID == "" {
+			return fmt.Errorf("%w: dispatch requires effect id and provider request id", ErrInvalidCommand)
+		}
+	case commandSettleModel:
+		if cmd.EffectID == "" || cmd.ExternalCommitID == "" {
+			return fmt.Errorf("%w: settle requires effect id and external commit id", ErrInvalidCommand)
+		}
+	default:
+		return fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.Kind)
+	}
+	return nil
+}
+
+func reqInt(fields canonical.Map, key string) (int64, error) {
 	raw, ok := fields[key]
 	if !ok {
 		return 0, fmt.Errorf("%w: missing %q", ErrInvalidState, key)
@@ -251,7 +497,7 @@ func mapInt(fields canonical.Map, key string) (int64, error) {
 	return value, nil
 }
 
-func mapString(fields canonical.Map, key string) (string, error) {
+func reqString(fields canonical.Map, key string) (string, error) {
 	raw, ok := fields[key]
 	if !ok {
 		return "", fmt.Errorf("%w: missing %q", ErrInvalidState, key)
@@ -261,4 +507,18 @@ func mapString(fields canonical.Map, key string) (string, error) {
 		return "", fmt.Errorf("%w: %q is not a string", ErrInvalidState, key)
 	}
 	return value, nil
+}
+
+func optString(fields canonical.Map, key string) string {
+	if raw, ok := fields[key].(string); ok {
+		return raw
+	}
+	return ""
+}
+
+func optInt(fields canonical.Map, key string) int64 {
+	if raw, ok := fields[key].(int64); ok {
+		return raw
+	}
+	return 0
 }

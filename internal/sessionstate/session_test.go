@@ -96,7 +96,7 @@ func TestOpenTurnAdmitsSequentiallyAndIsIdempotent(t *testing.T) {
 	}
 
 	state := finalState(t, storage, object)
-	if state.EventSequence != 3 || state.ActiveTurnID != "turn-2" || state.TurnStatus != turnStatusAccepted {
+	if state.EventSequence != 3 || state.ActiveTurnID != "turn-2" || state.TurnPhase != phaseAccepted {
 		t.Fatalf("final state = %+v, want seq=3 active=turn-2 accepted", state)
 	}
 }
