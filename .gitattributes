@@ -1,1 +1,12 @@
 workers/state-app/worker-configuration.d.ts -whitespace
+
+# Deployment artifacts are consumed by Linux tooling (docker build, helm,
+# kubectl). Pin them to LF so a Windows checkout (core.autocrlf=true) cannot
+# feed a CR into a Dockerfile RUN step or a shell script.
+.dockerignore text eol=lf
+deploy/images/Dockerfile text eol=lf
+deploy/**/*.yaml text eol=lf
+deploy/**/*.tpl text eol=lf
+deploy/**/*.sh text eol=lf
+deploy/helm/circulusd/.helmignore text eol=lf
+deploy/helm/circulusd/templates/NOTES.txt text eol=lf

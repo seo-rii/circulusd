@@ -1,0 +1,53 @@
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  circulusd — DEVELOPMENT / REFERENCE DEPLOYMENT                          │
+  │  NOT production. NOT a Kubernetes scheduler (SPEC.md §4 non-goal).       │
+  │  Every capability reports NOT_WIRED; AdmissionReady stays false.         │
+  └────────────────────────────────────────────────────────────────────────┘
+
+Release:  {{ .Release.Name }}
+Profile:  {{ .Values.profile }}
+Image:    {{ include "circulusd.image" . }}
+
+The DaemonSet "{{ include "circulusd.fullname" . }}" runs the control-plane
+daemons in one privilege-separated pod per selected node:
+
+  - platformd{{ if eq .Values.profile "development-reference" }}-dev{{ end }}  (control plane)
+{{- if .Values.daemons.agentd.enabled }}
+  - agentd      (workerd + cgroup domain; diagnostic-only)
+{{- end }}
+{{- if .Values.daemons.executord.enabled }}
+  - executord   (Docker/KVM/mount domain; diagnostic-only)
+{{- end }}
+
+1. Watch the pod come up:
+
+     kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "circulusd.fullname" . }}
+     kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+2. Read the honest capability report from any daemon (control handshake):
+
+     POD=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/instance={{ .Release.Name }} -o jsonpath='{.items[0].metadata.name}')
+     kubectl -n {{ .Release.Namespace }} exec "$POD" -c platformd -- \
+       platformctl capabilities -socket {{ .Values.socketDir }}/{{ if eq .Values.profile "development-reference" }}platformd-dev.sock{{ else }}platformd.sock{{ end }}
+
+{{- if eq .Values.profile "development-reference" }}
+
+3. Reach the loopback /v1/status endpoint. It binds {{ .Values.platformdDev.listen }}
+   (loopback only), so it is NOT reachable via a Service or httpGet probe — use
+   port-forward, which connects to the pod's loopback:
+
+     kubectl -n {{ .Release.Namespace }} port-forward "$POD" 8081:{{ (splitList ":" .Values.platformdDev.listen) | last }}
+     curl -s http://127.0.0.1:8081/v1/status
+{{- else }}
+
+3. This is the production-diagnostic profile: platformd's production graph is
+   intentionally incomplete, so it logs "production graph is unavailable" and
+   serves only the diagnostic control socket. {{ if .Values.production.filesSecretName }}Operator files are mounted from
+   Secret "{{ .Values.production.filesSecretName }}".{{ else }}No operator files are mounted (production.filesSecretName is empty).{{ end }}
+{{- end }}
+
+What this deployment does NOT include: workerd/celld/nsjail runtime, sandboxd
+(launched inside a sandbox by executord, not as a node daemon), any wired
+production capability, and any external network listener. See
+docs/deployment-k8s.md for the full boundary.

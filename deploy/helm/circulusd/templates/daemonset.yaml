@@ -1,0 +1,216 @@
+{{- include "circulusd.validateProfile" . -}}
+{{- $sockDir := .Values.socketDir -}}
+{{- $uid := .Values.runAsUser -}}
+{{- $peer := .Values.controlPeerUID -}}
+{{- $img := include "circulusd.image" . -}}
+{{- $devProfile := eq .Values.profile "development-reference" -}}
+{{- $cpSock := printf "%s/%s" $sockDir (ternary "platformd-dev.sock" "platformd.sock" $devProfile) -}}
+{{- $agentdSock := printf "%s/agentd.sock" $sockDir -}}
+{{- $executordSock := printf "%s/executord.sock" $sockDir -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "circulusd.fullname" . }}
+  labels:
+    {{- include "circulusd.labels" . | nindent 4 }}
+  annotations:
+    circulusd.dev/warning: >-
+      Development/reference only. Not production; not a Kubernetes scheduler.
+      Capabilities report NOT_WIRED and AdmissionReady stays false.
+spec:
+  selector:
+    matchLabels:
+      {{- include "circulusd.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "circulusd.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "circulusd.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostNetwork: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        runAsUser: {{ $uid }}
+        runAsGroup: {{ .Values.runAsGroup }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # --- Control plane -------------------------------------------------
+        - name: platformd
+          image: {{ $img | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if $devProfile }}
+          command: ["/usr/local/bin/platformd-dev"]
+          args:
+            - "-listen"
+            - {{ .Values.platformdDev.listen | quote }}
+            - "-socket"
+            - {{ $cpSock | quote }}
+            - "-allow-uid"
+            - {{ $uid | quote }}
+          {{- else }}
+          command: ["/usr/local/bin/platformd"]
+          args:
+            - "-socket"
+            - {{ $cpSock | quote }}
+            - "-config"
+            - {{ .Values.production.configPath | quote }}
+            - "-release-manifest"
+            - {{ .Values.production.releaseManifestPath | quote }}
+            - "-release-trust-roots"
+            - {{ .Values.production.releaseTrustRootsPath | quote }}
+            - "-allow-uid"
+            - {{ $uid | quote }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/platformctl", "capabilities", "-socket", {{ $cpSock | quote }}, "-timeout", "3s"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/platformctl", "capabilities", "-socket", {{ $cpSock | quote }}, "-timeout", "3s"]
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: run-pi-platform
+              mountPath: {{ $sockDir | quote }}
+            {{- if not $devProfile }}
+            {{- if .Values.production.filesSecretName }}
+            - name: production-files
+              mountPath: /etc/pi-platform
+              readOnly: true
+            {{- end }}
+            {{- end }}
+        {{- if .Values.daemons.agentd.enabled }}
+        # --- agentd (workerd + cgroup domain; diagnostic-only here) --------
+        - name: agentd
+          image: {{ $img | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/agentd"]
+          args:
+            - "-socket"
+            - {{ $agentdSock | quote }}
+            - "-allow-platformd-uid"
+            - {{ $peer | quote }}
+            - "-allow-platformctl-uid"
+            - {{ $peer | quote }}
+            {{- with .Values.daemons.agentd.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/platformctl", "capabilities", "-socket", {{ $agentdSock | quote }}, "-timeout", "3s"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: run-pi-platform
+              mountPath: {{ $sockDir | quote }}
+            {{- if .Values.privilege.agentd.hostCgroup }}
+            - name: host-cgroup
+              mountPath: {{ .Values.privilege.agentd.hostCgroupPath | quote }}
+            {{- end }}
+        {{- end }}
+        {{- if .Values.daemons.executord.enabled }}
+        # --- executord (Docker/KVM/mount domain; diagnostic-only here) -----
+        - name: executord
+          image: {{ $img | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/executord"]
+          args:
+            - "-socket"
+            - {{ $executordSock | quote }}
+            - "-allow-platformd-uid"
+            - {{ $peer | quote }}
+            - "-allow-platformctl-uid"
+            - {{ $peer | quote }}
+            {{- with .Values.daemons.executord.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- if .Values.privilege.executord.privileged }}
+            privileged: true
+            {{- end }}
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/platformctl", "capabilities", "-socket", {{ $executordSock | quote }}, "-timeout", "3s"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: run-pi-platform
+              mountPath: {{ $sockDir | quote }}
+            {{- if .Values.privilege.executord.dockerSocket }}
+            - name: docker-socket
+              mountPath: {{ .Values.privilege.executord.dockerSocketPath | quote }}
+            {{- end }}
+            {{- if .Values.privilege.executord.devKvm }}
+            - name: dev-kvm
+              mountPath: /dev/kvm
+            {{- end }}
+        {{- end }}
+      volumes:
+        - name: run-pi-platform
+          emptyDir: {}
+        {{- if and (not $devProfile) .Values.production.filesSecretName }}
+        - name: production-files
+          secret:
+            secretName: {{ .Values.production.filesSecretName | quote }}
+        {{- end }}
+        {{- if and .Values.daemons.agentd.enabled .Values.privilege.agentd.hostCgroup }}
+        - name: host-cgroup
+          hostPath:
+            path: {{ .Values.privilege.agentd.hostCgroupPath | quote }}
+            type: Directory
+        {{- end }}
+        {{- if and .Values.daemons.executord.enabled .Values.privilege.executord.dockerSocket }}
+        - name: docker-socket
+          hostPath:
+            path: {{ .Values.privilege.executord.dockerSocketPath | quote }}
+            type: Socket
+        {{- end }}
+        {{- if and .Values.daemons.executord.enabled .Values.privilege.executord.devKvm }}
+        - name: dev-kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        {{- end }}

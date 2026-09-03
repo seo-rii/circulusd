@@ -143,6 +143,13 @@ servers bound request reads to five seconds and keep a five-minute-five-second
 write horizon so a response still has a short slow-reader margin after the
 maximum RPC deadline; that transport margin does not extend request authority.
 
+A development/reference way to run these same diagnostic daemons on Kubernetes —
+a privilege-separated `DaemonSet`, container image, and Helm chart under
+`deploy/` — is documented in
+[`docs/deployment-k8s.md`](docs/deployment-k8s.md). It is not production and is
+not a Kubernetes scheduler (a `SPEC.md` §4 non-goal); capabilities stay
+`NOT_WIRED` and `AdmissionReady` stays false.
+
 ## Security status
 
 This repository begins at version `0.3.0` in development status. A compiled unit-test build is not a production qualification. In particular, celld, workerd/Pi, NsJail, Docker, Firecracker, the object store, and the offline bundle each have separate fail-closed conformance gates.

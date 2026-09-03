@@ -1,0 +1,134 @@
+# Default values for the circulusd reference chart.
+# DEVELOPMENT/REFERENCE ONLY — see docs/deployment-k8s.md.
+#
+# This chart deploys the circulusd control-plane daemons in their honest
+# diagnostic state. It does not wire any production capability, does not deploy
+# sandboxd (which is launched inside a sandbox by executord), and does not
+# bundle the workerd/celld/nsjail runtime. AdmissionReady stays false.
+
+# -- Which control-plane the pod runs.
+#   development-reference: runs `platformd-dev`, which comes up cleanly and
+#                          serves a loopback /v1/status endpoint plus a
+#                          diagnostic control socket. This is the default.
+#   production-diagnostic: runs `platformd`, whose production graph is
+#                          intentionally incomplete; it degrades to serving only
+#                          the diagnostic control socket. Supply operator files
+#                          via production.filesSecretName if you want it to
+#                          attempt (and honestly fail) the production bootstrap.
+profile: development-reference
+
+image:
+  repository: circulusd
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The pod (and every daemon) runs as this uid/gid. It must match the image's
+# nonroot user, and it is the UID authorized on the control sockets so that
+# exec probes and inter-daemon peers authenticate. Distroless nonroot = 65532.
+runAsUser: 65532
+runAsGroup: 65532
+
+# Absolute directory that holds every daemon's control socket. Shared between
+# the containers via an in-pod emptyDir so the sockets are mutually reachable.
+socketDir: /run/pi-platform
+
+# Peer UID authorities placed on the agentd/executord control sockets. Keep the
+# pod's own UID here so probes work; add platformd's UID if it runs elsewhere.
+controlPeerUID: 65532
+
+platformdDev:
+  # Must be a literal loopback address with a nonzero port; platformd-dev
+  # rejects any non-loopback bind. Because it is loopback-only it is NOT
+  # reachable through a Service or an httpGet kubelet probe — reach /v1/status
+  # with `kubectl port-forward` instead (see NOTES.txt).
+  listen: "127.0.0.1:8081"
+
+# Per-daemon toggles and overrides. Every daemon defaults on.
+daemons:
+  agentd:
+    enabled: true
+    extraArgs: []
+  executord:
+    enabled: true
+    extraArgs: []
+
+# production-diagnostic profile only: name of a pre-created Secret providing
+# config.yaml, release-manifest.json, and release-trust-roots.json. Empty means
+# no files are mounted and platformd serves the control socket alone.
+production:
+  filesSecretName: ""
+  configPath: /etc/pi-platform/config.yaml
+  releaseManifestPath: /usr/lib/pi-platform/release-manifest.json
+  releaseTrustRootsPath: /etc/pi-platform/release-trust-roots.json
+
+# Elevated privileges follow SPEC.md section 6.1: only executord may hold
+# Docker/`/dev/kvm`/mount-namespace rights, and only agentd manages workerd
+# cgroups. The current binaries are diagnostic control shells that use NONE of
+# these, so every toggle defaults OFF (least privilege). Turn one on only once
+# the matching production provider is actually wired.
+privilege:
+  agentd:
+    # Mount the host cgroup2 filesystem for future workerd cgroup management.
+    hostCgroup: false
+    hostCgroupPath: /sys/fs/cgroup
+  executord:
+    # Run executord privileged and/or expose Docker socket and /dev/kvm.
+    privileged: false
+    dockerSocket: false
+    dockerSocketPath: /var/run/docker.sock
+    devKvm: false
+
+# Pod-level security context. Honest least privilege for diagnostic shells.
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Per-container security context baseline. The privilege toggles above layer
+# onto executord/agentd when enabled.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+# The platform is single-node by design (SPEC.md section 6). Pin the DaemonSet
+# to the one node you intend to run it on; an unconstrained DaemonSet would
+# place a pod on every node.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  # The daemons never call the Kubernetes API, so the token is not mounted.
+  automountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+# No Service is created by default: platformd-dev binds loopback only, so a
+# Service could not route to it. See docs/deployment-k8s.md.
+service:
+  enabled: false

@@ -1,0 +1,10 @@
+# Build-context excludes for deploy/images/Dockerfile (built from the repo root).
+# Keep the Go module sources; drop everything the daemon build does not need.
+.git
+**/node_modules
+out.bundle
+*.bundle
+dist
+**/*.tsbuildinfo
+deploy/helm
+docs

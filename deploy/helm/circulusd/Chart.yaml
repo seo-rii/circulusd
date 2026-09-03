@@ -1,0 +1,24 @@
+apiVersion: v2
+name: circulusd
+description: >-
+  DEVELOPMENT/REFERENCE ONLY. Runs the circulusd single-node control-plane
+  daemons (platformd, agentd, executord) on Kubernetes as one privilege-separated
+  DaemonSet. This is NOT a Kubernetes scheduler (an explicit SPEC.md section 4
+  non-goal) and NOT production-ready: the daemons serve only diagnostic control
+  sockets, every capability reports NOT_WIRED, and AdmissionReady stays false.
+type: application
+# Chart version is a development pre-release; it is not a released artifact.
+version: 0.0.0-dev0
+appVersion: "0.3.0"
+kubeVersion: ">=1.26.0-0"
+home: https://github.com/hancomac/circulusd
+sources:
+  - https://github.com/hancomac/circulusd
+keywords:
+  - circulusd
+  - reference
+  - development
+annotations:
+  circulusd.dev/profile: development-reference
+  circulusd.dev/production-eligible: "false"
+  circulusd.dev/admission-ready: "false"
