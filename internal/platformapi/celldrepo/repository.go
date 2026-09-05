@@ -165,6 +165,19 @@ func (repo *Repository) AppendDurableEvent(
 	}
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
+	appendObserved := false
+	defer func() {
+		if !appendObserved {
+			// Execute can fail after a durable commit. No live reader may
+			// remain behind that commit while a later receipt replay skips
+			// publication. Disconnect under the same lock as open/subscribe
+			// so every reader recovers from its last durable cursor.
+			for _, channel := range repo.subscribers[command.Authority.Scope.SessionID] {
+				close(channel)
+			}
+			delete(repo.subscribers, command.Authority.Scope.SessionID)
+		}
+	}()
 	result, err := repo.host.Execute(ctx, celld.Request{
 		ObjectID: command.Authority.Scope.SessionID, CommandID: command.CommandID, Command: encoded,
 	})
@@ -182,6 +195,7 @@ func (repo *Repository) AppendDurableEvent(
 	if !result.Replayed {
 		repo.publishLocked(command.Authority.Scope.SessionID, event)
 	}
+	appendObserved = true
 	return event, result.Replayed, nil
 }
 
