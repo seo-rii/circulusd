@@ -127,11 +127,6 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 	command.Start = startPermit
 	startClaimActive := true
 	start, startErr := provider.Start(ctx, command)
-	if contextErr := ctx.Err(); contextErr != nil {
-		gateway.closeProviderCall(ctx, start.Call)
-		cancelled, cancelErr := gateway.Cancel(ctx, authority, current)
-		return cancelled, errors.Join(contextErr, cancelErr)
-	}
 	providerRequestID := strings.TrimSpace(start.ProviderRequestID)
 	validProviderID := providerRequestID != "" && providerRequestID == start.ProviderRequestID &&
 		validBoundedText(providerRequestID, gateway.bounds.MaxProviderRequestIDBytes)
@@ -139,6 +134,9 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 		startErr = errors.New("provider returned an invalid request identity after dispatch")
 	}
 	if validProviderID {
+		// Acceptance is an external fact even when the caller was cancelled
+		// during Start. Persist it with the bounded independent context before
+		// cleanup or cancellation needs to address the accepted request.
 		accepted, applyErr := gateway.Apply(current, Event{
 			ExpectedRevision: current.Revision, Kind: EventProviderAccepted, ProviderRequestID: providerRequestID,
 		})
@@ -152,6 +150,11 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 			return accepted.Effect, err
 		}
 		startClaimActive = false
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		gateway.closeProviderCall(ctx, start.Call)
+		cancelled, cancelErr := gateway.Cancel(ctx, authority, current)
+		return cancelled, errors.Join(contextErr, cancelErr)
 	}
 	if startErr != nil || isNilInterface(start.Call) || !validProviderID {
 		gateway.closeProviderCall(ctx, start.Call)
