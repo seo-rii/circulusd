@@ -93,6 +93,7 @@ type eventSubscriber struct {
 	id       uint64
 	events   chan ProcessEvent
 	done     chan error
+	closed   chan struct{}
 	finished bool
 }
 
@@ -496,6 +497,7 @@ func (supervisor *Supervisor) Attach(
 		id:     record.nextSubscriberID,
 		events: make(chan ProcessEvent, len(replay)+supervisor.subscriberBuffer),
 		done:   make(chan error, 1),
+		closed: make(chan struct{}),
 	}
 	for _, event := range replay {
 		subscriber.events <- event
@@ -517,17 +519,21 @@ func (supervisor *Supervisor) Attach(
 		},
 	}
 	if ctx.Done() != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				record.mu.Lock()
-				supervisor.finishSubscriber(record, subscriber, ctx.Err())
-				record.mu.Unlock()
-			case <-subscriber.done:
-			}
-		}()
+		go supervisor.watchAttachment(ctx, record, subscriber)
 	}
 	return attachment, nil
+}
+
+func (supervisor *Supervisor) watchAttachment(ctx context.Context, record *processRecord, subscriber *eventSubscriber) {
+	select {
+	case <-ctx.Done():
+		record.mu.Lock()
+		supervisor.finishSubscriber(record, subscriber, ctx.Err())
+		record.mu.Unlock()
+	case <-subscriber.closed:
+		// The public done channel carries the caller's one terminal error.
+		// Internal observers use a separate broadcast without consuming it.
+	}
 }
 
 // WriteStdin serializes writes so each call remains contiguous. A failed or
@@ -832,4 +838,5 @@ func (supervisor *Supervisor) finishSubscriber(
 		subscriber.done <- err
 	}
 	close(subscriber.done)
+	close(subscriber.closed)
 }

@@ -1374,7 +1374,7 @@ func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	return server, client, runner
 }
 
-func startTestTransportWithRunner(t *testing.T, runner sandboxd.Runner) (*Server, *Client) {
+func startTestTransportWithRunner(t *testing.T, runner sandboxd.Runner, configure ...func(*Server)) (*Server, *Client) {
 	t.Helper()
 	root, err := os.MkdirTemp("", "circulusd-srpc-")
 	if err != nil {
@@ -1418,6 +1418,9 @@ func startTestTransportWithRunner(t *testing.T, runner sandboxd.Runner) (*Server
 	})
 	if err != nil {
 		t.Fatalf("ListenServer() error = %v", err)
+	}
+	for _, configureServer := range configure {
+		configureServer(server)
 	}
 	serveContext, cancelServe := context.WithCancel(context.Background())
 	t.Cleanup(cancelServe)
