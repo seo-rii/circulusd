@@ -89,7 +89,7 @@ type processBinding struct {
 	handle sandboxd.ProcessHandle
 	wire   *v1.ProcessHandle
 
-	stdinMu          sync.Mutex
+	stdinGate        chan struct{}
 	acceptedSequence uint64
 	acceptedDigest   [sha256.Size]byte
 	acceptedBytes    uint64
@@ -564,7 +564,11 @@ func (handler *rpcHandler) Spawn(ctx context.Context, request *connect.Request[v
 			handler.mu.Unlock()
 			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("process identity collision"))
 		}
-		handler.processes[string(processID)] = &processBinding{handle: result.Handle, wire: proto.Clone(wireHandle).(*v1.ProcessHandle)}
+		handler.processes[string(processID)] = &processBinding{
+			handle:    result.Handle,
+			wire:      proto.Clone(wireHandle).(*v1.ProcessHandle),
+			stdinGate: make(chan struct{}, 1),
+		}
 		handler.mu.Unlock()
 		return &v1.SpawnProcessResponse{Process: wireHandle}, nil
 	})
@@ -670,8 +674,15 @@ func (handler *rpcHandler) WriteStdin(ctx context.Context, request *connect.Requ
 		return nil, connect.NewError(connect.CodeInternal, errors.New("cannot bind idempotent request"))
 	}
 	stored, err := handler.runOnce(requestContext, "write-stdin", message.GetMeta(), logicalDigest, func() (proto.Message, error) {
-		binding.stdinMu.Lock()
-		defer binding.stdinMu.Unlock()
+		select {
+		case binding.stdinGate <- struct{}{}:
+			defer func() { <-binding.stdinGate }()
+		case <-requestContext.Done():
+			return nil, redactedError(requestContext.Err())
+		}
+		if err := requestContext.Err(); err != nil {
+			return nil, redactedError(err)
+		}
 		dataDigest := sha256.Sum256(message.GetData())
 		if message.GetChunkSequence() == binding.acceptedSequence {
 			if subtle.ConstantTimeCompare(dataDigest[:], binding.acceptedDigest[:]) != 1 {

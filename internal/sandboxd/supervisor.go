@@ -62,12 +62,12 @@ type spawnCall struct {
 
 type processRecord struct {
 	mu        sync.Mutex
-	stdinMu   sync.Mutex
+	stdinGate chan struct{}
 	controlMu sync.Mutex
 
 	handle  ProcessHandle
 	running RunningProcess
-	stdin   io.WriteCloser
+	stdin   ProcessStdin
 
 	stdinMode   StdinMode
 	stdinClosed bool
@@ -359,6 +359,7 @@ func (supervisor *Supervisor) Spawn(
 		handle:      handle,
 		running:     running,
 		stdin:       running.Stdin(),
+		stdinGate:   make(chan struct{}, 1),
 		stdinMode:   request.StdinMode,
 		outputLimit: request.OutputLimitBytes,
 		subscribers: make(map[uint64]*eventSubscriber),
@@ -391,12 +392,12 @@ func (supervisor *Supervisor) Spawn(
 		<-streamsDone
 		runResult := running.Wait()
 
-		record.stdinMu.Lock()
+		record.stdinGate <- struct{}{}
 		if !record.stdinClosed {
 			record.stdinClosed = true
 			_ = record.stdin.Close()
 		}
-		record.stdinMu.Unlock()
+		<-record.stdinGate
 
 		record.mu.Lock()
 		reason := record.terminationReason
@@ -529,7 +530,8 @@ func (supervisor *Supervisor) Attach(
 	return attachment, nil
 }
 
-// WriteStdin serializes writes so each call remains contiguous.
+// WriteStdin serializes writes so each call remains contiguous. A failed or
+// partial write closes stdin: its delivered prefix cannot safely be retried.
 func (supervisor *Supervisor) WriteStdin(
 	ctx context.Context,
 	handle ProcessHandle,
@@ -542,8 +544,15 @@ func (supervisor *Supervisor) WriteStdin(
 	if err != nil {
 		return err
 	}
-	record.stdinMu.Lock()
-	defer record.stdinMu.Unlock()
+	select {
+	case record.stdinGate <- struct{}{}:
+		defer func() { <-record.stdinGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if record.stdinMode != StdinStream || record.stdinClosed {
 		return ErrStdinClosed
 	}
@@ -553,11 +562,13 @@ func (supervisor *Supervisor) WriteStdin(
 	if terminal {
 		return ErrProcessExited
 	}
-	written, err := record.stdin.Write(data)
-	if err != nil {
-		return err
-	}
-	if written != len(data) {
+	written, err := record.stdin.WriteContext(ctx, data)
+	if err != nil || written != len(data) {
+		record.stdinClosed = true
+		_ = record.stdin.Close()
+		if err != nil {
+			return err
+		}
 		return io.ErrShortWrite
 	}
 	return nil
@@ -572,8 +583,15 @@ func (supervisor *Supervisor) CloseStdin(ctx context.Context, handle ProcessHand
 	if err != nil {
 		return err
 	}
-	record.stdinMu.Lock()
-	defer record.stdinMu.Unlock()
+	select {
+	case record.stdinGate <- struct{}{}:
+		defer func() { <-record.stdinGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if record.stdinClosed {
 		return nil
 	}

@@ -47,7 +47,7 @@ func (developmentExecRunner) Start(ctx context.Context, spec RunSpec) (RunningPr
 	}
 	return &developmentExecProcess{
 		command: command,
-		stdin:   stdin,
+		stdin:   &developmentExecStdin{pipe: stdin},
 		stdout:  stdout,
 		stderr:  stderr,
 	}, nil
@@ -55,13 +55,43 @@ func (developmentExecRunner) Start(ctx context.Context, spec RunSpec) (RunningPr
 
 type developmentExecProcess struct {
 	command *exec.Cmd
-	stdin   io.WriteCloser
+	stdin   *developmentExecStdin
 	stdout  io.ReadCloser
 	stderr  io.ReadCloser
 }
 
-func (process *developmentExecProcess) Stdin() io.WriteCloser {
+func (process *developmentExecProcess) Stdin() ProcessStdin {
 	return process.stdin
+}
+
+type developmentExecStdin struct {
+	pipe io.WriteCloser
+}
+
+func (stdin *developmentExecStdin) WriteContext(ctx context.Context, data []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// StdinPipe owns an os.File pipe: closing it interrupts a blocked Write.
+	// Join the cancellation callback before returning so it cannot close the
+	// pipe after a later caller has begun using it.
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = stdin.pipe.Close()
+		close(canceled)
+	})
+	written, err := stdin.pipe.Write(data)
+	if !stop() {
+		<-canceled
+	}
+	if err != nil && ctx.Err() != nil {
+		return written, ctx.Err()
+	}
+	return written, err
+}
+
+func (stdin *developmentExecStdin) Close() error {
+	return stdin.pipe.Close()
 }
 
 func (process *developmentExecProcess) Stdout() io.ReadCloser {

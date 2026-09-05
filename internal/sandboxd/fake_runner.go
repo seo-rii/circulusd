@@ -71,7 +71,7 @@ type FakeProcess struct {
 	result       chan RunResult
 }
 
-func (process *FakeProcess) Stdin() io.WriteCloser {
+func (process *FakeProcess) Stdin() ProcessStdin {
 	return process.stdin
 }
 
@@ -140,9 +140,12 @@ type fakeStdin struct {
 	closed bool
 }
 
-func (stdin *fakeStdin) Write(data []byte) (int, error) {
+func (stdin *fakeStdin) WriteContext(ctx context.Context, data []byte) (int, error) {
 	stdin.mu.Lock()
 	defer stdin.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if stdin.closed {
 		return 0, io.ErrClosedPipe
 	}

@@ -1369,6 +1369,13 @@ func (wrongPeerSandboxControlClient) GetCapabilities(
 
 func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	t.Helper()
+	runner := sandboxd.NewFakeRunner()
+	server, client := startTestTransportWithRunner(t, runner)
+	return server, client, runner
+}
+
+func startTestTransportWithRunner(t *testing.T, runner sandboxd.Runner) (*Server, *Client) {
+	t.Helper()
 	root, err := os.MkdirTemp("", "circulusd-srpc-")
 	if err != nil {
 		t.Fatalf("MkdirTemp() error = %v", err)
@@ -1385,7 +1392,6 @@ func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 	if err := os.Mkdir(workspace, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runner := sandboxd.NewFakeRunner()
 	supervisor, err := sandboxd.NewSupervisor(sandboxd.Config{
 		Authority:         sandboxd.LaunchAuthority{SandboxID: "sandbox-alpha", Generation: 7},
 		WorkspaceRoot:     workspace,
@@ -1431,7 +1437,7 @@ func startTestTransport(t *testing.T) (*Server, *Client, *sandboxd.FakeRunner) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	return server, client, runner
+	return server, client
 }
 
 func validSpawnRequest(idempotencyKey, invocationID string) *v1.SpawnProcessRequest {

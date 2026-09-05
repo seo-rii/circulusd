@@ -241,10 +241,18 @@ type RunSpec struct {
 	StdinMode        StdinMode
 }
 
+// ProcessStdin is the runner-owned input pipe. WriteContext must return promptly
+// when its context is canceled. Close must also interrupt an ongoing write
+// without waiting for that write to release a lock.
+type ProcessStdin interface {
+	WriteContext(context.Context, []byte) (int, error)
+	Close() error
+}
+
 // RunningProcess is the minimum process-group abstraction shared by the
 // deterministic fake and development os/exec runner.
 type RunningProcess interface {
-	Stdin() io.WriteCloser
+	Stdin() ProcessStdin
 	Stdout() io.ReadCloser
 	Stderr() io.ReadCloser
 	SignalGroup(ProcessSignal) error
