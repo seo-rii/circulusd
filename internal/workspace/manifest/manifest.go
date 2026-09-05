@@ -30,7 +30,8 @@ const (
 	// deterministic-CBOR implementations.
 	MaxFileSize int64 = 9_007_199_254_740_991
 
-	rootDigestDomain = "circulusd.workspace.manifest.root"
+	rootDigestDomain     = "circulusd.workspace.manifest.root"
+	maxSymlinkExpansions = 40
 )
 
 var (
@@ -81,6 +82,7 @@ type Entry struct {
 func Canonicalize(entries []Entry) ([]Entry, error) {
 	canonical := make([]Entry, len(entries))
 	kinds := make(map[string]EntryType, len(entries))
+	symlinks := make(map[string]string)
 
 	for i, entry := range entries {
 		if !utf8.ValidString(entry.Path) {
@@ -243,8 +245,19 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				}
 			}
 
-			entry.SymlinkTarget = path.Clean(entry.SymlinkTarget)
+			// The parent is a real directory, so a leading current-directory
+			// prefix is redundant. Interior dots, parents, and trailing slashes
+			// must remain: the filesystem resolves symlinks and checks directory
+			// existence before consuming subsequent components.
+			for strings.HasPrefix(entry.SymlinkTarget, "./") {
+				entry.SymlinkTarget = strings.TrimLeft(entry.SymlinkTarget[2:], "/")
+			}
+			if entry.SymlinkTarget == "" {
+				entry.SymlinkTarget = "."
+			}
 
+			// Retain the lexical containment boundary for unresolved targets;
+			// the complete graph is checked below for indirect escapes as well.
 			resolvedTarget := path.Clean(path.Join(path.Dir(entry.Path), entry.SymlinkTarget))
 			if resolvedTarget == ".." || strings.HasPrefix(resolvedTarget, "../") {
 				return nil, fmt.Errorf(
@@ -255,6 +268,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				)
 			}
 			entry.Mode = 0o777
+			symlinks[entry.Path] = entry.SymlinkTarget
 
 		default:
 			return nil, fmt.Errorf(
@@ -300,7 +314,66 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 		}
 	}
 
+	for _, entry := range canonical {
+		if entry.Type == Symlink {
+			if err := validateSymlinkTraversal(entry, kinds, symlinks); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return canonical, nil
+}
+
+// validateSymlinkTraversal follows each link before processing its suffix,
+// including '..'. Missing and non-directory components stop real resolution;
+// their original target spelling is retained so dangling links stay dangling.
+// The expansion limit bounds cycles and the total pending target data.
+func validateSymlinkTraversal(entry Entry, kinds map[string]EntryType, symlinks map[string]string) error {
+	directory := path.Dir(entry.Path)
+	if directory == "." {
+		directory = ""
+	}
+	pending := strings.Split(entry.SymlinkTarget, "/")
+	expansions := 1
+	for len(pending) > 0 {
+		component := pending[0]
+		pending = pending[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if directory == "" {
+				return fmt.Errorf("%w: symlink %q target escapes through symlink traversal", ErrInvalidEntry, entry.Path)
+			}
+			if separator := strings.LastIndexByte(directory, '/'); separator >= 0 {
+				directory = directory[:separator]
+			} else {
+				directory = ""
+			}
+			continue
+		}
+		candidate := component
+		if directory != "" {
+			candidate = directory + "/" + component
+		}
+		switch kinds[candidate] {
+		case Symlink:
+			expansions++
+			if expansions > maxSymlinkExpansions {
+				return fmt.Errorf("%w: symlink %q exceeds %d link expansions", ErrInvalidEntry, entry.Path, maxSymlinkExpansions)
+			}
+			pending = append(strings.Split(symlinks[candidate], "/"), pending...)
+		case Directory:
+			directory = candidate
+		default:
+			// A regular file can terminate the target; any remaining suffix
+			// fails with ENOTDIR. An absent entry fails with ENOENT. Neither
+			// case can traverse another component or escape this snapshot.
+			return nil
+		}
+	}
+	return nil
 }
 
 // Validate checks the expanded flat representation and its logical tree
