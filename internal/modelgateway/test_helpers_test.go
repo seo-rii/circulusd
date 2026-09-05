@@ -597,7 +597,7 @@ type emptyProviderStream struct{}
 func (emptyProviderStream) Next(context.Context) (ProviderEvent, error) {
 	return ProviderEvent{}, io.EOF
 }
-func (emptyProviderStream) Close() error { return nil }
+func (emptyProviderStream) Close(context.Context) error { return nil }
 
 func mustID(t *testing.T, kind identity.Kind, fill byte) identity.ID {
 	t.Helper()

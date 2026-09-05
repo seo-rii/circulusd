@@ -113,10 +113,8 @@ func (gateway *Gateway) executeProviderDispatch(
 			ProviderRequestID: providerRequestID,
 		})
 		if applyErr != nil {
-			if providerResult.Stream != nil {
-				_ = providerResult.Stream.Close()
-			}
-			return DispatchExecution{Permit: permit, Effect: effect}, applyErr
+			closeErr := gateway.closeProviderStream(context.WithoutCancel(ctx), providerResult.Stream)
+			return DispatchExecution{Permit: permit, Effect: effect}, errors.Join(applyErr, closeErr)
 		}
 		acceptedEffect := accepted.Effect
 		acceptedEffect.Request = cloneModelRequest(accepted.Effect.Request)
@@ -126,10 +124,10 @@ func (gateway *Gateway) executeProviderDispatch(
 			Permit:           permit,
 			Effect:           acceptedEffect,
 		}); commitErr != nil {
-			if providerResult.Stream != nil {
-				_ = providerResult.Stream.Close()
-			}
-			return DispatchExecution{Permit: permit, Effect: accepted.Effect}, fmt.Errorf("%w: persist provider request identity", ErrDispatchNotDurable)
+			closeErr := gateway.closeProviderStream(context.WithoutCancel(ctx), providerResult.Stream)
+			return DispatchExecution{Permit: permit, Effect: accepted.Effect}, errors.Join(
+				fmt.Errorf("%w: persist provider request identity", ErrDispatchNotDurable), closeErr,
+			)
 		}
 		executionEffect = accepted.Effect
 	}
@@ -152,11 +150,9 @@ func (gateway *Gateway) executeProviderDispatch(
 			reason = gateway.normalizedFailureReason(FailurePreDispatch)
 		}
 	}
-	if providerResult.Stream != nil {
-		_ = providerResult.Stream.Close()
-	}
+	closeErr := gateway.closeProviderStream(context.WithoutCancel(ctx), providerResult.Stream)
 	failure := Event{ExpectedRevision: executionEffect.Revision, Kind: EventDispatchFailed, Failure: failureClass, Reason: reason}
-	return DispatchExecution{Permit: permit, Effect: executionEffect, Failure: &failure}, nil
+	return DispatchExecution{Permit: permit, Effect: executionEffect, Failure: &failure}, closeErr
 }
 
 // ExecuteCancel durably linearizes cancellation against provider dispatch. A
@@ -345,9 +341,21 @@ func (stream *normalizedProviderStream) Next(ctx context.Context) (Event, error)
 	return event, nil
 }
 
-func (stream *normalizedProviderStream) Close() error {
-	if err := stream.stream.Close(); err != nil {
-		return fmt.Errorf("%w: provider stream close failed", ErrProviderUnavailable)
+func (stream *normalizedProviderStream) Close(ctx context.Context) error {
+	return stream.gateway.closeProviderStream(ctx, stream.stream)
+}
+
+func (gateway *Gateway) closeProviderStream(ctx context.Context, stream ProviderStream) error {
+	if ctx == nil {
+		return ErrInvalidRequest
+	}
+	if stream == nil {
+		return nil
+	}
+	cleanupContext, cancelCleanup := context.WithTimeout(ctx, gateway.streamCloseTimeout)
+	defer cancelCleanup()
+	if err := stream.Close(cleanupContext); err != nil {
+		return errors.Join(fmt.Errorf("%w: provider stream close failed", ErrProviderUnavailable), cleanupContext.Err())
 	}
 	return nil
 }

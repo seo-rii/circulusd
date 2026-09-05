@@ -48,16 +48,20 @@ type ProviderEvent struct {
 }
 
 // ProviderStream leaves network framing in a provider adapter while exposing
-// only the narrow provider-neutral data plane above.
+// only the narrow provider-neutral data plane above. Close must release its
+// owned resources and return by the supplied context's cancellation/deadline;
+// it must not leave an unobserved background cleanup task behind. The gateway
+// always supplies a finite cleanup context.
 type ProviderStream interface {
 	Next(context.Context) (ProviderEvent, error)
-	Close() error
+	Close(context.Context) error
 }
 
 // EventStream contains gateway-normalized events safe to apply to an Effect.
+// Close honors the caller's context and the configured stream cleanup bound.
 type EventStream interface {
 	Next(context.Context) (Event, error)
-	Close() error
+	Close(context.Context) error
 }
 
 // ProviderDispatchResult carries the stable request identity. A successful or

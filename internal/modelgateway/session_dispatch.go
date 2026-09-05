@@ -164,7 +164,7 @@ func (starter *SessionDispatchStarter) Prepare(
 // provider retry and never calls the model gateway's independent dispatch
 // claim methods. The stream is drained here so no accepted response is left
 // attached to a returned-and-forgotten ProviderStream.
-func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.ClaimedDispatchStart) error {
+func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.ClaimedDispatchStart) (startErr error) {
 	if starter == nil || starter.gateway == nil || starter.ledger == nil || ctx == nil {
 		return ErrInvalidRequest
 	}
@@ -243,6 +243,14 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 			return starter.ledger.RecordAccepted(factContext, observation, request.Effect.ProviderRequestID)
 		},
 	)
+	if execution.Stream != nil {
+		// Retain the observed terminal result before cleanup can wait or fail.
+		// Close owns a fresh finite lifetime, even when stream consumption used
+		// up the dispatch context, and runs synchronously until it has finished.
+		defer func() {
+			startErr = errors.Join(startErr, execution.Stream.Close(context.WithoutCancel(ctx)))
+		}()
+	}
 	current := execution.Effect
 	if current.Scope == (ValidatedAuthority{}) {
 		current = effect
@@ -251,7 +259,7 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	terminalStatus := effectledger.TerminalUnknown
 	returnUnknown := executionErr != nil
 
-	if executionErr == nil && execution.Failure != nil {
+	if execution.Failure != nil {
 		failure := *execution.Failure
 		failure.ExpectedRevision = current.Revision
 		applied, applyErr := starter.gateway.Apply(current, failure)
@@ -301,7 +309,6 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 				break
 			}
 		}
-		_ = execution.Stream.Close()
 	} else {
 		returnUnknown = true
 	}
@@ -336,7 +343,7 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 		return fmt.Errorf("record Session model terminal fact: %w", err)
 	}
 	if returnUnknown || !accepted {
-		return fmt.Errorf("%w: provider start has no durable acceptance", ErrProviderUnavailable)
+		return errors.Join(fmt.Errorf("%w: provider start has no durable acceptance", ErrProviderUnavailable), executionErr)
 	}
 	return nil
 }

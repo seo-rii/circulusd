@@ -668,7 +668,7 @@ func TestProviderErrorsNeverCrossTheGatewayCredentialBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ExecuteDispatch() error = %v", err)
 		}
-		err = execution.Stream.Close()
+		err = execution.Stream.Close(context.Background())
 		if err == nil || !errors.Is(err, ErrProviderUnavailable) || strings.Contains(err.Error(), secret) {
 			t.Fatalf("Close() error = %q; want redacted ErrProviderUnavailable", err)
 		}
@@ -788,14 +788,14 @@ func (stream *singleEventProviderStream) Next(context.Context) (ProviderEvent, e
 	return stream.event, nil
 }
 
-func (*singleEventProviderStream) Close() error { return nil }
+func (*singleEventProviderStream) Close(context.Context) error { return nil }
 
 type errorProviderStream struct{ err error }
 
 func (stream errorProviderStream) Next(context.Context) (ProviderEvent, error) {
 	return ProviderEvent{}, stream.err
 }
-func (errorProviderStream) Close() error { return nil }
+func (errorProviderStream) Close(context.Context) error { return nil }
 
 type providerErrorStream struct {
 	nextErr  error
@@ -806,4 +806,4 @@ func (stream providerErrorStream) Next(context.Context) (ProviderEvent, error) {
 	return ProviderEvent{}, stream.nextErr
 }
 
-func (stream providerErrorStream) Close() error { return stream.closeErr }
+func (stream providerErrorStream) Close(context.Context) error { return stream.closeErr }

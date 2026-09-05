@@ -7,6 +7,7 @@ package modelgateway
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
@@ -169,6 +170,10 @@ type ModelGrant struct {
 type Configuration struct {
 	Bounds Bounds
 	Grants []ModelGrant
+
+	// StreamCloseTimeout bounds synchronous provider stream cleanup. Zero uses
+	// five seconds; explicit values must be positive and at most five minutes.
+	StreamCloseTimeout time.Duration
 
 	// AllowReferenceMemory is restricted to explicitly selected in-process
 	// reference deployments and tests. Production construction fails closed.

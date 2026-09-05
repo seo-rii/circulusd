@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -32,6 +33,8 @@ const (
 	hardMaxResponseBytes          = 64 << 20
 	hardMaxReasonBytes            = 4096
 	hardMaxPreDispatchRetries     = 16
+	defaultStreamCloseTimeout     = 5 * time.Second
+	maximumStreamCloseTimeout     = 5 * time.Minute
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*$`)
@@ -45,13 +48,14 @@ type grantKey struct {
 // Gateway is immutable after construction. Its collaborators must be safe for
 // concurrent use. Apply itself is pure; durable writers must CAS Effect.Revision.
 type Gateway struct {
-	bounds       Bounds
-	grants       map[grantKey]ModelGrant
-	authority    AuthorityValidator
-	tokenCounter TokenCounter
-	quota        QuotaAdmitter
-	dispatches   DispatchCoordinator
-	providers    map[string]Provider
+	bounds             Bounds
+	streamCloseTimeout time.Duration
+	grants             map[grantKey]ModelGrant
+	authority          AuthorityValidator
+	tokenCounter       TokenCounter
+	quota              QuotaAdmitter
+	dispatches         DispatchCoordinator
+	providers          map[string]Provider
 }
 
 // NewGateway constructs the explicitly selected in-process reference gateway.
@@ -101,6 +105,13 @@ func NewProductionGateway(configuration Configuration, dependencies ProductionDe
 
 func newGateway(configuration Configuration, dependencies Dependencies, verifiedProduction bool) (*Gateway, error) {
 	bounds := configuration.Bounds
+	streamCloseTimeout := configuration.StreamCloseTimeout
+	if streamCloseTimeout == 0 {
+		streamCloseTimeout = defaultStreamCloseTimeout
+	}
+	if streamCloseTimeout <= 0 || streamCloseTimeout > maximumStreamCloseTimeout {
+		return nil, fmt.Errorf("%w: stream close timeout exceeds its supported range", ErrInvalidConfiguration)
+	}
 	if bounds.MaxAuthorityBytes == 0 || bounds.MaxAuthorityBytes > hardMaxAuthorityBytes ||
 		bounds.MaxMessages == 0 || bounds.MaxMessages > hardMaxMessages ||
 		bounds.MaxMessageBytes == 0 || bounds.MaxMessageBytes > hardMaxMessageBytes ||
@@ -192,13 +203,14 @@ func newGateway(configuration Configuration, dependencies Dependencies, verified
 		grants[key] = grant
 	}
 	return &Gateway{
-		bounds:       bounds,
-		grants:       grants,
-		authority:    dependencies.Authority,
-		tokenCounter: dependencies.TokenCounter,
-		quota:        dependencies.Quota,
-		dispatches:   dependencies.Dispatches,
-		providers:    providers,
+		bounds:             bounds,
+		streamCloseTimeout: streamCloseTimeout,
+		grants:             grants,
+		authority:          dependencies.Authority,
+		tokenCounter:       dependencies.TokenCounter,
+		quota:              dependencies.Quota,
+		dispatches:         dependencies.Dispatches,
+		providers:          providers,
 	}, nil
 }
 

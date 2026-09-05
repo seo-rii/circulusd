@@ -498,7 +498,7 @@ func (stream *scriptedSessionProviderStream) Next(context.Context) (ProviderEven
 	return ProviderEvent{}, io.EOF
 }
 
-func (stream *scriptedSessionProviderStream) Close() error {
+func (stream *scriptedSessionProviderStream) Close(context.Context) error {
 	stream.closed = true
 	return nil
 }
