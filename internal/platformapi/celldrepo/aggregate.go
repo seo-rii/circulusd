@@ -77,17 +77,18 @@ func (Aggregate) ValidateState(_ context.Context, encoded []byte) error {
 	return err
 }
 
-// Authorize decodes both sides so a malformed pair is rejected before the
-// idempotency lookup. The durable authority and generation fences live in Apply,
-// which runs against the committed record.
+// Authorize checks current scope and generation before receipt lookup. A
+// previously committed command must not bypass a changed authority on replay.
 func (Aggregate) Authorize(_ context.Context, stateBytes, commandBytes []byte) error {
-	if _, err := decodeState(stateBytes); err != nil {
+	state, err := decodeState(stateBytes)
+	if err != nil {
 		return err
 	}
-	if _, err := decodeCommand(commandBytes); err != nil {
+	cmd, err := decodeCommand(commandBytes)
+	if err != nil {
 		return err
 	}
-	return nil
+	return authorizeCommand(state, cmd)
 }
 
 // Apply performs one deterministic durable transition and returns the next state
@@ -101,6 +102,9 @@ func (Aggregate) Apply(_ context.Context, stateBytes, commandBytes []byte) (cell
 	if err != nil {
 		return celld.ApplyResult{}, err
 	}
+	if err := authorizeCommand(state, cmd); err != nil {
+		return celld.ApplyResult{}, err
+	}
 	switch cmd.kind {
 	case commandRegister:
 		return applyRegister(state, cmd)
@@ -111,6 +115,27 @@ func (Aggregate) Apply(_ context.Context, stateBytes, commandBytes []byte) (cell
 	default:
 		return celld.ApplyResult{}, fmt.Errorf("%w: %q", ErrUnknownCommand, cmd.kind)
 	}
+}
+
+func authorizeCommand(state sessionRecord, cmd command) error {
+	if cmd.kind == commandRegister {
+		return nil
+	}
+	if !state.registered() {
+		return ErrNotRegistered
+	}
+	if cmd.tenantID != state.tenantID || cmd.subjectID != state.subjectID || cmd.sessionID != state.sessionID {
+		return ErrAccessDenied
+	}
+	if cmd.kind == commandAppendEvent &&
+		(cmd.runtimeRevision != state.runtimeRevision || cmd.workspaceID != state.workspaceID) {
+		return ErrAccessDenied
+	}
+	if cmd.authorizationGeneration != state.authorizationGeneration ||
+		(cmd.kind == commandAppendEvent && cmd.placementGeneration != state.placementGeneration) {
+		return ErrStaleAuthority
+	}
+	return nil
 }
 
 func applyRegister(state sessionRecord, cmd command) (celld.ApplyResult, error) {
@@ -137,15 +162,6 @@ func applyRegister(state sessionRecord, cmd command) (celld.ApplyResult, error) 
 }
 
 func applyCreateTurn(state sessionRecord, cmd command) (celld.ApplyResult, error) {
-	if !state.registered() {
-		return celld.ApplyResult{}, ErrNotRegistered
-	}
-	if cmd.subjectID != state.subjectID {
-		return celld.ApplyResult{}, ErrAccessDenied
-	}
-	if cmd.authorizationGeneration != state.authorizationGeneration {
-		return celld.ApplyResult{}, ErrStaleAuthority
-	}
 	if receipt, found := state.creationReceipts[cmd.keyDigest]; found {
 		if receipt.requestDigest != cmd.requestDigest {
 			return celld.ApplyResult{}, ErrIdempotencyConflict
@@ -167,13 +183,6 @@ func applyCreateTurn(state sessionRecord, cmd command) (celld.ApplyResult, error
 }
 
 func applyAppendEvent(state sessionRecord, cmd command) (celld.ApplyResult, error) {
-	if !state.registered() {
-		return celld.ApplyResult{}, ErrNotRegistered
-	}
-	if cmd.placementGeneration != state.placementGeneration ||
-		cmd.authorizationGeneration != state.authorizationGeneration {
-		return celld.ApplyResult{}, ErrStaleAuthority
-	}
 	if cmd.expectedSequence != int64(len(state.events)) {
 		return celld.ApplyResult{}, ErrSequenceConflict
 	}

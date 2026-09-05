@@ -336,7 +336,9 @@ type RegisterCommand struct {
 
 // CreateTurnCommand is the input to EncodeCreateTurn.
 type CreateTurnCommand struct {
+	TenantID                string
 	SubjectID               string
+	SessionID               string
 	KeyDigest               string
 	RequestDigest           string
 	ProposedTurnID          string
@@ -345,6 +347,11 @@ type CreateTurnCommand struct {
 
 // AppendEventCommand is the input to EncodeAppendEvent.
 type AppendEventCommand struct {
+	TenantID                string
+	SubjectID               string
+	SessionID               string
+	RuntimeRevision         string
+	WorkspaceID             string
 	TurnID                  string
 	ExpectedSequence        int64
 	Type                    string
@@ -366,7 +373,8 @@ func EncodeRegister(input RegisterCommand) ([]byte, error) {
 // EncodeCreateTurn encodes a create-turn command.
 func EncodeCreateTurn(input CreateTurnCommand) ([]byte, error) {
 	return encodeCommand(command{
-		kind: commandCreateTurn, subjectID: input.SubjectID, keyDigest: input.KeyDigest,
+		kind: commandCreateTurn, tenantID: input.TenantID, subjectID: input.SubjectID,
+		sessionID: input.SessionID, keyDigest: input.KeyDigest,
 		requestDigest: input.RequestDigest, proposedTurnID: input.ProposedTurnID,
 		authorizationGeneration: input.AuthorizationGeneration,
 	})
@@ -375,7 +383,9 @@ func EncodeCreateTurn(input CreateTurnCommand) ([]byte, error) {
 // EncodeAppendEvent encodes a durable append-event command.
 func EncodeAppendEvent(input AppendEventCommand) ([]byte, error) {
 	return encodeCommand(command{
-		kind: commandAppendEvent, turnID: input.TurnID, expectedSequence: input.ExpectedSequence,
+		kind: commandAppendEvent, tenantID: input.TenantID, subjectID: input.SubjectID,
+		sessionID: input.SessionID, runtimeRevision: input.RuntimeRevision, workspaceID: input.WorkspaceID,
+		turnID: input.TurnID, expectedSequence: input.ExpectedSequence,
 		eventType: input.Type, payload: input.Payload, turnStatus: input.TurnStatus,
 		placementGeneration: input.PlacementGeneration, authorizationGeneration: input.AuthorizationGeneration,
 	})
@@ -396,12 +406,19 @@ func encodeCommand(cmd command) ([]byte, error) {
 		fields["placementGeneration"] = cmd.placementGeneration
 		fields["authorizationGeneration"] = cmd.authorizationGeneration
 	case commandCreateTurn:
+		fields["tenantId"] = cmd.tenantID
 		fields["subjectId"] = cmd.subjectID
+		fields["sessionId"] = cmd.sessionID
 		fields["keyDigest"] = cmd.keyDigest
 		fields["requestDigest"] = cmd.requestDigest
 		fields["proposedTurnId"] = cmd.proposedTurnID
 		fields["authorizationGeneration"] = cmd.authorizationGeneration
 	case commandAppendEvent:
+		fields["tenantId"] = cmd.tenantID
+		fields["subjectId"] = cmd.subjectID
+		fields["sessionId"] = cmd.sessionID
+		fields["runtimeRevision"] = cmd.runtimeRevision
+		fields["workspaceId"] = cmd.workspaceID
 		fields["turnId"] = cmd.turnID
 		fields["expectedSequence"] = cmd.expectedSequence
 		fields["type"] = cmd.eventType
@@ -462,14 +479,20 @@ func validateCommandShape(cmd command) error {
 			return fmt.Errorf("%w: register requires positive generations", ErrInvalidCommand)
 		}
 	case commandCreateTurn:
-		if !nonControlUTF8(cmd.subjectID) || !nonControlUTF8(cmd.keyDigest) ||
+		if !nonControlUTF8(cmd.tenantID) || !nonControlUTF8(cmd.sessionID) ||
+			!nonControlUTF8(cmd.subjectID) || !nonControlUTF8(cmd.keyDigest) ||
 			!nonControlUTF8(cmd.requestDigest) || !nonControlUTF8(cmd.proposedTurnID) {
-			return fmt.Errorf("%w: create requires subject, key, digest, and proposed turn", ErrInvalidCommand)
+			return fmt.Errorf("%w: create requires tenant, subject, session, key, digest, and proposed turn", ErrInvalidCommand)
 		}
 		if cmd.authorizationGeneration <= 0 {
 			return fmt.Errorf("%w: create requires a positive authorization generation", ErrInvalidCommand)
 		}
 	case commandAppendEvent:
+		for _, id := range []string{cmd.tenantID, cmd.subjectID, cmd.sessionID, cmd.runtimeRevision, cmd.workspaceID} {
+			if !nonControlUTF8(id) {
+				return fmt.Errorf("%w: append requires complete authority scope", ErrInvalidCommand)
+			}
+		}
 		if !nonControlUTF8(cmd.turnID) || !nonControlUTF8(cmd.payload) {
 			return fmt.Errorf("%w: append requires a turn id and payload", ErrInvalidCommand)
 		}

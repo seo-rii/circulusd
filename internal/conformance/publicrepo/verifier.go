@@ -64,7 +64,7 @@ func RequiredChecks() []Check {
 		{
 			ID:          "atomic-authorization-fence",
 			Reference:   "SPEC §36 / §53.16",
-			Description: "an event authority with a stale placement or authorization generation is rejected before any durable write",
+			Description: "creation permits and event authority must match current principal, session, runtime, workspace, and generations before any durable write",
 		},
 		{
 			ID:          "crash-durable",
@@ -319,8 +319,8 @@ func checkReplaySubscribe(ctx context.Context, subject *Subject) (CheckOutcome, 
 }
 
 func checkAuthorizationFence(ctx context.Context, subject *Subject) (CheckOutcome, error) {
-	if subject.PlacementGeneration == 0 {
-		return CheckOutcome{}, errors.New("subject placement generation must be non-zero to fence")
+	if subject.PlacementGeneration == 0 || subject.AuthorizationGeneration == 0 {
+		return CheckOutcome{}, errors.New("subject generations must be non-zero to fence")
 	}
 	turnID, err := subject.createTurn(ctx, "conformance-fence-key", "fence")
 	if err != nil {
@@ -331,6 +331,72 @@ func checkAuthorizationFence(ctx context.Context, subject *Subject) (CheckOutcom
 	if !errors.Is(err, platformapi.ErrStaleAuthority) {
 		return CheckOutcome{Passed: false, Detail: fmt.Sprintf(
 			"append under a stale placement generation returned %v, want ErrStaleAuthority", err)}, nil
+	}
+	stale = subject.authority(turnID, subject.PlacementGeneration)
+	stale.AuthorizationGeneration++
+	if _, err := subject.appendAccepted(ctx, stale, 0); !errors.Is(err, platformapi.ErrStaleAuthority) {
+		return CheckOutcome{Detail: fmt.Sprintf("append under a mismatched authorization generation returned %v", err)}, nil
+	}
+	for _, kind := range []identity.Kind{identity.Tenant, identity.Subject, identity.RuntimeRevision, identity.Workspace} {
+		other, err := identity.New(kind)
+		if err != nil {
+			return CheckOutcome{}, err
+		}
+		mismatch := subject.authority(turnID, subject.PlacementGeneration)
+		switch kind {
+		case identity.Tenant:
+			mismatch.Scope.TenantID = other.String()
+		case identity.Subject:
+			mismatch.Scope.UserID = other.String()
+		case identity.RuntimeRevision:
+			mismatch.Scope.RuntimeRevision = other.String()
+		case identity.Workspace:
+			mismatch.Scope.WorkspaceID = other.String()
+		}
+		if _, err := subject.appendAccepted(ctx, mismatch, 0); !errors.Is(err, platformapi.ErrAccessDenied) {
+			return CheckOutcome{Detail: fmt.Sprintf("append under mismatched %s scope returned %v", kind, err)}, nil
+		}
+	}
+	keyDigest, err := idempotency.DigestKey(conformanceSecret, "conformance-permit-binding-key")
+	if err != nil {
+		return CheckOutcome{}, err
+	}
+	digest, err := canonical.StructuredDigest("circulusd.conformance.request", 1, canonical.Map{"body": "permit-binding"})
+	if err != nil {
+		return CheckOutcome{}, err
+	}
+	proposed, err := subject.proposedTurn(digest)
+	if err != nil {
+		return CheckOutcome{}, err
+	}
+	command := platformapi.CreateTurnCommand{
+		TenantID: subject.TenantID, SubjectID: subject.SubjectID, SessionID: subject.SessionID,
+		KeyDigest: keyDigest, RequestDigest: digest, ProposedTurn: proposed,
+		Authorization: subject.Permit(platformapi.OperationCreateTurn),
+	}
+	for _, kind := range []identity.Kind{identity.Tenant, identity.Subject, identity.Session} {
+		other, err := identity.New(kind)
+		if err != nil {
+			return CheckOutcome{}, err
+		}
+		mismatch := command
+		switch kind {
+		case identity.Tenant:
+			mismatch.Authorization.Principal.TenantID = other.String()
+		case identity.Subject:
+			mismatch.Authorization.Principal.SubjectID = other.String()
+		case identity.Session:
+			mismatch.Authorization.SessionID = other.String()
+		}
+		if _, _, err := subject.Repository.CreateTurn(ctx, mismatch); !errors.Is(err, platformapi.ErrAccessDenied) {
+			return CheckOutcome{Detail: fmt.Sprintf("create with mismatched %s permit returned %v", kind, err)}, nil
+		}
+	}
+	if _, duplicate, err := subject.Repository.CreateTurn(ctx, command); err != nil || duplicate {
+		return CheckOutcome{Detail: fmt.Sprintf("rejected permits changed creation state: duplicate=%t, error=%v", duplicate, err)}, nil
+	}
+	if _, err := subject.appendAccepted(ctx, subject.authority(turnID, subject.PlacementGeneration), 0); err != nil {
+		return CheckOutcome{Detail: fmt.Sprintf("rejected authorities changed event state: %v", err)}, nil
 	}
 	return CheckOutcome{Passed: true}, nil
 }

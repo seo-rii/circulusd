@@ -168,3 +168,57 @@ func TestRequiredChecksCoverDurableContract(t *testing.T) {
 		}
 	}
 }
+
+type unfencedRepository struct {
+	platformapi.Repository
+	subject *publicrepo.Subject
+	permit  bool
+}
+
+func (repo unfencedRepository) CreateTurn(ctx context.Context, command platformapi.CreateTurnCommand) (platformapi.Turn, bool, error) {
+	if repo.permit {
+		command.Authorization = repo.subject.Permit(platformapi.OperationCreateTurn)
+	}
+	return repo.Repository.CreateTurn(ctx, command)
+}
+
+func (repo unfencedRepository) AppendDurableEvent(ctx context.Context, command platformapi.AppendEventCommand) (platformapi.Event, bool, error) {
+	if !repo.permit {
+		command.Authority.Scope.TenantID = repo.subject.TenantID
+		command.Authority.Scope.UserID = repo.subject.SubjectID
+		command.Authority.Scope.RuntimeRevision = repo.subject.RuntimeRevision
+		command.Authority.Scope.WorkspaceID = repo.subject.WorkspaceID
+	}
+	return repo.Repository.AppendDurableEvent(ctx, command)
+}
+
+type unfencedHarness struct{ permit bool }
+
+func (harness unfencedHarness) NewSubject(ctx context.Context) (*publicrepo.Subject, error) {
+	subject, err := (memoryHarness{reference: true, durable: true}).NewSubject(ctx)
+	if err != nil {
+		return nil, err
+	}
+	subject.Repository = unfencedRepository{Repository: subject.Repository, subject: subject, permit: harness.permit}
+	return subject, nil
+}
+
+func (unfencedHarness) Provenance() publicrepo.Provenance {
+	return (memoryHarness{reference: true, durable: true}).Provenance()
+}
+
+func TestQualifyRejectsRepositoriesThatDropAuthorizationScope(t *testing.T) {
+	for _, permit := range []bool{false, true} {
+		name := "event-scope"
+		if permit {
+			name = "creation-permit"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			result := publicrepo.Qualify(context.Background(), unfencedHarness{permit: permit})
+			if result.Status != conformance.Fail || !strings.Contains(result.Reason, "atomic-authorization-fence") {
+				t.Fatalf("unfenced repository qualification = %+v", result)
+			}
+		})
+	}
+}

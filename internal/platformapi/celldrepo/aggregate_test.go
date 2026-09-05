@@ -80,13 +80,16 @@ func execAppend(t *testing.T, host *celld.Host, commandID string, input celldrep
 
 func createInput(keyDigest, requestDigest, proposedTurnID string) celldrepo.CreateTurnCommand {
 	return celldrepo.CreateTurnCommand{
-		SubjectID: subjectID, KeyDigest: keyDigest, RequestDigest: requestDigest,
+		TenantID: tenantID, SubjectID: subjectID, SessionID: sessionID,
+		KeyDigest: keyDigest, RequestDigest: requestDigest,
 		ProposedTurnID: proposedTurnID, AuthorizationGeneration: authorizationGen,
 	}
 }
 
 func appendInput(turnID string, expectedSequence int64, eventType, turnStatus string) celldrepo.AppendEventCommand {
 	return celldrepo.AppendEventCommand{
+		TenantID: tenantID, SubjectID: subjectID, SessionID: sessionID,
+		RuntimeRevision: runtimeRevision, WorkspaceID: workspaceID,
 		TurnID: turnID, ExpectedSequence: expectedSequence, Type: eventType,
 		Payload: `{"state":"` + turnStatus + `"}`, TurnStatus: turnStatus,
 		PlacementGeneration: placementGen, AuthorizationGeneration: authorizationGen,

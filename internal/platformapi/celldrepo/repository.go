@@ -115,10 +115,14 @@ func (repo *Repository) CreateTurn(
 		return platformapi.Turn{}, false, err
 	}
 	if command.Authorization.Operation != platformapi.OperationCreateTurn ||
+		command.Authorization.Principal.TenantID != command.TenantID ||
+		command.Authorization.Principal.SubjectID != command.SubjectID ||
+		command.Authorization.SessionID != command.SessionID ||
 		command.Authorization.Proof == (platformapi.OpaqueAuthorizationProof{}) {
 		return platformapi.Turn{}, false, platformapi.ErrAccessDenied
 	}
 	encoded, err := EncodeCreateTurn(CreateTurnCommand{
+		TenantID: command.TenantID, SessionID: command.SessionID,
 		SubjectID: command.SubjectID, KeyDigest: command.KeyDigest,
 		RequestDigest: command.RequestDigest, ProposedTurnID: command.ProposedTurn.ID,
 		AuthorizationGeneration: int64(command.Authorization.AuthorizationGeneration),
@@ -155,7 +159,10 @@ func (repo *Repository) AppendDurableEvent(
 		return platformapi.Event{}, false, err
 	}
 	encoded, err := EncodeAppendEvent(AppendEventCommand{
-		TurnID: command.Authority.Scope.TurnID, ExpectedSequence: int64(command.ExpectedSequence),
+		TenantID: command.Authority.Scope.TenantID, SubjectID: command.Authority.Scope.UserID,
+		SessionID: command.Authority.Scope.SessionID, RuntimeRevision: command.Authority.Scope.RuntimeRevision,
+		WorkspaceID: command.Authority.Scope.WorkspaceID,
+		TurnID:      command.Authority.Scope.TurnID, ExpectedSequence: int64(command.ExpectedSequence),
 		Type: string(command.Type), Payload: command.Payload, TurnStatus: string(command.TurnStatus),
 		PlacementGeneration:     int64(command.Authority.PlacementGeneration),
 		AuthorizationGeneration: int64(command.Authority.AuthorizationGeneration),
@@ -422,6 +429,8 @@ func mapCreateError(err error) error {
 
 func mapAppendError(err error) error {
 	switch {
+	case errors.Is(err, ErrAccessDenied):
+		return platformapi.ErrAccessDenied
 	case errors.Is(err, ErrSequenceConflict):
 		return platformapi.ErrSequenceConflict
 	case errors.Is(err, ErrStaleAuthority):
