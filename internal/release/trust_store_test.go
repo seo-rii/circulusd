@@ -53,6 +53,8 @@ func TestLoadTrustStoreRejectsAmbiguousAndUnboundedFiles(t *testing.T) {
 	validRoot := `{"keyId":"release-root-1","algorithm":"ed25519","publicKey":"` +
 		publicKey + `"}`
 	tests := map[string][]byte{
+		"case alias":         []byte(`{"SchemaVersion":1,"roots":[` + validRoot + `]}`),
+		"nested case alias":  []byte(`{"schemaVersion":1,"roots":[` + strings.Replace(validRoot, `"keyId"`, `"KeyId"`, 1) + `]}`),
 		"unknown field":      []byte(`{"schemaVersion":1,"roots":[` + validRoot + `],"extra":true}`),
 		"duplicate member":   []byte(`{"schemaVersion":1,"schemaVersion":1,"roots":[` + validRoot + `]}`),
 		"trailing value":     []byte(`{"schemaVersion":1,"roots":[` + validRoot + `]} {}`),

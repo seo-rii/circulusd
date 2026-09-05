@@ -2,6 +2,9 @@ package release
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +46,71 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 		var standard Manifest
 		if err := json.Unmarshal(data, &standard); err != nil {
 			t.Fatalf("decodeStrictJSON accepted input that json.Unmarshal rejects: %v\ninput: %q", err, data)
+		}
+		if !reflect.DeepEqual(strict, standard) {
+			t.Fatalf("strict and standard decoders disagree on an accepted manifest")
+		}
+	})
+}
+
+// FuzzStrictJSONFieldNames constructs schema-valid documents, then independently
+// requires rejection of case aliases, unknown members and duplicate members.
+// It therefore detects overly permissive decoding as well as false rejections.
+func FuzzStrictJSONFieldNames(f *testing.F) {
+	for index := byte(0); index < 7; index++ {
+		f.Add(index, uint64(1), "field value")
+		f.Add(index, ^uint64(0), "한글\u0000e\u0301")
+	}
+	f.Fuzz(func(t *testing.T, selector byte, mask uint64, text string) {
+		if len(text) > 1024 {
+			t.Skip()
+		}
+		quoted, err := json.Marshal(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets := []struct{ prefix, key, value, suffix string }{
+			{`{`, "schemaVersion", "1", `}`},
+			{`{"release":{`, "version", string(quoted), `}}`},
+			{`{"components":[{`, "name", string(quoted), `}]}`},
+			{`{"components":[{"artifacts":[{`, "sha256", string(quoted), `}]}]}`},
+			{`{"components":[{"artifacts":[{"signature":{`, "keyId", string(quoted), `}}]}]}`},
+			{`{"protocolCompatibility":[{"minimum":{`, "major", "1", `}}]}`},
+			{`{"signatures":[{`, "algorithm", string(quoted), `}]}`},
+		}
+		target := targets[int(selector)%len(targets)]
+		decode := func(members string) error {
+			var manifest Manifest
+			return decodeStrictJSON([]byte(target.prefix+members+target.suffix), "fuzz", &manifest)
+		}
+		member := `"` + target.key + `":` + target.value
+		if err := decode(member); err != nil {
+			t.Fatalf("rejected canonical field %q: %v", target.key, err)
+		}
+		alias := []byte(target.key)
+		for index, character := range alias {
+			if mask&(uint64(1)<<uint(index)) != 0 &&
+				(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z') {
+				alias[index] ^= 0x20
+			}
+		}
+		if string(alias) == target.key {
+			alias[0] ^= 0x20
+		}
+		escaped := fmt.Sprintf(`"\u%04x%s":%s`, target.key[0], target.key[1:], target.value)
+		if err := decode(escaped); err != nil {
+			t.Fatalf("rejected a canonical escaped field: %v", err)
+		}
+		for _, members := range []string{
+			`"` + string(alias) + `":` + target.value,
+			member + `,"` + string(alias) + `":` + target.value,
+			member + "," + member,
+			member + "," + escaped,
+			strings.Replace(member, target.key, "unknown_"+target.key, 1),
+		} {
+			if err := decode(members); err == nil {
+				t.Fatalf("accepted noncanonical members: %s", members)
+			}
 		}
 	})
 }

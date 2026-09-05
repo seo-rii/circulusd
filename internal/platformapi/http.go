@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/identity"
+	"github.com/hancomac/circulusd/internal/strictjson"
 )
 
 type RequestAuthenticator interface {
@@ -254,88 +255,10 @@ func (handler *HTTPHandler) createTurn(response http.ResponseWriter, request *ht
 		)
 		return
 	}
-	scanner := json.NewDecoder(bytes.NewReader(document))
-	scanner.UseNumber()
-	var scanValue func(int) error
-	scanValue = func(depth int) error {
-		if depth > 64 {
-			return ErrInvalidRequest
-		}
-		token, err := scanner.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, structured := token.(json.Delim)
-		if !structured {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			keys := make(map[string]struct{})
-			for scanner.More() {
-				keyToken, err := scanner.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return ErrInvalidRequest
-				}
-				if _, duplicate := keys[key]; duplicate {
-					return ErrInvalidRequest
-				}
-				keys[key] = struct{}{}
-				if err := scanValue(depth + 1); err != nil {
-					return err
-				}
-			}
-			closing, err := scanner.Token()
-			if err != nil || closing != json.Delim('}') {
-				return ErrInvalidRequest
-			}
-		case '[':
-			for scanner.More() {
-				if err := scanValue(depth + 1); err != nil {
-					return err
-				}
-			}
-			closing, err := scanner.Token()
-			if err != nil || closing != json.Delim(']') {
-				return ErrInvalidRequest
-			}
-		default:
-			return ErrInvalidRequest
-		}
-		return nil
-	}
-	if err := scanValue(0); err != nil {
-		writeHTTPError(
-			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
-			"the request is invalid", false,
-		)
-		return
-	}
-	if _, err := scanner.Token(); err != io.EOF {
-		writeHTTPError(
-			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
-			"the request is invalid", false,
-		)
-		return
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(document))
-	decoder.DisallowUnknownFields()
 	var body struct {
 		Messages []Message `json:"messages"`
 	}
-	if err := decoder.Decode(&body); err != nil {
-		writeHTTPError(
-			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
-			"the request is invalid", false,
-		)
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+	if err := strictjson.Decode(document, &body); err != nil {
 		writeHTTPError(
 			response, http.StatusBadRequest, "invalid_argument", "INVALID_REQUEST",
 			"the request is invalid", false,

@@ -175,3 +175,38 @@ func TestHTTPAuthenticationPrecedesBodyParsingAndErrorsAreRedacted(t *testing.T)
 		t.Fatalf("Authenticate() calls = %d, want 1", authenticator.calls)
 	}
 }
+
+func TestHTTPCreateTurnRequiresExactJSONFieldNames(t *testing.T) {
+	for name, body := range map[string]string{
+		"top-level alias":           `{"MESSAGES":[{"role":"user","content":"second"}]}`,
+		"nested alias":              `{"messages":[{"Role":"user","content":"second"}]}`,
+		"aliased duplicate":         `{"messages":[{"role":"user","content":"first","Content":"second"}]}`,
+		"top-level duplicate alias": `{"messages":[{"role":"user","content":"first"}],"Messages":[{"role":"user","content":"second"}]}`,
+		"escaped duplicate":         `{"messages":[{"role":"user","content":"first","cont\u0065nt":"second"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := platformapi.NewMemoryStore()
+			registerAPISession(t, store)
+			handler := newHTTPHandler(t, newAPIService(t, store, &scopedAuthorizer{}),
+				&requestAuthenticator{principal: platformapi.Principal{TenantID: apiTenantID, SubjectID: apiSubjectID}})
+			post := func(body string) *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+apiSessionID+"/turns", strings.NewReader(body))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("Idempotency-Key", "exact-json-key")
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				return response
+			}
+			if response := post(body); response.Code != http.StatusBadRequest {
+				t.Errorf("ambiguous body status = %d, want 400", response.Code)
+			}
+			if count := store.TurnCount(apiTenantID, apiSessionID); count != 0 {
+				t.Errorf("rejected request created %d turns", count)
+			}
+			// A rejected document must not consume the idempotency key.
+			if response := post(`{"messages":[{"role":"user","content":"second"}]}`); response.Code != http.StatusAccepted {
+				t.Errorf("canonical retry status = %d, want 202", response.Code)
+			}
+		})
+	}
+}
