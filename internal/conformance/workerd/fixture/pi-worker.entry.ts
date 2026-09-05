@@ -3,6 +3,7 @@ import {
   createOpaqueTurnAuthority,
   createPiAgentCoreFactory,
   createPiAgentCoreInitialState,
+  encodePiAgentCoreModelSettlement,
   type ExtensionRegistration,
 } from "../../../../workers/pi-runtime/src/index.ts";
 import type { NormalizedValue } from "../../../../packages/protocol-types/src/index.ts";
@@ -114,31 +115,28 @@ async function runAgentTurn(): Promise<{
       requestDigest: firstModel.request.requestDigest,
       outcome: {
         kind: "success",
-        result: {
-          version: 1,
-          message: {
-            role: "assistant",
-            content: [{
-              type: "toolCall",
-              id: "phase0_echo_1",
-              name: "echo",
-              arguments: { text: "hello" },
-            }],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
-            usage: {
-              input: 1,
-              output: 1,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 2,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-            stopReason: "toolUse",
-            timestamp: 1_700_000_000_001,
+        result: encodePiAgentCoreModelSettlement({
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "phase0_echo_1",
+            name: "echo",
+            arguments: { text: "hello" },
+          }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0.000001, output: 0.000002, cacheRead: 0, cacheWrite: 0, total: 0.000003 },
           },
-        },
+          stopReason: "toolUse",
+          timestamp: 1_700_000_000_001,
+        }),
       },
     },
   });
@@ -173,26 +171,23 @@ async function runAgentTurn(): Promise<{
       requestDigest: secondModel.request.requestDigest,
       outcome: {
         kind: "success",
-        result: {
-          version: 1,
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "done" }],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
-            usage: {
-              input: 2,
-              output: 1,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 3,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-            stopReason: "stop",
-            timestamp: 1_700_000_000_003,
+        result: encodePiAgentCoreModelSettlement({
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 2,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 3,
+            cost: { input: 0.000002, output: 0.000002, cacheRead: 0, cacheWrite: 0, total: 0.000004 },
           },
-        },
+          stopReason: "stop",
+          timestamp: 1_700_000_000_003,
+        }),
       },
     },
   });

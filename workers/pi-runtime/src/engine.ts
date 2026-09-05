@@ -3,6 +3,7 @@ import {
   digestBytes,
   digestStructuredValue,
   encodeCanonicalCbor,
+  parseAgentCheckpoint,
   validateAgentCheckpoint,
   validateEngineStepResult,
   type AgentCheckpoint,
@@ -693,11 +694,7 @@ export class LowLevelPiAgentEngine {
     }
     const hasSettlement = Object.prototype.hasOwnProperty.call(contextRecord, "settlement");
     const settlement = hasSettlement
-      ? parseEngineSettlement(
-          contextRecord.settlement,
-          this.#budgets.maxStepInputBytes,
-          "stepContext.settlement",
-        )
+      ? this.#prepareSettlement(state, contextRecord.settlement)
       : null;
     boundedProtocolValue(
       { checkpoint, settlement },
@@ -861,6 +858,29 @@ export class LowLevelPiAgentEngine {
       new BoundaryFault("TURN_ABORTED", `turn ${turnId} was aborted`),
     );
     await this.#interruptActiveStep(activeStep);
+  }
+
+  /**
+   * Pure input normalization for the SessionHost bridge. This parses checkpoint
+   * structure and adapter state only; it grants no execution authority. step()
+   * still verifies checkpoint digests and runtime identity and requires opaque
+   * turn authority.
+   */
+  prepareSettlement(checkpoint: AgentCheckpoint, value: unknown): EngineSettlement {
+    const parsed = parseAgentCheckpoint(checkpoint);
+    const state = parseAdapterState(
+      decodeCanonicalCheckpointPayload(parsed.payloadBytes, this.#budgets.maxCheckpointBytes),
+      this.#budgets,
+    );
+    return this.#prepareSettlement(state, value);
+  }
+
+  /** Normalize adapter data, then enforce the unchanged canonical wire contract. */
+  #prepareSettlement(state: AdapterState, value: unknown): EngineSettlement {
+    const normalized = this.#coreFactory.normalizeSettlement === undefined
+      ? value
+      : this.#coreFactory.normalizeSettlement(value, state.awaiting?.request ?? null);
+    return parseEngineSettlement(normalized, this.#budgets.maxStepInputBytes, "stepContext.settlement");
   }
 
   #interruptActiveStep(activeStep: ActiveStep): Promise<void> {

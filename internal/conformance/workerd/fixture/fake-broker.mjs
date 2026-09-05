@@ -10,7 +10,10 @@ const usage = Object.freeze({
   cacheRead: 0,
   cacheWrite: 0,
   totalTokens: 2,
-  cost: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }),
+  cost: Object.freeze({
+    encoding: "pi-cost-decimal-v1",
+    input: "0.000001", output: "0.000002", cacheRead: "0", cacheWrite: "0", total: "0.000003",
+  }),
 });
 const initialModelIdentities = new Set();
 
@@ -53,7 +56,7 @@ export const model = {
         effect.operation !== "complete" ||
         effect.replayPolicy !== "never" ||
         payload.protocol !== "pi-agent-core" ||
-        payload.version !== 1 ||
+        payload.version !== 2 ||
         payload.packageVersion !== "0.84.3" ||
         payload.model?.id !== modelIdentity.id ||
         payload.model?.api !== modelIdentity.api ||
@@ -80,7 +83,7 @@ export const model = {
           requestDigest: effect.requestDigest,
           stage: "model-tool",
           settlement: {
-            version: 1,
+            version: 2,
             message: {
               role: "assistant",
               content: [{
@@ -115,7 +118,7 @@ export const model = {
         requestDigest: effect.requestDigest,
         stage: "model-complete",
         settlement: {
-          version: 1,
+          version: 2,
           message: {
             role: "assistant",
             content: [{ type: "text", text: `complete:${body.identity}` }],

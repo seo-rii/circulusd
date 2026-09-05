@@ -23,7 +23,16 @@ import {
   type ReplayPolicy,
 } from "@circulusd/protocol-types";
 
-import { PiRuntimeError } from "./errors.ts";
+import { BoundaryFault, PiRuntimeError } from "./errors.ts";
+import {
+  PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
+  decodePiAgentCoreModelContext,
+  decodePiAgentCoreModelSettlement,
+  encodePiAgentCoreAssistantMessage,
+  encodePiAgentCoreModelContext,
+  normalizePiAgentCoreSettlement,
+  type DecodedPiAssistantRecord,
+} from "./pi-cost-codec.ts";
 import {
   boundedProtocolValue,
   boundedSafeInteger,
@@ -274,7 +283,7 @@ export function createPiAgentCoreFactory(
     toolExecution: "sequential",
   };
 
-  return (factoryContext) => {
+  const factory: AgentCoreFactory = (factoryContext) => {
     if (
       factoryContext.adapterAbiVersion !== PI_AGENT_CORE_ADAPTER_ABI_VERSION ||
       factoryContext.checkpointSchemaVersion !== PI_AGENT_CORE_STATE_VERSION
@@ -409,12 +418,7 @@ export function createPiAgentCoreFactory(
             },
           };
         }
-        const normalizedContext = boundedProtocolValue(
-          capturedContext,
-          maximumAdapterValueBytes,
-          "piAgentCore.modelContext",
-          "CORE_OUTPUT_INVALID",
-        ) as { readonly messages: NormalizedValue[] } & NormalizedValue;
+        const normalizedContext = encodePiAgentCoreModelContext(capturedContext) as { readonly messages: NormalizedValue[] } & NormalizedValue;
         return {
           kind: "model_request",
           state: {
@@ -429,7 +433,7 @@ export function createPiAgentCoreFactory(
             replayPolicy: "never",
             payload: {
               protocol: "pi-agent-core",
-              version: 1,
+              version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
               packageVersion: PI_AGENT_CORE_PACKAGE_VERSION,
               model: modelConfiguration,
               context: normalizedContext,
@@ -473,11 +477,17 @@ export function createPiAgentCoreFactory(
           "piAgentCore.modelSettlement",
           "CORE_OUTPUT_INVALID",
         );
-        if (settlementRecord.version !== 1) {
+        if (settlementRecord.version !== 1 && settlementRecord.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) {
           throw new Error("Pi model settlement version is unsupported");
         }
+        let decodedMessage: DecodedPiAssistantRecord;
+        try {
+          decodedMessage = decodePiAgentCoreModelSettlement(settlementRecord);
+        } catch (error) {
+          throw new BoundaryFault("CORE_OUTPUT_INVALID", "Pi model settlement encoding is invalid", { cause: error });
+        }
         const messageRecord = exactRecord(
-          settlementRecord.message,
+          decodedMessage,
           ["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"],
           ["responseModel", "responseId", "errorMessage", "rawStopReason", "endTurn"],
           "piAgentCore.modelSettlement.message",
@@ -585,7 +595,7 @@ export function createPiAgentCoreFactory(
             state: {
               version: PI_AGENT_CORE_STATE_VERSION,
               phase: "failed",
-              messages: [...state.messages, normalizeProtocolValue(messageRecord)],
+              messages: [...state.messages, encodePiAgentCoreAssistantMessage(messageRecord)],
               pendingToolCalls: [],
             },
             error: {
@@ -803,7 +813,9 @@ export function createPiAgentCoreFactory(
           }
           throw new Error("Pi model-only settlement contains unsupported content");
         }
-        const assistant = normalizeProtocolValue(messageRecord) as unknown as AssistantMessage;
+        // The codec narrows costs only; the Pi schema checks above validate the
+        // remaining response fields before this existing typed Pi boundary.
+        const assistant = decodedMessage as AssistantMessage;
         if ((toolCalls.length > 0) !== (stopReason === "toolUse")) {
           return {
             kind: "turn_error",
@@ -816,7 +828,7 @@ export function createPiAgentCoreFactory(
           };
         }
         if (toolCalls.length > 0) {
-          const durableAssistant = normalizeProtocolValue(messageRecord);
+          const durableAssistant = encodePiAgentCoreAssistantMessage(messageRecord);
           return {
             kind: "tool_requests",
             state: {
@@ -855,7 +867,8 @@ export function createPiAgentCoreFactory(
         const messages = await runAgentLoopContinue(
           {
             systemPrompt,
-            messages: state.messages.map((message) => structuredClone(message)) as unknown as Message[],
+            // These are the adapter's previously validated durable messages.
+            messages: decodePiAgentCoreModelContext({ messages: state.messages }).messages as Message[],
             tools: [],
           },
           loopConfiguration,
@@ -866,12 +879,7 @@ export function createPiAgentCoreFactory(
         if (modelCalls !== 1 || messages.length !== 1 || messages[0]?.role !== "assistant") {
           throw new Error("Pi model settlement did not complete exactly one bounded turn");
         }
-        const completedMessage = boundedProtocolValue(
-          messages[0] as AgentMessage,
-          maximumAdapterValueBytes,
-          "piAgentCore.completedMessage",
-          "CORE_OUTPUT_INVALID",
-        );
+        const completedMessage = encodePiAgentCoreAssistantMessage(messages[0] as AgentMessage);
         return {
           kind: "turn_complete",
           state: {
@@ -881,7 +889,7 @@ export function createPiAgentCoreFactory(
             pendingToolCalls: [],
           },
           result: {
-            version: 1,
+            version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
             message: structuredClone(completedMessage),
           },
         };
@@ -1071,9 +1079,8 @@ export function createPiAgentCoreFactory(
         await runAgentLoopContinue(
           {
             systemPrompt,
-            messages: continuationMessages.map((message) =>
-              structuredClone(message)
-            ) as unknown as Message[],
+            // Restore costs at the existing durable-transcript/Pi boundary.
+            messages: decodePiAgentCoreModelContext({ messages: continuationMessages }).messages as Message[],
             tools: runtimeTools,
           },
           loopConfiguration,
@@ -1092,12 +1099,7 @@ export function createPiAgentCoreFactory(
             },
           };
         }
-        const normalizedContext = boundedProtocolValue(
-          capturedContext,
-          maximumAdapterValueBytes,
-          "piAgentCore.modelContext",
-          "CORE_OUTPUT_INVALID",
-        ) as { readonly messages: NormalizedValue[] } & NormalizedValue;
+        const normalizedContext = encodePiAgentCoreModelContext(capturedContext) as { readonly messages: NormalizedValue[] } & NormalizedValue;
         return {
           kind: "model_request",
           state: {
@@ -1112,7 +1114,7 @@ export function createPiAgentCoreFactory(
             replayPolicy: "never",
             payload: {
               protocol: "pi-agent-core",
-              version: 1,
+              version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
               packageVersion: PI_AGENT_CORE_PACKAGE_VERSION,
               model: modelConfiguration,
               context: normalizedContext,
@@ -1133,4 +1135,6 @@ export function createPiAgentCoreFactory(
     },
     };
   };
+  Object.defineProperty(factory, "normalizeSettlement", { value: normalizePiAgentCoreSettlement });
+  return factory;
 }

@@ -460,7 +460,9 @@ export class LowLevelPiSessionHostAdapter implements SessionHostAgentEngine {
       ...(resume
         ? {
             settlement: parseEngineSettlement(
-              record.settlement,
+              this.#engine.prepareSettlement === undefined
+                ? record.settlement
+                : this.#engine.prepareSettlement(checkpoint, record.settlement),
               DEFAULT_ENGINE_BUDGETS.maxStepInputBytes,
               "resumeTurn.settlement",
             ),

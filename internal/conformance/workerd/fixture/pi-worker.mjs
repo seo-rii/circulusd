@@ -1138,6 +1138,7 @@ var PERMIT_FIELDS = [
   "placementGeneration",
   "sandboxGeneration",
   "authorizationGeneration",
+  "providerRouteDigest",
   "deadline"
 ];
 function parseEngineStepResult(value) {
@@ -2526,11 +2527,7 @@ var LowLevelPiAgentEngine = class {
         throw new PiRuntimeError("ENGINE_TERMINAL", "checkpoint is already terminal");
       }
       const hasSettlement = Object.prototype.hasOwnProperty.call(contextRecord, "settlement");
-      const settlement = hasSettlement ? parseEngineSettlement(
-        contextRecord.settlement,
-        this.#budgets.maxStepInputBytes,
-        "stepContext.settlement"
-      ) : null;
+      const settlement = hasSettlement ? this.#prepareSettlement(state2, contextRecord.settlement) : null;
       boundedProtocolValue(
         { checkpoint, settlement },
         this.#budgets.maxStepInputBytes,
@@ -2680,6 +2677,25 @@ var LowLevelPiAgentEngine = class {
       new BoundaryFault("TURN_ABORTED", `turn ${turnId} was aborted`)
     );
     await this.#interruptActiveStep(activeStep);
+  }
+  /**
+   * Pure input normalization for the SessionHost bridge. This parses checkpoint
+   * structure and adapter state only; it grants no execution authority. step()
+   * still verifies checkpoint digests and runtime identity and requires opaque
+   * turn authority.
+   */
+  prepareSettlement(checkpoint, value) {
+    const parsed = parseAgentCheckpoint(checkpoint);
+    const state2 = parseAdapterState(
+      decodeCanonicalCheckpointPayload(parsed.payloadBytes, this.#budgets.maxCheckpointBytes),
+      this.#budgets
+    );
+    return this.#prepareSettlement(state2, value);
+  }
+  /** Normalize adapter data, then enforce the unchanged canonical wire contract. */
+  #prepareSettlement(state2, value) {
+    const normalized = this.#coreFactory.normalizeSettlement === void 0 ? value : this.#coreFactory.normalizeSettlement(value, state2.awaiting?.request ?? null);
+    return parseEngineSettlement(normalized, this.#budgets.maxStepInputBytes, "stepContext.settlement");
   }
   #interruptActiveStep(activeStep) {
     if (activeStep.interruptPromise !== null) return activeStep.interruptPromise;
@@ -15977,6 +15993,158 @@ var writeSchema = typebox_exports.Object({
   content: typebox_exports.String({ description: "Content to write to the file" })
 });
 
+// workers/pi-runtime/src/pi-cost-codec.ts
+var PI_AGENT_CORE_MODEL_PROTOCOL_VERSION = 2;
+var PI_AGENT_CORE_COST_ENCODING = "pi-cost-decimal-v1";
+var maximumValueBytes = 4 << 20;
+var costFields = ["input", "output", "cacheRead", "cacheWrite", "total"];
+function assistantRecords(value) {
+  const message = exactRecord2(
+    value,
+    ["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"],
+    ["responseModel", "responseId", "errorMessage", "rawStopReason", "endTurn"],
+    "piModel.message",
+    "INVALID_CONTEXT"
+  );
+  const usage = exactRecord2(
+    message.usage,
+    ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"],
+    ["cacheWrite1h", "reasoning"],
+    "piModel.message.usage",
+    "INVALID_CONTEXT"
+  );
+  const cost = exactRecord2(
+    usage.cost,
+    costFields,
+    ["encoding"],
+    "piModel.message.usage.cost",
+    "INVALID_CONTEXT"
+  );
+  if (message.role !== "assistant") {
+    throw new PiRuntimeError("INVALID_CONTEXT", "Pi model response must be an assistant message");
+  }
+  return { message, usage, cost };
+}
+function checkedCost(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || Object.is(value, -0)) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "Pi cost must be a finite nonnegative number without negative zero");
+  }
+  return value;
+}
+function decodedCost(value) {
+  if (typeof value !== "string" || value.length > 32) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "encoded Pi cost must be a bounded decimal string");
+  }
+  const number = checkedCost(Number(value));
+  if (number.toString() !== value) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "encoded Pi cost is not a canonical Number decimal");
+  }
+  return number;
+}
+function encodePiAgentCoreAssistantMessage(value) {
+  const { message, usage, cost } = assistantRecords(value);
+  if (cost.encoding !== void 0) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "provider Pi costs must be numeric, not already encoded");
+  }
+  const encodedCost = Object.fromEntries(costFields.map((field) => [field, checkedCost(cost[field]).toString()]));
+  return boundedProtocolValue({
+    ...message,
+    usage: { ...usage, cost: { encoding: PI_AGENT_CORE_COST_ENCODING, ...encodedCost } }
+  }, maximumValueBytes, "piModel.encodedMessage", "INVALID_CONTEXT");
+}
+function decodePiAgentCoreAssistantMessage(value) {
+  const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.message", "INVALID_CONTEXT");
+  const { message, usage, cost } = assistantRecords(normalized);
+  let decode;
+  if (cost.encoding === void 0) {
+    decode = checkedCost;
+  } else {
+    if (cost.encoding !== PI_AGENT_CORE_COST_ENCODING) {
+      throw new PiRuntimeError("INVALID_CONTEXT", "Pi cost encoding is unsupported");
+    }
+    decode = decodedCost;
+  }
+  const numericCost = {
+    input: decode(cost.input),
+    output: decode(cost.output),
+    cacheRead: decode(cost.cacheRead),
+    cacheWrite: decode(cost.cacheWrite),
+    total: decode(cost.total)
+  };
+  return {
+    ...message,
+    role: "assistant",
+    content: message.content,
+    api: message.api,
+    provider: message.provider,
+    model: message.model,
+    stopReason: message.stopReason,
+    timestamp: message.timestamp,
+    usage: {
+      ...usage,
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      totalTokens: usage.totalTokens,
+      cost: numericCost
+    }
+  };
+}
+function encodePiAgentCoreModelSettlement(message) {
+  return { version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION, message: encodePiAgentCoreAssistantMessage(message) };
+}
+function decodePiAgentCoreModelSettlement(value) {
+  const result = exactRecord2(value, ["version", "message"], [], "piModel.settlement", "INVALID_CONTEXT");
+  const { cost } = assistantRecords(result.message);
+  if (result.version === 1 && cost.encoding !== void 0 || result.version === PI_AGENT_CORE_MODEL_PROTOCOL_VERSION && cost.encoding !== PI_AGENT_CORE_COST_ENCODING || result.version !== 1 && result.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "Pi settlement version and cost encoding disagree");
+  }
+  return decodePiAgentCoreAssistantMessage(result.message);
+}
+function encodePiAgentCoreModelContext(value) {
+  return boundedProtocolValue({
+    ...value,
+    messages: value.messages.map((message) => message.role === "assistant" ? encodePiAgentCoreAssistantMessage(message) : message)
+  }, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
+}
+function decodePiAgentCoreModelContext(value) {
+  const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
+  const context = exactRecord2(normalized, ["messages"], ["systemPrompt", "tools"], "piModel.context", "INVALID_CONTEXT");
+  if (!Array.isArray(context.messages)) {
+    throw new PiRuntimeError("INVALID_CONTEXT", "Pi model context messages must be an array");
+  }
+  return {
+    ...context,
+    messages: context.messages.map((message) => message !== null && typeof message === "object" && message.role === "assistant" ? decodePiAgentCoreAssistantMessage(message) : message)
+  };
+}
+function normalizePiAgentCoreSettlement(value, request) {
+  const payload = request?.payload;
+  if (request?.service !== "model" || request.operation !== "complete" || payload === null || typeof payload !== "object" || Array.isArray(payload) || payload instanceof Uint8Array || payload.protocol !== "pi-agent-core" || payload.version !== 1 && payload.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) return value;
+  let candidate = value;
+  for (const field of ["outcome", "result", "message", "usage", "cost"]) {
+    if (candidate === null || typeof candidate !== "object") return value;
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
+    if (descriptor === void 0 || !("value" in descriptor)) return value;
+    candidate = descriptor.value;
+  }
+  if (candidate === null || typeof candidate !== "object" || !costFields.some((field) => {
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
+    return descriptor !== void 0 && "value" in descriptor && typeof descriptor.value === "number" && !Number.isSafeInteger(descriptor.value);
+  })) return value;
+  const settlement = exactRecord2(value, ["requestDigest", "outcome"], [], "piModel.engineSettlement", "INVALID_CONTEXT");
+  const outcome = exactRecord2(settlement.outcome, ["kind"], ["result", "code", "message", "retryable", "reason"], "piModel.outcome", "INVALID_CONTEXT");
+  if (outcome.kind !== "success") return value;
+  const result = exactRecord2(outcome.result, ["version", "message"], [], "piModel.settlement", "INVALID_CONTEXT");
+  const { cost } = assistantRecords(result.message);
+  if (result.version !== 1 || costFields.every((field) => Number.isSafeInteger(cost[field]))) return value;
+  return {
+    ...settlement,
+    outcome: { ...outcome, result: encodePiAgentCoreModelSettlement(result.message) }
+  };
+}
+
 // workers/pi-runtime/src/pi-agent-core-adapter.ts
 var PI_AGENT_CORE_PACKAGE_VERSION = "0.84.3";
 var PI_AGENT_CORE_ADAPTER_ABI_VERSION = 2;
@@ -16154,7 +16322,7 @@ function createPiAgentCoreFactory(configuration) {
     },
     toolExecution: "sequential"
   };
-  return (factoryContext) => {
+  const factory = (factoryContext) => {
     if (factoryContext.adapterAbiVersion !== PI_AGENT_CORE_ADAPTER_ABI_VERSION || factoryContext.checkpointSchemaVersion !== PI_AGENT_CORE_STATE_VERSION) {
       throw new PiRuntimeError(
         "INVALID_CONFIGURATION",
@@ -16275,12 +16443,7 @@ function createPiAgentCoreFactory(configuration) {
               }
             };
           }
-          const normalizedContext = boundedProtocolValue(
-            capturedContext,
-            maximumAdapterValueBytes,
-            "piAgentCore.modelContext",
-            "CORE_OUTPUT_INVALID"
-          );
+          const normalizedContext = encodePiAgentCoreModelContext(capturedContext);
           return {
             kind: "model_request",
             state: {
@@ -16295,7 +16458,7 @@ function createPiAgentCoreFactory(configuration) {
               replayPolicy: "never",
               payload: {
                 protocol: "pi-agent-core",
-                version: 1,
+                version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
                 packageVersion: PI_AGENT_CORE_PACKAGE_VERSION,
                 model: modelConfiguration,
                 context: normalizedContext
@@ -16334,11 +16497,17 @@ function createPiAgentCoreFactory(configuration) {
             "piAgentCore.modelSettlement",
             "CORE_OUTPUT_INVALID"
           );
-          if (settlementRecord.version !== 1) {
+          if (settlementRecord.version !== 1 && settlementRecord.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) {
             throw new Error("Pi model settlement version is unsupported");
           }
+          let decodedMessage;
+          try {
+            decodedMessage = decodePiAgentCoreModelSettlement(settlementRecord);
+          } catch (error) {
+            throw new BoundaryFault("CORE_OUTPUT_INVALID", "Pi model settlement encoding is invalid", { cause: error });
+          }
           const messageRecord = exactRecord2(
-            settlementRecord.message,
+            decodedMessage,
             ["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"],
             ["responseModel", "responseId", "errorMessage", "rawStopReason", "endTurn"],
             "piAgentCore.modelSettlement.message",
@@ -16431,7 +16600,7 @@ function createPiAgentCoreFactory(configuration) {
               state: {
                 version: PI_AGENT_CORE_STATE_VERSION,
                 phase: "failed",
-                messages: [...state2.messages, normalizeProtocolValue(messageRecord)],
+                messages: [...state2.messages, encodePiAgentCoreAssistantMessage(messageRecord)],
                 pendingToolCalls: []
               },
               error: {
@@ -16604,7 +16773,7 @@ function createPiAgentCoreFactory(configuration) {
             }
             throw new Error("Pi model-only settlement contains unsupported content");
           }
-          const assistant = normalizeProtocolValue(messageRecord);
+          const assistant = decodedMessage;
           if (toolCalls.length > 0 !== (stopReason === "toolUse")) {
             return {
               kind: "turn_error",
@@ -16617,7 +16786,7 @@ function createPiAgentCoreFactory(configuration) {
             };
           }
           if (toolCalls.length > 0) {
-            const durableAssistant = normalizeProtocolValue(messageRecord);
+            const durableAssistant = encodePiAgentCoreAssistantMessage(messageRecord);
             return {
               kind: "tool_requests",
               state: {
@@ -16656,7 +16825,8 @@ function createPiAgentCoreFactory(configuration) {
           const messages = await runAgentLoopContinue(
             {
               systemPrompt,
-              messages: state2.messages.map((message) => structuredClone(message)),
+              // These are the adapter's previously validated durable messages.
+              messages: decodePiAgentCoreModelContext({ messages: state2.messages }).messages,
               tools: []
             },
             loopConfiguration,
@@ -16667,12 +16837,7 @@ function createPiAgentCoreFactory(configuration) {
           if (modelCalls !== 1 || messages.length !== 1 || messages[0]?.role !== "assistant") {
             throw new Error("Pi model settlement did not complete exactly one bounded turn");
           }
-          const completedMessage = boundedProtocolValue(
-            messages[0],
-            maximumAdapterValueBytes,
-            "piAgentCore.completedMessage",
-            "CORE_OUTPUT_INVALID"
-          );
+          const completedMessage = encodePiAgentCoreAssistantMessage(messages[0]);
           return {
             kind: "turn_complete",
             state: {
@@ -16682,7 +16847,7 @@ function createPiAgentCoreFactory(configuration) {
               pendingToolCalls: []
             },
             result: {
-              version: 1,
+              version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
               message: structuredClone(completedMessage)
             }
           };
@@ -16848,9 +17013,8 @@ function createPiAgentCoreFactory(configuration) {
           await runAgentLoopContinue(
             {
               systemPrompt,
-              messages: continuationMessages.map(
-                (message) => structuredClone(message)
-              ),
+              // Restore costs at the existing durable-transcript/Pi boundary.
+              messages: decodePiAgentCoreModelContext({ messages: continuationMessages }).messages,
               tools: runtimeTools
             },
             loopConfiguration,
@@ -16869,12 +17033,7 @@ function createPiAgentCoreFactory(configuration) {
               }
             };
           }
-          const normalizedContext = boundedProtocolValue(
-            capturedContext,
-            maximumAdapterValueBytes,
-            "piAgentCore.modelContext",
-            "CORE_OUTPUT_INVALID"
-          );
+          const normalizedContext = encodePiAgentCoreModelContext(capturedContext);
           return {
             kind: "model_request",
             state: {
@@ -16889,7 +17048,7 @@ function createPiAgentCoreFactory(configuration) {
               replayPolicy: "never",
               payload: {
                 protocol: "pi-agent-core",
-                version: 1,
+                version: PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
                 packageVersion: PI_AGENT_CORE_PACKAGE_VERSION,
                 model: modelConfiguration,
                 context: normalizedContext
@@ -16909,6 +17068,8 @@ function createPiAgentCoreFactory(configuration) {
       }
     };
   };
+  Object.defineProperty(factory, "normalizeSettlement", { value: normalizePiAgentCoreSettlement });
+  return factory;
 }
 
 // internal/conformance/workerd/fixture/pi-worker.entry.ts
@@ -17006,31 +17167,28 @@ async function runAgentTurn() {
       requestDigest: firstModel.request.requestDigest,
       outcome: {
         kind: "success",
-        result: {
-          version: 1,
-          message: {
-            role: "assistant",
-            content: [{
-              type: "toolCall",
-              id: "phase0_echo_1",
-              name: "echo",
-              arguments: { text: "hello" }
-            }],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
-            usage: {
-              input: 1,
-              output: 1,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 2,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-            },
-            stopReason: "toolUse",
-            timestamp: 1700000000001
-          }
-        }
+        result: encodePiAgentCoreModelSettlement({
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "phase0_echo_1",
+            name: "echo",
+            arguments: { text: "hello" }
+          }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 1e-6, output: 2e-6, cacheRead: 0, cacheWrite: 0, total: 3e-6 }
+          },
+          stopReason: "toolUse",
+          timestamp: 1700000000001
+        })
       }
     }
   });
@@ -17065,26 +17223,23 @@ async function runAgentTurn() {
       requestDigest: secondModel.request.requestDigest,
       outcome: {
         kind: "success",
-        result: {
-          version: 1,
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "done" }],
-            api: model.api,
-            provider: model.provider,
-            model: model.id,
-            usage: {
-              input: 2,
-              output: 1,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 3,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-            },
-            stopReason: "stop",
-            timestamp: 1700000000003
-          }
-        }
+        result: encodePiAgentCoreModelSettlement({
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 2,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 3,
+            cost: { input: 2e-6, output: 2e-6, cacheRead: 0, cacheWrite: 0, total: 4e-6 }
+          },
+          stopReason: "stop",
+          timestamp: 1700000000003
+        })
       }
     }
   });

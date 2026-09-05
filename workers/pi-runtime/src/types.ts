@@ -102,7 +102,11 @@ export interface AgentCoreFactoryContext {
  * deterministic and must not retain mutable turn state: durable progress lives
  * exclusively in AgentCoreStepContext.state and the enclosing checkpoint.
  */
-export type AgentCoreFactory = (context: Readonly<AgentCoreFactoryContext>) => AgentCore;
+export interface AgentCoreFactory {
+  (context: Readonly<AgentCoreFactoryContext>): AgentCore;
+  /** Adapter-specific conversion before the shared integer-only wire parser. */
+  readonly normalizeSettlement?: (value: unknown, request: EffectIntent | null) => unknown;
+}
 
 export interface EngineStepContext {
   readonly authority: OpaqueTurnAuthority;
@@ -238,6 +242,7 @@ export interface ExtensionRegistration {
 export interface AgentEngine {
   step(context: EngineStepContext): Promise<EngineStepResult>;
   abortTurn(turnId: string): Promise<void>;
+  prepareSettlement?(checkpoint: AgentCheckpoint, value: unknown): EngineSettlement;
 }
 
 export type PiWorkerdConformanceStatus = ConformanceStatus;

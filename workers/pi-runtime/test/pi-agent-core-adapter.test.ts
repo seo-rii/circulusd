@@ -215,7 +215,7 @@ describe("pinned Pi Agent Core bounded adapter", () => {
         replayPolicy: "never",
         payload: {
           protocol: "pi-agent-core",
-          version: 1,
+          version: 2,
           packageVersion: "0.84.3",
           model: MODEL,
           context: {
@@ -252,7 +252,7 @@ describe("pinned Pi Agent Core bounded adapter", () => {
     expect(completed).toMatchObject({
       kind: "turn_complete",
       result: {
-        version: 1,
+        version: 2,
         message: {
           role: "assistant",
           content: [{ type: "text", text: "hello back" }],
