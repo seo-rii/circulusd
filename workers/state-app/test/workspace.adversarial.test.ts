@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Digest } from "@circulusd/protocol-types";
 
@@ -1118,57 +1118,39 @@ describe("workspace adversarial contracts", () => {
     }
 
     let relationalComparisons = 0;
-    const instrumentedArrayPrototype = Object.create(Array.prototype) as unknown[];
-    Object.defineProperties(instrumentedArrayPrototype, {
-      find: {
-        configurable: true,
-        value: function (
-          this: unknown[],
-          predicate: (value: unknown, index: number, array: unknown[]) => unknown,
-          thisArgument?: unknown,
-        ): unknown {
-          for (let index = 0; index < this.length; index += 1) {
-            if (!(index in this)) {
-              continue;
-            }
-            relationalComparisons += 1;
-            const value = this[index];
-            if (predicate.call(thisArgument, value, index, this)) {
-              return value;
-            }
-          }
-          return undefined;
-        },
-      },
-      some: {
-        configurable: true,
-        value: function (
-          this: unknown[],
-          predicate: (value: unknown, index: number, array: unknown[]) => unknown,
-          thisArgument?: unknown,
-        ): boolean {
-          for (let index = 0; index < this.length; index += 1) {
-            if (!(index in this)) {
-              continue;
-            }
-            relationalComparisons += 1;
-            if (predicate.call(thisArgument, this[index], index, this)) {
-              return true;
-            }
-          }
-          return false;
-        },
-      },
+    const originalFind = Array.prototype.find;
+    const originalSome = Array.prototype.some;
+    // Instrument only the synchronous invariant check while keeping state
+    // arrays plain, as required by canonical serialization.
+    const find = vi.spyOn(Array.prototype, "find").mockImplementation(function (
+      this: unknown[],
+      predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+      thisArgument?: unknown,
+    ): unknown {
+      return originalFind.call(this, (value, index, array) => {
+        if (this === current.leaseHistory || this === current.invocationLedger) {
+          relationalComparisons += 1;
+        }
+        return predicate.call(thisArgument, value, index, array);
+      });
     });
-    const historyPrototype = Object.getPrototypeOf(current.leaseHistory);
-    const ledgerPrototype = Object.getPrototypeOf(current.invocationLedger);
-    Object.setPrototypeOf(current.leaseHistory, instrumentedArrayPrototype);
-    Object.setPrototypeOf(current.invocationLedger, instrumentedArrayPrototype);
+    const some = vi.spyOn(Array.prototype, "some").mockImplementation(function (
+      this: unknown[],
+      predicate: (value: unknown, index: number, array: unknown[]) => unknown,
+      thisArgument?: unknown,
+    ): boolean {
+      return originalSome.call(this, (value, index, array) => {
+        if (this === current.leaseHistory || this === current.invocationLedger) {
+          relationalComparisons += 1;
+        }
+        return predicate.call(thisArgument, value, index, array);
+      });
+    });
     try {
       expect(() => assertWorkspaceInvariants(current)).not.toThrow();
     } finally {
-      Object.setPrototypeOf(current.leaseHistory, historyPrototype);
-      Object.setPrototypeOf(current.invocationLedger, ledgerPrototype);
+      find.mockRestore();
+      some.mockRestore();
     }
 
     expect(relationalComparisons).toBeLessThanOrEqual(

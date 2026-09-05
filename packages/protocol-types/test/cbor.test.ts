@@ -106,6 +106,28 @@ describe("RFC 8949 deterministic CBOR", () => {
     expect(() => encodeCanonicalCbor("\ud800")).toThrow(/Unicode scalar/);
   });
 
+  it("rejects custom array prototypes without invoking inherited methods", () => {
+    class CustomArray extends Array<number> {}
+    let calls = 0;
+    Object.defineProperty(CustomArray.prototype, "map", {
+      value: () => {
+        calls += 1;
+        return [Number.MAX_SAFE_INTEGER + 1];
+      },
+    });
+
+    expect(() => encodeCanonicalCbor(new CustomArray(0), {
+      maxDepth: 0,
+      maxItems: 1,
+    })).toThrow(/plain array/);
+    expect(calls).toBe(0);
+
+    const noPrototype: number[] = [0];
+    Object.setPrototypeOf(noPrototype, null);
+    expect(() => encodeCanonicalCbor(noPrototype)).toThrow(/plain array/);
+    expect(encodeCanonicalCbor(Object.freeze([0, 1]))).toEqual(decodeHex("820001"));
+  });
+
   it("rejects repeated object references before a DAG can expand", () => {
     let dag: unknown = { leaf: "bounded" };
     for (let depth = 0; depth < 18; depth += 1) {

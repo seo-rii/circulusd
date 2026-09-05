@@ -631,6 +631,9 @@ function normalize(value, path, depth, maxDepth, itemBudget, seen) {
   }
   seen.add(value);
   if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      validationError(path, "must be a plain array");
+    }
     const ownKeys = Reflect.ownKeys(value);
     for (const key of ownKeys) {
       if (key === "length") {
@@ -647,9 +650,22 @@ function normalize(value, path, depth, maxDepth, itemBudget, seen) {
     if (Object.keys(value).length !== value.length) {
       validationError(path, "sparse arrays are unsupported");
     }
-    return value.map(
-      (entry, index3) => normalize(entry, `${path}[${index3}]`, depth + 1, maxDepth, itemBudget, seen)
-    );
+    const result2 = [];
+    for (let index3 = 0; index3 < value.length; index3 += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index3));
+      if (descriptor === void 0 || !("value" in descriptor)) {
+        validationError(`${path}[${index3}]`, "must be a data property");
+      }
+      result2.push(normalize(
+        descriptor.value,
+        `${path}[${index3}]`,
+        depth + 1,
+        maxDepth,
+        itemBudget,
+        seen
+      ));
+    }
+    return result2;
   }
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
