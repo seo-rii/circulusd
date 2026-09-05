@@ -33,13 +33,13 @@ func canonicalFuzzSeeds(tb testing.TB) [][]byte {
 	}
 	// Adversarial encodings that Decode MUST reject (non-canonical or unsupported).
 	seeds = append(seeds,
-		[]byte{0x18, 0x01},                               // non-minimal uint (1 in two bytes)
-		[]byte{0x19, 0x00, 0x17},                         // non-minimal uint (23 in three bytes)
-		[]byte{0x1f},                                     // reserved additional info 31
-		[]byte{0x9f, 0xff},                               // indefinite-length array
-		[]byte{0xc0, 0x00},                               // tagged value
-		[]byte{0xf9, 0x00, 0x00},                         // half-float simple value
-		[]byte{0x00, 0x00},                               // trailing bytes after a value
+		[]byte{0x18, 0x01},       // non-minimal uint (1 in two bytes)
+		[]byte{0x19, 0x00, 0x17}, // non-minimal uint (23 in three bytes)
+		[]byte{0x1f},             // reserved additional info 31
+		[]byte{0x9f, 0xff},       // indefinite-length array
+		[]byte{0xc0, 0x00},       // tagged value
+		[]byte{0xf9, 0x00, 0x00}, // half-float simple value
+		[]byte{0x00, 0x00},       // trailing bytes after a value
 		[]byte{0xa2, 0x61, 0x62, 0x01, 0x61, 0x61, 0x02}, // map keys "b","a" out of order
 		[]byte{0xa1, 0x01, 0x01},                         // map with a non-text key
 	)

@@ -111,12 +111,12 @@ type SessionState struct {
 
 	// At most one effect is active (§15.3 serial-effect invariant). Empty
 	// EffectID means no active effect.
-	EffectID          string
-	EffectKind        string
-	EffectPhase       string
-	EffectRequestID   string
-	EffectProviderID  string
-	EffectExternalID  string
+	EffectID         string
+	EffectKind       string
+	EffectPhase      string
+	EffectRequestID  string
+	EffectProviderID string
+	EffectExternalID string
 }
 
 type command struct {

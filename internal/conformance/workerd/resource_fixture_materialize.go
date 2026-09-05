@@ -93,10 +93,10 @@ func materializeResourceQualificationFixture(directory string, workerdRelease st
 
 	configPath := filepath.Join(directory, "phase0-resource.capnp")
 	for name, contents := range map[string][]byte{
-		"phase0-resource.capnp":      []byte(renderedConfig),
-		"session-host-resource.mjs":  []byte(renderedHost),
-		"phase0-resource-entry.mjs":  entry,
-		"pi-worker.mjs":              worker,
+		"phase0-resource.capnp":     []byte(renderedConfig),
+		"session-host-resource.mjs": []byte(renderedHost),
+		"phase0-resource-entry.mjs": entry,
+		"pi-worker.mjs":             worker,
 	} {
 		if err := os.WriteFile(filepath.Join(directory, name), contents, 0o600); err != nil {
 			return resourceFixtureRendering{}, fmt.Errorf("%w: write %s: %v", errResourceFixtureMaterialization, name, err)

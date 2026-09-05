@@ -22,10 +22,10 @@ func identityFuzzSeeds(tb testing.TB) [][]byte {
 		[]byte("sess_"),
 		[]byte("sess"),
 		[]byte("sess__"),
-		[]byte("unknown_AAAAAAAAAAAAAAAAAAAAAAAAAA"),   // undeclared kind, 26-char tail
-		[]byte("sess_AAAAAAAAAAAAAAAAAAAAAAAAA1"),      // non-canonical base32 tail
-		[]byte("sess_aaaaaaaaaaaaaaaaaaaaaaaaaa"),      // lowercase tail (encoder emits uppercase)
-		[]byte("sess_AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),    // over-long tail
+		[]byte("unknown_AAAAAAAAAAAAAAAAAAAAAAAAAA"), // undeclared kind, 26-char tail
+		[]byte("sess_AAAAAAAAAAAAAAAAAAAAAAAAA1"),    // non-canonical base32 tail
+		[]byte("sess_aaaaaaaaaaaaaaaaaaaaaaaaaa"),    // lowercase tail (encoder emits uppercase)
+		[]byte("sess_AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),  // over-long tail
 	)
 	return seeds
 }
