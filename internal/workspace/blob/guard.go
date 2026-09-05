@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -68,6 +69,9 @@ type GuardTable struct {
 	lastEpoch uint64
 	guards    map[Key]*guardRecord
 	permits   map[string]*permitRecord
+
+	storageMu    sync.Mutex
+	storageGates map[Key]*storageGate
 }
 
 type guardRecord struct {
@@ -99,13 +103,24 @@ func NewGuardTable(grace time.Duration) *GuardTable {
 		panic("blob guard grace must not be negative")
 	}
 	return &GuardTable{
-		grace:   grace,
-		guards:  make(map[Key]*guardRecord),
-		permits: make(map[string]*permitRecord),
+		grace:        grace,
+		guards:       make(map[Key]*guardRecord),
+		permits:      make(map[string]*permitRecord),
+		storageGates: make(map[Key]*storageGate),
 	}
 }
 
 func (table *GuardTable) Register(key Key, createdAt time.Time) error {
+	release, err := table.acquireStorage(context.Background(), key)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return table.register(key, createdAt)
+}
+
+// register requires the caller to hold the key's storage gate.
+func (table *GuardTable) register(key Key, createdAt time.Time) error {
 	if err := validateKey(key); err != nil {
 		return err
 	}
@@ -300,7 +315,20 @@ func (table *GuardTable) Sweep(epoch uint64, rootsComplete bool, marked map[Key]
 	return deletions, nil
 }
 
+// CompleteDeletion updates metadata after deletion and waits for any physical
+// operation already using this authority. Physical deletion itself must use
+// ContentStore.Delete, which holds the fence across both operations.
 func (table *GuardTable) CompleteDeletion(deletion Deletion) error {
+	release, err := table.acquireStorage(context.Background(), deletion.Key)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return table.completeDeletion(deletion)
+}
+
+// completeDeletion requires the caller to hold the key's storage gate.
+func (table *GuardTable) completeDeletion(deletion Deletion) error {
 	if err := validateKey(deletion.Key); err != nil {
 		return err
 	}
@@ -319,6 +347,8 @@ func (table *GuardTable) CompleteDeletion(deletion Deletion) error {
 	return nil
 }
 
+// ValidateDeletion checks the current metadata only. A successful result is not
+// a storage deletion fence; use ContentStore.Delete for the physical operation.
 func (table *GuardTable) ValidateDeletion(deletion Deletion) error {
 	if err := validateKey(deletion.Key); err != nil {
 		return err

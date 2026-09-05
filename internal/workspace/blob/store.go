@@ -48,6 +48,9 @@ type ContentStore struct {
 	guards  *GuardTable
 }
 
+// NewContentStore binds physical blob operations to a process-local guard
+// authority. Stores sharing an object namespace must share the same GuardTable.
+// Direct writes/deletes through objects bypass its incarnation fence.
 func NewContentStore(objects objectstore.Store, guards *GuardTable) (*ContentStore, error) {
 	if objects == nil || guards == nil {
 		return nil, ErrInvalidContentStore
@@ -60,8 +63,14 @@ func (store *ContentStore) Upload(ctx context.Context, tenant identity.ID, data 
 		return Reference{}, ErrInvalidReference
 	}
 	reference := ReferenceFor(tenant, data)
+	guardKey := Key{TenantID: tenant.String(), Digest: reference.Digest}
+	release, err := store.guards.acquireStorage(ctx, guardKey)
+	if err != nil {
+		return Reference{}, err
+	}
+	defer release()
 	key := reference.ObjectKey()
-	_, err := store.objects.PutIfAbsent(ctx, objectstore.BucketWorkspaceBlobs, key, data)
+	_, err = store.objects.PutIfAbsent(ctx, objectstore.BucketWorkspaceBlobs, key, data)
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		existing, readErr := store.objects.Get(ctx, objectstore.BucketWorkspaceBlobs, key)
 		if readErr != nil {
@@ -73,19 +82,15 @@ func (store *ContentStore) Upload(ctx context.Context, tenant identity.ID, data 
 	} else if err != nil {
 		return Reference{}, fmt.Errorf("create workspace blob: %w", err)
 	}
-	guardKey := Key{TenantID: tenant.String(), Digest: reference.Digest}
-	if err := store.guards.Register(guardKey, createdAt); err != nil {
+	if err := store.guards.register(guardKey, createdAt); err != nil {
 		return Reference{}, fmt.Errorf("register workspace blob guard: %w", err)
 	}
 	return reference, nil
 }
 
 func (store *ContentStore) Read(ctx context.Context, tenant identity.ID, reference Reference) ([]byte, error) {
-	if tenant.Kind() != identity.Tenant || reference.TenantID.Kind() != identity.Tenant || !digestPattern.MatchString(reference.Digest) || reference.ObjectKey() == "" {
-		return nil, ErrInvalidReference
-	}
-	if tenant != reference.TenantID {
-		return nil, ErrTenantMismatch
+	if err := validateReference(tenant, reference); err != nil {
+		return nil, err
 	}
 	object, err := store.objects.Get(ctx, objectstore.BucketWorkspaceBlobs, reference.ObjectKey())
 	if err != nil {
@@ -100,6 +105,14 @@ func (store *ContentStore) Read(ctx context.Context, tenant identity.ID, referen
 }
 
 func (store *ContentStore) Protect(ctx context.Context, tenant identity.ID, reference Reference, permitID string) (Permit, error) {
+	if err := validateReference(tenant, reference); err != nil {
+		return Permit{}, err
+	}
+	release, err := store.guards.acquireStorage(ctx, Key{TenantID: tenant.String(), Digest: reference.Digest})
+	if err != nil {
+		return Permit{}, err
+	}
+	defer release()
 	if _, err := store.Read(ctx, tenant, reference); err != nil {
 		return Permit{}, err
 	}
@@ -111,6 +124,11 @@ func (store *ContentStore) Protect(ctx context.Context, tenant identity.ID, refe
 }
 
 func (store *ContentStore) Delete(ctx context.Context, deletion Deletion) error {
+	release, err := store.guards.acquireStorage(ctx, deletion.Key)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := store.guards.ValidateDeletion(deletion); err != nil {
 		return err
 	}
@@ -128,8 +146,18 @@ func (store *ContentStore) Delete(ctx context.Context, deletion Deletion) error 
 	if err != nil && !errors.Is(err, objectstore.ErrNotFound) {
 		return fmt.Errorf("delete workspace blob: %w", err)
 	}
-	if err := store.guards.CompleteDeletion(deletion); err != nil {
+	if err := store.guards.completeDeletion(deletion); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateReference(tenant identity.ID, reference Reference) error {
+	if tenant.Kind() != identity.Tenant || reference.TenantID.Kind() != identity.Tenant || !digestPattern.MatchString(reference.Digest) || reference.ObjectKey() == "" {
+		return ErrInvalidReference
+	}
+	if tenant != reference.TenantID {
+		return ErrTenantMismatch
 	}
 	return nil
 }
