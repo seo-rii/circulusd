@@ -22,6 +22,14 @@ const (
 	sessionDispatchResultVersion  = 1
 	sessionDispatchOperation      = "model.generate"
 	sessionDispatchFactTimeout    = 5 * time.Second
+
+	// These budgets cover JSON member names, punctuation, maximum-width numbers,
+	// fixed enum values, typed identities and digest arrays. Variable strings and
+	// repeated message/tool envelopes are accounted for separately below.
+	sessionDispatchPayloadEnvelopeBytes = 4096
+	sessionDispatchResultEnvelopeBytes  = 1024
+	sessionDispatchMessageEnvelopeBytes = 64
+	sessionDispatchToolEnvelopeBytes    = 96
 )
 
 var sessionDispatchCommandDomain = []byte("circulusd.modelgateway.session-dispatch.v1\x00")
@@ -55,7 +63,37 @@ func NewReferenceSessionDispatchStarter(
 	if gateway == nil || ledgerIsNil || route == (broker.Digest{}) {
 		return nil, ErrInvalidConfiguration
 	}
+	required := requiredSessionDispatchLedgerLimits(gateway.bounds)
+	limits := ledger.Limits()
+	if limits.MaximumPayloadBytes < required.MaximumPayloadBytes || limits.MaximumResultBytes < required.MaximumResultBytes {
+		return nil, fmt.Errorf("%w: subordinate ledger limits cannot retain the configured model JSON envelopes", ErrInvalidConfiguration)
+	}
 	return &SessionDispatchStarter{gateway: gateway, ledger: ledger, route: route}, nil
+}
+
+func requiredSessionDispatchLedgerLimits(bounds Bounds) effectledger.ReferenceLimits {
+	// encoding/json can expand one string byte to six bytes (for example '<'
+	// becomes '\u003c'). The same multiplier also covers base64 tool arguments:
+	// 4*ceil(n/3) <= 6*n for every nonempty canonical argument.
+	const jsonExpansion = 6
+	const maximumQuotaReservationBytes = 256
+	inputBytes := min(bounds.MaxInputBytes, uint64(bounds.MaxMessages)*bounds.MaxMessageBytes)
+	messageCount := min(uint64(bounds.MaxMessages), inputBytes)
+	payloadBytes := sessionDispatchPayloadEnvelopeBytes +
+		jsonExpansion*(inputBytes+bounds.MaxModelBytes+bounds.MaxProviderIDBytes+maximumQuotaReservationBytes) +
+		messageCount*sessionDispatchMessageEnvelopeBytes
+
+	// Completion is constrained by both the response and single-event budgets.
+	// normalizeToolCalls charges at least one byte each for ID, name and CBOR,
+	// plus nine order bytes, which bounds the number of JSON tool envelopes.
+	responseBytes := min(bounds.MaxResponseBytes, bounds.MaxEventBytes)
+	toolCount := min(uint64(hardMaxEvents), responseBytes/12)
+	resultBytes := sessionDispatchResultEnvelopeBytes +
+		jsonExpansion*(responseBytes+bounds.MaxProviderRequestIDBytes+bounds.MaxReasonBytes) +
+		toolCount*sessionDispatchToolEnvelopeBytes
+	// Gateway construction caps every operand, keeping both totals within int
+	// even on 32-bit targets. Incompatible reference-ledger caps fail above.
+	return effectledger.ReferenceLimits{MaximumPayloadBytes: int(payloadBytes), MaximumResultBytes: int(resultBytes)}
 }
 
 func (starter *SessionDispatchStarter) RouteDigest() broker.Digest {
