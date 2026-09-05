@@ -33,7 +33,7 @@ The machine-transfer resume checkpoint for the current unit is
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
 | 11 | in progress | Phase 0B durable turn/effect state machine and celld authority: reference-first slices U11.1-U11.5 landed and the U11.6 celld conformance probe scaffold; the real-process celld durability PASS remains external-gated |
-| 12 | in progress | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 slices U12.1-U12.3 landed (idempotency concurrency, SSE reconnect/ephemeral-loss, durable Repository conformance gate); durable celld-backed serving (U12.4/U12.5) is external-gated |
+| 12 | in progress | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 slices U12.1-U12.3 and the celld-backed Repository composition U12.4a/b landed (idempotency concurrency, SSE reconnect/ephemeral-loss, durable Repository conformance gate, celld public-session aggregate + Repository adapter); the crash-durable celld substrate and served listener (U12.5) are external-gated |
 
 After Unit 12, the private `platformd`-to-`agentd` workload composition and the
 Phase 1A NsJail single-node vertical slice receive separate work-unit plans.
@@ -1196,10 +1196,13 @@ Unit 11 is complete only when all of the following are true:
 
 ## Unit 12: Durable public idempotency and API/SSE disconnect/replay recovery
 
-Status: in progress (2026-09-05). Reference-first slices U12.1-U12.3 landed: the
-§53.16 idempotency concurrency suite (`internal/platformapi`), the SSE
-disconnect/reconnect durable replay + ephemeral-loss isolation suite, and the
-durable `Repository` conformance gate (`internal/conformance/publicrepo`). The
+Status: in progress (2026-09-05). Reference-first slices U12.1-U12.3 and the
+celld-backed Repository composition U12.4a/b landed: the §53.16 idempotency
+concurrency suite (`internal/platformapi`), the SSE disconnect/reconnect durable
+replay + ephemeral-loss isolation suite, the durable `Repository` conformance
+gate (`internal/conformance/publicrepo`), and a celld public-session aggregate
+plus `platformapi.Repository` adapter (`internal/platformapi/celldrepo`) that
+passes that gate behaviorally over the reference celld storage. The
 public turn API, its `Idempotency-Key` handling, and the SSE durable-replay
 handler exist as a race-safe reference in `internal/platformapi` against a
 non-durable `MemoryStore`; they are excluded from `cmd/platformd` (enforced by
@@ -1302,10 +1305,30 @@ harness PASSes but carries mock reference-only evidence the production profile
 rejects, and only an external backend produces promotable evidence. Green under
 `-race`.
 
-#### U12.4 — Durable celld-backed Repository (external, gated on Unit 11)
+#### U12.4 — Durable celld-backed Repository (reference landed; durable PASS external)
 
-Implement a celld-backed `platformapi.Repository` reporting `CrashDurable:true`;
-gated on Unit 11's celld authority; deferred.
+Status: reference-first slices landed (commits `c25c4f2`, `d05a44a`).
+`internal/platformapi/celldrepo` composes the public turn/event Repository over
+the celld host boundary in two parts:
+
+- U12.4a — a pure `celld.Aggregate` holding the public session's durable record
+  (registration, per-key creation receipts, turns, the durable event journal,
+  and the replay snapshot) in canonical CBOR, applying register / create-turn /
+  append-event with dedup, expected-sequence fencing, the turn-status transition
+  ladder, and placement/authorization generation fencing. Driven through
+  `celld.Host.Execute` over the reference `celld.Storage`, with a kill/restart
+  test that replays the committed record through a fresh `Host`.
+- U12.4b — a `platformapi.Repository` adapter over that aggregate (durable writes
+  through celld; in-process live subscription fan-out and ephemeral delivery, one
+  mutex serializing append+publish against open+subscribe). It is validated
+  against the U12.3 conformance gate: it passes every atomic behavioral check and
+  FAILs only `crash-durable`, because the reference `celld.Storage` is not
+  durable; a durability-override wrapper passes the full gate with mock
+  reference-only evidence the production profile rejects.
+
+Remaining and external-gated: a real crash-durable celld substrate (Unit 11.6)
+so the Repository reports `CrashDurable:true` and produces promotable evidence.
+The reference composition promotes no §53 status.
 
 #### U12.5 — Served public HTTP/SSE listener wiring (external, gated)
 
@@ -1334,5 +1357,6 @@ Unit 12 is complete only when all of the following are true:
 1. §53.16 idempotency concurrency suite (U12.1);
 2. SSE disconnect/reconnect durable replay suite (U12.2);
 3. durable Repository contract and conformance wrapper (U12.3);
-4. durable celld-backed Repository (U12.4, gated);
+4. durable celld-backed Repository — reference aggregate + adapter (U12.4a/b)
+   landed; the crash-durable substrate and `CrashDurable:true` PASS stay gated;
 5. served public listener wiring and acceptance docs (U12.5, gated).
