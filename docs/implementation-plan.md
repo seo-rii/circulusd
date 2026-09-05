@@ -33,7 +33,7 @@ The machine-transfer resume checkpoint for the current unit is
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
 | 11 | in progress | Phase 0B durable turn/effect state machine and celld authority: reference-first slices U11.1-U11.5 landed and the U11.6 celld conformance probe scaffold; the real-process celld durability PASS remains external-gated |
-| 12 | planned | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 suite lands now; durable celld-backed serving is external-gated |
+| 12 | in progress | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 slices U12.1-U12.3 landed (idempotency concurrency, SSE reconnect/ephemeral-loss, durable Repository conformance gate); durable celld-backed serving (U12.4/U12.5) is external-gated |
 
 After Unit 12, the private `platformd`-to-`agentd` workload composition and the
 Phase 1A NsJail single-node vertical slice receive separate work-unit plans.
@@ -1196,14 +1196,18 @@ Unit 11 is complete only when all of the following are true:
 
 ## Unit 12: Durable public idempotency and API/SSE disconnect/replay recovery
 
-Status: planned (2026-09-03). The public turn API, its `Idempotency-Key`
-handling, and the SSE durable-replay handler already exist as a race-safe
-reference in `internal/platformapi` against a non-durable `MemoryStore`; they are
-excluded from `cmd/platformd` (enforced by
+Status: in progress (2026-09-05). Reference-first slices U12.1-U12.3 landed: the
+§53.16 idempotency concurrency suite (`internal/platformapi`), the SSE
+disconnect/reconnect durable replay + ephemeral-loss isolation suite, and the
+durable `Repository` conformance gate (`internal/conformance/publicrepo`). The
+public turn API, its `Idempotency-Key` handling, and the SSE durable-replay
+handler exist as a race-safe reference in `internal/platformapi` against a
+non-durable `MemoryStore`; they are excluded from `cmd/platformd` (enforced by
 `TestPlatformdProductionDependenciesExcludeReferenceProviders`) and the public
-listener is a stub. Unit 12's reference-first slices consolidate the §53.16
-idempotency/replay suite and pin the durable `Repository` contract; serving the
-API and backing it with durable celld records is gated on Unit 11.
+listener is a stub. Serving the API and backing it with durable celld records
+(U12.4/U12.5) is gated on Unit 11 and remains external. Unit 12 promotes nothing:
+§53.16 stays `NOT_RUN`, the public API stays unwired, `AdmissionReady` stays
+false.
 
 ### Outcome
 
@@ -1260,25 +1264,43 @@ External-evidence (gated on Unit 11 + public-API admission; deferred):
 
 #### U12.1 — §53.16 idempotency concurrency suite (reference)
 
-Status: in-process reference only.
+Status: landed (commit `ab6b750`), in-process reference only.
 
-1. RED: concurrent duplicate and distinct `Idempotency-Key` create-turn calls
-   against `MemoryStore`; exactly one turn is created per key, same-key/
-   different-body yields a conflict, and distinct keys create distinct turns.
-2. GREEN: assert the existing reference already satisfies the invariant, or fix
-   it; run under `-race` with high fan-out.
+`internal/platformapi/idempotency_concurrency_test.go` proves, against the
+race-safe `MemoryStore`: (a) distinct + duplicate `Idempotency-Key`s racing
+together create exactly one turn per key, every duplicate converges on its key's
+single turn ID, distinct keys never collide, and creators equal the distinct-key
+count; (b) same key + two distinct bodies racing yields exactly one winning turn
+and every caller of the losing body gets `ErrIdempotencyConflict`. Green under
+`go test -race -shuffle=on -count=5`.
 
 #### U12.2 — SSE disconnect/reconnect durable replay suite (reference)
 
-Reconnect after `Last-Event-ID` resends exactly the durable events after the
-cursor plus the current turn snapshot, with no duplication; ephemeral delta loss
-between reconnects leaves durable turn state unchanged.
+Status: landed (commit `f106356`), in-process reference only.
+
+`internal/platformapi/sse_replay_test.go`: reconnecting from the last durable
+cursor with a page limit smaller than the journal covers the whole turn/effect
+ladder — the union of replayed events across every reconnect is exactly the
+contiguous durable sequence 1..N with no gap and no duplication, each reconnect
+carries the current snapshot, and only the final caught-up page opens a live
+subscription. Ephemeral-delta loss across a disconnect never enters the durable
+journal, never advances the durable cursor, and never consumes a durable slot.
+Green under `-race`.
 
 #### U12.3 — Durable Repository contract and conformance wrapper (reference)
 
-Pin the `RepositoryDurability` all-true contract and add a reference conformance
-checker that any celld-backed `Repository` must pass (atomic idempotency,
-sequence fencing, replay+subscribe atomicity, authorization fence).
+Status: landed (commit `f509e60`), in-process reference only.
+
+`internal/conformance/publicrepo` pins the durable `Repository` contract and
+adds the reference conformance gate any celld-backed `Repository` must pass:
+atomic idempotency, event-sequence fencing, replay+subscribe atomicity (caught-up
+opens a live subscription; behind-head forces a reconnect), authorization-
+generation fencing, and crash-durability self-report. `Qualify` drives the
+interface directly via a `Harness`-provisioned `Subject`; a nil harness is
+`UNAVAILABLE`, the non-durable `MemoryStore` FAILs crash-durable, a reference
+harness PASSes but carries mock reference-only evidence the production profile
+rejects, and only an external backend produces promotable evidence. Green under
+`-race`.
 
 #### U12.4 — Durable celld-backed Repository (external, gated on Unit 11)
 
