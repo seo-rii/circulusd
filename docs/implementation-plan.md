@@ -1164,7 +1164,10 @@ Build `internal/conformance/celld` and run it against a provisioned, pinned cell
 process for single-writer/late-write rejection, atomic-durable commit, the
 durability-barrier API (§15.8), and object-store CAS (§16.1). If the host is
 unavailable, record `UNAVAILABLE` and leave Unit 11 incomplete. This is the
-§53.2/§53.5 promotion gate.
+§53.2/§53.5 promotion gate. The operator runbook — required checks, host and
+object-store provisioning, and the fail-closed production admission wiring the
+`PASS` feeds (`internal/statebootstrap`, the signed production-probe descriptor,
+`State.ProductionEvidenceFile`) — is `docs/unit11-operator.md`.
 
 ### Required evidence and exit criteria
 
