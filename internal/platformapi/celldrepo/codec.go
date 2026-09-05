@@ -79,12 +79,18 @@ type DurableEvent struct {
 // durable events after afterSequence, bounded to limit entries. It is the
 // read path a Repository read uses over a committed object.
 func ProjectState(encoded []byte, afterSequence uint64, limit int) (Snapshot, []DurableEvent, error) {
-	if limit < 1 {
-		return Snapshot{}, nil, fmt.Errorf("%w: limit must be positive", ErrInvalidState)
-	}
 	record, err := decodeState(encoded)
 	if err != nil {
 		return Snapshot{}, nil, err
+	}
+	return project(record, afterSequence, limit)
+}
+
+// project builds a replay snapshot and bounded event page from an already
+// decoded record. A cursor past the durable head is ErrSequenceConflict.
+func project(record sessionRecord, afterSequence uint64, limit int) (Snapshot, []DurableEvent, error) {
+	if limit < 1 {
+		return Snapshot{}, nil, fmt.Errorf("%w: limit must be positive", ErrInvalidState)
 	}
 	snapshot := Snapshot{
 		SessionID:           record.sessionID,
