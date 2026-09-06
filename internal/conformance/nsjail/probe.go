@@ -96,6 +96,11 @@ func RequiredChecks() []Check {
 			Reference:   "SPEC §53.10",
 			Description: "only the sandboxd private UDS is reachable from inside the jail",
 		},
+		{
+			ID:          "resource-cleanup",
+			Reference:   "SPEC §53.10",
+			Description: "after destroy the namespaces, cgroup, veth, and scratch are reclaimed",
+		},
 	}
 }
 

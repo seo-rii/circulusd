@@ -1,4 +1,4 @@
-package nsjail
+package firecracker
 
 import (
 	"context"
@@ -22,7 +22,7 @@ func (probe fakeProbe) RunCheck(_ context.Context, check Check) (CheckOutcome, e
 	case probe.errorID:
 		return CheckOutcome{}, errors.New("probe transport error")
 	case probe.failID:
-		return CheckOutcome{Passed: false, Detail: "observed a permitted disallowed syscall"}, nil
+		return CheckOutcome{Passed: false, Detail: "observed a guest NIC in network mode none"}, nil
 	default:
 		return CheckOutcome{Passed: true}, nil
 	}
@@ -50,7 +50,7 @@ func TestQualifyWithoutProbeIsUnavailable(t *testing.T) {
 
 func TestQualifyReferenceProbePassesButIsNotPromotable(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "3.4", Reference: true}})
+	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "1.9", Reference: true}})
 	if result.Status != conformance.Pass {
 		t.Fatalf("reference probe result = %+v, want PASS", result)
 	}
@@ -59,20 +59,19 @@ func TestQualifyReferenceProbePassesButIsNotPromotable(t *testing.T) {
 	}
 	mustCollect(t, result)
 
-	// A production profile must reject this reference PASS as synthetic.
 	collector := conformance.NewCollector()
 	if err := collector.Add(result); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
 	profile := conformance.Profile{Name: "production", Production: true, Required: []string{Component}}
 	if err := collector.Evaluate(profile); err == nil {
-		t.Fatal("production profile accepted a reference/mock NsJail PASS")
+		t.Fatal("production profile accepted a reference/mock Firecracker PASS")
 	}
 }
 
 func TestQualifyNonReferenceProbeCarriesExternalEvidence(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "3.4", Reference: false}})
+	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "1.9", Reference: false}})
 	if result.Status != conformance.Pass {
 		t.Fatalf("result = %+v, want PASS", result)
 	}
@@ -83,11 +82,11 @@ func TestQualifyNonReferenceProbeCarriesExternalEvidence(t *testing.T) {
 
 func TestQualifyFailsOnFailedCheck(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{failID: "seccomp-deny"})
+	result := Qualify(context.Background(), fakeProbe{failID: "no-guest-nic"})
 	if result.Status != conformance.Fail {
 		t.Fatalf("result = %+v, want FAIL", result)
 	}
-	if !strings.Contains(result.Reason, "seccomp-deny") {
+	if !strings.Contains(result.Reason, "no-guest-nic") {
 		t.Fatalf("reason %q should name the failed check", result.Reason)
 	}
 	mustCollect(t, result)
@@ -95,32 +94,26 @@ func TestQualifyFailsOnFailedCheck(t *testing.T) {
 
 func TestQualifyUnavailableWhenCheckErrors(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{errorID: "network-default-deny"})
+	result := Qualify(context.Background(), fakeProbe{errorID: "jailer"})
 	if result.Status != conformance.Unavailable {
 		t.Fatalf("result = %+v, want UNAVAILABLE", result)
 	}
-	if !strings.Contains(result.Reason, "network-default-deny") {
+	if !strings.Contains(result.Reason, "jailer") {
 		t.Fatalf("reason %q should name the check that could not run", result.Reason)
 	}
 	mustCollect(t, result)
 }
 
-func TestRequiredChecksCoverIsolationContract(t *testing.T) {
+func TestRequiredChecksCoverMicroVMContract(t *testing.T) {
 	t.Parallel()
 	want := map[string]bool{
-		"namespace-isolation":      false,
-		"uid-gid-mapping":          false,
-		"rootfs-read-only":         false,
-		"write-confinement":        false,
-		"host-path-nonexposure":    false,
-		"no-new-privs":             false,
-		"no-retained-capabilities": false,
-		"seccomp-deny":             false,
-		"cgroup-limits":            false,
-		"network-default-deny":     false,
-		"timeout-cancel-teardown":  false,
-		"sandboxd-private-uds":     false,
-		"resource-cleanup":         false,
+		"jailer":                 false,
+		"unique-microvm-uid-gid": false,
+		"api-socket-nonaccess":   false,
+		"control-channel-vsock":  false,
+		"no-guest-nic":           false,
+		"scratch-discard":        false,
+		"no-silent-kvm-fallback": false,
 	}
 	seen := make(map[string]struct{})
 	for _, check := range RequiredChecks() {
@@ -137,7 +130,7 @@ func TestRequiredChecksCoverIsolationContract(t *testing.T) {
 	}
 	for id, covered := range want {
 		if !covered {
-			t.Fatalf("required isolation check %q is missing", id)
+			t.Fatalf("required microVM check %q is missing", id)
 		}
 	}
 	if len(seen) != len(want) {
