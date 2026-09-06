@@ -1737,7 +1737,7 @@ func claimResultMap(
 func claimSuccessEnvelope(requestID string, result canonical.Value) canonical.Map {
 	return canonical.Map{
 		"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0),
-		"schemaDigest": "sha256:2b94724f102698a958e5d03593a9f49e1b50665045b22b831d3c0f3538558144",
+		"schemaDigest": "sha256:1fc4442a073af358bee3519f5386731e59919042317447e0cbba7b2706fc7f82",
 		"requestId":    requestID,
 		"payload":      canonical.Map{"ok": true, "result": result},
 	}
@@ -1791,7 +1791,7 @@ func requestIDFromBody(t *testing.T, body []byte) string {
 func baseEnvelope(requestID string, payload canonical.Map) canonical.Map {
 	return canonical.Map{
 		"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0),
-		"schemaDigest": "sha256:6d9260ac502780b0480ed359ac7a5c368ddb7baa0a2c5772f6a5bc89d5647fba",
+		"schemaDigest": "sha256:66307b50a0a5b909c47a5b83f9856a0fff24f34426d33dce05d0f1628ce54a7c",
 		"requestId":    requestID, "payload": payload,
 	}
 }

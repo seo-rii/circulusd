@@ -447,6 +447,175 @@ describe("workspace independent-review regressions", () => {
     expect(committed.outcome.kind).toBe("workspace_committed");
   });
 
+  it("reaps a turn-lease-expired head that blocks a live waiter, only under contention (BUG-012)", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const ownerAuthority = authority("owner-drain", digest("a"));
+    const owner = await acquire(initial, ownerAuthority, { now: 1, leaseId: "lease-owner" });
+    if (owner.outcome.kind !== "write_lease_acquired") {
+      throw new Error("expected owner lease");
+    }
+
+    // A head whose turn lease expires at t=100 while its acquire deadline sits
+    // far in the future. Once the turn lease lapses the admission can never be
+    // granted a usable lease (grantQueueHead caps at turnLeaseExpiresAt) and its
+    // holder can no longer mint a valid authority to refresh or cancel it
+    // (validatedAuthority rejects now >= turnLeaseExpiresAt).
+    const deadWaiter = authority("dead-waiter", digest("b"), {
+      turnLeaseExpiresAt: 100,
+      expiresAt: 100,
+    });
+    const queuedDead = await applyWorkspaceCommand(owner.state, {
+      kind: "acquire_write_lease",
+      expectedEventSequence: owner.state.eventSequence,
+      now: 2,
+      authority: deadWaiter,
+      requestedLeaseId: "lease-dead-waiter",
+      sandboxId: deadWaiter.sandboxId,
+      backend: deadWaiter.backend,
+      projectionGeneration: 1,
+      requestedLeaseTtlMs: 500,
+      requestedMaximumHoldMs: 2_000,
+      acquireDeadline: 86_400_000,
+      waitPolicy: "queue",
+    });
+    expect(queuedDead.outcome).toMatchObject({
+      kind: "write_lease_queued",
+      queuePosition: 1,
+    });
+
+    const liveWaiter = authority("live-waiter", digest("c"));
+    const queuedLive = await acquire(queuedDead.state, liveWaiter, {
+      now: 3,
+      leaseId: "lease-live-waiter",
+    });
+    // The live waiter is stranded behind the dead head.
+    expect(queuedLive.outcome).toMatchObject({
+      kind: "write_lease_queued",
+      queuePosition: 2,
+    });
+
+    // A background reconcile carries no contender, so it must NOT reap the head:
+    // an uncontended lapsed head is preserved for a possible same-generation
+    // refresh. It still clears the expired owner lease.
+    const reconciled = await applyWorkspaceCommand(queuedLive.state, {
+      kind: "reconcile_write_queue",
+      expectedEventSequence: queuedLive.state.eventSequence,
+      now: 600,
+    });
+    expect(reconciled.state.activeWriteLease).toBeNull();
+    expect(reconciled.state.writeQueue.map((entry) => entry.authority.invocationId)).toEqual([
+      "dead-waiter",
+      "live-waiter",
+    ]);
+
+    // The live waiter's own acquire is the contender: it reaps the dead head and
+    // is granted, instead of being stranded behind it until t=86,400,000.
+    const granted = await acquire(reconciled.state, liveWaiter, {
+      now: 601,
+      leaseId: "lease-live-waiter",
+    });
+    expect(granted.outcome).toMatchObject({
+      kind: "write_lease_acquired",
+      lease: { invocationId: "live-waiter" },
+    });
+    expect(granted.state.writeQueue).toHaveLength(0);
+    expect(
+      granted.state.leaseHistory.find((record) => record.invocationId === "dead-waiter"),
+    ).toMatchObject({ status: "admission_expired", latestLeaseGeneration: null });
+  });
+
+  it("cancels a queued admission with a rotated non-widening authority (BUG-013)", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const ownerAuthority = authority("owner-cancel", digest("a"));
+    const owner = await acquire(initial, ownerAuthority, { now: 1, leaseId: "lease-owner" });
+    if (owner.outcome.kind !== "write_lease_acquired") {
+      throw new Error("expected owner lease");
+    }
+
+    const waiterV1 = authority("waiter-rotated", digest("b"));
+    const queued = await acquire(owner.state, waiterV1, { now: 2, leaseId: "lease-waiter" });
+    expect(queued.outcome.kind).toBe("write_lease_queued");
+    expect(queued.state.writeQueue[0]?.authority.authorizationGeneration).toBe(11);
+
+    // The ingress rotates the waiter's authorization to a newer, non-widening
+    // generation. An acquire retry refreshes the admission but leaves the stored
+    // queue authority at generation 11.
+    const waiterV2: WorkspaceAuthoritySnapshot = {
+      ...waiterV1,
+      emergencyOverlayDigest: digest("f"),
+      authorizationGeneration: waiterV1.authorizationGeneration + 1,
+    };
+    const refreshed = await acquire(queued.state, waiterV2, { now: 3, leaseId: "lease-waiter" });
+    expect(refreshed.outcome.kind).toBe("write_lease_queued");
+    expect(refreshed.state.writeQueue[0]?.authority.authorizationGeneration).toBe(11);
+
+    // Cancellation with the rotated authority must succeed instead of demanding
+    // the now-unavailable generation-11 snapshot.
+    const canceled = await applyWorkspaceCommand(refreshed.state, {
+      kind: "cancel_write_lease_request",
+      expectedEventSequence: refreshed.state.eventSequence,
+      now: 4,
+      invocationId: "waiter-rotated",
+      requestDigest: digest("b"),
+      authority: waiterV2,
+    });
+    expect(canceled.outcome).toMatchObject({
+      kind: "write_lease_request_canceled",
+      invocationId: "waiter-rotated",
+    });
+    expect(canceled.state.writeQueue[0]).toMatchObject({
+      authority: { invocationId: "waiter-rotated" },
+      canceled: true,
+    });
+    expect(
+      canceled.state.leaseHistory.find((record) => record.invocationId === "waiter-rotated"),
+    ).toMatchObject({ status: "canceled" });
+  });
+
+  it("still rejects a cancel whose authorization rotation widens permissions (BUG-013)", async () => {
+    const initial = createWorkspaceState({
+      workspaceId: "workspace-1",
+      tenantId: "tenant-1",
+      initialRootDigest: digest("0"),
+    });
+    const ownerAuthority = authority("owner-widen", digest("a"));
+    const owner = await acquire(initial, ownerAuthority, { now: 1, leaseId: "lease-owner" });
+    if (owner.outcome.kind !== "write_lease_acquired") {
+      throw new Error("expected owner lease");
+    }
+    const waiterV1 = authority("waiter-widen", digest("b"), {
+      effectivePermissions: ["workspace.write"],
+    });
+    const queued = await acquire(owner.state, waiterV1, { now: 2, leaseId: "lease-waiter" });
+    expect(queued.outcome.kind).toBe("write_lease_queued");
+
+    // A rotation that adds a permission is widening and must not authorize a
+    // cancel, even though its generation is newer.
+    const widened: WorkspaceAuthoritySnapshot = {
+      ...waiterV1,
+      effectivePermissions: ["workspace.read", "workspace.write"],
+      authorizationGeneration: waiterV1.authorizationGeneration + 1,
+    };
+    await expect(
+      applyWorkspaceCommand(queued.state, {
+        kind: "cancel_write_lease_request",
+        expectedEventSequence: queued.state.eventSequence,
+        now: 3,
+        invocationId: "waiter-widen",
+        requestDigest: digest("b"),
+        authority: widened,
+      }),
+    ).rejects.toMatchObject({ code: "STALE_GENERATION" });
+  });
+
   it("allows exact settlement after ticket TTL when the renewable lease remains current", async () => {
     const initial = createWorkspaceState({
       workspaceId: "workspace-1",

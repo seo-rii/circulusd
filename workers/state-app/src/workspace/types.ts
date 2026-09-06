@@ -133,6 +133,7 @@ export type WorkspaceLeaseHistoryStatus =
   | "active"
   | "canceled"
   | "timed_out"
+  | "admission_expired"
   | "expired"
   | "released"
   | "committed";

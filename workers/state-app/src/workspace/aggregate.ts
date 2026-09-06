@@ -23,6 +23,7 @@ import {
   type WorkspaceLeaseConflictRecord,
   type WorkspaceLeaseFence,
   type WorkspaceLeaseHistoryRecord,
+  type WorkspaceLeaseHistoryStatus,
   type WorkspaceLeaseQueueEntry,
   type WorkspaceMaterializationTicket,
   type WorkspacePermission,
@@ -751,6 +752,7 @@ function grantQueueHead(
 function advanceLeaseQueue(
   state: WorkspaceAggregateState,
   now: number,
+  options: { readonly contendingInvocationId?: string } = {},
 ): { readonly changed: boolean; readonly promotedInvocationId: string | null } {
   let changed = false;
   if (state.activeWriteLease !== null && now >= state.activeWriteLease.expiresAt) {
@@ -772,74 +774,63 @@ function advanceLeaseQueue(
     changed = true;
   }
 
-  while (state.writeQueue[0]?.canceled === true) {
-    const canceled = state.writeQueue.shift();
-    if (canceled === undefined) {
-      break;
+  // Reap FIFO heads in queue order. A head whose admission was canceled or whose
+  // acquire deadline elapsed is always reaped. A head whose turn lease has
+  // expired is reaped only on behalf of a *different* live waiter contending for
+  // the queue (`contendingInvocationId`): once the turn lease is gone the head
+  // can never be granted a usable lease (`grantQueueHead` caps a granted lease
+  // at `authority.turnLeaseExpiresAt`) and — critically — its holder can no
+  // longer act on it, because `validatedAuthority` rejects any authority once
+  // `now >= turnLeaseExpiresAt`. Leaving it at the head would strand every
+  // waiter behind it until its (possibly far-future) acquire deadline.
+  //
+  // The turn-lease reap is deliberately contention-gated and never touches the
+  // contender's own head. An uncontended waiter is preserved even past its
+  // stored `turnLeaseExpiresAt`: a still-live holder can refresh the same
+  // `turnLeaseGeneration` with an extended expiry on its next acquire, so the
+  // stored snapshot is not by itself proof of lost authority. Reaping only when
+  // a distinct waiter is actually blocked keeps that refresh path intact while
+  // guaranteeing liveness under contention.
+  const contendingInvocationId = options.contendingInvocationId;
+  const reapHead = (): boolean => {
+    const head = state.writeQueue[0];
+    if (head === undefined) {
+      return false;
     }
+    let status: WorkspaceLeaseHistoryStatus;
+    if (head.canceled === true) {
+      status = "canceled";
+    } else if (now >= head.acquireDeadline) {
+      status = "timed_out";
+    } else if (
+      contendingInvocationId !== undefined &&
+      head.authority.invocationId !== contendingInvocationId &&
+      now >= head.authority.turnLeaseExpiresAt
+    ) {
+      status = "admission_expired";
+    } else {
+      return false;
+    }
+    state.writeQueue.shift();
     setLeaseHistory(state, {
-      invocationId: canceled.authority.invocationId,
-      requestDigest: canceled.authority.requestDigest,
-      effectService: canceled.authority.effectService,
-      effectOperation: canceled.authority.effectOperation,
-      effectId: canceled.authority.effectId,
-      latestProjectionGeneration: canceled.projectionGeneration,
-      latestDispatchAttempt: canceled.authority.dispatchAttempt,
+      invocationId: head.authority.invocationId,
+      requestDigest: head.authority.requestDigest,
+      effectService: head.authority.effectService,
+      effectOperation: head.authority.effectOperation,
+      effectId: head.authority.effectId,
+      latestProjectionGeneration: head.projectionGeneration,
+      latestDispatchAttempt: head.authority.dispatchAttempt,
       latestLeaseGeneration:
         state.leaseHistory.find(
-          (history) => history.invocationId === canceled.authority.invocationId,
+          (history) => history.invocationId === head.authority.invocationId,
         )?.latestLeaseGeneration ?? null,
-      latestEnqueueSequence: canceled.enqueueSequence,
-      status: "canceled",
+      latestEnqueueSequence: head.enqueueSequence,
+      status,
     });
+    return true;
+  };
+  while (reapHead()) {
     changed = true;
-  }
-  while (
-    state.writeQueue[0] !== undefined &&
-    now >= state.writeQueue[0].acquireDeadline
-  ) {
-    const timedOut = state.writeQueue.shift();
-    if (timedOut === undefined) {
-      break;
-    }
-    setLeaseHistory(state, {
-      invocationId: timedOut.authority.invocationId,
-      requestDigest: timedOut.authority.requestDigest,
-      effectService: timedOut.authority.effectService,
-      effectOperation: timedOut.authority.effectOperation,
-      effectId: timedOut.authority.effectId,
-      latestProjectionGeneration: timedOut.projectionGeneration,
-      latestDispatchAttempt: timedOut.authority.dispatchAttempt,
-      latestLeaseGeneration:
-        state.leaseHistory.find(
-          (history) => history.invocationId === timedOut.authority.invocationId,
-        )?.latestLeaseGeneration ?? null,
-      latestEnqueueSequence: timedOut.enqueueSequence,
-      status: "timed_out",
-    });
-    changed = true;
-    while (state.writeQueue[0]?.canceled === true) {
-      const canceled = state.writeQueue.shift();
-      if (canceled === undefined) {
-        break;
-      }
-      setLeaseHistory(state, {
-        invocationId: canceled.authority.invocationId,
-        requestDigest: canceled.authority.requestDigest,
-        effectService: canceled.authority.effectService,
-        effectOperation: canceled.authority.effectOperation,
-        effectId: canceled.authority.effectId,
-        latestProjectionGeneration: canceled.projectionGeneration,
-        latestDispatchAttempt: canceled.authority.dispatchAttempt,
-        latestLeaseGeneration:
-          state.leaseHistory.find(
-            (history) => history.invocationId === canceled.authority.invocationId,
-          )?.latestLeaseGeneration ?? null,
-        latestEnqueueSequence: canceled.enqueueSequence,
-        status: "canceled",
-      });
-      changed = true;
-    }
   }
 
   return { changed, promotedInvocationId: null };
@@ -1485,6 +1476,7 @@ export function assertWorkspaceInvariants(state: WorkspaceAggregateState): void 
       history.status !== "active" &&
       history.status !== "canceled" &&
       history.status !== "timed_out" &&
+      history.status !== "admission_expired" &&
       history.status !== "expired" &&
       history.status !== "released" &&
       history.status !== "committed"
@@ -2419,7 +2411,9 @@ export async function applyWorkspaceCommand(
   switch (command.kind) {
     case "acquire_write_lease": {
       const authority = validatedAcquireInputs(command, next);
-      const advanced = advanceLeaseQueue(next, command.now);
+      const advanced = advanceLeaseQueue(next, command.now, {
+        contendingInvocationId: authority.invocationId,
+      });
       const history = next.leaseHistory.find(
         (record) => record.invocationId === authority.invocationId,
       );
@@ -2808,7 +2802,14 @@ export async function applyWorkspaceCommand(
           `invocationId ${invocationId} was reused with a different request digest`,
         );
       }
-      if (!authorityIdentityMatches(authority, queued.authority)) {
+      // Cancellation validates the current authority the same way an acquire
+      // retry refreshes a queued admission: the stable request identity must
+      // match and the authorization rotation must be monotonic and non-widening
+      // (`authorityCanRefreshQueuedAdmission`). Requiring an exact match against
+      // the stored snapshot would strand a waiter whose ingress only issues a
+      // newer, non-widening authorization generation — it could refresh its
+      // queued admission but never cancel it.
+      if (!authorityCanRefreshQueuedAdmission(authority, queued.authority)) {
         workspaceError("STALE_GENERATION", "cancel authority is stale");
       }
       next.writeQueue[index] = { ...queued, canceled: true };
