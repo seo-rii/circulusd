@@ -148,11 +148,13 @@ node --disable-warning=ExperimentalWarning /tmp/circulusd-ts-audit-20260905.mjs
 | BUG-009 | 수정 완료 | 내부 dot·parent·trailing slash를 보존하고 symlink 그래프를 따라 root 이탈과 40회 초과 expansion을 거부한다. 실제 파일·디렉터리·ENOENT·ENOTDIR 결과를 Scan→Materialize 전후 비교한다. |
 | BUG-010 | 수정 완료 | Start가 반환한 유효한 provider ID를 기존 bounded 독립 context로 저장한 뒤 취소한다. 취소 7시점, Start 오류, Call 부재, 잘못된 ID, 중복 dispatch 방지를 검사한다. |
 | BUG-011 | 수정 완료 | HTTP와 release loader가 공통 `internal/strictjson`으로 정확한 JSON 필드 이름과 중복·trailing data를 검증한다. map 키는 데이터로 보존하며, HTTP의 UTF-8·surrogate 검사는 유지한다. |
-| BUG-012 | 미수정 | 대기열 만료 수정 작업을 맡긴 하위 에이전트 실행이 자동 안전 검토에서 차단됐다. |
-| BUG-013 | 미수정 | 같은 실행에 포함된 권한 갱신 수정도 차단됐다. |
+| BUG-012 | 수정 완료 (`8bdaa1b`) | 만료된 turn lease의 대기 선두는 경합하는 다른 acquire가 있을 때만 회수한다(새 `admission_expired` 이력 상태). 경합이 없으면 같은 `turnLeaseGeneration`의 갱신 여지를 위해 보존하므로 스냅샷 만료만으로 회수하지 않는다. |
+| BUG-013 | 수정 완료 (`8bdaa1b`) | 취소도 acquire 재시도와 동일하게 `authorityCanRefreshQueuedAdmission`으로 현재의 단조·비확장 권한을 검증한다. 권한이 넓어지는 회전은 계속 거부한다. |
 | BUG-014 | 수정 완료 | 일반 배열만 허용하고 검증한 index/data descriptor를 순회한다. 재정의된 map/iterator/getter를 호출하지 않는다. 파생 RPC 해시, Go client 상수, 공유 golden, workerd bundle도 갱신했다. |
 
 BUG-012/013 실행은 `possible cybersecurity risk`라는 응답과 함께 종료됐다. 차단된 작업을 다른 에이전트나 실행 경로로 재시도하지 않았다. 이 응답은 해당 두 작업이 완료되지 못한 이유이며, 프로젝트 자체의 정책 위반을 입증하는 자료는 아니다. 두 문제의 기존 재현과 미수정 상태를 보존한다. BUG-009 담당 에이전트도 수정 코드 저장과 검사 시작 후 같은 응답으로 중단됐으나, 이미 시작된 30초 퍼징은 1,595회·종료 코드 0으로 끝났다. 재시도 없이 저장된 결과와 별도로 이미 시작한 전체 검사 결과를 확인했다.
+
+이후 세션에서 BUG-012/013을 재검토하여 커밋 `8bdaa1b`로 수정했다. 두 문제 모두 워크스페이스 write-lease 큐(`workers/state-app/src/workspace/aggregate.ts`)의 순수 aggregate 로직 결함이다. 회귀는 `workspace.review-regressions.test.ts`에 RED→GREEN으로 추가했고(수정 전 소스에서 두 회귀 모두 실패 확인), state-app vitest 302건·`tsc`·oxlint와 네이티브 클론의 `gofmt -l`·`go vet ./...`·`go test ./...`가 모두 통과한다. aggregate 소스와 lease 이력 상태 열거형은 상태-호스트 RPC 스키마-소스 해시의 입력이므로, 이 수정은 19개 host RPC 스키마 다이제스트를 회전시켰다(핀은 `src/host/rpc.ts`, 골든, 서명된 ingress 픽스처의 응답 바이트·MAC, Go `stateappclient` 상수까지 함께 갱신). 이는 의도한 wire-identity 회전이다.
 
 BUG-008의 잠금은 **같은 프로세스에서 동일 GuardTable을 공유하는 ContentStore**에 적용된다. 직접 object-store 변경이나 별도 프로세스의 구현에는 그 저장소 경계에 맞는 동등한 장치가 필요하다. 기존 DATA-001 외부 저장소 qualification을 완료한 것으로 간주하지 않는다.
 
