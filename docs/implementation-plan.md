@@ -1462,9 +1462,12 @@ External-evidence (gated on a provisioned NsJail host; deferred):
 
 ### Work packages and strict TDD order
 
-- U13.1 — launch-plan §53.10 static verifier (reference). RED: a deliberately
-  weakened plan (e.g. `keep_caps:true` or rootfs `rw:true`) must fail the
-  verifier; GREEN: the real `Planner.Build` output passes every check. No kernel.
+- U13.1 — launch-plan §53.10 static verifier (reference). Status: landed
+  (`internal/executor/nsjail.VerifyLaunchPlanIsolation`). RED: a deliberately
+  weakened plan (retained caps, writable rootfs, disabled seccomp, shared net
+  namespace, exposed docker socket, unbounded cgroup, non-ONCE jail) fails the
+  matching check; GREEN: the real `Planner.Build` output passes every one of the
+  thirteen §53.10 checks. No kernel. Green under `go test -race`.
 - U13.2 — single-environment resolution (reference). Requirement-union → one
   curated environment; version-conflict → session-creation failure; missing
   artifact → backend unselectable; raw-path attempt → rejected.
