@@ -34,11 +34,15 @@ The machine-transfer resume checkpoint for the current unit is
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
 | 11 | in progress | Phase 0B durable turn/effect state machine and celld authority: reference-first slices U11.1-U11.5 landed and the U11.6 celld conformance probe scaffold; the real-process celld durability PASS remains external-gated |
 | 12 | in progress | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 slices U12.1-U12.3 and the celld-backed Repository composition U12.4a/b landed (idempotency concurrency, SSE reconnect/ephemeral-loss, durable Repository conformance gate, celld public-session aggregate + Repository adapter); the crash-durable celld substrate and served listener (U12.5) are external-gated |
+| 13 | planned | Phase 1A NsJail single-node vertical slice: reference-first launch-plan §53.10 static verifier, single-environment resolution, and end-to-end orchestration over the reference provider land host-independently; the real NsJail isolation PASS, offline install, and live end-to-end durable turn are external-gated on a provisioned NsJail host |
+| 14 | planned | Private `platformd`↔`agentd` workload composition: the reference workload graph wiring platformd dispatch to agentd/workerd execution and back, proven host-independently against reference providers; the served production graph is external-gated |
 
-After Unit 12, the private `platformd`-to-`agentd` workload composition and the
-Phase 1A NsJail single-node vertical slice receive separate work-unit plans.
-Their exact cut lines must use the evidence produced by Units 10–12; they are
-not silently included in Unit 10.
+After Unit 12, the Phase 1A NsJail single-node vertical slice (Unit 13) receives
+the work-unit plan below; the private `platformd`↔`agentd` workload composition
+(Unit 14) follows it. Their cut lines use the evidence produced by Units 10–12
+and the §53 conformance gates in `internal/conformance/`; they are not silently
+included in earlier units. Both promote a §53 status only from a provisioned
+host, never from their reference-first slices.
 
 ## Unit 10: Phase 0A workerd resource qualification
 
@@ -1363,3 +1367,139 @@ Unit 12 is complete only when all of the following are true:
 4. durable celld-backed Repository — reference aggregate + adapter (U12.4a/b)
    landed; the crash-durable substrate and `CrashDurable:true` PASS stay gated;
 5. served public listener wiring and acceptance docs (U12.5, gated).
+
+## Unit 13: Phase 1A NsJail single-node vertical slice
+
+Status: planned (2026-09-06). This is the `SPEC.md` §51.3 vertical slice: the
+first lightweight provider (NsJail), one execution environment, and the whole
+single-node graph from offline install to a recovered durable turn. It is
+sequenced after Units 10–12 and consumes their evidence and the §53 conformance
+gates; it introduces no new experimental component beyond NsJail and one
+environment. Unit 13 promotes a §53 status only from a provisioned NsJail host;
+every reference-first slice below promotes nothing and `AdmissionReady` stays
+false until the full single-node graph closes on real hardware.
+
+### Outcome
+
+Deliver the `SPEC.md` §51.3 completion set on a single node:
+
+```text
+✓ offline install (lightweight profile)
+✓ per-session Pi isolate
+✓ native command through NsJail
+✓ workspace commit/recovery
+✓ seccomp/network/resource enforcement
+✓ end-to-end durable turn/effect recovery
+✓ platformctl doctor --backend nsjail
+```
+
+Scope (per §51.3): platformd, state-app/celld, object store, agentd/workerd,
+executord, sandboxd, NsJailProvider, one `minimal-v1`/`standard-v1`
+ExecutionEnvironmentRevision, materialized-manifest workspace, content-addressed
+workspace blob, local model gateway, basic Auth/Tenant/ACL, air-gap lightweight
+profile. Excluded (per §51.3): Docker, Firecracker, FUSE, upstream computerd,
+long-lived stdio MCP servers, browser/CUA, dynamic environment composition.
+
+A real end-to-end run promotes §53.10 (NsJail isolation) and contributes real
+evidence toward §53.7 (single-environment resolution), §53.8 (workspace
+filesystem), §53.13 (single mutable lease under one backend), and §53.18
+(lightweight offline install + `doctor` end-to-end turn). None of these are
+promoted by the reference-first slices.
+
+### Current implemented baseline
+
+- `internal/executor/nsjail` compiles a trusted, immutable NsJail `LaunchPlan`
+  from trusted metadata only (`plan.go`): all namespaces (`clone_new*`), uid/gid
+  maps, read-only rootfs bind, `keep_caps:false`/`disable_no_new_privs:false`,
+  `seccomp_policy_file`, cgroup v2 mem/pids/cpu limits, `clone_newnet` with no
+  interface, tmpfs `/scratch`//`/tmp`//`/run`, a private control-socket bind, and
+  a content-addressed plan digest with an integrity recheck (`Validate`). The
+  `//go:build linux` provider (`provider_linux.go`), launcher, and handshake
+  broker exist with `EnsureSandbox`/`Capabilities`/`ControlSession`.
+- `internal/sandboxd` + `internal/sandboxrpc` are the in-jail supervisor and its
+  private-UDS control protocol; `cmd/{executord,agentd,sandboxd}` are the daemon
+  shells (Unit 9), each control-only with UID-role authorities.
+- `internal/conformance/nsjail` (§53.10), `internal/conformance/environment`
+  (§53.7), and `internal/conformance/filesystem` (§53.8) pin the external
+  isolation, resolution, and workspace-filesystem contracts and return
+  UNAVAILABLE without a provisioned host.
+- `internal/workspace` (manifest, blob, materialized) and the state-app Workspace
+  aggregate provide the materialized-manifest workspace and content-addressed
+  blob store the slice writes through.
+
+### Reference-first vs external-evidence split
+
+Reference-first (lands now, host-independent):
+- U13.1 a launch-plan `§53.10` static verifier: assert the compiled `LaunchPlan`
+  configuration encodes each of the thirteen `internal/conformance/nsjail` checks
+  declaratively (every `clone_new*` true, `keep_caps:false`,
+  `disable_no_new_privs:false`, rootfs `rw:false`, `/workspace` writable only
+  under a write lease, `seccomp_policy_file` set, cgroup mem/pids/cpu set,
+  `clone_newnet` with no interface, control-socket bind private) so the plan
+  provably encodes the boundary a real kernel then enforces;
+- U13.2 single-environment resolution against `internal/environment` /
+  `internal/extensionregistry`: one `minimal-v1`/`standard-v1` environment
+  resolves from the requirement union, a version conflict fails session creation,
+  a missing NsJail rootfs artifact blocks backend selection, and an extension
+  cannot name a raw rootfs path (`§53.7` shape);
+- U13.3 end-to-end orchestration over the reference `executor.MockProvider`: the
+  full control flow — session admit → environment resolve → `EnsureSandbox` →
+  native-command dispatch → workspace `prepare`/commit → effect settle →
+  kill/restart recovery — proven host-independently, reusing the Unit 11 durable
+  turn/effect machine and the Unit 12 idempotency boundary;
+- U13.4 the NsJail `IsolationProbe` harness and the `doctor --backend nsjail`
+  report shape: the seam a provisioned host plugs a real launcher into, plus the
+  backend-capability probe descriptor the doctor emits, validated at the
+  reference level.
+
+External-evidence (gated on a provisioned NsJail host; deferred):
+- U13.5 the real vertical slice: a real NsJail `IsolationProbe` returning an
+  external `§53.10` PASS against a live kernel (namespaces/seccomp/cgroup/network/
+  cleanup); offline lightweight-profile install on a clean network-denied Linux
+  host; per-session Pi isolate; a native command executed through NsJail; real
+  workspace commit and post-kill recovery; and `platformctl doctor --backend
+  nsjail` against the live sandbox.
+
+### Work packages and strict TDD order
+
+- U13.1 — launch-plan §53.10 static verifier (reference). RED: a deliberately
+  weakened plan (e.g. `keep_caps:true` or rootfs `rw:true`) must fail the
+  verifier; GREEN: the real `Planner.Build` output passes every check. No kernel.
+- U13.2 — single-environment resolution (reference). Requirement-union → one
+  curated environment; version-conflict → session-creation failure; missing
+  artifact → backend unselectable; raw-path attempt → rejected.
+- U13.3 — end-to-end orchestration over the reference provider (reference).
+  Dispatch → sandbox → native command → workspace commit → settle → kill/restart
+  recovery, all green under `-race`; reuses Units 11–12.
+- U13.4 — NsJail `IsolationProbe` harness + `doctor --backend nsjail` shape
+  (reference harness; the real probe is U13.5).
+- U13.5 — external vertical slice (gated): live NsJail §53.10 PASS, offline
+  install, per-session isolate, native command, commit/recovery, resource
+  enforcement, e2e durable turn, `doctor --backend nsjail`. Promotes §53.10 and
+  contributes §53.7/§53.8/§53.13/§53.18 only here.
+
+### Required evidence and exit criteria
+
+Unit 13 is complete only when all of the following hold:
+
+- the reference slices U13.1–U13.4 pass under `go test -race`;
+- a real NsJail `IsolationProbe` returns an external §53.10 `PASS` on a
+  provisioned host (else §53.10 stays `UNAVAILABLE`);
+- offline lightweight install, per-session Pi isolate, native command through
+  NsJail, workspace commit/recovery, seccomp/network/resource enforcement,
+  end-to-end durable turn/effect recovery, and `platformctl doctor --backend
+  nsjail` all pass on that host;
+- §53.10 is promoted only from the live host, and §53.7/§53.8/§53.13/§53.18 gain
+  real evidence only from it — never from the reference slices;
+- `AdmissionReady` becomes true only when the whole single-node production graph
+  is served and every required gate is a fresh external `PASS`;
+- `docs/acceptance.md` records exactly what ran without promoting reference
+  evidence.
+
+### Unit 13 commit boundaries
+
+1. launch-plan §53.10 static verifier (U13.1);
+2. single-environment resolution suite (U13.2);
+3. end-to-end orchestration over the reference provider (U13.3);
+4. NsJail `IsolationProbe` harness + `doctor --backend nsjail` shape (U13.4);
+5. external vertical slice and acceptance docs (U13.5, gated).
