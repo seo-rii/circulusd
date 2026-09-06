@@ -1503,3 +1503,117 @@ Unit 13 is complete only when all of the following hold:
 3. end-to-end orchestration over the reference provider (U13.3);
 4. NsJail `IsolationProbe` harness + `doctor --backend nsjail` shape (U13.4);
 5. external vertical slice and acceptance docs (U13.5, gated).
+
+## Unit 14: Private platformd↔agentd workload composition
+
+Status: planned (2026-09-06). This unit closes the private workload loop between
+`platformd` (dispatch admission + settlement over the durable state plane) and
+`agentd`/`executord` (out-of-process execution in workerd/NsJail), replacing the
+`errProductionGraphIncomplete` stub in `cmd/platformd`. Unlike Units 10–13 it
+introduces almost no new logic: its constituent reference pieces already exist
+and are tested (see the baseline). Unit 14 is the composition and served-graph
+wiring. It promotes a §53 status only from the served graph on real celld +
+agentd/workerd; every reference slice promotes nothing and `AdmissionReady`
+stays false until the whole single-node graph closes.
+
+### Outcome
+
+Compose the durable dispatch loop: `platformd` admits and claims each effect
+dispatch through the celld-backed `broker.DurableStore`, hands the claimed,
+durable start to `agentd`/`executord` over `controlrpc`, which executes it in
+workerd/NsJail and drives the external-commit and settlement back through the
+same durable store — so a durable turn's effects execute out-of-process exactly
+once and settle in the state plane, and a crash at any boundary recovers without
+re-executing (`SPEC.md` §15.2–§15.4, §53.2, §53.5). Replaces the
+`cmd/platformd` `listenPublic`/production-graph `errProductionGraphIncomplete`
+stub with the real composition behind authenticated admission.
+
+Unit 14 promotes no §53 status by itself: §53.2 and §53.5 are promoted only
+from the served composition backed by a real crash-durable celld store (Unit 11)
+and a real workerd/NsJail executor (Units 10/13); the reference slices run over
+the in-process reference store and reference executor.
+
+### Current implemented baseline
+
+The composition's parts already exist and are reference-tested:
+
+- `internal/broker.Coordinator` exposes the full effect lifecycle over the
+  injected `DurableStore`: `AdmitDispatch`, `ClaimDispatchStart`,
+  `ConfirmExternalCommit`, `SettleEffect`, `RecoverEffect`, plus the engine-step
+  pair. `internal/broker.DispatchConsumer.StartExactAttempt` is the durable-claim
+  →provider-start seam and is proven exactly-once, replay-never-re-executes,
+  fence/route-mismatch-rejected, deadline/abort-blocked, and
+  recovery-safe over the reference `fakeStore` (`dispatch_consumer_test.go`,
+  including a 64-way concurrent race and a claim-response-loss + restart matrix).
+- `internal/broker.DurableStore` is the celld-backed atomic effect ladder;
+  `internal/stateappadapter` provides the production celld-backed implementation.
+- `internal/controlrpc` (linux) is the credentialed `platformd`↔`agentd`/
+  `executord` RPC with a concurrent-clients integration test.
+- `internal/agent.Manager` is the agentd-side workerd/isolate execution manager.
+- `cmd/platformd` builds the production graph but returns
+  `errProductionGraphIncomplete` for the workload/public portions by design.
+
+### Reference-first vs external-evidence split
+
+Reference-first (already landed; Unit 14 verifies/consolidates, does not re-prove):
+- the broker dispatch→start→confirm→settle→recover composition over the
+  reference `DurableStore` (`internal/broker`);
+- the `controlrpc` platformd↔agentd/executord boundary
+  (`internal/controlrpc` integration).
+
+Reference-first (lands in Unit 14, host-independent):
+- U14.1 a named `WorkloadDispatcher` composition object that wires
+  `broker.DispatchConsumer` to an `agentExecutor` seam (the interface the
+  controlrpc-transported agentd start satisfies), with a reference `agentExecutor`
+  proving the platformd→agentd handoff preserves the claimed-start identity and
+  executes exactly once — the reusable seam `cmd/platformd` will back with the
+  real transport;
+- U14.2 a `controlrpc`-transported `broker.DispatchStarter` (linux) that forwards
+  the claimed start to a reference agentd over the real RPC and drives the
+  external-commit/settlement return, proving the boundary preserves claim
+  identity and exactly-once across the wire (verified in the WSL2 native gate).
+
+External-evidence (gated on Units 10/11/13; deferred):
+- U14.3 the served production graph: replace `errProductionGraphIncomplete` in
+  `cmd/platformd` with the celld-backed `DurableStore` + `DispatchConsumer` +
+  `controlrpc` + agentd/workerd `DispatchStarter` behind authenticated admission,
+  and serve the public listener (joining U12.5). Promotes §53.2/§53.5 only from
+  the real durable + executed composition.
+
+### Work packages and strict TDD order
+
+- U14.1 — `WorkloadDispatcher` composition + reference `agentExecutor`
+  (reference). RED: a dispatcher that double-starts or drops the claim identity
+  fails; GREEN: the composition starts the reference executor exactly once per
+  fresh claim, never on replay, and returns the settlement path. Green under
+  `-race`.
+- U14.2 — `controlrpc`-transported `DispatchStarter` (reference, linux). The
+  starter forwards the claimed start to a reference agentd over `controlrpc`;
+  exactly-once and claim-identity preservation across the wire; verified in the
+  native WSL2 gate.
+- U14.3 — served production graph (external, gated): the real composition wired
+  into `cmd/platformd`, gated on Units 10/11/13; promotes §53.2/§53.5 only here.
+
+### Required evidence and exit criteria
+
+Unit 14 is complete only when all of the following hold:
+
+- the reference `WorkloadDispatcher` composition (U14.1) and the controlrpc
+  transported starter (U14.2) pass under `go test -race` (U14.2 in the native
+  WSL2 gate);
+- the served production graph replaces `errProductionGraphIncomplete`, backed by
+  a real crash-durable celld `DurableStore` and a real agentd/workerd executor,
+  behind authenticated admission;
+- §53.2 and §53.5 are promoted only from that served composition — never from
+  the reference store or reference executor;
+- `AdmissionReady` becomes true only when the whole single-node production graph
+  (this unit + Units 12/13) is served and every required gate is a fresh external
+  `PASS`;
+- `docs/acceptance.md` records exactly what ran without promoting reference
+  evidence.
+
+### Unit 14 commit boundaries
+
+1. `WorkloadDispatcher` composition + reference `agentExecutor` (U14.1);
+2. controlrpc-transported `DispatchStarter` (U14.2, linux);
+3. served production graph and acceptance docs (U14.3, gated).
