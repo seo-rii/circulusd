@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -22,119 +23,182 @@ func (probe fakeProbe) RunCheck(_ context.Context, check Check) (CheckOutcome, e
 	case probe.errorID:
 		return CheckOutcome{}, errors.New("probe transport error")
 	case probe.failID:
-		return CheckOutcome{Passed: false, Detail: "observed the Docker socket bind-mounted into the container"}, nil
+		return CheckOutcome{Passed: false, Detail: "observed a retained capability"}, nil
 	default:
 		return CheckOutcome{Passed: true}, nil
 	}
 }
 
-func mustCollect(t *testing.T, result conformance.Result) {
+// doctorRequiredDockerComponents is the per-check component set internal/doctor's
+// production ConformanceProfile requires for the docker backend (host.nftables-tool
+// is a host-probe property, not this sandbox gate). This gate must produce exactly
+// this set so the doctor profile cannot require a component nothing emits.
+var doctorRequiredDockerComponents = []string{
+	"docker.creation",
+	"docker.hardening",
+	"docker.limits",
+	"docker.network-deny",
+	"docker.non-root",
+	"docker.read-only-rootfs",
+	"docker.sandboxd-uds",
+	"docker.socket-invisibility",
+	"docker.workspace-roundtrip",
+}
+
+func index(report conformance.Report) map[string]conformance.Result {
+	byComponent := make(map[string]conformance.Result, len(report.Results))
+	for _, result := range report.Results {
+		byComponent[result.Component] = result
+	}
+	return byComponent
+}
+
+func mustCollect(t *testing.T, report conformance.Report) {
 	t.Helper()
 	collector := conformance.NewCollector()
-	if err := collector.Add(result); err != nil {
-		t.Fatalf("result failed conformance validation: %v", err)
+	if err := collector.Merge(report); err != nil {
+		t.Fatalf("report failed conformance validation: %v", err)
 	}
 }
 
-func TestQualifyWithoutProbeIsUnavailable(t *testing.T) {
+func TestQualifyReportWithoutProbeIsUnavailablePerComponent(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), nil)
-	if result.Component != Component || result.Status != conformance.Unavailable {
-		t.Fatalf("result = %+v, want %s UNAVAILABLE", result, Component)
+	report := QualifyReport(context.Background(), nil)
+	byComponent := index(report)
+	for _, component := range doctorRequiredDockerComponents {
+		result, found := byComponent[component]
+		if !found {
+			t.Fatalf("component %q missing from report", component)
+		}
+		if result.Status != conformance.Unavailable {
+			t.Fatalf("component %q = %s, want UNAVAILABLE", component, result.Status)
+		}
+		if strings.TrimSpace(result.Reason) == "" {
+			t.Fatalf("UNAVAILABLE component %q must carry a reason", component)
+		}
 	}
-	if strings.TrimSpace(result.Reason) == "" {
-		t.Fatal("UNAVAILABLE result must carry a reason")
+	if len(report.Results) != len(doctorRequiredDockerComponents) {
+		t.Fatalf("report has %d results, want %d", len(report.Results), len(doctorRequiredDockerComponents))
 	}
-	mustCollect(t, result)
+	mustCollect(t, report)
 }
 
-func TestQualifyReferenceProbePassesButIsNotPromotable(t *testing.T) {
+func TestQualifyReportReferenceProbePassesButIsNotPromotable(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "27.0", Reference: true}})
-	if result.Status != conformance.Pass {
-		t.Fatalf("reference probe result = %+v, want PASS", result)
+	report := QualifyReport(context.Background(), fakeProbe{provenance: Provenance{Version: "27.0", Reference: true}})
+	for _, result := range report.Results {
+		if result.Status != conformance.Pass {
+			t.Fatalf("component %q = %s, want PASS", result.Component, result.Status)
+		}
+		if !result.Evidence.Mock || result.Evidence.Class != conformance.EvidenceClassReferenceOnly {
+			t.Fatalf("component %q reference evidence = %+v, want mock reference-only", result.Component, result.Evidence)
+		}
 	}
-	if !result.Evidence.Mock || result.Evidence.Class != conformance.EvidenceClassReferenceOnly {
-		t.Fatalf("reference PASS evidence = %+v, want mock reference-only", result.Evidence)
-	}
-	mustCollect(t, result)
+	mustCollect(t, report)
 
 	collector := conformance.NewCollector()
-	if err := collector.Add(result); err != nil {
-		t.Fatalf("Add() error = %v", err)
+	if err := collector.Merge(report); err != nil {
+		t.Fatalf("Merge() error = %v", err)
 	}
-	profile := conformance.Profile{Name: "production", Production: true, Required: []string{Component}}
+	profile := conformance.Profile{Name: "production", Production: true, Required: doctorRequiredDockerComponents}
 	if err := collector.Evaluate(profile); err == nil {
-		t.Fatal("production profile accepted a reference/mock Docker PASS")
+		t.Fatal("production profile accepted a reference/mock Docker report")
 	}
 }
 
-func TestQualifyNonReferenceProbeCarriesExternalEvidence(t *testing.T) {
+func TestQualifyReportNonReferenceProbeSatisfiesProductionProfile(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{provenance: Provenance{Version: "27.0", Reference: false}})
-	if result.Status != conformance.Pass {
-		t.Fatalf("result = %+v, want PASS", result)
+	report := QualifyReport(context.Background(), fakeProbe{provenance: Provenance{Version: "27.0", Reference: false}})
+	for _, result := range report.Results {
+		if result.Status != conformance.Pass {
+			t.Fatalf("component %q = %s, want PASS", result.Component, result.Status)
+		}
+		if result.Evidence.Mock || result.Evidence.Class != conformance.EvidenceClassExternal {
+			t.Fatalf("component %q evidence = %+v, want external non-mock", result.Component, result.Evidence)
+		}
 	}
-	if result.Evidence.Mock || result.Evidence.Class != conformance.EvidenceClassExternal {
-		t.Fatalf("evidence = %+v, want external non-mock", result.Evidence)
+
+	collector := conformance.NewCollector()
+	if err := collector.Merge(report); err != nil {
+		t.Fatalf("Merge() error = %v", err)
+	}
+	profile := conformance.Profile{Name: "production", Production: true, Required: doctorRequiredDockerComponents}
+	if err := collector.Evaluate(profile); err != nil {
+		t.Fatalf("production profile rejected an external Docker report: %v", err)
 	}
 }
 
-func TestQualifyFailsOnFailedCheck(t *testing.T) {
+func TestQualifyReportFailsOnlyTheFailedComponent(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{failID: "docker-socket-nonexposure"})
-	if result.Status != conformance.Fail {
-		t.Fatalf("result = %+v, want FAIL", result)
+	report := QualifyReport(context.Background(), fakeProbe{failID: "cap-drop-no-new-privs"})
+	byComponent := index(report)
+	failed := byComponent["docker.hardening"]
+	if failed.Status != conformance.Fail {
+		t.Fatalf("docker.hardening = %s, want FAIL", failed.Status)
 	}
-	if !strings.Contains(result.Reason, "docker-socket-nonexposure") {
-		t.Fatalf("reason %q should name the failed check", result.Reason)
+	if !strings.Contains(failed.Reason, "cap-drop-no-new-privs") {
+		t.Fatalf("reason %q should name the failed check", failed.Reason)
 	}
-	mustCollect(t, result)
+	for component, result := range byComponent {
+		if component == "docker.hardening" {
+			continue
+		}
+		if result.Status != conformance.Pass {
+			t.Fatalf("component %q = %s, want PASS (a single failed boundary must not mask the others)", component, result.Status)
+		}
+	}
+	mustCollect(t, report)
 }
 
-func TestQualifyUnavailableWhenCheckErrors(t *testing.T) {
+func TestQualifyReportUnavailableOnlyForTheErroredComponent(t *testing.T) {
 	t.Parallel()
-	result := Qualify(context.Background(), fakeProbe{errorID: "cgroup-limits"})
-	if result.Status != conformance.Unavailable {
-		t.Fatalf("result = %+v, want UNAVAILABLE", result)
+	report := QualifyReport(context.Background(), fakeProbe{errorID: "network-default-deny"})
+	byComponent := index(report)
+	errored := byComponent["docker.network-deny"]
+	if errored.Status != conformance.Unavailable {
+		t.Fatalf("docker.network-deny = %s, want UNAVAILABLE", errored.Status)
 	}
-	if !strings.Contains(result.Reason, "cgroup-limits") {
-		t.Fatalf("reason %q should name the check that could not run", result.Reason)
+	if !strings.Contains(errored.Reason, "network-default-deny") {
+		t.Fatalf("reason %q should name the check that could not run", errored.Reason)
 	}
-	mustCollect(t, result)
+	for component, result := range byComponent {
+		if component == "docker.network-deny" {
+			continue
+		}
+		if result.Status != conformance.Pass {
+			t.Fatalf("component %q = %s, want PASS", component, result.Status)
+		}
+	}
+	mustCollect(t, report)
 }
 
-func TestRequiredChecksCoverHardeningContract(t *testing.T) {
+func TestRequiredChecksMatchDoctorComponentSet(t *testing.T) {
 	t.Parallel()
-	want := map[string]bool{
-		"non-root-uid":              false,
-		"docker-socket-nonexposure": false,
-		"rootfs-read-only":          false,
-		"cap-drop-no-new-privs":     false,
-		"cgroup-limits":             false,
-		"network-default-deny":      false,
-		"timeout-teardown":          false,
-		"sandboxd-private-uds":      false,
-	}
-	seen := make(map[string]struct{})
+	seenID := make(map[string]struct{})
+	components := make([]string, 0, len(RequiredChecks()))
 	for _, check := range RequiredChecks() {
-		if _, duplicate := seen[check.ID]; duplicate {
+		if _, duplicate := seenID[check.ID]; duplicate {
 			t.Fatalf("duplicate check id %q", check.ID)
 		}
-		seen[check.ID] = struct{}{}
+		seenID[check.ID] = struct{}{}
 		if check.Reference == "" || check.Description == "" {
 			t.Fatalf("check %q is missing its SPEC reference or description", check.ID)
 		}
-		if _, expected := want[check.ID]; expected {
-			want[check.ID] = true
+		if check.Component == "" {
+			t.Fatalf("check %q is missing its conformance component", check.ID)
 		}
+		components = append(components, check.Component)
 	}
-	for id, covered := range want {
-		if !covered {
-			t.Fatalf("required hardening check %q is missing", id)
+	sort.Strings(components)
+
+	want := append([]string(nil), doctorRequiredDockerComponents...)
+	sort.Strings(want)
+	if len(components) != len(want) {
+		t.Fatalf("RequiredChecks produced %d components, want %d", len(components), len(want))
+	}
+	for i := range want {
+		if components[i] != want[i] {
+			t.Fatalf("component set drifted from the doctor profile: got %v, want %v", components, want)
 		}
-	}
-	if len(seen) != len(want) {
-		t.Fatalf("RequiredChecks returned %d checks, want exactly %d", len(seen), len(want))
 	}
 }
