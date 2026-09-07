@@ -304,12 +304,17 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
     SessionCommandOutcome
   >;
 
-  constructor(state: StateHostContext, environment: StateHostEnvironment) {
+  constructor(
+    state: StateHostContext,
+    environment: StateHostEnvironment,
+    clock: () => number = Date.now,
+  ) {
     super(state, environment);
     this.kernel = new TransactionalAggregateKernel(
       state,
       sessionAdapter,
       cellRoute(state, environment, "SESSION_CELL"),
+      clock,
     );
   }
 

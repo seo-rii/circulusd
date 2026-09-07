@@ -153,6 +153,8 @@ export class RecoverableWorkspaceEffect {
     this.#sessionKernel = new TransactionalAggregateKernel(
       { storage: sessionStorage },
       sessionAdapter,
+      undefined,
+      () => 1_000,
     );
     this.#workspaceKernel = new TransactionalAggregateKernel(
       { storage: workspaceStorage },
@@ -168,6 +170,8 @@ export class RecoverableWorkspaceEffect {
     const sessionKernel = new TransactionalAggregateKernel(
       { storage: sessionStorage },
       sessionAdapter,
+      undefined,
+      () => 1_000,
     );
     const workspaceKernel = new TransactionalAggregateKernel(
       { storage: workspaceStorage },

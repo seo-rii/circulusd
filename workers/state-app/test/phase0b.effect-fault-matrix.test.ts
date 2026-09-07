@@ -112,6 +112,8 @@ function kernel(storage: RestartableDurableStorage) {
   return new TransactionalAggregateKernel(
     { storage },
     sessionAdapter,
+    undefined,
+    () => TRANSACTION_TIME + 1,
   );
 }
 

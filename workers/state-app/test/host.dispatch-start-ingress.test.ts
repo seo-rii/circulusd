@@ -35,7 +35,7 @@ const INGRESS_SCHEMA_DIGEST =
   "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724";
 const HOST_PROTOCOL = "circulus.v1alpha1";
 const HOST_SCHEMA_DIGEST =
-  "sha256:1fc4442a073af358bee3519f5386731e59919042317447e0cbba7b2706fc7f82";
+  "sha256:6823545b5f7299f5303e9d9e9cc9f8b638a61d8003dcc5156421febcad4a2528";
 const CLAIM_KEY_ID = "dispatch-start-current-1";
 const CLAIM_KEY = new Uint8Array(32).fill(0x51);
 const READ_KEY_ID = "state-current-1";

@@ -2813,7 +2813,11 @@ export async function applySessionCommand(
         1,
       );
       const leaseExpiresAt = validatedInteger(command.leaseExpiresAt, "leaseExpiresAt", 1);
-      if (leaseExpiresAt <= transactionTime) {
+      // Admit against trusted host time, not the command-embedded time (see
+      // commit_engine_step): a queued admission whose lease has since expired
+      // must be rejected even if the command's own timestamp predates expiry.
+      const verificationTime = context?.transactionTime ?? transactionTime;
+      if (leaseExpiresAt <= verificationTime) {
         sessionError(
           "FAILED_PRECONDITION",
           "turn admission requires transactionTime < leaseExpiresAt",
@@ -2894,7 +2898,14 @@ export async function applySessionCommand(
         "transactionTime",
         0,
       );
-      if (transactionTime >= active.leaseExpiresAt) {
+      // Authority/expiry decisions that gate new forward progress must use the
+      // host's trusted transaction time, not the (possibly stale) time the caller
+      // embedded in the command. command.transactionTime stays validated and part
+      // of the command identity/digest; it is only the fallback when no host
+      // context is supplied. Settlement/recovery paths keep command time to
+      // preserve the durable recovery contract.
+      const verificationTime = context?.transactionTime ?? transactionTime;
+      if (verificationTime >= active.leaseExpiresAt) {
         sessionError(
           "FAILED_PRECONDITION",
           "engine step commit requires transactionTime < leaseExpiresAt",
@@ -3070,7 +3081,7 @@ export async function applySessionCommand(
           );
         }
         status = step.kind === "turn_complete" ? "completed" : "failed";
-        turnPromotionTime = transactionTime;
+        turnPromotionTime = verificationTime;
         const terminalTurnBase = {
           turnId: active.turnId,
           sequence: active.sequence,
@@ -3142,7 +3153,11 @@ export async function applySessionCommand(
         0,
       );
       const deadline = validatedInteger(command.deadline, "deadline", 1);
-      if (transactionTime >= deadline || deadline > active.leaseExpiresAt) {
+      // Authorizing a new dispatch is forward progress: gate it on trusted host
+      // time so a stale command time cannot dispatch past the real deadline. The
+      // deadline<=leaseExpiresAt bound stays state-based.
+      const verificationTime = context?.transactionTime ?? transactionTime;
+      if (verificationTime >= deadline || deadline > active.leaseExpiresAt) {
         sessionError(
           "FAILED_PRECONDITION",
           "dispatch requires transactionTime < deadline <= leaseExpiresAt",
@@ -3797,7 +3812,8 @@ export async function applySessionCommand(
         next.latestSettledTurn = abortedTurnId;
         next.activeTurn = null;
         next.status = "ready";
-        turnPromotionTime = transactionTime;
+        // Promotion expiry of queued turns is evaluated against trusted host time.
+        turnPromotionTime = context?.transactionTime ?? transactionTime;
         outcome = { kind: "abort_requested", turnId: abortedTurnId, status: "aborted" };
       } else {
         outcome = {
@@ -3850,7 +3866,8 @@ export async function applySessionCommand(
       next.latestSettledTurn = abortedTurnId;
       next.activeTurn = null;
       next.status = "ready";
-      turnPromotionTime = transactionTime;
+      // Promotion expiry of queued turns is evaluated against trusted host time.
+      turnPromotionTime = context?.transactionTime ?? transactionTime;
       outcome = { kind: "abort_finalized", turnId: abortedTurnId, status: "aborted" };
       break;
     }
@@ -3877,7 +3894,10 @@ export async function applySessionCommand(
         "nextLeaseExpiresAt",
         1,
       );
-      if (nextLeaseExpiresAt <= transactionTime) {
+      // Renewing a lease is a new grant of authority: the rotated lease must
+      // expire in the future relative to trusted host time.
+      const verificationTime = context?.transactionTime ?? transactionTime;
+      if (nextLeaseExpiresAt <= verificationTime) {
         sessionError("FAILED_PRECONDITION", "the rotated turn lease must expire in the future");
       }
       active.turnLeaseGeneration = nextTurnLeaseGeneration;

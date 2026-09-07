@@ -447,13 +447,19 @@ async function enqueueSessionCommand(
   };
 }
 
-function sessionCell(storage: FakeTransactionalStorage): SessionCell {
+function sessionCell(
+  storage: FakeTransactionalStorage,
+  clock: () => number = () => 200,
+): SessionCell {
   const route = routedCellContext(
     storage,
     "SESSION_CELL",
     sessionCellName("tenant-1", "session-1"),
   );
-  return new SessionCell(route.state, route.environment);
+  // Authority/expiry decisions now use the cell's trusted host clock rather than
+  // the command-embedded time; pin it so admission/commit against the fixtures'
+  // synthetic lease times (leaseExpiresAt 1000) stays deterministic.
+  return new SessionCell(route.state, route.environment, clock);
 }
 
 function readSessionPublicEvents(
@@ -1158,7 +1164,7 @@ describe("named aggregate cells", () => {
       "SESSION_CELL",
       sessionCellName(initialization.tenantId, initialization.sessionId),
     );
-    const cell = new SessionCell(route.state, route.environment);
+    const cell = new SessionCell(route.state, route.environment, () => 200);
 
     const response = await cell.initializeSession(
       hostRpcRequest("session.initialize", initialization),
@@ -1224,7 +1230,7 @@ describe("named aggregate cells", () => {
       "SESSION_CELL",
       sessionCellName("tenant-1", "session-1"),
     );
-    const cell = new SessionCell(route.state, route.environment);
+    const cell = new SessionCell(route.state, route.environment, () => 200);
     await hostRpcResult(
       "session.initialize",
       sessionInitialization(),
@@ -1260,6 +1266,45 @@ describe("named aggregate cells", () => {
       queuedTurns: [],
     });
     expect("load" in cell || "save" in cell || "patch" in cell).toBe(false);
+  });
+
+  it("gates turn admission on the trusted host clock, not the command's embedded time", async () => {
+    // The command carries transactionTime 100 and leaseExpiresAt 1000 (see
+    // enqueueSessionCommand). A queued or delayed command whose lease has since
+    // expired must be rejected against the host's trusted clock even though the
+    // command's own timestamp still predates expiry.
+    const initialize = async (cell: SessionCell) =>
+      hostRpcResult("session.initialize", sessionInitialization(), (request) =>
+        cell.initializeSession(request));
+
+    const expiredStorage = new FakeTransactionalStorage();
+    const expiredRoute = routedCellContext(
+      expiredStorage,
+      "SESSION_CELL",
+      sessionCellName("tenant-1", "session-1"),
+    );
+    const expiredCell = new SessionCell(expiredRoute.state, expiredRoute.environment, () => 5000);
+    await initialize(expiredCell);
+    await expect(hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => expiredCell.executeSessionCommand(request),
+    )).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+
+    // Control: with the host clock before the lease, the identical command admits.
+    const liveStorage = new FakeTransactionalStorage();
+    const liveRoute = routedCellContext(
+      liveStorage,
+      "SESSION_CELL",
+      sessionCellName("tenant-1", "session-1"),
+    );
+    const liveCell = new SessionCell(liveRoute.state, liveRoute.environment, () => 100);
+    await initialize(liveCell);
+    await expect(hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => liveCell.executeSessionCommand(request),
+    )).resolves.toMatchObject({ version: 1, replayed: false });
   });
 
   it("migrates a persisted schema-v1 Session to the current journal schema before use", async () => {
@@ -1303,7 +1348,7 @@ describe("named aggregate cells", () => {
     });
     const legacyRevision = storage.revision;
 
-    const cell = new SessionCell(route.state, route.environment);
+    const cell = new SessionCell(route.state, route.environment, () => 200);
     await expect(hostRpcResult(
       "session.initialize",
       initialization,
@@ -1360,7 +1405,7 @@ describe("named aggregate cells", () => {
       "SESSION_CELL",
       sessionCellName("tenant-1", "session-1"),
     );
-    const cell = new SessionCell(route.state, route.environment);
+    const cell = new SessionCell(route.state, route.environment, () => 200);
     await hostRpcResult(
       "session.initialize",
       sessionInitialization(),
