@@ -176,6 +176,8 @@ export class RecoverableWorkspaceEffect {
     const workspaceKernel = new TransactionalAggregateKernel(
       { storage: workspaceStorage },
       workspaceAdapter,
+      undefined,
+      () => 2_000,
     );
     const diagnostics: RecoveryDiagnostics = {
       workspaceAcquireExecutions: 0,

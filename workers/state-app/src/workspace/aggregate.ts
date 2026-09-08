@@ -536,12 +536,13 @@ function latestDispatchAttemptForInvocation(
 function validatedAcquireInputs(
   command: AcquireWriteLeaseCommand,
   state: WorkspaceAggregateState,
+  now: number,
 ): WorkspaceAuthoritySnapshot {
   const authority = validatedAuthority(
     command.authority,
     state,
     "authority",
-    command.now,
+    now,
     "workspace.write",
     "admission",
   );
@@ -568,8 +569,8 @@ function validatedAcquireInputs(
   if (command.waitPolicy !== "queue" && command.waitPolicy !== "fail") {
     workspaceError("INVALID_ARGUMENT", "waitPolicy must be queue or fail");
   }
-  checkedAdd(command.now, ttl, "initial lease expiry");
-  checkedAdd(command.now, maximumHold, "maximum hold deadline");
+  checkedAdd(now, ttl, "initial lease expiry");
+  checkedAdd(now, maximumHold, "maximum hold deadline");
   return authority;
 }
 
@@ -1995,6 +1996,7 @@ export function lookupWorkspaceInvocation(
 export async function applyWorkspaceCommand(
   state: WorkspaceAggregateState,
   command: WorkspaceCommand,
+  context?: { readonly transactionTime: number },
 ): Promise<ApplyWorkspaceCommandResult> {
   assertWorkspaceInvariants(state);
   const commandRecord = validatedDataRecord(command, "command");
@@ -2080,6 +2082,12 @@ export async function applyWorkspaceCommand(
   validatedExactKeys(command, commandFields, "command");
   validatedInteger(command.expectedEventSequence, "expectedEventSequence", 0);
   validatedInteger(command.now, "now", 0);
+  // Authority/expiry decisions use the host's trusted transaction time (mirrors the
+  // session aggregate). command.now stays validated and part of the command
+  // identity/digest and is only the fallback when no host context is supplied.
+  // Settlement (commit_workspace) deliberately keeps command.now to preserve the
+  // durable recovery contract.
+  const now = context?.transactionTime ?? command.now;
 
   let commandDigest;
   try {
@@ -2170,7 +2178,7 @@ export async function applyWorkspaceCommand(
   }
 
   if (command.kind === "acquire_write_lease") {
-    const authority = validatedAcquireInputs(command, state);
+    const authority = validatedAcquireInputs(command, state, now);
     const history = state.leaseHistory.find(
       (record) => record.invocationId === authority.invocationId,
     );
@@ -2204,7 +2212,7 @@ export async function applyWorkspaceCommand(
     const active = state.activeWriteLease;
     if (
       active !== null &&
-      command.now < active.expiresAt &&
+      now < active.expiresAt &&
       active.invocationId === authority.invocationId
     ) {
       if (!authorityIdentityMatches(authority, active.admissionAuthority)) {
@@ -2228,10 +2236,10 @@ export async function applyWorkspaceCommand(
     );
     if (
       active !== null &&
-      command.now < active.expiresAt &&
+      now < active.expiresAt &&
       queued !== undefined &&
       !queued.canceled &&
-      command.now < queued.acquireDeadline
+      now < queued.acquireDeadline
     ) {
       if (!authorityCanRefreshQueuedAdmission(authority, queued.authority)) {
         workspaceError("STALE_GENERATION", "queued lease acquisition authority is stale");
@@ -2264,14 +2272,14 @@ export async function applyWorkspaceCommand(
       command.authority,
       state,
       "authority",
-      command.now,
+      now,
       "workspace.write",
       "admission",
     );
     if (!authorityMatchesLease(authority, active)) {
       workspaceError("STALE_GENERATION", "lease renewal authority is stale");
     }
-    if (command.now >= active.expiresAt) {
+    if (now >= active.expiresAt) {
       workspaceError("LEASE_EXPIRED", "the workspace write lease has expired");
     }
     if (command.nextRenewalSequence === active.renewalSequence) {
@@ -2313,7 +2321,7 @@ export async function applyWorkspaceCommand(
         command.authority,
         state,
         "authority",
-        command.now,
+        now,
         command.accessMode === "read_write" ? "workspace.write" : "workspace.read",
         "admission",
       );
@@ -2342,7 +2350,7 @@ export async function applyWorkspaceCommand(
       let currentLease: WorkspaceWriteLease | null = null;
       if (existing.accessMode === "read_write" && command.leaseFence !== null) {
         currentLease = currentLeaseForFence(state, command.leaseFence);
-        if (command.now >= currentLease.expiresAt) {
+        if (now >= currentLease.expiresAt) {
           workspaceError("LEASE_EXPIRED", "the workspace write lease has expired");
         }
         if (!authorityMatchesLease(authority, currentLease)) {
@@ -2376,7 +2384,7 @@ export async function applyWorkspaceCommand(
           `materialization ticket ${command.ticketId} was reused`,
         );
       }
-      if (command.now >= existing.expiresAt) {
+      if (now >= existing.expiresAt) {
         workspaceError("LEASE_EXPIRED", "the materialization ticket has expired");
       }
       if (existing.accessMode === "read_write") {
@@ -2410,8 +2418,8 @@ export async function applyWorkspaceCommand(
 
   switch (command.kind) {
     case "acquire_write_lease": {
-      const authority = validatedAcquireInputs(command, next);
-      const advanced = advanceLeaseQueue(next, command.now, {
+      const authority = validatedAcquireInputs(command, next, now);
+      const advanced = advanceLeaseQueue(next, now, {
         contendingInvocationId: authority.invocationId,
       });
       const history = next.leaseHistory.find(
@@ -2469,7 +2477,7 @@ export async function applyWorkspaceCommand(
         (entry) => entry.authority.invocationId === authority.invocationId,
       );
       if (queued !== undefined) {
-        if (queued.canceled || command.now >= queued.acquireDeadline) {
+        if (queued.canceled || now >= queued.acquireDeadline) {
           workspaceError("FAILED_PRECONDITION", "the prior lease admission is no longer live");
         }
         if (!authorityCanRefreshQueuedAdmission(authority, queued.authority)) {
@@ -2491,7 +2499,7 @@ export async function applyWorkspaceCommand(
           if (removed?.enqueueSequence !== refreshed.enqueueSequence) {
             workspaceError("FAILED_PRECONDITION", "FIFO lease head changed during admission");
           }
-          const granted = grantQueueHead(next, refreshed, command.now);
+          const granted = grantQueueHead(next, refreshed, now);
           return committedResult(
             state,
             next,
@@ -2537,7 +2545,7 @@ export async function applyWorkspaceCommand(
       if (next.knownLeaseIds.includes(command.requestedLeaseId)) {
         workspaceError("ALREADY_EXISTS", `lease ID ${command.requestedLeaseId} was already used`);
       }
-      if (command.acquireDeadline <= command.now) {
+      if (command.acquireDeadline <= now) {
         workspaceError("FAILED_PRECONDITION", "the lease acquire deadline has elapsed");
       }
 
@@ -2579,7 +2587,7 @@ export async function applyWorkspaceCommand(
           requestedMaximumHoldMs: command.requestedMaximumHoldMs,
           acquireDeadline: command.acquireDeadline,
           waitPolicy: "fail",
-          recordedAt: command.now,
+          recordedAt: now,
           outcome,
         };
         next.leaseConflicts.push(receipt);
@@ -2624,7 +2632,7 @@ export async function applyWorkspaceCommand(
         if (queuedHead === undefined) {
           workspaceError("FAILED_PRECONDITION", "new FIFO head disappeared");
         }
-        const granted = grantQueueHead(next, queuedHead, command.now);
+        const granted = grantQueueHead(next, queuedHead, now);
         return committedResult(
           state,
           next,
@@ -2652,14 +2660,14 @@ export async function applyWorkspaceCommand(
         command.authority,
         next,
         "authority",
-        command.now,
+        now,
         "workspace.write",
         "admission",
       );
       if (!authorityMatchesLease(authority, lease)) {
         workspaceError("STALE_GENERATION", "lease renewal authority is stale");
       }
-      if (command.now >= lease.expiresAt) {
+      if (now >= lease.expiresAt) {
         workspaceError("LEASE_EXPIRED", "the workspace write lease has expired");
       }
       if (command.nextRenewalSequence !== lease.renewalSequence + 1) {
@@ -2669,7 +2677,7 @@ export async function applyWorkspaceCommand(
         );
       }
       const requestedExpiry = checkedAdd(
-        command.now,
+        now,
         command.requestedLeaseTtlMs,
         "renewed lease expiry",
       );
@@ -2726,7 +2734,7 @@ export async function applyWorkspaceCommand(
         command.authority,
         next,
         "authority",
-        command.now,
+        now,
         "workspace.write",
         "admission",
       );
@@ -2747,7 +2755,7 @@ export async function applyWorkspaceCommand(
       });
       dropWriteTicketsForLease(next, lease.leaseId);
       next.activeWriteLease = null;
-      const advanced = advanceLeaseQueue(next, command.now);
+      const advanced = advanceLeaseQueue(next, now);
       return committedResult(
         state,
         next,
@@ -2767,7 +2775,7 @@ export async function applyWorkspaceCommand(
         command.authority,
         next,
         "authority",
-        command.now,
+        now,
         "workspace.write",
         "admission",
       );
@@ -2826,7 +2834,7 @@ export async function applyWorkspaceCommand(
         status: "canceled",
       });
       if (next.activeWriteLease === null) {
-        advanceLeaseQueue(next, command.now);
+        advanceLeaseQueue(next, now);
       }
       return committedResult(
         state,
@@ -2841,7 +2849,7 @@ export async function applyWorkspaceCommand(
     }
 
     case "reconcile_write_queue": {
-      const advanced = advanceLeaseQueue(next, command.now);
+      const advanced = advanceLeaseQueue(next, now);
       const outcome: WorkspaceCommandOutcome = {
         kind: "write_queue_reconciled",
         promotedInvocationId: advanced.promotedInvocationId,
@@ -2859,7 +2867,7 @@ export async function applyWorkspaceCommand(
         command.authority,
         next,
         "authority",
-        command.now,
+        now,
         command.accessMode === "read_write" ? "workspace.write" : "workspace.read",
         "admission",
       );
@@ -2894,7 +2902,7 @@ export async function applyWorkspaceCommand(
           workspaceError("FAILED_PRECONDITION", "write materialization requires a lease fence");
         }
         lease = currentLeaseForFence(next, command.leaseFence);
-        if (command.now >= lease.expiresAt) {
+        if (now >= lease.expiresAt) {
           workspaceError("LEASE_EXPIRED", "the workspace write lease has expired");
         }
         if (!authorityMatchesLease(authority, lease)) {
@@ -2914,13 +2922,13 @@ export async function applyWorkspaceCommand(
       if (next.knownMaterializationTicketIds.includes(ticketId)) {
         workspaceError("ALREADY_EXISTS", `materialization ticket ${ticketId} was already used`);
       }
-      const requestedExpiry = checkedAdd(command.now, ticketTtlMs, "ticket expiry");
+      const requestedExpiry = checkedAdd(now, ticketTtlMs, "ticket expiry");
       const expiresAt = Math.min(
         requestedExpiry,
         authority.turnLeaseExpiresAt,
         lease?.expiresAt ?? Number.MAX_SAFE_INTEGER,
       );
-      if (expiresAt <= command.now) {
+      if (expiresAt <= now) {
         workspaceError("LEASE_EXPIRED", "materialization ticket has no valid lifetime");
       }
       const ticket: WorkspaceMaterializationTicket = {
@@ -2946,7 +2954,7 @@ export async function applyWorkspaceCommand(
         sandboxGeneration: authority.sandboxGeneration,
         projectionGeneration,
         authorizationGeneration: authority.authorizationGeneration,
-        issuedAt: command.now,
+        issuedAt: now,
         expiresAt,
         requestedTicketTtlMs: ticketTtlMs,
         admissionAuthority: authority,

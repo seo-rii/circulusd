@@ -1813,7 +1813,7 @@ describe("named aggregate cells", () => {
       "WORKSPACE_CELL",
       workspaceCellName("tenant-1", "workspace-1"),
     );
-    const cell = new WorkspaceCell(route.state, route.environment);
+    const cell = new WorkspaceCell(route.state, route.environment, () => 100);
     await hostRpcResult(
       "workspace.initialize",
       workspaceInitialization(),
@@ -1886,7 +1886,7 @@ describe("named aggregate cells", () => {
       "WORKSPACE_CELL",
       workspaceCellName("tenant-1", "workspace-1"),
     );
-    const cell = new WorkspaceCell(route.state, route.environment);
+    const cell = new WorkspaceCell(route.state, route.environment, () => 100);
     await hostRpcResult(
       "workspace.initialize",
       workspaceInitialization(),
@@ -1933,6 +1933,45 @@ describe("named aggregate cells", () => {
       (request) => cell.executeWorkspaceCommand(request),
     )).resolves.toMatchObject({ replayed: true });
     expect(storage.revision).toBe(revisionAfterWinner);
+  });
+
+  it("gates Workspace lease acquisition on the trusted host clock, not the command's now", async () => {
+    // acquireWorkspaceCommand carries now 100 and an authority whose turn lease
+    // expires at 10_000. A delayed command whose lease has since expired must be
+    // rejected against the host's trusted clock even though command.now predates it.
+    const initialize = async (cell: WorkspaceCell) =>
+      hostRpcResult("workspace.initialize", workspaceInitialization(), (request) =>
+        cell.initializeWorkspace(request));
+
+    const expiredStorage = new FakeTransactionalStorage();
+    const expiredRoute = routedCellContext(
+      expiredStorage,
+      "WORKSPACE_CELL",
+      workspaceCellName("tenant-1", "workspace-1"),
+    );
+    const expiredCell = new WorkspaceCell(expiredRoute.state, expiredRoute.environment, () => 20_000);
+    await initialize(expiredCell);
+    await expect(hostRpcResult(
+      "workspace.execute",
+      acquireWorkspaceCommand(),
+      (request) => expiredCell.executeWorkspaceCommand(request),
+    )).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+
+    // Control: with the host clock inside the lease window, the identical command acquires.
+    const liveStorage = new FakeTransactionalStorage();
+    const liveRoute = routedCellContext(
+      liveStorage,
+      "WORKSPACE_CELL",
+      workspaceCellName("tenant-1", "workspace-1"),
+    );
+    const liveCell = new WorkspaceCell(liveRoute.state, liveRoute.environment, () => 100);
+    await initialize(liveCell);
+    const acquired = await hostRpcResult(
+      "workspace.execute",
+      acquireWorkspaceCommand(),
+      (request) => liveCell.executeWorkspaceCommand(request),
+    );
+    expect(acquired.outcome.kind).toBe("write_lease_acquired");
   });
 
   it("routes ExtensionState commands through its authorized read model", async () => {

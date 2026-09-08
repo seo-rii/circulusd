@@ -392,12 +392,17 @@ export class WorkspaceCell extends DurableObject<StateHostEnvironment> {
     WorkspaceCommandOutcome
   >;
 
-  constructor(state: StateHostContext, environment: StateHostEnvironment) {
+  constructor(
+    state: StateHostContext,
+    environment: StateHostEnvironment,
+    clock: () => number = Date.now,
+  ) {
     super(state, environment);
     this.kernel = new TransactionalAggregateKernel(
       state,
       workspaceAdapter,
       cellRoute(state, environment, "WORKSPACE_CELL"),
+      clock,
     );
   }
 
