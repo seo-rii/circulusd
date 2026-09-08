@@ -24,6 +24,7 @@ import {
 } from "@circulusd/protocol-types";
 
 import { BoundaryFault, PiRuntimeError } from "./errors.ts";
+import { decodePiJson, encodePiJson } from "./pi-json-codec.ts";
 import {
   PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
   decodePiAgentCoreModelContext,
@@ -90,11 +91,44 @@ export function createPiAgentCoreInitialState(): NormalizedValue {
   };
 }
 
+// wrapToolSchemaNumbers wraps fractional numbers in each tool's JSON Schema so the
+// configuration survives the integer-only canonical bound below (tool schemas
+// legitimately carry constraints such as "minimum": 0.1). A malformed tool is left
+// untouched so the bound and per-tool validation still reject it with their own
+// error. Tool-call argument numbers are wrapped at the (Go) producer boundary, not
+// here.
+function wrapToolSchemaNumbers(
+  configuration: PiAgentCoreAdapterConfiguration,
+): PiAgentCoreAdapterConfiguration {
+  const record = configuration as unknown as Record<string, unknown>;
+  const tools = record.tools;
+  if (!Array.isArray(tools)) {
+    return configuration;
+  }
+  return {
+    ...configuration,
+    tools: tools.map((tool) => {
+      if (tool === null || typeof tool !== "object" || Array.isArray(tool)) {
+        return tool;
+      }
+      const toolRecord = tool as Record<string, unknown>;
+      if (!("parameters" in toolRecord)) {
+        return tool;
+      }
+      try {
+        return { ...toolRecord, parameters: encodePiJson(toolRecord.parameters) };
+      } catch {
+        return tool;
+      }
+    }),
+  } as PiAgentCoreAdapterConfiguration;
+}
+
 export function createPiAgentCoreFactory(
   configuration: PiAgentCoreAdapterConfiguration,
 ): AgentCoreFactory {
   const normalizedConfiguration = boundedProtocolValue(
-    configuration,
+    wrapToolSchemaNumbers(configuration),
     maximumAdapterValueBytes,
     "piAgentCore.configuration",
     "INVALID_CONFIGURATION",
@@ -209,28 +243,33 @@ export function createPiAgentCoreFactory(
         `piAgentCore.configuration.tools contains duplicate name ${toolRecord.name}`,
       );
     }
-    const parameters = normalizeProtocolValue(toolRecord.parameters);
-    const schemaNodes: NormalizedValue[] = [parameters];
-    while (schemaNodes.length > 0) {
-      const node = schemaNodes.pop();
-      if (node instanceof Uint8Array) {
-        throw new PiRuntimeError(
-          "INVALID_CONFIGURATION",
-          `piAgentCore.configuration.tools[${index}].parameters is not JSON`,
-        );
-      }
-      if (Array.isArray(node)) {
-        schemaNodes.push(...node);
-      } else if (node !== null && typeof node === "object") {
-        schemaNodes.push(...Object.values(node));
-      }
+    // Capture the validated replay policy (checked above) as its exact union; the
+    // try/catch below otherwise resets control-flow narrowing back to string.
+    const replayPolicy = toolRecord.replayPolicy as
+      | "safe"
+      | "idempotency-key"
+      | "never"
+      | "confirm";
+    // The schema was wrapped before the configuration bound so fractional
+    // constraints survive the integer-only canonical encoder; decode it back to real
+    // numbers for in-process JSON-Schema validation and model advertisement. Byte
+    // (non-JSON) schemas were already rejected by the bound. It is re-wrapped when it
+    // crosses the canonical boundary in a model request.
+    let parameters: unknown;
+    try {
+      parameters = decodePiJson(toolRecord.parameters as NormalizedValue);
+    } catch {
+      throw new PiRuntimeError(
+        "INVALID_CONFIGURATION",
+        `piAgentCore.configuration.tools[${index}].parameters is not JSON`,
+      );
     }
     toolNames.add(toolRecord.name);
     return Object.freeze({
       name: toolRecord.name,
       description: toolRecord.description,
       parameters: structuredClone(parameters),
-      replayPolicy: toolRecord.replayPolicy,
+      replayPolicy,
     });
   });
   const toolRegistry = new Map(toolDefinitions.map((tool) => [tool.name, tool]));
@@ -372,7 +411,10 @@ export function createPiAgentCoreFactory(
           capturedContext = {
             ...(piContext.systemPrompt === undefined ? {} : { systemPrompt: piContext.systemPrompt }),
             messages: structuredClone(piContext.messages),
-            tools: structuredClone(advertisedTools) as unknown as NonNullable<PiContext["tools"]>,
+            tools: advertisedTools.map((tool) => ({
+              ...tool,
+              parameters: encodePiJson(tool.parameters),
+            })) as unknown as NonNullable<PiContext["tools"]>,
           };
           const stream = createAssistantMessageEventStream();
           const aborted: AssistantMessage = {
@@ -1052,7 +1094,10 @@ export function createPiAgentCoreFactory(
           capturedContext = {
             ...(piContext.systemPrompt === undefined ? {} : { systemPrompt: piContext.systemPrompt }),
             messages: structuredClone(piContext.messages),
-            tools: structuredClone(advertisedTools) as unknown as NonNullable<PiContext["tools"]>,
+            tools: advertisedTools.map((tool) => ({
+              ...tool,
+              parameters: encodePiJson(tool.parameters),
+            })) as unknown as NonNullable<PiContext["tools"]>,
           };
           const stream = createAssistantMessageEventStream();
           const aborted: AssistantMessage = {

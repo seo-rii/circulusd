@@ -12,6 +12,7 @@ import {
   type ExtensionRegistration,
   type PiAgentCoreModelConfiguration,
 } from "../src/index.ts";
+import { decodePiJson } from "../src/pi-json-codec.ts";
 import { identity, successSettlement } from "./helpers.ts";
 
 const MODEL = {
@@ -159,6 +160,42 @@ describe("pinned Pi Agent Core bounded adapter", () => {
       model: MODEL,
       tools: [TOOL_REGISTRY[0], structuredClone(TOOL_REGISTRY[0])],
     })).toThrowError(/duplicate name echo/);
+  });
+
+  it("accepts a tool JSON Schema with fractional constraints and carries it across the model boundary (R3)", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        factor: { type: "number", minimum: 0.1, maximum: 1.5, multipleOf: 0.25, default: 0.75 },
+      },
+      required: ["factor"],
+      additionalProperties: false,
+    };
+    const engine = new LowLevelPiAgentEngine(
+      { ...identity("session_fractional_schema"), adapterAbiVersion: 2, checkpointSchemaVersion: 2 },
+      createPiAgentCoreFactory({
+        systemPrompt: "You are a deterministic test agent.",
+        model: MODEL,
+        tools: [{ name: "scale", description: "Scale a value", parameters: schema, replayPolicy: "safe" }],
+      }),
+    );
+    // Construction validates the fractional schema (previously rejected by the
+    // integer-only configuration bound), and the model request carries it across the
+    // canonical boundary.
+    const model = await engine.step({
+      authority: authority(),
+      checkpoint: await makeGenesis(engine, "turn_fractional_schema"),
+    });
+    expect(model.kind).toBe("effect_request");
+    if (model.kind !== "effect_request") throw new Error("expected model request");
+    const payload = model.request.payload as unknown as {
+      readonly context: { readonly tools: readonly { readonly parameters: NormalizedValue }[] };
+    };
+    // The advertised schema is wrapped for the canonical model request; decoding
+    // restores the exact fractional constraints.
+    const advertised = payload.context.tools[0];
+    if (advertised === undefined) throw new Error("expected an advertised tool");
+    expect(decodePiJson(advertised.parameters)).toEqual(schema);
   });
 
   it("rejects construction under checkpoint schema version 1", async () => {
