@@ -232,6 +232,39 @@ describe("Session authoritative aggregate", () => {
     } as never)).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
   });
 
+  it("rejects turn admission before acceptance when no capacity remains to persist its completion (F01)", async () => {
+    const enqueueLarge = async (
+      state: SessionAggregateState,
+      turnId: string,
+      commandId: string,
+    ) => {
+      // Just under the 1 MiB per-value limit; two of these plus a completion
+      // reservation exceed the 3 MiB bounded state.
+      const input = { message: "x".repeat(1_000_000) };
+      return applySessionCommand(state, {
+        kind: "enqueue_turn",
+        commandId,
+        expectedEventSequence: state.eventSequence,
+        transactionTime: TRANSACTION_TIME,
+        turnId,
+        input,
+        inputDigest: await turnInputDigest(input),
+        genesisCheckpoint: await genesisCheckpoint(state, turnId),
+        turnLeaseGeneration: state.nextTurnSequence + 10,
+        leaseExpiresAt: 1_900_000_000_000,
+      });
+    };
+
+    const first = await enqueueLarge(newSession(), "turn_big_1", "enqueue_big_1");
+    // The second admission would leave less than one completion's reservation, so it
+    // must be rejected before acceptance rather than accepted and unable to complete.
+    await expect(enqueueLarge(first.state, "turn_big_2", "enqueue_big_2"))
+      .rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    // The rejected turn was never accepted.
+    expect(first.state.knownTurnIds).not.toContain("turn_big_2");
+    expect(first.state.queuedTurns.some((turn) => turn.turnId === "turn_big_2")).toBe(false);
+  });
+
   it("requires trusted admission time, a live lease, and a positive lease generation", async () => {
     const initial = newSession();
     const input = { message: "turn_01" };

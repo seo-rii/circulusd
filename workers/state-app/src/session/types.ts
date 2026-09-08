@@ -22,6 +22,16 @@ export const SESSION_COMMAND_MAX_ENCODED_BYTES = 8 * 1_048_576;
 // The host record adds routing and manifest metadata around this value. Three
 // MiB leaves headroom below the host's 4 MiB record/isolate-memory boundary.
 export const SESSION_STATE_MAX_ENCODED_BYTES = 3 * 1_048_576;
+// Worst-case durable growth a single turn's terminal transition can add on top of
+// the bounded state: a maximal result value plus a fixed budget covering the final
+// checkpoint delta, terminal metadata, command receipt, and public event. Turn
+// admission reserves this per not-yet-terminal turn so an accepted turn can always
+// store its completion; without a reservation the state could accept a turn and then
+// fail to persist its result (the completed-turn accumulation defect, review F01).
+// This is the interim admission guard; paged history/externalized payloads remain
+// the long-term layout.
+export const SESSION_TURN_COMPLETION_RESERVE_BYTES =
+  SESSION_VALUE_MAX_ENCODED_BYTES + 256 * 1024;
 export const SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS = 256 as const;
 
 export type SessionStatus =

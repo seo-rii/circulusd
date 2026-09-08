@@ -27,6 +27,7 @@ import {
   SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS,
   SESSION_STATE_SCHEMA_VERSION,
   SESSION_STATE_MAX_ENCODED_BYTES,
+  SESSION_TURN_COMPLETION_RESERVE_BYTES,
   SESSION_TURN_INPUT_DIGEST_DOMAIN,
   SESSION_TURN_INPUT_DIGEST_SCHEMA_VERSION,
   SESSION_VALUE_MAX_ENCODED_BYTES,
@@ -170,6 +171,16 @@ function validatedNormalizedValue(
     }
     throw error;
   }
+}
+
+// sessionStateEncodedSize returns the canonical CBOR byte length of the durable
+// state. It throws the same bounded-value failure as assertSessionInvariants if the
+// state already exceeds the limit; turn admission uses it to reserve headroom for
+// the pending turns' completions.
+function sessionStateEncodedSize(state: SessionAggregateState): number {
+  return encodeCanonicalCbor(normalizeProtocolValue(state), {
+    maxBytes: SESSION_STATE_MAX_ENCODED_BYTES,
+  }).byteLength;
 }
 
 function validatedIdentifier(value: unknown, field: string): string {
@@ -2884,6 +2895,28 @@ export async function applySessionCommand(
           publicEventSequence: next.publicEventSequence,
         };
         next.turnAdmissionReceipts.push(admissionReceipt);
+      }
+      // Reject before acceptance if admitting this turn would leave no durable room
+      // to persist its completion. Terminal records (result/error, final checkpoint,
+      // receipt, public event) accumulate in the bounded state, so without a
+      // reservation a turn could be accepted and then fail to store its result once
+      // enough prior results have accumulated (review F01, the observed defect).
+      // Reserve headroom for one worst-case completion beyond the projected state and
+      // convert the failure into a contractual pre-admission rejection that reports
+      // the durable size and reserved budget. This is the interim admission guard;
+      // paged history and externalized payloads remain the long-term layout, so a
+      // long-lived session can still legitimately exhaust its bounded history here.
+      const projectedStateBytes = sessionStateEncodedSize(next);
+      if (
+        projectedStateBytes + SESSION_TURN_COMPLETION_RESERVE_BYTES >
+        SESSION_STATE_MAX_ENCODED_BYTES
+      ) {
+        sessionError(
+          "FAILED_PRECONDITION",
+          `turn admission would leave no room to persist its completion: ` +
+            `${projectedStateBytes} durable bytes plus a ${SESSION_TURN_COMPLETION_RESERVE_BYTES}-byte ` +
+            `completion reservation exceeds the ${SESSION_STATE_MAX_ENCODED_BYTES}-byte limit`,
+        );
       }
       break;
     }
