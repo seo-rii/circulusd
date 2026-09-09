@@ -24,6 +24,8 @@ import {
   type SessionCommand,
   type SessionFence,
 } from "../src/session/index.ts";
+import { SESSION_STATE_MAX_ENCODED_ITEMS } from "../src/session/types.ts";
+import { MAX_RECORD_ITEMS } from "../src/host/storage.ts";
 
 const RUNTIME_DIGEST = `sha256:${"1".repeat(64)}` as Digest;
 const INPUT_DIGEST = `sha256:${"2".repeat(64)}` as Digest;
@@ -779,6 +781,28 @@ describe("Session authoritative aggregate", () => {
     missingAdmittedTurn.queuedTurns.pop();
     expect(() => assertSessionInvariants(missingAdmittedTurn)).toThrow(
       /exactly one durable status/,
+    );
+  });
+
+  it("keeps the session state item budget strictly inside the host record item limit (U04)", () => {
+    // The host storage record wraps the state with routing metadata; the aggregate's
+    // item budget must leave room for that wrapper so a state the aggregate accepts
+    // never exceeds the host record's item limit.
+    expect(SESSION_STATE_MAX_ENCODED_ITEMS).toBeLessThan(MAX_RECORD_ITEMS);
+    expect(SESSION_STATE_MAX_ENCODED_ITEMS + 64).toBeLessThanOrEqual(MAX_RECORD_ITEMS);
+  });
+
+  it("rejects a state whose encoded item count exceeds the aggregate item budget (U04)", async () => {
+    const admitted = await enqueueTurn(newSession(), "turn_01", "enqueue_01");
+    expect(() => assertSessionInvariants(admitted.state)).not.toThrow();
+    // A large-item value (e.g. a big array result) must be rejected by the aggregate
+    // itself, not silently accepted here and then rejected by the host storage record
+    // with an opaque late error (review U04). The item check runs before the field
+    // checks, so an oversized array anywhere in the state triggers it.
+    const oversized = structuredClone(admitted.state) as unknown as { knownTurnIds: unknown };
+    oversized.knownTurnIds = Array.from({ length: MAX_RECORD_ITEMS + 1 }, (_, index) => index);
+    expect(() => assertSessionInvariants(oversized as never)).toThrow(
+      /bounded protocol value|item limit/,
     );
   });
 

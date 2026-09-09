@@ -21,9 +21,12 @@ const CHUNK_BYTES = 1_048_576;
 // A stored record is simultaneously encoded, decoded, normalized, validated,
 // and cloned on command paths. Keep each copy below 4 MiB so the worst-case
 // amplification remains bounded inside workerd's 128 MiB isolate limit.
-const MAX_RECORD_BYTES = 4 * 1_048_576;
-const MAX_RECORD_ITEMS = 100_000;
-const MAX_RECORD_DEPTH = 72;
+// Exported so the Session aggregate's state budget (session/types.ts) can be
+// asserted to stay strictly inside these host record limits (review U04): the
+// aggregate must never produce a state whose stored record the host then rejects.
+export const MAX_RECORD_BYTES = 4 * 1_048_576;
+export const MAX_RECORD_ITEMS = 100_000;
+export const MAX_RECORD_DEPTH = 72;
 const MAX_CHUNKS = Math.ceil(MAX_RECORD_BYTES / CHUNK_BYTES);
 const MAX_TRANSACTION_MUTATED_KEYS = 128;
 const MAX_CELL_NAME_BYTES = 2_048;

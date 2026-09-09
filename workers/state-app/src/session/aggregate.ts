@@ -27,6 +27,7 @@ import {
   SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS,
   SESSION_STATE_SCHEMA_VERSION,
   SESSION_STATE_MAX_ENCODED_BYTES,
+  SESSION_STATE_MAX_ENCODED_ITEMS,
   SESSION_TURN_COMPLETION_RESERVE_BYTES,
   SESSION_TURN_INPUT_DIGEST_DOMAIN,
   SESSION_TURN_INPUT_DIGEST_SCHEMA_VERSION,
@@ -131,9 +132,10 @@ function validatedNormalizedValue(
   maxBytes: number,
   requireCanonical: boolean,
   errorCode: SessionAggregateErrorCode,
+  maxItems?: number,
 ): NormalizedValue {
   try {
-    const normalized = normalizeProtocolValue(value);
+    const normalized = normalizeProtocolValue(value, maxItems === undefined ? {} : { maxItems });
     if (requireCanonical) {
       const pending: unknown[] = [value];
       while (pending.length > 0) {
@@ -907,6 +909,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     SESSION_STATE_MAX_ENCODED_BYTES,
     true,
     "FAILED_PRECONDITION",
+    SESSION_STATE_MAX_ENCODED_ITEMS,
   );
   validatedExactFields(
     state,

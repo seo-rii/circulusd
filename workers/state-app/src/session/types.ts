@@ -22,6 +22,14 @@ export const SESSION_COMMAND_MAX_ENCODED_BYTES = 8 * 1_048_576;
 // The host record adds routing and manifest metadata around this value. Three
 // MiB leaves headroom below the host's 4 MiB record/isolate-memory boundary.
 export const SESSION_STATE_MAX_ENCODED_BYTES = 3 * 1_048_576;
+// The host storage record bounds encoded item count, not just bytes: it rejects a
+// record whose canonical CBOR exceeds MAX_RECORD_ITEMS (100_000). The aggregate must
+// enforce the same budget on its state, minus the record wrapper's own items, so it
+// never produces a state the host storage then rejects with a late, opaque error
+// (review U04). Kept strictly below the host limit; host.storage.test asserts the
+// margin covers the wrapper. (Depth is already bounded by the canonical normalizer's
+// default, which is stricter than the host's depth limit.)
+export const SESSION_STATE_MAX_ENCODED_ITEMS = 99_936;
 // Worst-case durable growth a single turn's terminal transition can add on top of
 // the bounded state: a maximal result value plus a fixed budget covering the final
 // checkpoint delta, terminal metadata, command receipt, and public event. Turn
