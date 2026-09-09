@@ -1030,6 +1030,132 @@ describe("command host transactional kernel", () => {
     expect(storage.values.size).toBe(0);
   }, 30_000);
 
+  it("persists, reads back, and garbage-collects externalized payload blobs (storage stage B)", async () => {
+    interface BlobState {
+      readonly version: number;
+      readonly refs: readonly Digest[];
+    }
+    interface BlobCommand {
+      readonly add: readonly Uint8Array[];
+      readonly keep: readonly Digest[];
+    }
+    const adapter: AggregateAdapter<BlobState, BlobState, BlobCommand, null> = {
+      kind: "blob-externalization-test",
+      create: (input) => ({ version: input.version, refs: input.refs }),
+      validate: (state) => {
+        if (typeof state.version !== "number" || !Array.isArray(state.refs)) {
+          throw new Error("invalid blob test state");
+        }
+      },
+      apply: async (state, command) => {
+        const blobs = new Map<Digest, Uint8Array>();
+        const created: Digest[] = [];
+        for (const bytes of command.add) {
+          const digest = await digestBytes(bytes);
+          blobs.set(digest, bytes);
+          created.push(digest);
+        }
+        const referencedBlobs = [...command.keep, ...created];
+        return {
+          state: { version: state.version + 1, refs: referencedBlobs },
+          outcome: null,
+          replayed: false,
+          blobs,
+          referencedBlobs,
+        };
+      },
+      version: (state) => state.version,
+    };
+    const storage = new FakeTransactionalStorage();
+    const kernel = new TransactionalAggregateKernel(stateWith(storage), adapter);
+    const reader = new ChunkedAggregateStorage<BlobState>(adapter.kind, adapter.validate);
+    const blobKeys = () =>
+      [...storage.values.keys()].filter((key) =>
+        key.startsWith("circulusd.state-app.aggregate.v2.blob."),
+      );
+
+    await kernel.initialize({ version: 0, refs: [] });
+    expect(blobKeys()).toHaveLength(0);
+
+    // A 1.5 MiB payload frames into two blob chunks and reads back byte-identically.
+    const first = new Uint8Array(1_500_000).fill(7);
+    const firstDigest = await digestBytes(first);
+    await kernel.execute({ add: [first], keep: [] });
+    expect(blobKeys()).toHaveLength(2);
+    const readFirst = await storage.transaction((tx) => reader.readBlob(tx, firstDigest));
+    expect(readFirst).toEqual(first);
+
+    // A second turn carries the first blob (without re-providing its bytes) and adds
+    // a second; both are readable and the carried blob was not rewritten.
+    const second = new Uint8Array(400_000).fill(9);
+    const secondDigest = await digestBytes(second);
+    await kernel.execute({ add: [second], keep: [firstDigest] });
+    expect(await storage.transaction((tx) => reader.readBlob(tx, firstDigest))).toEqual(first);
+    expect(await storage.transaction((tx) => reader.readBlob(tx, secondDigest))).toEqual(second);
+    expect(blobKeys()).toHaveLength(3);
+
+    // Dropping every reference deletes the blobs (set membership is the refcount).
+    await kernel.execute({ add: [], keep: [] });
+    expect(blobKeys()).toHaveLength(0);
+    expect(await storage.transaction((tx) => reader.readBlob(tx, firstDigest))).toBeUndefined();
+    expect(await storage.transaction((tx) => reader.readBlob(tx, secondDigest))).toBeUndefined();
+  }, 30_000);
+
+  it("rejects an aggregate that references a blob whose bytes it did not provide", async () => {
+    interface BlobState {
+      readonly version: number;
+    }
+    const orphan = await digestBytes(new Uint8Array([1, 2, 3]));
+    const adapter: AggregateAdapter<BlobState, BlobState, null, null> = {
+      kind: "blob-missing-bytes-test",
+      create: (input) => input,
+      validate: () => undefined,
+      apply: async (state) => ({
+        state: { version: state.version + 1 },
+        outcome: null,
+        replayed: false,
+        blobs: new Map<Digest, Uint8Array>(),
+        referencedBlobs: [orphan],
+      }),
+      version: (state) => state.version,
+    };
+    const storage = new FakeTransactionalStorage();
+    const kernel = new TransactionalAggregateKernel(stateWith(storage), adapter);
+    await kernel.initialize({ version: 0 });
+
+    await expect(kernel.execute(null)).rejects.toMatchObject({
+      code: "INVALID_AGGREGATE_OUTPUT",
+    });
+  });
+
+  it("rejects an aggregate blob whose bytes do not hash to its claimed digest", async () => {
+    interface BlobState {
+      readonly version: number;
+    }
+    const claimed = await digestBytes(new Uint8Array([1, 2, 3]));
+    const adapter: AggregateAdapter<BlobState, BlobState, null, null> = {
+      kind: "blob-digest-mismatch-test",
+      create: (input) => input,
+      validate: () => undefined,
+      apply: async (state) => ({
+        state: { version: state.version + 1 },
+        outcome: null,
+        replayed: false,
+        // The bytes hash to a different digest than the key claims.
+        blobs: new Map<Digest, Uint8Array>([[claimed, new Uint8Array([9, 9, 9])]]),
+        referencedBlobs: [claimed],
+      }),
+      version: (state) => state.version,
+    };
+    const storage = new FakeTransactionalStorage();
+    const kernel = new TransactionalAggregateKernel(stateWith(storage), adapter);
+    await kernel.initialize({ version: 0 });
+
+    await expect(kernel.execute(null)).rejects.toMatchObject({
+      code: "INVALID_AGGREGATE_OUTPUT",
+    });
+  });
+
   it("preserves the aggregate depth-64 contract inside the storage record wrapper", async () => {
     interface State {
       readonly version: number;

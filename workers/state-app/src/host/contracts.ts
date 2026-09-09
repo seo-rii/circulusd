@@ -1,3 +1,5 @@
+import type { Digest } from "@circulusd/protocol-types";
+
 export type HostContractErrorCode =
   | "STORAGE_CONTRACT"
   | "CELL_ID_MISMATCH"
@@ -57,13 +59,26 @@ export interface CommittedCommandResult<Outcome> {
   readonly replayed: boolean;
 }
 
-export interface AggregateApplyResult<State, Outcome> {
+// Payload externalization side channel (storage redesign stage B). A pure
+// aggregate cannot perform blob I/O, so it validates and digests a large payload,
+// stores a fixed-size reference in its state, and returns the raw bytes here for
+// the host kernel to persist as digest-keyed blob rows in the same durable
+// transaction as the state. `blobs` are the NEW bytes to persist this write, keyed
+// by their content digest; `referencedBlobs` is the COMPLETE set of blob digests
+// the returned `state` references, from which the storage layer derives which blob
+// rows to create and which are now unreferenced and can be deleted.
+export interface AggregateBlobEffects {
+  readonly blobs?: ReadonlyMap<Digest, Uint8Array>;
+  readonly referencedBlobs?: readonly Digest[];
+}
+
+export interface AggregateApplyResult<State, Outcome> extends AggregateBlobEffects {
   readonly state: State;
   readonly outcome: Outcome;
   readonly replayed: boolean;
 }
 
-export interface AggregateMigrationResult<State> {
+export interface AggregateMigrationResult<State> extends AggregateBlobEffects {
   readonly state: State;
   readonly migrated: boolean;
 }

@@ -224,7 +224,36 @@ export class TransactionalAggregateKernel<State, Initialization, Command, Outcom
           ...record,
           state: nextState,
         };
-        await this.records.write(transaction, nextRecord, stored.manifest);
+        let blobs: ReadonlyMap<Digest, Uint8Array> | undefined;
+        if (applied.blobs !== undefined) {
+          if (!(applied.blobs instanceof Map)) {
+            throw new HostContractError(
+              "INVALID_AGGREGATE_OUTPUT",
+              "aggregate blobs must be a Map keyed by content digest",
+            );
+          }
+          blobs = cloneBoundary(applied.blobs, "aggregate output blobs");
+        }
+        let referencedBlobs: readonly Digest[] | undefined;
+        if (applied.referencedBlobs !== undefined) {
+          if (!Array.isArray(applied.referencedBlobs)) {
+            throw new HostContractError(
+              "INVALID_AGGREGATE_OUTPUT",
+              "aggregate referencedBlobs must be an array of content digests",
+            );
+          }
+          referencedBlobs = cloneBoundary(
+            applied.referencedBlobs,
+            "aggregate referenced blobs",
+          );
+        }
+        await this.records.write(
+          transaction,
+          nextRecord,
+          stored.manifest,
+          blobs,
+          referencedBlobs,
+        );
       }
       return committed;
     });
