@@ -9,7 +9,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   turnInputDigest,
@@ -83,7 +82,7 @@ async function nextCheckpoint(state: SessionAggregateState): Promise<EngineAgent
     sessionId: state.sessionId,
     turnId: state.activeTurn.turnId,
     checkpointSequence: state.activeTurn.checkpoint.checkpointSequence + 1,
-    predecessorDigest: await checkpointDigest(state.activeTurn.checkpoint),
+    predecessorDigest: state.activeTurn.checkpointChainDigest,
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),

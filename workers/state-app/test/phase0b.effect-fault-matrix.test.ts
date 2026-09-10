@@ -10,7 +10,6 @@ import type { AggregateAdapter } from "../src/host/contracts.ts";
 import { TransactionalAggregateKernel } from "../src/host/kernel.ts";
 import {
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   migrateSessionState,
@@ -181,7 +180,7 @@ async function nextCheckpoint(
     sessionId: state.sessionId,
     turnId: activeTurn.turnId,
     checkpointSequence,
-    predecessorDigest: await checkpointDigest(activeTurn.checkpoint),
+    predecessorDigest: activeTurn.checkpointChainDigest,
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),

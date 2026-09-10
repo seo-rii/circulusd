@@ -4,7 +4,6 @@ import type { AggregateAdapter } from "../../src/host/contracts.ts";
 import { TransactionalAggregateKernel } from "../../src/host/kernel.ts";
 import {
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   migrateSessionState,
@@ -284,7 +283,7 @@ export class RecoverableWorkspaceEffect {
           sessionId: admitted.sessionId,
           turnId: admitted.activeTurn.turnId,
           checkpointSequence: 1,
-          predecessorDigest: await checkpointDigest(admitted.activeTurn.checkpoint),
+          predecessorDigest: admitted.activeTurn.checkpointChainDigest,
           payloadEncoding: "opaque-v1",
           payloadBytes: enginePayload,
           payloadDigest: await digestBytes(enginePayload),

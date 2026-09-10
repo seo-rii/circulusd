@@ -51,6 +51,39 @@ export interface EngineAgentCheckpoint extends AgentCheckpointBase {
 
 export type AgentCheckpoint = GenesisAgentCheckpoint | EngineAgentCheckpoint;
 
+// The durable (externalized) form of a checkpoint (storage redesign stage B):
+// identical metadata, but the payload bytes live in a content-addressed blob keyed
+// by payloadDigest, and only their exact length is retained inline. The wire form
+// (AgentCheckpoint) keeps payloadBytes; the checkpoint chain digest is always
+// computed over the wire form, so externalization never changes it.
+interface ExternalizedAgentCheckpointBase {
+  readonly engineKind: EngineKind;
+  readonly adapterAbiVersion: number;
+  readonly checkpointSchemaVersion: number;
+  readonly runtimeRevisionDigest: Digest;
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly payloadEncoding: CheckpointPayloadEncoding;
+  readonly payloadDigest: Digest;
+  readonly payloadSize: number;
+}
+
+export interface GenesisExternalizedAgentCheckpoint extends ExternalizedAgentCheckpointBase {
+  readonly kind: "genesis";
+  readonly checkpointSequence: 0;
+  readonly predecessorDigest: null;
+}
+
+export interface EngineExternalizedAgentCheckpoint extends ExternalizedAgentCheckpointBase {
+  readonly kind: "engine";
+  readonly checkpointSequence: number;
+  readonly predecessorDigest: Digest;
+}
+
+export type ExternalizedAgentCheckpoint =
+  | GenesisExternalizedAgentCheckpoint
+  | EngineExternalizedAgentCheckpoint;
+
 export const EFFECT_SERVICES = [
   "model",
   "workspace",

@@ -6,10 +6,14 @@ import type {
   EffectClaim,
   EngineKind,
   EngineStepResult,
+  ExternalizedAgentCheckpoint,
   NormalizedValue,
 } from "@circulusd/protocol-types";
 
-export const SESSION_STATE_SCHEMA_VERSION = 4 as const;
+// Schema v5 (storage redesign stage B): checkpoints are stored in their
+// externalized form (payload bytes in a content-addressed blob) alongside the
+// precomputed checkpoint chain digest a successor must link to.
+export const SESSION_STATE_SCHEMA_VERSION = 5 as const;
 export const SESSION_COMMAND_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_DOMAIN = "circulusd.session.agent-checkpoint" as const;
@@ -102,7 +106,14 @@ interface TurnRecordBase {
   sequence: number;
   input: NormalizedValue;
   inputDigest: Digest;
-  checkpoint: AgentCheckpoint;
+  // The latest checkpoint in its durable form; its payload bytes are the blob
+  // keyed by checkpoint.payloadDigest.
+  checkpoint: ExternalizedAgentCheckpoint;
+  // The chain digest of `checkpoint` (computed over its wire form at ingestion,
+  // when the payload bytes were present). The next engine step's
+  // predecessorDigest must equal it; storing it lets the aggregate verify the
+  // chain without re-materializing the externalized payload.
+  checkpointChainDigest: Digest;
   turnLeaseGeneration: number;
   leaseExpiresAt: number;
 }
@@ -123,7 +134,7 @@ interface TerminalTurnBase {
   sequence: number;
   input: NormalizedValue;
   inputDigest: Digest;
-  finalCheckpoint: AgentCheckpoint;
+  finalCheckpoint: ExternalizedAgentCheckpoint;
   turnLeaseGeneration: number;
   leaseExpiresAt: number;
   abortRequested: boolean;
@@ -587,4 +598,10 @@ export interface ApplySessionCommandResult {
   readonly outcome: SessionCommandOutcome;
   readonly commandDigest: Digest;
   readonly replayed: boolean;
+  // Payload externalization side channel (see host AggregateBlobEffects): the new
+  // blob bytes this command introduced, keyed by content digest, and the complete
+  // set of blob digests the returned state references. Omitted on replay, where
+  // the host persists nothing.
+  readonly blobs?: ReadonlyMap<Digest, Uint8Array>;
+  readonly referencedBlobs?: readonly Digest[];
 }

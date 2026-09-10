@@ -14,7 +14,6 @@ import { TransactionalAggregateKernel } from "../src/host/kernel.ts";
 import worker from "../src/host/worker.ts";
 import {
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   migrateSessionState,
@@ -35,7 +34,7 @@ const INGRESS_SCHEMA_DIGEST =
   "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724";
 const HOST_PROTOCOL = "circulus.v1alpha1";
 const HOST_SCHEMA_DIGEST =
-  "sha256:91d6843e1206ae3464fce8b3fead4588b74ff9e0d40aafd8dd68cb76e7fc7551";
+  "sha256:f19900245010c48aa99e8a8281dbe669bcbae7a412b9b303402f4ac1ecfc7f19";
 const CLAIM_KEY_ID = "dispatch-start-current-1";
 const CLAIM_KEY = new Uint8Array(32).fill(0x51);
 const READ_KEY_ID = "state-current-1";
@@ -547,7 +546,7 @@ describe("authenticated dispatch-start claim ingress", () => {
           sessionId: admitted.sessionId,
           turnId: identity("turn"),
           checkpointSequence: 1,
-          predecessorDigest: await checkpointDigest(admitted.activeTurn.checkpoint),
+          predecessorDigest: admitted.activeTurn.checkpointChainDigest,
           payloadEncoding: "opaque-v1",
           payloadBytes: effectPayload,
           payloadDigest: await digestBytes(effectPayload),

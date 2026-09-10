@@ -12,7 +12,6 @@ import { ChunkedAggregateStorage } from "../src/host/storage.ts";
 import {
   SESSION_COMMAND_SCHEMA_VERSION,
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   migrateSessionState,
@@ -168,7 +167,7 @@ async function prepareDispatchedStorage() {
         sessionId: admitted.sessionId,
         turnId: admitted.activeTurn.turnId,
         checkpointSequence: 1,
-        predecessorDigest: await checkpointDigest(admitted.activeTurn.checkpoint),
+        predecessorDigest: admitted.activeTurn.checkpointChainDigest,
         payloadEncoding: "opaque-v1",
         payloadBytes,
         payloadDigest: await digestBytes(payloadBytes),
@@ -491,8 +490,8 @@ describe("Phase 0B durable dispatch start claim", () => {
       schemaVersion: number;
     };
     cleanLegacy.schemaVersion = 3;
-    const cleanMigration = migrateSessionState(cleanLegacy);
-    expect(cleanMigration).toMatchObject({ migrated: true, state: { schemaVersion: 4 } });
+    const cleanMigration = await migrateSessionState(cleanLegacy);
+    expect(cleanMigration).toMatchObject({ migrated: true, state: { schemaVersion: 5 } });
     await expect(validateSessionState(cleanMigration.state)).resolves.toBeUndefined();
 
     const { state } = await prepareDispatchedStorage();
@@ -517,7 +516,7 @@ describe("Phase 0B durable dispatch start claim", () => {
     }
     Reflect.deleteProperty(legacyPermit, "providerRouteDigest");
 
-    expect(() => migrateSessionState(dispatchedLegacy)).toThrowError(
+    await expect(migrateSessionState(dispatchedLegacy)).rejects.toThrowError(
       expect.objectContaining({ code: "FAILED_PRECONDITION" }),
     );
 

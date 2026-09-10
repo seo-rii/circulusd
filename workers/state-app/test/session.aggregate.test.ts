@@ -1,5 +1,6 @@
 import {
   digestBytes,
+  externalizeAgentCheckpoint,
   digestStructuredValue,
   parseDispatchPermitClaims,
   type AgentCheckpoint,
@@ -105,7 +106,7 @@ async function nextCheckpoint(
     sessionId: state.sessionId,
     turnId: activeTurn.turnId,
     checkpointSequence: activeTurn.checkpoint.checkpointSequence + 1,
-    predecessorDigest: await checkpointDigest(activeTurn.checkpoint),
+    predecessorDigest: activeTurn.checkpointChainDigest,
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),
@@ -420,7 +421,7 @@ describe("Session authoritative aggregate", () => {
         sequence: 0,
         input: { message: "turn_01" },
         inputDigest: await turnInputDigest({ message: "turn_01" }),
-        finalCheckpoint,
+        finalCheckpoint: externalizeAgentCheckpoint(finalCheckpoint).checkpoint,
         turnLeaseGeneration: 10,
         leaseExpiresAt: 1_900_000_000_000,
         status: "completed",
@@ -691,17 +692,48 @@ describe("Session authoritative aggregate", () => {
     ).rejects.toMatchObject({ code: "DIGEST_MISMATCH" });
   });
 
-  it("cryptographically validates persisted checkpoint payloads", async () => {
-    const admitted = await enqueueTurn(newSession(), "turn_01", "enqueue_01");
-    const corrupt = structuredClone(admitted.state);
-    if (corrupt.activeTurn === null) {
+  it("stores checkpoints externalized and hands their payloads to the host as blobs", async () => {
+    const initial = newSession();
+    const genesis = await genesisCheckpoint(initial, "turn_01");
+    const admitted = await enqueueTurn(initial, "turn_01", "enqueue_01");
+    const active = admitted.state.activeTurn;
+    if (active === null) {
       throw new Error("active turn missing from test state");
     }
-    corrupt.activeTurn.checkpoint = {
-      ...corrupt.activeTurn.checkpoint,
-      payloadDigest: INPUT_DIGEST,
-    };
-    await expect(validateSessionState(corrupt)).rejects.toThrow(/payloadDigest/);
+    // The durable checkpoint carries no payload bytes, only their digest and size,
+    // plus the chain digest computed over the wire form the engine will link to.
+    expect(active.checkpoint).toEqual(externalizeAgentCheckpoint(genesis).checkpoint);
+    expect(active.checkpoint).not.toHaveProperty("payloadBytes");
+    expect(active.checkpointChainDigest).toBe(await checkpointDigest(genesis));
+    expect(admitted.referencedBlobs).toEqual([genesis.payloadDigest]);
+    expect(admitted.blobs?.get(genesis.payloadDigest)).toEqual(genesis.payloadBytes);
+
+    // A stored checkpoint that still embeds payload bytes, or claims an implausible
+    // payload size, is rejected as durable state.
+    const inlined = structuredClone(admitted.state);
+    (inlined.activeTurn!.checkpoint as Record<string, unknown>).payloadBytes = genesis.payloadBytes;
+    await expect(validateSessionState(inlined)).rejects.toThrow(/payloadBytes/);
+    const emptied = structuredClone(admitted.state);
+    (emptied.activeTurn!.checkpoint as { payloadSize: number }).payloadSize = 0;
+    await expect(validateSessionState(emptied)).rejects.toThrow(/payloadSize/);
+
+    // Committing an engine step replaces the active checkpoint: the new payload is
+    // the only newly referenced blob and the superseded genesis blob drops out.
+    const step = await nextCheckpoint(admitted.state);
+    const committed = await applySessionCommand(admitted.state, {
+      kind: "commit_engine_step",
+      commandId: "step_01",
+      expectedEventSequence: admitted.state.eventSequence,
+      turnId: "turn_01",
+      fence: currentFence(admitted.state),
+      transactionTime: TRANSACTION_TIME,
+      consumedSettlementEffectId: null,
+      effectIdentity: null,
+      step: { kind: "checkpoint", checkpoint: step },
+    });
+    expect(committed.referencedBlobs).toEqual([step.payloadDigest]);
+    expect([...(committed.blobs?.keys() ?? [])]).toEqual([step.payloadDigest]);
+    expect(committed.state.activeTurn?.checkpointChainDigest).toBe(await checkpointDigest(step));
   });
 
   it("preserves failed turns with their input, final checkpoint, and exact error", async () => {
@@ -735,7 +767,7 @@ describe("Session authoritative aggregate", () => {
         sequence: 0,
         input: { message: "turn_01" },
         inputDigest: await turnInputDigest({ message: "turn_01" }),
-        finalCheckpoint,
+        finalCheckpoint: externalizeAgentCheckpoint(finalCheckpoint).checkpoint,
         turnLeaseGeneration: 10,
         leaseExpiresAt: 1_900_000_000_000,
         status: "failed",
@@ -757,7 +789,9 @@ describe("Session authoritative aggregate", () => {
     if (terminal === undefined) {
       throw new Error("terminal turn missing from test state");
     }
-    terminal.finalCheckpoint = await genesisCheckpoint(newSession(), "turn_01");
+    terminal.finalCheckpoint = externalizeAgentCheckpoint(
+      await genesisCheckpoint(newSession(), "turn_01"),
+    ).checkpoint;
     expect(() => assertSessionInvariants(corruptTerminalCheckpoint)).toThrow(
       /terminal engine checkpoint/,
     );

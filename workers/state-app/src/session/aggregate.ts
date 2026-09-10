@@ -2,17 +2,20 @@ import {
   ProtocolValidationError,
   digestStructuredValue,
   encodeCanonicalCbor,
+  externalizeAgentCheckpoint,
   normalizeProtocolValue,
-  parseAgentCheckpoint,
+  parseAgentError,
   parseDigest,
   parseDispatchPermitClaims,
   parseEffectClaim,
   parseEngineStepResult,
+  parseExternalizedAgentCheckpoint,
   validateAgentCheckpoint,
   type AgentCheckpoint,
   type Digest,
   type EffectIntent,
   type EngineKind,
+  type ExternalizedAgentCheckpoint,
   type NormalizedValue,
 } from "@circulusd/protocol-types";
 
@@ -226,7 +229,7 @@ function validatedEngineKind(value: unknown, field: string): EngineKind {
 
 function checkpointMatchesSession(
   state: SessionAggregateState,
-  checkpoint: AgentCheckpoint,
+  checkpoint: AgentCheckpoint | ExternalizedAgentCheckpoint,
   turnId: string,
   requireActiveRuntime = true,
 ): void {
@@ -731,11 +734,37 @@ function assertSessionCommandOutcome(
 
 export async function checkpointDigest(checkpoint: AgentCheckpoint) {
   const validated = await validateAgentCheckpoint(checkpoint);
+  return validatedCheckpointDigest(validated);
+}
+
+// The checkpoint chain digest is always computed over the WIRE form (payload bytes
+// included): the engine derives predecessorDigest the same way, so externalizing
+// the payload in durable state must never change it. The aggregate computes it
+// once at ingestion, while the bytes are present, and stores it on the turn.
+function validatedCheckpointDigest(validated: AgentCheckpoint) {
   return digestStructuredValue(
     SESSION_CHECKPOINT_DIGEST_DOMAIN,
     SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION,
     validated,
   );
+}
+
+// Every externalized payload the state references, as blob digests (deduplicated,
+// in durable order): queued-turn checkpoints, the active checkpoint, and each
+// terminal turn final checkpoint. The host derives blob creation/deletion from
+// the difference between successive states' sets.
+export function sessionReferencedBlobDigests(state: SessionAggregateState): Digest[] {
+  const digests = new Set<Digest>();
+  for (const turn of state.queuedTurns) {
+    digests.add(turn.checkpoint.payloadDigest);
+  }
+  if (state.activeTurn !== null) {
+    digests.add(state.activeTurn.checkpoint.payloadDigest);
+  }
+  for (const turn of state.terminalTurns) {
+    digests.add(turn.finalCheckpoint.payloadDigest);
+  }
+  return [...digests];
 }
 
 export async function turnInputDigest(input: NormalizedValue) {
@@ -843,10 +872,49 @@ export function createSessionState(input: CreateSessionStateInput): SessionAggre
   return state;
 }
 
-export function migrateSessionState(state: unknown): {
+export interface MigrateSessionStateResult {
   readonly state: SessionAggregateState;
   readonly migrated: boolean;
-} {
+  // Payloads lifted out of a legacy inline state (storage redesign stage B); the
+  // host persists them with the migrating write.
+  readonly blobs?: ReadonlyMap<Digest, Uint8Array>;
+  readonly referencedBlobs?: readonly Digest[];
+}
+
+// Externalize one legacy inline checkpoint: verify its payload digest, split off
+// the bytes as a blob, and compute the chain digest over the wire form (needed by
+// turns that can still receive engine steps).
+async function migrateInlineCheckpoint(
+  value: unknown,
+  field: string,
+  blobs: Map<Digest, Uint8Array>,
+): Promise<{
+  readonly checkpoint: ExternalizedAgentCheckpoint;
+  readonly checkpointChainDigest: Digest;
+}> {
+  let full: AgentCheckpoint;
+  try {
+    full = await validateAgentCheckpoint(value);
+  } catch (error) {
+    if (error instanceof ProtocolValidationError) {
+      sessionError(
+        "FAILED_PRECONDITION",
+        `${field} is not a valid inline checkpoint: ${error.message}`,
+      );
+    }
+    throw error;
+  }
+  const externalized = externalizeAgentCheckpoint(full);
+  blobs.set(externalized.checkpoint.payloadDigest, externalized.payloadBytes);
+  return {
+    checkpoint: externalized.checkpoint,
+    checkpointChainDigest: await validatedCheckpointDigest(full),
+  };
+}
+
+export async function migrateSessionState(
+  state: unknown,
+): Promise<MigrateSessionStateResult> {
   const schemaVersion =
     typeof state === "object" && state !== null && !Array.isArray(state)
       ? (state as { readonly schemaVersion?: unknown }).schemaVersion
@@ -855,7 +923,10 @@ export function migrateSessionState(state: unknown): {
     typeof state !== "object" ||
     state === null ||
     Array.isArray(state) ||
-    (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3)
+    (schemaVersion !== 1 &&
+      schemaVersion !== 2 &&
+      schemaVersion !== 3 &&
+      schemaVersion !== 4)
   ) {
     return {
       state: state as SessionAggregateState,
@@ -883,22 +954,81 @@ export function migrateSessionState(state: unknown): {
       : {}),
   } as unknown as SessionAggregateState;
   if (
-    !Array.isArray(migrated.effects) ||
-    migrated.effects.some((effect) =>
-      typeof effect !== "object" ||
-      effect === null ||
-      !("lastDispatch" in effect) ||
-      effect.lastDispatch !== null
-    )
+    schemaVersion <= 3 &&
+    (!Array.isArray(migrated.effects) ||
+      migrated.effects.some((effect) =>
+        typeof effect !== "object" ||
+        effect === null ||
+        !("lastDispatch" in effect) ||
+        effect.lastDispatch !== null
+      ))
   ) {
     sessionError(
       "FAILED_PRECONDITION",
       `schema-v${schemaVersion} Session dispatch history lacks a provable provider route`,
     );
   }
+  // Schema v5: every inline checkpoint (pre-v5 states kept payload bytes in the
+  // record) becomes an externalized checkpoint plus a blob, and each turn that can
+  // still take engine steps records its checkpoint chain digest.
+  if (
+    !Array.isArray(migrated.queuedTurns) ||
+    !Array.isArray(migrated.terminalTurns) ||
+    (migrated.activeTurn !== null && typeof migrated.activeTurn !== "object")
+  ) {
+    sessionError(
+      "FAILED_PRECONDITION",
+      `schema-v${schemaVersion} Session turn history is malformed`,
+    );
+  }
+  const blobs = new Map<Digest, Uint8Array>();
+  const legacyTurn = (turn: unknown, field: string) => {
+    if (typeof turn !== "object" || turn === null || Array.isArray(turn)) {
+      sessionError("FAILED_PRECONDITION", `${field} is not a turn record`);
+    }
+    return turn as Record<string, unknown>;
+  };
+  const queuedTurns = [];
+  for (const [index, entry] of migrated.queuedTurns.entries()) {
+    const turn = legacyTurn(entry, `queuedTurns[${index}]`);
+    const { checkpoint, checkpointChainDigest } = await migrateInlineCheckpoint(
+      turn.checkpoint,
+      `queuedTurns[${index}].checkpoint`,
+      blobs,
+    );
+    queuedTurns.push({ ...turn, checkpoint, checkpointChainDigest });
+  }
+  let activeTurn = null;
+  if (migrated.activeTurn !== null) {
+    const turn = legacyTurn(migrated.activeTurn, "activeTurn");
+    const { checkpoint, checkpointChainDigest } = await migrateInlineCheckpoint(
+      turn.checkpoint,
+      "activeTurn.checkpoint",
+      blobs,
+    );
+    activeTurn = { ...turn, checkpoint, checkpointChainDigest };
+  }
+  const terminalTurns = [];
+  for (const [index, entry] of migrated.terminalTurns.entries()) {
+    const turn = legacyTurn(entry, `terminalTurns[${index}]`);
+    const { checkpoint } = await migrateInlineCheckpoint(
+      turn.finalCheckpoint,
+      `terminalTurns[${index}].finalCheckpoint`,
+      blobs,
+    );
+    terminalTurns.push({ ...turn, finalCheckpoint: checkpoint });
+  }
+  const externalized = {
+    ...migrated,
+    queuedTurns,
+    activeTurn,
+    terminalTurns,
+  } as unknown as SessionAggregateState;
   return {
-    state: migrated,
+    state: externalized,
     migrated: true,
+    blobs,
+    referencedBlobs: sessionReferencedBlobDigests(externalized),
   };
 }
 
@@ -1064,7 +1194,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       "FAILED_PRECONDITION",
     );
     parseDigest(turn.inputDigest, `terminal turn ${turn.turnId} inputDigest`);
-    const finalCheckpoint = parseAgentCheckpoint(turn.finalCheckpoint);
+    const finalCheckpoint = parseExternalizedAgentCheckpoint(turn.finalCheckpoint);
     checkpointMatchesSession(state, finalCheckpoint, turn.turnId, false);
     validatedInteger(turn.turnLeaseGeneration, "terminal turn lease generation", 1);
     validatedInteger(turn.leaseExpiresAt, "terminal turn lease expiry", 1);
@@ -1084,11 +1214,6 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "terminal engine checkpoint must be engine kind");
     }
     if (turn.status === "completed") {
-      parseEngineStepResult({
-        kind: "turn_complete",
-        checkpoint: finalCheckpoint,
-        result: turn.result,
-      });
       validatedNormalizedValue(
         turn.result,
         `state.terminalTurns[${index}].result`,
@@ -1100,11 +1225,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         sessionError("FAILED_PRECONDITION", "completed turn retained a terminal error");
       }
     } else if (turn.status === "failed") {
-      parseEngineStepResult({
-        kind: "turn_error",
-        checkpoint: finalCheckpoint,
-        error: turn.error,
-      });
+      parseAgentError(turn.error, `state.terminalTurns[${index}].error`);
       if (turn.error.details !== undefined) {
         validatedNormalizedValue(
           turn.error.details,
@@ -1149,6 +1270,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "input",
         "inputDigest",
         "checkpoint",
+        "checkpointChainDigest",
         "turnLeaseGeneration",
         "leaseExpiresAt",
       ],
@@ -1175,7 +1297,8 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "queued turn sequence does not match admission order");
     }
     previousSequence = turn.sequence;
-    const checkpoint = parseAgentCheckpoint(turn.checkpoint);
+    const checkpoint = parseExternalizedAgentCheckpoint(turn.checkpoint);
+    parseDigest(turn.checkpointChainDigest, `queued turn ${turn.turnId} checkpointChainDigest`);
     checkpointMatchesSession(state, checkpoint, turn.turnId);
     if (checkpoint.kind !== "genesis" || checkpoint.checkpointSequence !== 0) {
       sessionError("FAILED_PRECONDITION", "a queued turn must retain its genesis checkpoint");
@@ -1210,6 +1333,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "input",
         "inputDigest",
         "checkpoint",
+        "checkpointChainDigest",
         "turnLeaseGeneration",
         "leaseExpiresAt",
         "abortRequested",
@@ -1247,7 +1371,8 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     ) {
       sessionError("FAILED_PRECONDITION", "active turn is not the FIFO head");
     }
-    const checkpoint = parseAgentCheckpoint(active.checkpoint);
+    const checkpoint = parseExternalizedAgentCheckpoint(active.checkpoint);
+    parseDigest(active.checkpointChainDigest, `active turn ${active.turnId} checkpointChainDigest`);
     checkpointMatchesSession(state, checkpoint, active.turnId);
     validatedNormalizedValue(
       active.input,
@@ -2057,20 +2182,19 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
 
 export async function validateSessionState(state: SessionAggregateState): Promise<void> {
   assertSessionInvariants(state);
+  // Stored checkpoints are externalized (parsed structurally above); their payload
+  // bytes live in the host blob store, so no payload digest re-check happens here.
   if (state.activeTurn !== null) {
-    await validateAgentCheckpoint(state.activeTurn.checkpoint);
     if ((await turnInputDigest(state.activeTurn.input)) !== state.activeTurn.inputDigest) {
       sessionError("DIGEST_MISMATCH", "active turn inputDigest does not bind its input");
     }
   }
   for (const turn of state.queuedTurns) {
-    await validateAgentCheckpoint(turn.checkpoint);
     if ((await turnInputDigest(turn.input)) !== turn.inputDigest) {
       sessionError("DIGEST_MISMATCH", `queued turn ${turn.turnId} inputDigest is invalid`);
     }
   }
   for (const turn of state.terminalTurns) {
-    await validateAgentCheckpoint(turn.finalCheckpoint);
     if ((await turnInputDigest(turn.input)) !== turn.inputDigest) {
       sessionError("DIGEST_MISMATCH", `terminal turn ${turn.turnId} inputDigest is invalid`);
     }
@@ -2773,6 +2897,9 @@ export async function applySessionCommand(
   const next = structuredClone(state);
   let outcome: SessionCommandOutcome;
   let turnPromotionTime: number | null = null;
+  // Payload bytes this command externalized, keyed by blob digest; the tail hands
+  // the newly referenced ones to the host as blobs.
+  const ingestedPayloads = new Map<Digest, Uint8Array>();
   const appendPublicEvent = (event: SessionPublicEventInput): void => {
     if (next.publicEventSequence === Number.MAX_SAFE_INTEGER) {
       sessionError("FAILED_PRECONDITION", "public event sequence cannot be incremented safely");
@@ -2850,13 +2977,18 @@ export async function applySessionCommand(
       if (checkpoint.kind !== "genesis") {
         sessionError("FAILED_PRECONDITION", "a newly admitted turn requires a genesis checkpoint");
       }
+      // Externalize the genesis payload: the turn keeps the durable checkpoint form
+      // plus the chain digest its first engine step must link to.
+      const genesis = externalizeAgentCheckpoint(checkpoint);
+      ingestedPayloads.set(genesis.checkpoint.payloadDigest, genesis.payloadBytes);
       const queuedTurn = {
         turnId,
         sequence: next.nextTurnSequence,
         status: "queued" as const,
         input,
         inputDigest,
-        checkpoint,
+        checkpoint: genesis.checkpoint,
+        checkpointChainDigest: await validatedCheckpointDigest(checkpoint),
         turnLeaseGeneration,
         leaseExpiresAt,
       };
@@ -2992,8 +3124,9 @@ export async function applySessionCommand(
       if (step.checkpoint.checkpointSequence !== active.checkpoint.checkpointSequence + 1) {
         sessionError("FAILED_PRECONDITION", "checkpointSequence must increment by exactly one");
       }
-      const predecessorDigest = await checkpointDigest(active.checkpoint);
-      if (step.checkpoint.predecessorDigest !== predecessorDigest) {
+      // The predecessor chain digest was computed over its wire form at ingestion
+      // and stored; the externalized checkpoint cannot be re-digested.
+      if (step.checkpoint.predecessorDigest !== active.checkpointChainDigest) {
         sessionError(
           "DIGEST_MISMATCH",
           "checkpoint predecessorDigest does not match durable state",
@@ -3107,7 +3240,10 @@ export async function applySessionCommand(
         sessionError("INVALID_ARGUMENT", `${step.kind} cannot allocate an effect identity`);
       }
 
-      active.checkpoint = step.checkpoint;
+      const committed = externalizeAgentCheckpoint(step.checkpoint);
+      ingestedPayloads.set(committed.checkpoint.payloadDigest, committed.payloadBytes);
+      active.checkpoint = committed.checkpoint;
+      active.checkpointChainDigest = await validatedCheckpointDigest(step.checkpoint);
       let status: "active" | "completed" | "failed" = "active";
       if (step.kind === "turn_complete" || step.kind === "turn_error") {
         if (active.activeEffectId !== null) {
@@ -3123,7 +3259,7 @@ export async function applySessionCommand(
           sequence: active.sequence,
           input: structuredClone(active.input),
           inputDigest: active.inputDigest,
-          finalCheckpoint: step.checkpoint,
+          finalCheckpoint: committed.checkpoint,
           turnLeaseGeneration: active.turnLeaseGeneration,
           leaseExpiresAt: active.leaseExpiresAt,
           abortRequested: active.abortRequested,
@@ -4314,5 +4450,24 @@ export async function applySessionCommand(
     outcome: structuredClone(outcome),
   });
   await validateSessionState(next);
-  return { state: next, outcome, commandDigest, replayed: false };
+  // Blob side channel: the complete referenced set plus bytes for every digest the
+  // prior state did not already reference (those must have been ingested here;
+  // content-addressing means an already-stored digest needs no bytes).
+  const referencedBlobs = sessionReferencedBlobDigests(next);
+  const previouslyReferenced = new Set(sessionReferencedBlobDigests(state));
+  const blobs = new Map<Digest, Uint8Array>();
+  for (const digest of referencedBlobs) {
+    if (previouslyReferenced.has(digest)) {
+      continue;
+    }
+    const bytes = ingestedPayloads.get(digest);
+    if (bytes === undefined) {
+      sessionError(
+        "FAILED_PRECONDITION",
+        `state references payload ${digest} whose bytes this command did not ingest`,
+      );
+    }
+    blobs.set(digest, bytes);
+  }
+  return { state: next, outcome, commandDigest, replayed: false, blobs, referencedBlobs };
 }

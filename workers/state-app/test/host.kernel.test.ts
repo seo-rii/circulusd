@@ -28,6 +28,7 @@ import {
   workspaceCellName,
 } from "../src/host/index.ts";
 import type { AggregateAdapter } from "../src/host/contracts.ts";
+import { inlineLegacyCheckpoints } from "./support/legacy-checkpoints.ts";
 import { TransactionalAggregateKernel } from "../src/host/kernel.ts";
 import { ChunkedAggregateStorage } from "../src/host/storage.ts";
 import {
@@ -1377,7 +1378,8 @@ describe("named aggregate cells", () => {
     expect(committed).toMatchObject({ version: 1, replayed: false });
     expect(replayed).toMatchObject({ version: 1, replayed: true });
     expect(replayed.outcome).toEqual(committed.outcome);
-    expect(storage.values.size).toBe(3);
+    // anchor + manifest + one state chunk + the externalized genesis checkpoint blob
+    expect(storage.values.size).toBe(4);
     const snapshot = await hostRpcResult(
       "session.read",
       { authority: sessionAuthority(), now: 200 },
@@ -1442,12 +1444,13 @@ describe("named aggregate cells", () => {
       await enqueueSessionCommand(),
     ) as SessionCommand & { publicAdmission?: unknown };
     delete legacyCommand.publicAdmission;
-    const committedLegacyState = (
-      await applySessionCommand(createSessionState(initialization), legacyCommand)
-    ).state;
-    const legacyState = structuredClone(
-      committedLegacyState,
-    ) as unknown as Record<string, unknown>;
+    const committedLegacy = await applySessionCommand(
+      createSessionState(initialization),
+      legacyCommand,
+    );
+    // A real schema-v1 record kept checkpoint payloads inline (no blobs, no chain
+    // digest); rebuild that layout so the migration externalizes it for real.
+    const legacyState = inlineLegacyCheckpoints(committedLegacy.state, committedLegacy.blobs);
     legacyState.schemaVersion = 1;
     delete legacyState.publicEventSequence;
     delete legacyState.publicEvents;
@@ -1487,9 +1490,13 @@ describe("named aggregate cells", () => {
       { authority: sessionAuthority(), now: 200 },
       (request) => cell.readSession(request),
     )).resolves.toMatchObject({
-      schemaVersion: 4,
+      schemaVersion: 5,
       eventSequence: 1,
-      activeTurn: { turnId: "turn-1" },
+      activeTurn: {
+        turnId: "turn-1",
+        checkpoint: committedLegacy.state.activeTurn?.checkpoint,
+        checkpointChainDigest: committedLegacy.state.activeTurn?.checkpointChainDigest,
+      },
       publicEventSequence: 0,
       publicEvents: [],
       turnAdmissionReceipts: [],

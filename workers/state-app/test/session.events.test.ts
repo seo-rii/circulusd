@@ -10,7 +10,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   applySessionCommand,
-  checkpointDigest,
   createSessionState,
   effectRequestDigest,
   migrateSessionState,
@@ -20,6 +19,7 @@ import {
   type SessionAggregateState,
   type SessionFence,
 } from "../src/session/index.ts";
+import { inlineLegacyCheckpoints } from "./support/legacy-checkpoints.ts";
 
 const RUNTIME_DIGEST = `sha256:${"1".repeat(64)}` as Digest;
 const POLICY_DIGEST = `sha256:${"2".repeat(64)}` as Digest;
@@ -99,7 +99,7 @@ async function nextCheckpoint(
     sessionId: state.sessionId,
     turnId: state.activeTurn.turnId,
     checkpointSequence: state.activeTurn.checkpoint.checkpointSequence + 1,
-    predecessorDigest: await checkpointDigest(state.activeTurn.checkpoint),
+    predecessorDigest: state.activeTurn.checkpointChainDigest,
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),
@@ -545,10 +545,18 @@ describe("Session public durable event journal", () => {
 
   it("migrates schema-v1 and schema-v2 states without losing prior admission events", async () => {
     const admitted = await admit(newSession(), "turn-migrated", "9");
-    const schemaV2 = structuredClone(admitted.state) as unknown as Record<string, unknown>;
+    // Pre-v5 states stored checkpoint payloads inline; rebuild that layout from the
+    // blobs the admission returned so the migration exercises real externalization.
+    const schemaV2 = inlineLegacyCheckpoints(admitted.state, admitted.blobs);
     schemaV2.schemaVersion = 2;
-    const migratedV2 = migrateSessionState(schemaV2);
-    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 4 } });
+    const migratedV2 = await migrateSessionState(schemaV2);
+    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 5 } });
+    expect(migratedV2.state.activeTurn?.checkpoint).toEqual(admitted.state.activeTurn?.checkpoint);
+    expect(migratedV2.state.activeTurn?.checkpointChainDigest).toBe(
+      admitted.state.activeTurn?.checkpointChainDigest,
+    );
+    expect([...(migratedV2.blobs?.keys() ?? [])]).toEqual(migratedV2.referencedBlobs);
+    expect(migratedV2.referencedBlobs).toEqual([admitted.state.activeTurn?.checkpoint.payloadDigest]);
     expect(migratedV2.state.publicEvents).toEqual(admitted.state.publicEvents);
     expect(migratedV2.state.turnAdmissionReceipts).toEqual(
       admitted.state.turnAdmissionReceipts,
@@ -565,16 +573,16 @@ describe("Session public durable event journal", () => {
       "model.effect.prepared",
     ]);
 
-    const schemaV1 = structuredClone(admitted.state) as unknown as Record<string, unknown>;
+    const schemaV1 = inlineLegacyCheckpoints(admitted.state, admitted.blobs);
     schemaV1.schemaVersion = 1;
     delete schemaV1.publicEventSequence;
     delete schemaV1.publicEvents;
     delete schemaV1.turnAdmissionReceipts;
-    const migratedV1 = migrateSessionState(schemaV1);
+    const migratedV1 = await migrateSessionState(schemaV1);
     expect(migratedV1).toMatchObject({
       migrated: true,
       state: {
-        schemaVersion: 4,
+        schemaVersion: 5,
         publicEventSequence: 0,
         publicEvents: [],
         turnAdmissionReceipts: [],

@@ -36,13 +36,13 @@ const (
 	ingressSchemaDigest = "sha256:6365dfa4e6e73b349508a46688cfcaacdeacece11cd11ed2d7f3e40af49ad3ee"
 
 	hostProtocol     = "circulus.v1alpha1"
-	hostSchemaDigest = "sha256:9d5c8e213c2701b5072c5f849fad927e23369bfd2c9aa11c14ad3b36e96a5315"
+	hostSchemaDigest = "sha256:d095b5fe7cdc114c84996b4e6c66db9ede524a65d1acf96fa287bcc10af3d3a0"
 
 	dispatchStartIngressPath         = "/circulusd/state/v1/session-dispatch-start:claim"
 	dispatchStartIngressContentType  = "application/vnd.circulusd.state-dispatch-start-ingress+cbor"
 	dispatchStartIngressProtocol     = "circulus.state-dispatch-start-ingress.v1alpha1"
 	dispatchStartIngressSchemaDigest = "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724"
-	dispatchStartHostSchemaDigest    = "sha256:91d6843e1206ae3464fce8b3fead4588b74ff9e0d40aafd8dd68cb76e7fc7551"
+	dispatchStartHostSchemaDigest    = "sha256:f19900245010c48aa99e8a8281dbe669bcbae7a412b9b303402f4ac1ecfc7f19"
 	dispatchStartRequestMACDomain    = "circulusd.state-dispatch-start-ingress.request.v1"
 	dispatchStartResponseMACDomain   = "circulusd.state-dispatch-start-ingress.response.v1"
 

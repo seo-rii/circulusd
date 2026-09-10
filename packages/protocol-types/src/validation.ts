@@ -11,7 +11,9 @@ import {
 } from "./types.ts";
 import type {
   AgentCheckpoint,
+  AgentError,
   ConformanceStatus,
+  ExternalizedAgentCheckpoint,
   DispatchPermitClaims,
   EffectClaim,
   EffectService,
@@ -284,6 +286,117 @@ export async function validateAgentCheckpoint(value: unknown): Promise<AgentChec
   return checkpoint;
 }
 
+const EXTERNALIZED_CHECKPOINT_FIELDS = [
+  "kind",
+  "engineKind",
+  "adapterAbiVersion",
+  "checkpointSchemaVersion",
+  "runtimeRevisionDigest",
+  "sessionId",
+  "turnId",
+  "checkpointSequence",
+  "predecessorDigest",
+  "payloadEncoding",
+  "payloadDigest",
+  "payloadSize",
+] as const;
+
+// Parse the durable (externalized) checkpoint form: the wire metadata with the
+// payload bytes replaced by their exact length. The bytes themselves are held in
+// the blob keyed by payloadDigest, so no digest re-check is possible or needed here.
+export function parseExternalizedAgentCheckpoint(value: unknown): ExternalizedAgentCheckpoint {
+  const record = exactRecord(value, EXTERNALIZED_CHECKPOINT_FIELDS, [], "$checkpoint");
+  const payloadSize = safeInteger(record.payloadSize, "$checkpoint.payloadSize", 1);
+  if (payloadSize > MAX_CHECKPOINT_PAYLOAD_BYTES) {
+    validationError(
+      "$checkpoint.payloadSize",
+      `must not exceed ${MAX_CHECKPOINT_PAYLOAD_BYTES} bytes`,
+    );
+  }
+  const common = {
+    engineKind: oneOf(
+      record.engineKind,
+      ["low-level", "agent-harness"] as const,
+      "$checkpoint.engineKind",
+    ),
+    adapterAbiVersion: safeInteger(record.adapterAbiVersion, "$checkpoint.adapterAbiVersion", 1),
+    checkpointSchemaVersion: safeInteger(
+      record.checkpointSchemaVersion,
+      "$checkpoint.checkpointSchemaVersion",
+      1,
+    ),
+    runtimeRevisionDigest: parseDigest(
+      record.runtimeRevisionDigest,
+      "$checkpoint.runtimeRevisionDigest",
+    ),
+    sessionId: identifier(record.sessionId, "$checkpoint.sessionId"),
+    turnId: identifier(record.turnId, "$checkpoint.turnId"),
+    payloadEncoding: oneOf(
+      record.payloadEncoding,
+      ["protobuf", "canonical-cbor", "opaque-v1"] as const,
+      "$checkpoint.payloadEncoding",
+    ),
+    payloadDigest: parseDigest(record.payloadDigest, "$checkpoint.payloadDigest"),
+    payloadSize,
+  };
+  if (record.kind === "genesis") {
+    exactLiteral(record.checkpointSequence, 0, "$checkpoint.checkpointSequence");
+    if (record.predecessorDigest !== null) {
+      validationError("$checkpoint.predecessorDigest", "must be null for a genesis checkpoint");
+    }
+    return { kind: "genesis", ...common, checkpointSequence: 0, predecessorDigest: null };
+  }
+  if (record.kind === "engine") {
+    return {
+      kind: "engine",
+      ...common,
+      checkpointSequence: safeInteger(
+        record.checkpointSequence,
+        "$checkpoint.checkpointSequence",
+        1,
+      ),
+      predecessorDigest: parseDigest(
+        record.predecessorDigest,
+        "$checkpoint.predecessorDigest",
+      ),
+    };
+  }
+  validationError("$checkpoint.kind", "must be genesis or engine");
+}
+
+// Split a validated wire checkpoint into its durable form plus the payload bytes
+// to persist as a blob. The caller must already have verified payloadDigest binds
+// payloadBytes (validateAgentCheckpoint), so the digest is the blob's key.
+export function externalizeAgentCheckpoint(checkpoint: AgentCheckpoint): {
+  readonly checkpoint: ExternalizedAgentCheckpoint;
+  readonly payloadBytes: Uint8Array;
+} {
+  const { payloadBytes, ...metadata } = checkpoint;
+  if (payloadBytes.byteLength < 1) {
+    validationError("$checkpoint.payloadBytes", "must not be empty when externalized");
+  }
+  return {
+    checkpoint: parseExternalizedAgentCheckpoint({
+      ...metadata,
+      payloadSize: payloadBytes.byteLength,
+    }),
+    payloadBytes: new Uint8Array(payloadBytes),
+  };
+}
+
+// Reattach fetched payload bytes to a durable checkpoint, yielding the wire form.
+// The bytes must have the recorded length and hash to payloadDigest.
+export async function rehydrateAgentCheckpoint(
+  checkpoint: ExternalizedAgentCheckpoint,
+  payloadBytes: Uint8Array,
+): Promise<AgentCheckpoint> {
+  if (payloadBytes.byteLength !== checkpoint.payloadSize) {
+    validationError("$checkpoint.payloadSize", "does not match the fetched payload length");
+  }
+  const { payloadSize: _payloadSize, ...metadata } = checkpoint;
+  return validateAgentCheckpoint({ ...metadata, payloadBytes: new Uint8Array(payloadBytes) });
+}
+
 const EFFECT_REQUIRED_FIELDS = [
   "tenantId",
   "userId",
@@ -410,6 +523,24 @@ export function parseDispatchPermitClaims(value: unknown): DispatchPermitClaims 
   };
 }
 
+// Parse a terminal AgentError (also used to re-validate durable terminal turns,
+// whose checkpoints are stored externalized and so cannot be re-parsed as a full
+// engine step).
+export function parseAgentError(value: unknown, path = "$agentError"): AgentError {
+  const error = exactRecord(value, ["code", "message", "retryable"], ["details"], path);
+  if (typeof error.retryable !== "boolean") {
+    validationError(`${path}.retryable`, "must be a boolean");
+  }
+  const parsedError = {
+    code: operation(error.code, `${path}.code`),
+    message: nfcString(error.message, `${path}.message`, { maxBytes: 4096 }),
+    retryable: error.retryable,
+  };
+  return hasOwn(error, "details")
+    ? { ...parsedError, details: normalizeProtocolValue(error.details) }
+    : parsedError;
+}
+
 export function parseEngineStepResult(value: unknown): EngineStepResult {
   const preliminary = plainRecord(value, "$engineStepResult");
   switch (preliminary.kind) {
@@ -477,28 +608,10 @@ export function parseEngineStepResult(value: unknown): EngineStepResult {
         [],
         "$engineStepResult",
       );
-      const error = exactRecord(
-        record.error,
-        ["code", "message", "retryable"],
-        ["details"],
-        "$engineStepResult.error",
-      );
-      if (typeof error.retryable !== "boolean") {
-        validationError("$engineStepResult.error.retryable", "must be a boolean");
-      }
-      const parsedError = {
-        code: operation(error.code, "$engineStepResult.error.code"),
-        message: nfcString(error.message, "$engineStepResult.error.message", {
-          maxBytes: 4096,
-        }),
-        retryable: error.retryable,
-      };
       return {
         kind: "turn_error",
         checkpoint: parseAgentCheckpoint(record.checkpoint),
-        error: hasOwn(error, "details")
-          ? { ...parsedError, details: normalizeProtocolValue(error.details) }
-          : parsedError,
+        error: parseAgentError(record.error, "$engineStepResult.error"),
       };
     }
     default:

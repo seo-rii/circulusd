@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import {
   applySessionCommand,
   assertSessionInvariants,
-  checkpointDigest,
   createSessionState,
   turnInputDigest,
   type SessionAggregateState,
@@ -147,7 +146,7 @@ describe("session ordering model", () => {
               sessionId: state.sessionId,
               turnId: active.turnId,
               checkpointSequence: 1,
-              predecessorDigest: await checkpointDigest(active.checkpoint),
+              predecessorDigest: active.checkpointChainDigest,
               payloadEncoding: "opaque-v1",
               payloadBytes,
               payloadDigest: await digestBytes(payloadBytes),
