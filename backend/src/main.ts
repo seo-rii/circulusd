@@ -33,6 +33,7 @@ if (!SANDBOX_LAUNCHER_KINDS.includes(launcher)) {
 }
 const maxSessions = optionalPositiveInteger("CIRCULUSD_TEST_SANDBOX_MAX_SESSIONS");
 const maxChatSessions = optionalPositiveInteger("CIRCULUSD_TEST_MAX_SESSIONS");
+const sandboxStartupTimeoutMs = optionalPositiveInteger("CIRCULUSD_TEST_SANDBOX_STARTUP_TIMEOUT_MS");
 const sessionIdle = process.env.CIRCULUSD_TEST_SANDBOX_SESSION_IDLE?.trim();
 if (sessionIdle !== undefined && sessionIdle !== "" && !/^(0|\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(sessionIdle)) {
   console.error(`CIRCULUSD_TEST_SANDBOX_SESSION_IDLE must be a Go duration such as 30m, 1h, or 0, got ${sessionIdle}`);
@@ -67,6 +68,7 @@ if (sandboxMode === "circulusd") {
       workspaceSize: process.env.CIRCULUSD_TEST_SANDBOX_WORKSPACE_SIZE ?? "256m",
       ...(maxSessions === undefined ? {} : { maxSessions }),
       ...(sessionIdle === undefined || sessionIdle === "" ? {} : { sessionIdle }),
+      ...(sandboxStartupTimeoutMs === undefined ? {} : { startupTimeoutMs: sandboxStartupTimeoutMs }),
       log,
     });
   } catch (error) {

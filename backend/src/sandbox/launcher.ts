@@ -13,6 +13,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 export type SandboxLauncherKind = "auto" | "unshare" | "docker" | "nsjail";
+export const DEFAULT_STARTUP_TIMEOUT_MS = 180_000;
 export const SANDBOX_LAUNCHER_KINDS: readonly SandboxLauncherKind[] = ["auto", "unshare", "docker", "nsjail"];
 
 export interface SandboxLaunchOptions {
@@ -117,7 +118,9 @@ export async function launchSandbox(options: SandboxLaunchOptions): Promise<Sand
     options.log(`[sandbox] ${line}`);
   });
 
-  const timeoutMs = options.startupTimeoutMs ?? 90_000;
+  // The agent probes a real sandbox before reporting ready, and the docker
+  // launcher may first have to pull its image; give that room by default.
+  const timeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
   const ready = await new Promise<SandboxReady>((resolveReady, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`sandbox agent did not report ready within ${timeoutMs} ms`));
