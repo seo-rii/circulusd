@@ -1,0 +1,5 @@
+# Keep LF in the working copy on every platform: gofmt, the Go build, and the
+# shell wrappers the agent writes into the jail all expect LF.
+* text=auto eol=lf
+*.png binary
+*.ico binary

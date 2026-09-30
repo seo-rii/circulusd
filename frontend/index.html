@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>circulusd-test</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="conn-dot" title="SSE 연결 상태"></span>
+      <strong>circulusd-test</strong>
+      <span class="muted">Pi runtime engine · local harness</span>
+    </div>
+    <div class="caps" id="caps">capabilities 불러오는 중…</div>
+    <div class="actions">
+      <button id="new-session" type="button">새 세션</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="chat">
+      <div class="session-line">
+        <span class="muted">session</span> <code id="session-id">—</code>
+        <span class="muted">revision</span> <code id="revision" title="runtime revision digest">—</code>
+      </div>
+      <div class="messages" id="messages"></div>
+      <form class="composer" id="composer">
+        <textarea id="prompt" rows="2" placeholder='예: "12*(3+4) 계산해줘", "지금 몇 시야?", "echo 안녕"  (Enter 전송, Shift+Enter 줄바꿈)'></textarea>
+        <div class="composer-actions">
+          <button id="send" type="submit">보내기</button>
+          <button id="abort" type="button" class="danger" disabled>중단</button>
+        </div>
+      </form>
+    </section>
+
+    <aside class="events">
+      <div class="events-head">
+        <strong>durable event log</strong>
+        <span class="muted">SSE · <span id="event-count">0</span> events · last id <span id="last-id">0</span></span>
+        <button id="clear-log" type="button" class="small">지우기</button>
+      </div>
+      <ol class="event-list" id="event-list"></ol>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
