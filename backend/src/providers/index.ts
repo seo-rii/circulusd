@@ -12,6 +12,8 @@ export interface ResolveModelProviderOptions {
   /** Injectable for tests; defaults to the global fetch. */
   readonly fetch?: typeof fetch;
   readonly log?: (line: string) => void;
+  /** Passed to every real provider (see PiAiProviderOptions.stallTimeoutMs). */
+  readonly stallTimeoutMs?: number;
 }
 
 /**
@@ -32,6 +34,7 @@ export async function resolveModelProvider(
   const separator = trimmed.indexOf(":");
   const kind = separator === -1 ? trimmed : trimmed.slice(0, separator);
   const rest = separator === -1 ? "" : trimmed.slice(separator + 1);
+  const stall = options.stallTimeoutMs === undefined ? {} : { stallTimeoutMs: options.stallTimeoutMs };
 
   if (kind === "ollama") {
     const at = rest.indexOf("@");
@@ -57,6 +60,7 @@ export async function resolveModelProvider(
       contextWindow: metadata.contextLength,
       reasoning: metadata.thinking,
       supportsTools: metadata.tools,
+      ...stall,
     });
   }
   if (kind === "anthropic") {
@@ -68,6 +72,7 @@ export async function resolveModelProvider(
       modelId: rest,
       apiKeyEnv: "ANTHROPIC_API_KEY",
       apiKeyRequired: true,
+      ...stall,
     });
   }
   if (kind === "openai-compatible") {
@@ -85,6 +90,7 @@ export async function resolveModelProvider(
       apiKeyEnv: "OPENAI_API_KEY",
       apiKeyRequired: false,
       placeholderApiKey: "none",
+      ...stall,
     });
   }
   throw new ModelProviderError(

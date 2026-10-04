@@ -23,8 +23,8 @@ import { createTurnRuntime, runTurn, type TurnRuntime } from "./turn-runner.ts";
 export interface AppOptions {
   readonly provider: ModelProvider;
   readonly tools: readonly ToolDefinition[];
-  /** How the python tool executes (see PythonExecutor.describe); reported in /v1/capabilities. */
-  readonly execution?: Record<string, unknown>;
+  /** How the python tool executes (see PythonExecutor.describe); reported in /v1/capabilities. A function is called per request. */
+  readonly execution?: Record<string, unknown> | (() => Record<string, unknown>);
   readonly frontendDirectory: string | null;
   readonly historyInjection: boolean;
   readonly log?: (line: string) => void;
@@ -128,7 +128,7 @@ export function createApp(options: AppOptions): App {
     historyInjection: options.historyInjection,
     execution: {
       baseTools: "echo, now, calculator run in-process inside the backend",
-      python: options.execution ?? { mode: "disabled" },
+      python: (typeof options.execution === "function" ? options.execution() : options.execution) ?? { mode: "disabled" },
     },
     upstream: { piWorkerdConformance: getPiWorkerdConformanceStatus() },
     systemPrompt: configuration.systemPrompt,

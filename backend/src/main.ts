@@ -34,6 +34,7 @@ if (!SANDBOX_LAUNCHER_KINDS.includes(launcher)) {
 const maxSessions = optionalPositiveInteger("CIRCULUSD_TEST_SANDBOX_MAX_SESSIONS");
 const maxChatSessions = optionalPositiveInteger("CIRCULUSD_TEST_MAX_SESSIONS");
 const sandboxStartupTimeoutMs = optionalPositiveInteger("CIRCULUSD_TEST_SANDBOX_STARTUP_TIMEOUT_MS");
+const modelStallTimeoutMs = optionalPositiveInteger("CIRCULUSD_TEST_MODEL_STALL_TIMEOUT_MS");
 const sessionIdle = process.env.CIRCULUSD_TEST_SANDBOX_SESSION_IDLE?.trim();
 if (sessionIdle !== undefined && sessionIdle !== "" && !/^(0|\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(sessionIdle)) {
   console.error(`CIRCULUSD_TEST_SANDBOX_SESSION_IDLE must be a Go duration such as 30m, 1h, or 0, got ${sessionIdle}`);
@@ -44,6 +45,7 @@ let provider;
 try {
   provider = await resolveModelProvider(process.env.CIRCULUSD_TEST_MODEL, {
     log: (line) => console.warn(line),
+    ...(modelStallTimeoutMs === undefined ? {} : { stallTimeoutMs: modelStallTimeoutMs }),
   });
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
@@ -93,7 +95,8 @@ const pythonExecutor = python;
 const app = createApp({
   provider,
   tools,
-  execution: python === null ? { mode: "disabled", notes: pythonNotes } : { ...python.describe(), notes: pythonNotes },
+  // Evaluated per request: the sandbox description changes (agent relaunched, agent dead).
+  execution: () => (pythonExecutor === null ? { mode: "disabled", notes: pythonNotes } : { ...pythonExecutor.describe(), notes: pythonNotes }),
   frontendDirectory,
   historyInjection,
   log,

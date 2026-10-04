@@ -27,9 +27,18 @@ export interface PiAiProviderOptions {
   readonly reasoning?: boolean;
   /** When false, tool definitions are withheld from the request (the server would reject them). */
   readonly supportsTools?: boolean;
+  /** Milliseconds without a stream event before the request is given up (see DEFAULT_STALL_TIMEOUT_MS). */
+  readonly stallTimeoutMs?: number;
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
+/**
+ * A model server that accepts the request and then never answers (a wedged
+ * Ollama, a proxy holding the connection) would otherwise hold the turn until
+ * someone aborts it. Measured between stream events, so a slow but live
+ * stream is fine; the first token of a large local model can take a while.
+ */
+export const DEFAULT_STALL_TIMEOUT_MS = 120_000;
 
 /**
  * Real model provider backed by the same pinned pi-ai 0.84.3 that
@@ -113,28 +122,51 @@ export class PiAiModelProvider implements ModelProvider {
       const { tools: _withheld, ...withoutTools } = context;
       requestContext = withoutTools;
     }
-    const events = stream(this.#model, requestContext, {
-      ...(apiKey ? { apiKey } : {}),
-      signal,
-      maxTokens: Math.min(
-        this.configuration.maxTokens,
-        this.#options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-      ),
-    });
-    for await (const event of events) {
-      if (event.type === "text_delta") onDelta(event.delta);
-      else if (event.type === "thinking_delta") onThinking?.(event.delta);
+    const stallTimeoutMs = this.#options.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    const stall = new AbortController();
+    let stalled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const armStallTimer = (): void => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        stalled = true;
+        stall.abort();
+      }, stallTimeoutMs);
+    };
+    armStallTimer();
+    try {
+      const events = stream(this.#model, requestContext, {
+        ...(apiKey ? { apiKey } : {}),
+        signal: AbortSignal.any([signal, stall.signal]),
+        maxTokens: Math.min(
+          this.configuration.maxTokens,
+          this.#options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+      });
+      for await (const event of events) {
+        armStallTimer();
+        if (event.type === "text_delta") onDelta(event.delta);
+        else if (event.type === "thinking_delta") onThinking?.(event.delta);
+      }
+      const message = await events.result();
+      if (stalled) {
+        throw new ModelProviderError(
+          "MODEL_STALLED",
+          `no response from ${this.#model.provider} (${this.#model.id}) for ${stallTimeoutMs} ms; the request was given up`,
+        );
+      }
+      if (message.stopReason === "error") {
+        throw new ModelProviderError(
+          "MODEL_REQUEST_FAILED",
+          message.errorMessage ?? "model request failed",
+        );
+      }
+      if (message.stopReason === "aborted") {
+        throw new ModelProviderError("MODEL_ABORTED", "model request aborted");
+      }
+      return sanitizeAssistantMessage(message, this.configuration);
+    } finally {
+      clearTimeout(timer);
     }
-    const message = await events.result();
-    if (message.stopReason === "error") {
-      throw new ModelProviderError(
-        "MODEL_REQUEST_FAILED",
-        message.errorMessage ?? "model request failed",
-      );
-    }
-    if (message.stopReason === "aborted") {
-      throw new ModelProviderError("MODEL_ABORTED", "model request aborted");
-    }
-    return sanitizeAssistantMessage(message, this.configuration);
   }
 }

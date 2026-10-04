@@ -140,6 +140,9 @@ durable 이벤트에만 `id:` 가 붙고, 재접속 시 `Last-Event-ID` 이후�
   넘치면 턴이 돌고 있지 않은 가장 오래 쉰 세션을 비웁니다(그 세션의 SSE 스트림은 끊고 python 샌드박스도 내림). 사라진 세션을 보고 있던 UI 는
   스트림이 끊기거나 turn 제출이 404 를 받으면 새 세션을 시작합니다. 세션 하나도 durable 이벤트 5000 개, 전사 400 항목까지만 유지하고
   오래된 것부터 버립니다(`stream.open` 의 `firstEventId` 가 남아 있는 가장 오래된 이벤트). 프롬프트는 64 K 자, `Idempotency-Key` 는 256 자까지입니다.
+- 모델 서버가 요청을 받고 아무 것도 보내지 않으면(멈춘 Ollama, 연결을 쥐고 있는 프록시) 스트림 이벤트 없이 120 초가 지난 뒤 `MODEL_STALLED`
+  로 턴을 실패시킵니다(`CIRCULUSD_TEST_MODEL_STALL_TIMEOUT_MS`). 이벤트 사이 간격을 재므로 느리지만 살아 있는 스트림은 괜찮습니다.
+  SSE 클라이언트가 읽지 않아 보낼 것이 4 MB 넘게 쌓이면 그 연결을 끊습니다(브라우저는 `Last-Event-ID` 로 다시 붙음).
 - circulusd Pi 어댑터는 매 턴을 빈 상태에서 시작합니다(`turn_start requires a fresh adapter state`).
   채팅처럼 보이게 하려고 이전 턴의 user/assistant 텍스트를 모델 요청 직전에 앞에 붙이며
   (`CIRCULUSD_TEST_HISTORY=0` 으로 끌 수 있음), 붙인 개수는 `model.started` 이벤트의 `historyInjected` 로 보입니다.

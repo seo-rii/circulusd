@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
@@ -9,6 +9,7 @@ import { buildAdapterConfiguration, engineIdentity, runtimeRevisionDigest } from
 import {
   MOCK_MODEL,
   MockModelProvider,
+  ModelProviderError,
   defaultOllamaBaseUrl,
   planToolCall,
   resolveModelProvider,
@@ -16,6 +17,7 @@ import {
 } from "../src/providers/index.ts";
 import { CirculusdSandboxExecutor } from "../src/sandbox/executor.ts";
 import type { SandboxProcess, SandboxReady } from "../src/sandbox/launcher.ts";
+import { PiAiModelProvider } from "../src/providers/pi-ai.ts";
 import { createApp } from "../src/server.ts";
 import {
   MAX_EVENTS_PER_SESSION,
@@ -739,4 +741,40 @@ test("circulusd sandbox executor starts the agent again after it died, at most o
     for (const agent of agents) agent.die(0);
   }
   assert.ok(agents.every((agent) => agent.process.exitStatus() !== undefined), "close() stopped the live agent");
+});
+
+test("a model server that accepts the request and never answers is given up as MODEL_STALLED", async () => {
+  // An OpenAI-compatible endpoint that opens the stream and then says nothing.
+  const held: ServerResponse[] = [];
+  const server = createServer((request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(": open\n\n");
+    held.push(response);
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const { port } = server.address() as AddressInfo;
+  const provider = new PiAiModelProvider({
+    kind: "openai-compatible",
+    modelId: "wedged",
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    apiKeyEnv: "CIRCULUSD_TEST_NO_SUCH_KEY",
+    apiKeyRequired: false,
+    placeholderApiKey: "none",
+    stallTimeoutMs: 300,
+  });
+  const started = Date.now();
+  try {
+    await assert.rejects(
+      provider.complete({
+        context: { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+        signal: new AbortController().signal,
+        onDelta: () => undefined,
+      }),
+      (error: unknown) => error instanceof ModelProviderError && error.code === "MODEL_STALLED" && /300 ms/.test(error.message),
+    );
+    assert.ok(Date.now() - started < 10_000, "gave up on the stall timer, not on some other timeout");
+  } finally {
+    for (const response of held) response.destroy();
+    server.close();
+  }
 });
