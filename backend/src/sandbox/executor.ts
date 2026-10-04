@@ -11,7 +11,19 @@ import { agentHeaders, launchSandbox, type SandboxLaunchOptions, type SandboxPro
 
 export interface CirculusdSandboxOptions extends Omit<SandboxLaunchOptions, "log"> {
   readonly log: (line: string) => void;
+  /** Starts the agent process; tests substitute a fake. */
+  readonly launch?: (options: SandboxLaunchOptions) => Promise<SandboxProcess>;
+  /** Overrides AGENT_RELAUNCH_MIN_INTERVAL_MS (tests). */
+  readonly relaunchMinIntervalMs?: number;
 }
+
+/**
+ * After the agent dies it is started again on the next python call, but not
+ * more often than this: an agent that dies right after starting (a broken
+ * launcher, a WSL distro shutting down) would otherwise cost a full launch
+ * and probe per tool call.
+ */
+export const AGENT_RELAUNCH_MIN_INTERVAL_MS = 30_000;
 
 interface AgentRunResult {
   readonly stdout: string;
@@ -39,25 +51,84 @@ const ISOLATION: Readonly<Record<string, string>> = {
 
 export class CirculusdSandboxExecutor implements PythonExecutor {
   readonly kind = "circulusd-sandbox" as const;
-  readonly #process: SandboxProcess;
+  readonly #options: CirculusdSandboxOptions;
   readonly #log: (line: string) => void;
+  #process: SandboxProcess;
+  #relaunch: Promise<SandboxProcess> | null = null;
+  #launchedAt: number;
+  #relaunches = 0;
   #closed = false;
 
-  private constructor(process: SandboxProcess, log: (line: string) => void) {
+  private constructor(process: SandboxProcess, options: CirculusdSandboxOptions, launchedAt: number) {
+    this.#options = options;
+    this.#log = options.log;
     this.#process = process;
-    this.#log = log;
-    void process.exited.then((code) => {
-      if (!this.#closed) this.#log(`[sandbox] agent exited unexpectedly with status ${code ?? "unknown"}; python tool calls will fail`);
-    });
+    this.#launchedAt = launchedAt;
+    this.#watch(process);
   }
 
   static async start(options: CirculusdSandboxOptions): Promise<CirculusdSandboxExecutor> {
-    const process = await launchSandbox(options);
-    return new CirculusdSandboxExecutor(process, options.log);
+    const launchedAt = Date.now();
+    const process = await (options.launch ?? launchSandbox)(options);
+    return new CirculusdSandboxExecutor(process, options, launchedAt);
   }
 
   get ready(): SandboxReady {
     return this.#process.ready;
+  }
+
+  /** Times the agent was started again after dying (see #current). */
+  get relaunches(): number {
+    return this.#relaunches;
+  }
+
+  #watch(process: SandboxProcess): void {
+    void process.exited.then((code) => {
+      if (this.#closed || this.#process !== process) return;
+      this.#log(
+        `[sandbox] agent exited unexpectedly with status ${code ?? "unknown"}; ` +
+          "it is started again on the next python call (every session's /workspace is gone)",
+      );
+    });
+  }
+
+  /**
+   * The running agent, started again if the previous one died. One relaunch
+   * at a time; concurrent callers share it. Without this a dead agent (WSL
+   * shut down, OOM-killed, crashed) left the python tool broken until the
+   * backend was restarted.
+   */
+  async #current(): Promise<SandboxProcess> {
+    if (this.#closed) throw new Error("circulusd sandbox is closed");
+    if (this.#process.exitStatus() === undefined) return this.#process;
+    if (this.#relaunch === null) {
+      const exitStatus = this.#process.exitStatus();
+      const minInterval = this.#options.relaunchMinIntervalMs ?? AGENT_RELAUNCH_MIN_INTERVAL_MS;
+      const sinceLaunch = Date.now() - this.#launchedAt;
+      if (sinceLaunch < minInterval) {
+        throw new Error(
+          `circulusd sandbox agent exited (status ${exitStatus ?? "unknown"}) ${Math.round(sinceLaunch / 1000)} s after starting; ` +
+            `it is started again at most every ${Math.round(minInterval / 1000)} s, try later`,
+        );
+      }
+      this.#relaunch = (async () => {
+        this.#log(`[sandbox] agent exited (status ${exitStatus ?? "unknown"}); starting it again`);
+        this.#launchedAt = Date.now();
+        const next = await (this.#options.launch ?? launchSandbox)(this.#options);
+        if (this.#closed) {
+          await next.close();
+          throw new Error("circulusd sandbox is closed");
+        }
+        this.#process = next;
+        this.#relaunches += 1;
+        this.#watch(next);
+        this.#log(`[sandbox] agent is back at ${next.ready.host}:${next.ready.port} (relaunch ${this.#relaunches})`);
+        return next;
+      })().finally(() => {
+        this.#relaunch = null;
+      });
+    }
+    return this.#relaunch;
   }
 
   describe(): Record<string, unknown> {
@@ -70,6 +141,8 @@ export class CirculusdSandboxExecutor implements PythonExecutor {
       isolation: ISOLATION[ready.launcher] ?? ready.launcher,
       scope: "one sandboxd instance (own jail and /workspace) per session; relaunched with a new generation when sandboxd exits or its idempotency ledger nears the cap",
       sessions: { max: ready.maxSessions, idleMs: ready.sessionIdleMs, ledgerBudget: ready.ledgerBudget },
+      agentRelaunches: this.#relaunches,
+      agentAlive: this.#process.exitStatus() === undefined,
       environmentDigest: ready.environmentDigest,
       sandboxdDigest: `sha256:${ready.sandboxdDigest}`,
       agent: `${ready.host}:${ready.port}`,
@@ -83,10 +156,13 @@ export class CirculusdSandboxExecutor implements PythonExecutor {
 
   async close(): Promise<void> {
     this.#closed = true;
+    // A relaunch in flight closes its own process once it sees #closed.
+    await this.#relaunch?.catch(() => undefined);
     await this.#process.close();
   }
 
   async closeSession(sessionId: string): Promise<void> {
+    // A dead agent took every session with it; nothing is left to close.
     if (this.#closed || this.#process.exitStatus() !== undefined) return;
     const ready = this.#process.ready;
     const response = await fetch(`http://${ready.host}:${ready.port}/v1/sessions/${encodeURIComponent(sessionId)}`, {
@@ -101,14 +177,9 @@ export class CirculusdSandboxExecutor implements PythonExecutor {
   }
 
   async run(request: PythonRunRequest): Promise<ToolExecution> {
-    if (this.#closed) throw new Error("circulusd sandbox is closed");
-    const exitStatus = this.#process.exitStatus();
-    if (exitStatus !== undefined) {
-      throw new Error(`circulusd sandbox agent is no longer running (exit status ${exitStatus ?? "unknown"}); restart the backend`);
-    }
     const { context } = request;
     const timeoutMs = Math.max(1, Math.trunc(request.timeoutMs));
-    const ready = this.#process.ready;
+    const ready = (await this.#current()).ready;
     // The agent cancels the sandbox process when the HTTP request is aborted.
     const signal = AbortSignal.any([context.signal, AbortSignal.timeout(timeoutMs + 5 * 60_000)]);
     let response: Response;

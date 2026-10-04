@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 
 import { buildAdapterConfiguration, engineIdentity, runtimeRevisionDigest } from "../src/agent-config.ts";
@@ -12,6 +14,8 @@ import {
   resolveModelProvider,
   type ModelProvider,
 } from "../src/providers/index.ts";
+import { CirculusdSandboxExecutor } from "../src/sandbox/executor.ts";
+import type { SandboxProcess, SandboxReady } from "../src/sandbox/launcher.ts";
 import { createApp } from "../src/server.ts";
 import {
   MAX_EVENTS_PER_SESSION,
@@ -644,3 +648,95 @@ test(
     }
   },
 );
+
+test("circulusd sandbox executor starts the agent again after it died, at most once per interval", async () => {
+  // Stand-ins for sandbox/agent: each fake agent answers the JSON API from
+  // its own HTTP server and prints its launch number, and can be made to die.
+  interface FakeAgent {
+    readonly process: SandboxProcess;
+    readonly server: Server;
+    die(code: number): void;
+  }
+  const agents: FakeAgent[] = [];
+  const launch = async (): Promise<SandboxProcess> => {
+    const number = agents.length + 1;
+    const server = createServer((request, response) => {
+      const body =
+        request.url === "/v1/ready"
+          ? { ready: true }
+          : {
+              stdout: `agent ${number}\n`,
+              stderr: "",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              exitCode: 0,
+              timedOut: false,
+              cancelled: false,
+              outputTruncated: false,
+              signal: "",
+              sandboxId: "sb",
+              generation: 1,
+            };
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const { port } = server.address() as AddressInfo;
+    let exitStatus: number | null | undefined;
+    let resolveExit: (code: number | null) => void = () => undefined;
+    const exited = new Promise<number | null>((resolveExited) => {
+      resolveExit = resolveExited;
+    });
+    const die = (code: number): void => {
+      if (exitStatus !== undefined) return;
+      exitStatus = code;
+      resolveExit(code);
+      server.close();
+    };
+    const process: SandboxProcess = {
+      ready: { host: "127.0.0.1", port, token: `token-${number}` } as unknown as SandboxReady,
+      exited,
+      exitStatus: () => exitStatus,
+      close: async () => die(0),
+    };
+    agents.push({ process, server, die });
+    return process;
+  };
+  const logs: string[] = [];
+  const executor = await CirculusdSandboxExecutor.start({
+    distro: null,
+    sandboxDirectory: ".",
+    launcher: "auto",
+    python: "python3",
+    workspaceSize: "64m",
+    log: (line) => logs.push(line),
+    launch,
+    relaunchMinIntervalMs: 300,
+  });
+  const run = (callId: string): Promise<{ text: string; isError: boolean }> =>
+    executor.run({ code: "print(1)", stdin: "", timeoutMs: 1_000, context: toolContext("sess_x", callId) });
+  try {
+    assert.match((await run("c1")).text, /agent 1/);
+    assert.equal(executor.describe().agentAlive, true);
+
+    // The agent dies right after starting: no relaunch yet, a clear error instead.
+    agents[0]!.die(137);
+    await new Promise((resolveTick) => setTimeout(resolveTick, 10));
+    assert.equal(executor.describe().agentAlive, false);
+    await assert.rejects(run("c2"), /exited \(status 137\).*started again at most every/);
+    assert.equal(agents.length, 1);
+
+    // Past the interval the next call starts a new agent; concurrent calls share that launch.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 350));
+    const [a, b] = await Promise.all([run("c3"), run("c4")]);
+    assert.match(a.text, /agent 2/);
+    assert.match(b.text, /agent 2/);
+    assert.equal(agents.length, 2, "one relaunch served both calls");
+    assert.equal(executor.relaunches, 1);
+    assert.equal(executor.describe().agentRelaunches, 1);
+    assert.ok(logs.some((line) => /agent is back/.test(line)), logs.join("\n"));
+  } finally {
+    await executor.close();
+    for (const agent of agents) agent.die(0);
+  }
+  assert.ok(agents.every((agent) => agent.process.exitStatus() !== undefined), "close() stopped the live agent");
+});
