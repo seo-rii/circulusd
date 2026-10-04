@@ -59,6 +59,8 @@ export interface TranscriptEntry {
  */
 export const MAX_EVENTS_PER_SESSION = 5_000;
 export const MAX_TRANSCRIPT_ENTRIES = 400;
+/** Finished turn records kept (each holds its prompt and result); the running turn is never dropped. */
+export const MAX_TURNS_PER_SESSION = 200;
 
 export class Session {
   readonly id: string;
@@ -66,6 +68,7 @@ export class Session {
   readonly runtimeRevisionDigest: string;
   /** The retained tail of the durable log (see MAX_EVENTS_PER_SESSION). */
   readonly events: DurableEvent[] = [];
+  /** The newest turns (see MAX_TURNS_PER_SESSION), oldest first. */
   readonly turns: TurnRecord[] = [];
   readonly transcript: TranscriptEntry[] = [];
   activeTurn: TurnRecord | null = null;
@@ -165,6 +168,13 @@ export class Session {
     };
     this.turns.push(turn);
     this.activeTurn = turn;
+    if (this.turns.length > MAX_TURNS_PER_SESSION) {
+      const dropped = new Set(this.turns.splice(0, this.turns.length - MAX_TURNS_PER_SESSION).map((old) => old.turnId));
+      // A replayed Idempotency-Key must not point at a turn that no longer exists.
+      for (const [key, turnId] of this.#idempotency) {
+        if (dropped.has(turnId)) this.#idempotency.delete(key);
+      }
+    }
     return turn;
   }
 

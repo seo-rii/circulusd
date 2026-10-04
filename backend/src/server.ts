@@ -48,6 +48,13 @@ const MAX_BODY_BYTES = 1_048_576;
 const MAX_PROMPT_CHARS = 64 * 1024;
 const MAX_IDEMPOTENCY_KEY_CHARS = 256;
 const SSE_HEARTBEAT_MS = 15_000;
+/**
+ * Bytes an SSE client may leave unread before it is dropped. A client that
+ * stopped reading (a stalled tab, a half-open connection) would otherwise make
+ * the backend buffer every model delta for it indefinitely. The client
+ * reconnects with Last-Event-ID and gets the durable events it missed.
+ */
+const SSE_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -82,14 +89,16 @@ export function createApp(options: AppOptions): App {
     historyInjection: options.historyInjection,
   });
   const frontendRoot = options.frontendDirectory === null ? null : resolve(options.frontendDirectory);
-  // Open SSE responses per session, so a deleted or evicted session's streams
-  // are ended (the browser then learns the session is gone instead of waiting
-  // on a stream nothing will ever write to again).
-  const sseClients = new Map<string, Set<ServerResponse>>();
+  // Open SSE streams per session (each entry closes one), so a deleted or
+  // evicted session's streams are ended (the browser then learns the session
+  // is gone instead of waiting on a stream nothing will ever write to again).
+  const sseClients = new Map<string, Set<() => void>>();
   const dropSessionResources = (session: Session, reason: string): void => {
-    session.activeTurn?.controller.abort();
-    for (const client of sseClients.get(session.id) ?? []) client.end();
+    // Streams first: the abort below makes the turn runner commit its final
+    // events, which must not land on a response that has already been ended.
+    for (const close of [...(sseClients.get(session.id) ?? [])]) close();
     sseClients.delete(session.id);
+    session.activeTurn?.controller.abort();
     log(`session ${session.id} ${reason}`);
     options.onSessionDeleted?.(session.id).catch((error: unknown) => {
       log(`session ${session.id} cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -318,13 +327,35 @@ export function createApp(options: AppOptions): App {
       "x-accel-buffering": "no",
     });
     response.write("retry: 1000\n\n");
-    let clients = sseClients.get(session.id);
-    if (clients === undefined) {
-      clients = new Set();
-      sseClients.set(session.id, clients);
-    }
-    clients.add(response);
+    // Writing to a response after it ended (or to one the socket has already
+    // torn down) raises ERR_STREAM_WRITE_AFTER_END as an 'error' event, which
+    // without a listener takes the whole process down.
+    response.on("error", (error) => log(`sse ${session.id}: ${error.message}`));
+    let closed = false;
+    let unsubscribe = (): void => undefined;
+    const writable = (): boolean => !closed && !response.writableEnded && !response.destroyed;
+    // Detaches from the session and ends the response. Idempotent, and safe
+    // to call before the socket has actually closed.
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+      const remaining = sseClients.get(session.id);
+      if (remaining !== undefined) {
+        remaining.delete(close);
+        if (remaining.size === 0) sseClients.delete(session.id);
+      }
+      if (!response.writableEnded && !response.destroyed) response.end();
+    };
     const write = (event: SessionEvent): void => {
+      if (!writable()) return;
+      if (response.writableLength > SSE_MAX_BUFFERED_BYTES) {
+        log(`sse ${session.id}: client is not reading (${response.writableLength} bytes pending); dropping it`);
+        close();
+        response.destroy();
+        return;
+      }
       const lines = [
         ...(event.id === null ? [] : [`id: ${event.id}`]),
         `event: ${event.type}`,
@@ -332,6 +363,17 @@ export function createApp(options: AppOptions): App {
       ];
       response.write(`${lines.join("\n")}\n\n`);
     };
+    const heartbeat = setInterval(() => {
+      if (writable()) response.write(": ping\n\n");
+    }, SSE_HEARTBEAT_MS);
+    let clients = sseClients.get(session.id);
+    if (clients === undefined) {
+      clients = new Set();
+      sseClients.set(session.id, clients);
+    }
+    clients.add(close);
+    request.on("close", close);
+    response.on("close", close);
     write({
       id: null,
       type: "stream.open",
@@ -341,21 +383,9 @@ export function createApp(options: AppOptions): App {
       // firstEventId > resumeFrom + 1 means older events were dropped and cannot be replayed.
       data: { resumeFrom: lastEventId, firstEventId: session.firstEventId, lastEventId: session.lastEventId },
     });
-    const unsubscribe = session.subscribe(write, lastEventId);
-    const heartbeat = setInterval(() => {
-      response.write(": ping\n\n");
-    }, SSE_HEARTBEAT_MS);
-    const cleanup = (): void => {
-      clearInterval(heartbeat);
-      unsubscribe();
-      const remaining = sseClients.get(session.id);
-      if (remaining !== undefined) {
-        remaining.delete(response);
-        if (remaining.size === 0) sseClients.delete(session.id);
-      }
-    };
-    request.on("close", cleanup);
-    response.on("close", cleanup);
+    // Replays the retained log first; a client that cannot take it all is closed by write().
+    unsubscribe = session.subscribe(write, lastEventId);
+    if (closed) unsubscribe();
   };
 
   const server = createServer((request, response) => {
@@ -396,8 +426,8 @@ export function createApp(options: AppOptions): App {
       });
     },
     close() {
-      for (const clients of sseClients.values()) {
-        for (const client of clients) client.end();
+      for (const clients of [...sseClients.values()]) {
+        for (const close of [...clients]) close();
       }
       sseClients.clear();
       for (const session of store.list()) session.activeTurn?.controller.abort();

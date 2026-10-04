@@ -16,6 +16,7 @@ import { createApp } from "../src/server.ts";
 import {
   MAX_EVENTS_PER_SESSION,
   MAX_TRANSCRIPT_ENTRIES,
+  MAX_TURNS_PER_SESSION,
   Session,
   SessionStore,
   type DurableEvent,
@@ -368,6 +369,21 @@ test("a session retains a bounded tail of its log and transcript", () => {
   assert.equal(session.transcript[0]?.turnId, "t3");
 });
 
+test("a session keeps a bounded number of turn records and forgets their idempotency keys", () => {
+  const session = new Session("sha256:x");
+  const firstTurnId = session.beginTurn("first").turnId;
+  session.rememberIdempotency("key-first", firstTurnId);
+  session.activeTurn = null;
+  for (let index = 0; index < MAX_TURNS_PER_SESSION; index += 1) {
+    session.beginTurn(`turn ${index}`);
+    session.activeTurn = null;
+  }
+  assert.equal(session.turns.length, MAX_TURNS_PER_SESSION);
+  assert.equal(session.findTurn(firstTurnId), undefined, "the oldest turn was dropped");
+  assert.equal(session.idempotentTurnId("key-first"), undefined, "its key no longer replays a missing turn");
+  assert.equal(session.turns[session.turns.length - 1]?.prompt, `turn ${MAX_TURNS_PER_SESSION - 1}`);
+});
+
 test("session store evicts the longest-idle session at its limit, never one with a running turn", () => {
   const evicted: string[] = [];
   const store = new SessionStore({ limit: 2, onEvict: (session) => evicted.push(session.id) });
@@ -430,11 +446,24 @@ test("HTTP API: deleting or evicting a session ends its event streams and runs t
     ((await (await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" })).json()) as { sessionId: string }).sessionId;
   try {
     const first = await createSession();
+    const firstSession = app.store.get(first)!;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
     const stream = await fetch(`${base}/v1/sessions/${first}/events`, { signal: controller.signal });
     const reader = stream.body!.getReader();
     await reader.read(); // stream.open
+    // A running turn is aborted when its session goes; the runner then still
+    // commits the turn's final events. The stream must already be detached so
+    // nothing is written to the ended response (a write after end raises
+    // ERR_STREAM_WRITE_AFTER_END, fatal when unhandled). Stand in for the
+    // runner with a listener that commits right after the abort.
+    const pending = firstSession.beginTurn("pending");
+    pending.controller.signal.addEventListener("abort", () => {
+      queueMicrotask(() => {
+        firstSession.commit("turn.aborted", pending.turnId, { late: true });
+        firstSession.emit("model.delta", pending.turnId, { text: "late" });
+      });
+    });
     assert.equal((await fetch(`${base}/v1/sessions/${first}`, { method: "DELETE" })).status, 204);
     // The stream must end on its own instead of hanging on a dead session.
     for (;;) {
@@ -443,6 +472,7 @@ test("HTTP API: deleting or evicting a session ends its event streams and runs t
     }
     clearTimeout(timer);
     assert.deepEqual(cleaned, [first]);
+    assert.equal((await fetch(`${base}/v1/capabilities`)).status, 200, "the backend is still up");
 
     // With one slot, a new session evicts the idle one and cleans up after it.
     const second = await createSession();

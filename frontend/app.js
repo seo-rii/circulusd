@@ -249,6 +249,14 @@ function handleEvent(event, id) {
   switch (event.type) {
     case "stream.open":
       setConnection("open");
+      // The backend keeps a bounded tail of the log; say so when the replay
+      // cannot start where this client left off (a long session, reloaded).
+      if (typeof data.firstEventId === "number" && data.firstEventId > data.resumeFrom + 1 && data.firstEventId <= data.lastEventId) {
+        const element = document.createElement("div");
+        element.className = "bubble assistant";
+        element.textContent = `이벤트 ${data.resumeFrom + 1}~${data.firstEventId - 1} 은 보존 기간이 지나 다시 받을 수 없습니다. 남아 있는 기록부터 표시합니다.`;
+        ui.messages.append(element);
+      }
       break;
     case "turn.accepted": {
       // The bubble drawn optimistically on submit is adopted here; otherwise
