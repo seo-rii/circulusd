@@ -1,0 +1,7 @@
+{
+  "name": "@circulusd-test/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Static single-page test UI served by @circulusd-test/backend (no build step)",
+  "files": ["index.html", "app.js", "style.css"]
+}

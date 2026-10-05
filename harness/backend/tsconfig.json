@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "paths": {
+      "@circulusd/pi-runtime": ["../../circulusd/workers/pi-runtime/src/index.ts"],
+      "@circulusd/protocol-types": ["../../circulusd/packages/protocol-types/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

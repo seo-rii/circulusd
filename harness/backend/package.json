@@ -1,0 +1,21 @@
+{
+  "name": "@circulusd-test/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../.env --watch --watch-path=src src/main.ts",
+    "start": "node --env-file-if-exists=../.env src/main.ts",
+    "check": "tsc -p tsconfig.json",
+    "test": "node --test test/agent.test.ts"
+  },
+  "dependencies": {
+    "@circulusd/pi-runtime": "link:../../circulusd/workers/pi-runtime",
+    "@circulusd/protocol-types": "link:../../circulusd/packages/protocol-types",
+    "@earendil-works/pi-ai": "0.84.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "7.0.2"
+  }
+}
