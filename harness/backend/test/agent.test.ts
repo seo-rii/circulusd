@@ -13,6 +13,7 @@ import {
   defaultOllamaBaseUrl,
   planToolCall,
   resolveModelProvider,
+  textOfContent,
   type ModelProvider,
 } from "../src/providers/index.ts";
 import { CirculusdSandboxExecutor } from "../src/sandbox/executor.ts";
@@ -618,6 +619,29 @@ test("mock model routes python code to the python tool", () => {
     name: "calculator",
     arguments: { expression: "12*(3+4)" },
   });
+});
+
+test("mock model does not call a tool the turn's context does not offer", async () => {
+  const provider = new MockModelProvider({ deltaDelayMs: 0 });
+  const complete = (tools: { name: string }[] | undefined) =>
+    provider.complete({
+      context: {
+        messages: [{ role: "user", content: "python: print(1)", timestamp: Date.now() }],
+        ...(tools === undefined ? {} : { tools: tools.map((tool) => ({ ...tool, description: "", parameters: { type: "object" } })) as never }),
+      },
+      signal: new AbortController().signal,
+      onDelta: () => undefined,
+    });
+  // With python offered the plan goes through as a tool call.
+  const withPython = await complete([{ name: "echo" }, { name: "python" }]);
+  assert.equal(withPython.stopReason, "toolUse");
+  // Without it (sandbox disabled) the mock answers in text and says why.
+  const withoutPython = await complete([{ name: "echo" }, { name: "calculator" }]);
+  assert.equal(withoutPython.stopReason, "stop");
+  const text = textOfContent(withoutPython.content);
+  assert.match(text, /`python` 도구는 이 백엔드에서 꺼져 있어/);
+  assert.match(text, /사용 가능한 도구: echo, calculator\./);
+  assert.doesNotMatch(text, /python: print\(2\*\*10\)/, "no example for a tool that is off");
 });
 
 test(

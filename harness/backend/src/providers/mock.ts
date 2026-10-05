@@ -80,8 +80,12 @@ export class MockModelProvider implements ModelProvider {
       return this.#assistant([{ type: "text", text: reply }], "stop", inputTokens);
     }
 
+    // The tools the engine actually offers for this turn come with the context
+    // (python is absent when the sandbox could not start); a tool the context
+    // lacks is not called, or the result would just be "unknown tool".
+    const available = Array.isArray(context.tools) ? context.tools.map((tool) => tool.name) : this.#toolNames;
     const plan = planToolCall(prompt);
-    if (plan !== null) {
+    if (plan !== null && available.includes(plan.name)) {
       const toolCall: ToolCall = {
         type: "toolCall",
         id: `call_${randomUUID().slice(0, 8)}`,
@@ -91,10 +95,12 @@ export class MockModelProvider implements ModelProvider {
       return this.#assistant([toolCall], "toolUse", inputTokens);
     }
 
-    const toolNames = this.#toolNames.join(", ");
+    const toolNames = available.join(", ");
+    const examples = ['"12*(3+4) 계산해줘"', '"지금 몇 시야?"', '"echo 안녕"', ...(available.includes("python") ? ['"python: print(2**10)"'] : [])];
+    const unavailable = plan === null ? "" : `\`${plan.name}\` 도구는 이 백엔드에서 꺼져 있어 호출하지 않았습니다(기동 로그와 /v1/capabilities 의 execution 참고). `;
     const reply =
-      `[mock] "${prompt}" 을(를) 받았습니다. 이 답변은 실제 LLM이 아니라 circulusd-test 내장 모의 모델이 만든 것입니다. ` +
-      `사용 가능한 도구: ${toolNames}. 예: "12*(3+4) 계산해줘", "지금 몇 시야?", "echo 안녕", "python: print(2**10)".`;
+      `[mock] "${prompt}" 을(를) 받았습니다. 이 답변은 실제 LLM이 아니라 circulusd-test 내장 모의 모델이 만든 것입니다. ${unavailable}` +
+      `사용 가능한 도구: ${toolNames}. 예: ${examples.join(", ")}.`;
     await this.#stream(reply, onDelta, signal);
     return this.#assistant([{ type: "text", text: reply }], "stop", inputTokens);
   }
