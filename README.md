@@ -67,8 +67,9 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
   `DELETE /v1/sessions/{id}` 하면 그 샌드박스도 내려갑니다. 회수·삭제·재기동 시 그 세션의 `/workspace` 는 사라집니다.
 - sandboxd 의 idempotency 원장은 세대(generation)마다 4096 키가 상한이고 비워지지 않습니다. 에이전트는 키가 붙은 RPC(spawn, stdin,
   cancel …)를 세며 예산(기본 3800)에 닿으면, 또는 sandboxd 가 죽거나 `ResourceExhausted` 를 돌려주거나 응답을 멈추면(단항 RPC 는
-  35 초에 끊김) 그 세션의 sandboxd 만 다음 세대로 다시 띄우고 그 호출을 한 번 다시 실행합니다. 그 호출의 결과 앞에는 `note:` 로
-  재기동과 workspace 초기화 사실이 적힙니다.
+  35 초에 끊김) 그 세션의 sandboxd 만 다음 세대로 다시 띄웁니다. 그 호출은 sandboxd 가 spawn 을 받아들이기 전에 실패한 경우에만
+  한 번 다시 실행합니다(결과 앞에 `note:` 로 재기동과 workspace 초기화 사실이 적힘). spawn 뒤에 끊겼다면 스크립트가 이미 돌았을 수
+  있으므로(`python` 의 replay 정책은 `never`) 다시 돌리지 않고 실패로 보고하며, 새 샌드박스는 다음 호출을 기다립니다.
 - 기동 시 에이전트는 일회용 샌드박스를 띄워 `print('ok')` 를 실제로 돌려 보고(probe) 실패하면 종료하므로, 런처가 깨진 채로
   `python` 도구가 켜지는 일은 없습니다. 같은 때에 이전 에이전트가 비정상 종료하며 남긴 인스턴스 디렉터리(2 분 이상 지났고 제어 소켓이
   응답하지 않는 것; docker 면 그 컨테이너도)를 치웁니다. jail 감독 프로세스(nsjail/unshare)는 에이전트가 죽으면 함께 죽도록(`PDEATHSIG`)

@@ -151,6 +151,20 @@ func shouldRelaunch(err error) bool {
 // errInvalidRequest marks caller mistakes (reported as 400, not 500).
 var errInvalidRequest = errors.New("invalid run request")
 
+// spawnedError wraps a failure that happened after sandboxd accepted the
+// spawn: the script may have run (to completion, even), so the pool must not
+// run it again. The python tool's replay policy is "never".
+type spawnedError struct{ err error }
+
+func (e *spawnedError) Error() string { return e.err.Error() }
+func (e *spawnedError) Unwrap() error { return e.err }
+
+// wasSpawned reports whether the process behind a failed run may have started.
+func wasSpawned(err error) bool {
+	var spawned *spawnedError
+	return errors.As(err, &spawned)
+}
+
 // validateRunRequest rejects requests no sandbox should be launched for.
 func validateRunRequest(request runRequest) error {
 	if strings.TrimSpace(request.Code) == "" {
@@ -297,8 +311,22 @@ func (e *executor) execute(ctx context.Context, plan spawnPlan) (*runResult, err
 	e.keyed++
 	handle, err := e.client.spawn(ctx, spawnRequest)
 	if err != nil {
+		// A spawn that timed out may still have started the process; only a
+		// definite refusal (ledger full, nothing listening) is safe to retry.
+		if connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
+			return nil, &spawnedError{err}
+		}
 		return nil, err
 	}
+	result, err := e.afterSpawn(ctx, handle, plan)
+	if err != nil {
+		return nil, &spawnedError{err}
+	}
+	return result, nil
+}
+
+// afterSpawn feeds stdin and collects the process; the process exists by now.
+func (e *executor) afterSpawn(ctx context.Context, handle *v1.ProcessHandle, plan spawnPlan) (*runResult, error) {
 	if plan.stdin != "" {
 		// A script that exits without draining stdin makes a later write fail
 		// (EPIPE, or "process exited"); that is the script's business, not an

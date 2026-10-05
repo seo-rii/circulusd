@@ -86,10 +86,20 @@ func (p *pool) run(ctx context.Context, request runRequest) (*runResult, error) 
 	result, err := exec.run(ctx, request)
 	if shouldRelaunch(err) && ctx.Err() == nil {
 		// The ledger filled up ahead of our count, or sandboxd stopped
-		// answering: relaunch and retry once (the run is repeated in a fresh
-		// /workspace; a sandbox that stays broken would otherwise fail every
-		// call of this session for good).
-		exec, err = p.relaunch(sb, "sandboxd did not serve the request: "+err.Error(), &note)
+		// answering: relaunch (a sandbox that stays broken would otherwise
+		// fail every call of this session for good). The run itself is only
+		// repeated when sandboxd never accepted the spawn; once the process
+		// may have started, running the script a second time is not ours to
+		// decide (the python tool's replay policy is "never"), so the failure
+		// is reported and the fresh sandbox waits for the next call.
+		reason := "sandboxd did not serve the request: " + err.Error()
+		if wasSpawned(err) {
+			if _, relaunchErr := p.relaunch(sb, reason, &note); relaunchErr != nil {
+				return nil, fmt.Errorf("%w (and relaunching the sandbox failed: %v)", err, relaunchErr)
+			}
+			return nil, fmt.Errorf("%w; the sandbox was relaunched (/workspace reset) but the script was not run again because it may already have run", err)
+		}
+		exec, err = p.relaunch(sb, reason, &note)
 		if err != nil {
 			return nil, err
 		}
