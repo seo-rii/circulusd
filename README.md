@@ -85,7 +85,7 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
 |---|---|---|---|
 | `nsjail` | `nsjail` | NsJail 이 tmpfs 루트에 `/usr` 읽기 전용 bind, user/mount/pid/net/ipc/uts 네임스페이스, uid 매핑은 newuidmap, rlimit, no_new_privs. sandboxd 는 내부 root 로 CAP_SETUID/SETGID/KILL 만 가지고, 파이썬은 `setpriv` 로 subuid 에 매핑된 uid 1000 으로 실행 | O |
 | `docker` | `docker` | 세션당 컨테이너: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 512m --user <uid>`, tmpfs `/workspace`, 이미지 기본 `python:3.14-slim`(`CIRCULUSD_TEST_SANDBOX_IMAGE`). nonce 는 컨테이너 stdin → fd 3. 제어 소켓은 `/mnt/wsl` 공유 tmpfs. **주의**: 비root `--user` 는 setuid 능력이 없어 sandboxd 와 파이썬이 같은 uid 로 돌며, 파이썬이 자기 세션의 sandboxd 를 죽이거나 제어 소켓을 건드릴 수는 있습니다(다른 세션·호스트에는 닿지 않음). 격리가 중요하면 nsjail 을 쓰세요 | O (WSL 안 docker.io 29.1.3) |
-| `unshare` | `nsjail` (라벨) | util-linux `unshare` 네임스페이스 + 에이전트의 `jail-init`(mount(2)/pivot_root). nsjail 이 없을 때의 대역이며 seccomp 등은 없음 | O |
+| `unshare` | `nsjail` (라벨) | util-linux `unshare` 네임스페이스 + 에이전트의 `jail-init`(mount(2)/pivot_root). 파이썬은 `prlimit`(nproc 256, as 2 GiB, fsize 512 MiB, nofile 512, core 0) 아래 `setpriv` 로 uid 1000 으로 실행, `/tmp` 는 64 MiB. nsjail 이 없을 때의 대역이며 seccomp 등은 없음 | O |
 
 어떤 launcher 인지는 기동 로그와 `/v1/capabilities` 의 `execution.python.launcher`, UI 헤더에 항상 드러납니다. 샌드박스를 못 띄우면
 `python` 도구는 **빠집니다**(호스트 실행으로 조용히 대체하지 않음). 격리 없이 호스트 파이썬으로 돌리려면 `CIRCULUSD_TEST_SANDBOX=host` 를

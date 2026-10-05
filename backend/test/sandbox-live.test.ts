@@ -85,11 +85,18 @@ test("circulusd sandbox: python runs inside a per-session sandboxd with kernel i
           "except OSError as e: print('net', type(e).__name__)",
           "print('env', dict(os.environ))",
           "print('pids', sorted(int(p) for p in os.listdir('/proc') if p.isdigit()))",
+          "import resource",
+          "print('nproc', resource.getrlimit(resource.RLIMIT_NPROC)[0], 'as', resource.getrlimit(resource.RLIMIT_AS)[0])",
         ].join("\n"),
       },
       context,
     );
     assert.equal(facts.isError, false, facts.text);
+    if (ready.launcher !== "docker") {
+      // nsjail sets these for the jail; the unshare launcher's python wrapper sets them with prlimit.
+      // (docker bounds pids and memory with cgroups instead, which rlimits do not show.)
+      assert.match(facts.text, /^nproc 256 as 2147483648$/m, "per-process rlimits apply to the model's python");
+    }
     assert.match(facts.text, /^uid \d+$/m);
     assert.doesNotMatch(facts.text, /^uid 0$/m, "python never runs as root");
     assert.match(facts.text, /^cwd \/workspace$/m, "the session owns the whole /workspace of its sandbox");

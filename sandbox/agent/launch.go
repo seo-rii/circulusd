@@ -33,6 +33,7 @@ const (
 	dockerPythonPath     = "/usr/local/bin/python3"
 	sharedStateDir       = "/mnt/wsl/circulusd-test"
 	setprivPath          = "/usr/bin/setpriv"
+	prlimitPath          = "/usr/bin/prlimit"
 	unprivilegedUID      = 1000
 	launchNonceFD        = 3
 	readyTimeout         = 20 * time.Second
@@ -176,10 +177,17 @@ func distroName() string {
 }
 
 // pythonWrapperScript is the manifest command sandboxd runs as inner root; it
-// drops to the unprivileged inner uid before starting the interpreter.
-func pythonWrapperScript(python string) string {
-	return fmt.Sprintf("#!/bin/sh\nexec %s --reuid=%d --regid=%d --clear-groups --inh-caps=-all --no-new-privs %s \"$@\"\n",
-		setprivPath, unprivilegedUID, unprivilegedUID, python)
+// drops to the unprivileged inner uid before starting the interpreter. With
+// `limits` it also applies the per-process rlimits that nsjail sets for its
+// whole jail (the unshare launcher has no other place to set them; without
+// them a script can fork-bomb the host's pid space or eat its RAM).
+func pythonWrapperScript(python string, limits bool) string {
+	prefix := ""
+	if limits {
+		prefix = prlimitPath + " --nproc=256 --as=2147483648 --fsize=536870912 --nofile=512 --core=0 "
+	}
+	return fmt.Sprintf("#!/bin/sh\nexec %s%s --reuid=%d --regid=%d --clear-groups --inh-caps=-all --no-new-privs %s \"$@\"\n",
+		prefix, setprivPath, unprivilegedUID, unprivilegedUID, python)
 }
 
 func sandboxdArguments(id string, generation uint64, backend, environmentDigest string, allowClientUID uint32) []string {
@@ -255,9 +263,15 @@ func namespacesProblem(launcher string) string {
 			return tool + " is not on PATH"
 		}
 	}
-	// The python wrapper inside the jail calls setpriv by this exact path.
-	if _, err := os.Stat(setprivPath); err != nil {
-		return setprivPath + " is missing (install util-linux)"
+	// The python wrapper inside the jail calls these by their exact paths.
+	required = []string{setprivPath}
+	if launcher == "unshare" {
+		required = append(required, prlimitPath)
+	}
+	for _, path := range required {
+		if _, err := os.Stat(path); err != nil {
+			return path + " is missing (install util-linux)"
+		}
 	}
 	return ""
 }
@@ -384,6 +398,32 @@ func (plan *launcherPlan) sweepStaleInstances() {
 	if removed > 0 {
 		logf("removed %d stale sandbox instance directories from %s", removed, plan.StateDir)
 	}
+	// Copies of sandboxd from other builds. The state directory is often a
+	// tmpfs, so every rebuild would otherwise keep another 13 MB of RAM. An
+	// agent of another build that still runs re-creates its copy on its next
+	// launch (see ensureSandboxdCopy); its running jails hold the old inode.
+	for _, entry := range entries {
+		name := entry.Name()
+		path := filepath.Join(plan.StateDir, name)
+		if entry.IsDir() || !strings.HasPrefix(name, "sandboxd-") || path == plan.sandboxdCopy {
+			continue
+		}
+		if info, err := entry.Info(); err != nil || time.Since(info.ModTime()) < staleInstanceAge {
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			logf("removed sandboxd copy of another build: %s", name)
+		}
+	}
+}
+
+// ensureSandboxdCopy puts the digest-named copy back if a sweep by another
+// agent removed it (the copy is bind-mounted into every jail at launch).
+func (plan *launcherPlan) ensureSandboxdCopy() error {
+	if _, err := os.Stat(plan.sandboxdCopy); err == nil {
+		return nil
+	}
+	return copyFile(plan.options.sandboxd, plan.sandboxdCopy, 0o755)
 }
 
 func (plan *launcherPlan) prepareNamespaces() error {
@@ -411,7 +451,7 @@ func (plan *launcherPlan) prepareNamespaces() error {
 	}
 	manifest := map[string]any{"schemaVersion": 1, "commands": []map[string]string{{"name": "python3", "path": pythonWrapperInside}}}
 	plan.manifest, _ = json.Marshal(manifest)
-	plan.wrapper = pythonWrapperScript(options.python)
+	plan.wrapper = pythonWrapperScript(options.python, false) // nsjail applies the rlimits itself
 	plan.EnvironmentDigest = environmentDigestOf(map[string]any{
 		"harness":       "circulusd-test",
 		"launcher":      plan.Launcher,
@@ -528,6 +568,9 @@ func (plan *launcherPlan) launch(id string, generation uint64) (*instance, error
 		done:       make(chan struct{}),
 	}
 	if _, err := rand.Read(inst.Nonce); err != nil {
+		return nil, err
+	}
+	if err := plan.ensureSandboxdCopy(); err != nil {
 		return nil, err
 	}
 	instanceDir := filepath.Join(plan.StateDir, fmt.Sprintf("%s-g%d", id, generation))

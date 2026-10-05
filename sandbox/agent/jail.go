@@ -143,7 +143,7 @@ func jailInit(root, control, sandboxd, python, manifestJSON, workspaceSize strin
 	}
 	// Python wrapper: sandboxd runs manifest commands as inner root with an
 	// empty environment; the wrapper drops to the unprivileged inner uid.
-	if err := writeOwned("sandbox/python3", pythonWrapperScript(python), 0o755, -1); err != nil {
+	if err := writeOwned("sandbox/python3", pythonWrapperScript(python, true), 0o755, -1); err != nil {
 		return err
 	}
 	if err := os.WriteFile("sandbox/sandboxd", nil, 0o755); err != nil {
@@ -166,7 +166,8 @@ func jailInit(root, control, sandboxd, python, manifestJSON, workspaceSize strin
 	if err := mount("proc", "proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
 		return err
 	}
-	if err := mount("tmpfs", "tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777"); err != nil {
+	// Sized like the docker launcher's /tmp; an unsized tmpfs may grow to half the host's RAM.
+	if err := mount("tmpfs", "tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777,size=64m"); err != nil {
 		return err
 	}
 	if err := mount("tmpfs", "workspace", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=0755,size="+workspaceSize); err != nil {
