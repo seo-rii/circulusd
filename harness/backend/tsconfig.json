@@ -1,11 +1,9 @@
 {
-  "extends": "../tsconfig.base.json",
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["node"],
-    "paths": {
-      "@circulusd/pi-runtime": ["../../circulusd/workers/pi-runtime/src/index.ts"],
-      "@circulusd/protocol-types": ["../../circulusd/packages/protocol-types/src/index.ts"]
-    }
+    "lib": ["ES2024"],
+    "skipLibCheck": true,
+    "types": ["node"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

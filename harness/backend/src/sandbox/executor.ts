@@ -150,7 +150,7 @@ export class CirculusdSandboxExecutor implements PythonExecutor {
       kernel: ready.kernel,
       python: ready.python,
       permits: "harness-signed DispatchPermit + WorkspaceProtectionPermit (field bindings only; not state-issued)",
-      ...(ready.extra ?? {}),
+      ...ready.extra,
     };
   }
 

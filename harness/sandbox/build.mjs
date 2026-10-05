@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Cross-compiles the two Linux binaries the python sandbox needs:
-//   bin/sandboxd       circulusd's cmd/sandboxd, from the sibling checkout (unmodified)
-//   bin/sandbox-agent  sandbox/agent, circulusd-test's executord stand-in
-//   node sandbox/build.mjs [--circulusd <path>]   build both binaries
-//   node sandbox/build.mjs --test                  run the agent's Go tests with the same toolchain
+//   bin/sandboxd       circulusd's cmd/sandboxd (unmodified)
+//   bin/sandbox-agent  harness/sandbox/agent, the harness' executord stand-in
+//   node harness/sandbox/build.mjs [--circulusd <path>]   build both binaries (default: this repository)
+//   node harness/sandbox/build.mjs --test                  run the agent's host-OS Go tests with the same toolchain
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -17,7 +17,7 @@ if (circulusdArgument !== -1 && (argv[circulusdArgument + 1] === undefined || ar
   console.error("--circulusd needs a path");
   process.exit(2);
 }
-const circulusd = resolve(circulusdArgument === -1 ? resolve(here, "../../circulusd") : argv[circulusdArgument + 1]);
+const circulusd = resolve(circulusdArgument === -1 ? resolve(here, "../..") : argv[circulusdArgument + 1]);
 const binDirectory = resolve(here, "bin");
 
 if (!existsSync(resolve(circulusd, "cmd", "sandboxd", "main_linux.go"))) {
@@ -44,7 +44,7 @@ if (go === null) {
 }
 if (argv.includes("--test")) {
   // Host-OS tests (protocol vectors, text helpers); the Linux-only files are vetted at build time.
-  const result = spawnSync(go.command, ["test", "./..."], { cwd: resolve(here, "agent"), stdio: "inherit", windowsHide: true });
+  const result = spawnSync(go.command, ["test", "./harness/sandbox/agent/..."], { cwd: circulusd, stdio: "inherit", windowsHide: true });
   process.exit(result.status ?? 1);
 }
 mkdirSync(binDirectory, { recursive: true });
@@ -60,6 +60,6 @@ function build(name, cwd, target) {
 }
 
 build("sandboxd", circulusd, "./cmd/sandboxd");
-build("sandbox-agent", resolve(here, "agent"), ".");
+build("sandbox-agent", circulusd, "./harness/sandbox/agent");
 const revision = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: circulusd, encoding: "utf8", windowsHide: true });
 console.log(`circulusd ${revision.status === 0 ? revision.stdout.trim() : "unknown revision"}`);

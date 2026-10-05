@@ -1,5 +1,7 @@
 packages:
   - packages/*
   - workers/*
+  - harness/backend
+  - harness/frontend
 
 minimumReleaseAge: 1440

@@ -352,7 +352,8 @@ test("a turn whose model keeps calling tools is stopped at the tool-call budget"
   assert.equal(turn.status, "failed");
   assert.equal(session.events.filter((event) => event.type === "tool.started").length, MAX_TOOL_CALLS_PER_TURN);
   const rejected = session.events.find((event) => event.type === "effect.rejected");
-  assert.equal((rejected?.data as { error: { code: string } }).error.code, "TOOL_CALL_LIMIT");
+  assert.ok(rejected, "the budget rejection is in the log");
+  assert.equal((rejected.data as { error: { code: string } }).error.code, "TOOL_CALL_LIMIT");
   assert.equal(session.events.at(-1)?.type, "turn.failed");
 });
 

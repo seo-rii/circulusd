@@ -1,9 +1,12 @@
-# circulusd-test
+# harness (circulusd-test)
 
-`../circulusd`의 실제 Pi runtime 엔진(`@circulusd/pi-runtime`)을 그대로 가져와 한 턴을 끝까지
+circulusd의 실제 Pi runtime 엔진(`@circulusd/pi-runtime`)을 그대로 가져와 한 턴을 끝까지
 돌려보는 **아주 작은 에이전트 테스트용 프론트엔드/백엔드**입니다. circulusd 본체는 아직
-프로덕션 워크로드 그래프가 완성되지 않았기 때문에, 이 프로젝트가 circulusd의 다음 요소를
-인프로세스로 대신합니다.
+프로덕션 워크로드 그래프가 완성되지 않았기 때문에, 이 하네스가 circulusd의 다음 요소를
+인프로세스로 대신합니다. **프로덕션 코드가 아닙니다**: 아래 대체물은 SPEC 의 설계와 다르며
+(세션 상태는 메모리에만, permit 은 하네스가 직접 서명, 한 프로세스가 모든 역할), 어떤 §53
+상태도 올리지 않습니다. 2026-10-05 까지는 형제 저장소 `../circulusd-test` 였고, 그 히스토리를
+그대로 `harness/` 로 들여왔습니다.
 
 | circulusd 개념 | 여기서의 대체물 |
 |---|---|
@@ -14,20 +17,19 @@
 | Public API §36 / SSE | `backend/src/server.ts` (`POST /v1/sessions`, `POST …/turns`, `GET …/events`, abort, `Last-Event-ID` 재전송) |
 
 엔진 자체(`LowLevelPiAgentEngine`, `createPiAgentCoreFactory`, 체크포인트 체인, effect request/settlement
-digest 바인딩)는 circulusd 소스를 `link:` 의존성으로 직접 사용하며, 이 저장소에 복사본이 없습니다.
+digest 바인딩)는 `workspace:*` 의존성으로 `workers/pi-runtime` 을 직접 사용하며, 복사본이 없습니다.
 
 ## 실행
 
-요구사항: Node ≥ 24.1 (TypeScript 소스를 네이티브 type stripping으로 실행), pnpm 10, 옆에
-클론된 `../circulusd` (의존성 설치 완료 상태).
+요구사항: Node ≥ 24.1 (TypeScript 소스를 네이티브 type stripping으로 실행), pnpm 10. 모든 명령은 저장소 루트에서 실행합니다.
 
 ```bash
-corepack pnpm install
-CIRCULUSD_TEST_MODEL=ollama:qwen3:8b corepack pnpm dev   # http://127.0.0.1:8090, 로컬 Ollama 모델
-corepack pnpm dev                                        # 모델 미지정 시 네트워크 없는 mock 모델
+corepack pnpm install --frozen-lockfile
+CIRCULUSD_TEST_MODEL=ollama:qwen3:8b corepack pnpm harness:dev   # http://127.0.0.1:8090, 로컬 Ollama 모델
+corepack pnpm harness:dev                                        # 모델 미지정 시 네트워크 없는 mock 모델
 ```
 
-환경 변수는 `.env.example` 참고. 저장소 루트에 `.env` 를 두면 `pnpm dev`/`pnpm start` 가 읽습니다(`--env-file-if-exists`). 프로바이더 스펙:
+환경 변수는 `harness/.env.example` 참고. `harness/.env` 를 두면 `harness:dev`/`harness:start` 가 읽습니다(`--env-file-if-exists`). 프로바이더 스펙:
 
 ```bash
 CIRCULUSD_TEST_MODEL=ollama:qwen3:8b                      # OLLAMA_HOST 또는 http://127.0.0.1:11434/v1 의 Ollama
@@ -40,15 +42,15 @@ CIRCULUSD_TEST_MODEL=openai-compatible:<id>@<base-url>    # 그 밖의 OpenAI �
 모델이 없으면 설치된 목록과 함께 종료하고, `tools` 능력이 없으면 경고 후 도구 정의를 보내지 않습니다.
 thinking 을 지원하는 모델(qwen3 등)의 사고 텍스트는 `model.thinking` ephemeral 이벤트로 UI 에 흘러가며
 durable 전사에는 남지 않습니다. 엔진과 무관하게 Ollama 모델의 툴 호출만 따로 확인하려면
-`node backend/scripts/ollama-probe.mjs [model] [base-url]`.
+`node harness/backend/scripts/ollama-probe.mjs [model] [base-url]`.
 
 ## `python` 도구와 circulusd 샌드박스
 
 모델이 `python` 도구를 호출하면 기본값(`CIRCULUSD_TEST_SANDBOX=circulusd`)에서는 circulusd 의 `sandboxd` 안에서 실행됩니다.
 circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circulusd 에 아직 없는 **session host + executord 역할**만 채웁니다.
 
-- `sandbox/bin/sandboxd`: circulusd 의 `cmd/sandboxd` 를 그대로 크로스 컴파일한 것 (`corepack pnpm sandbox:build`).
-- `sandbox/agent` (Go, `sandbox/bin/sandbox-agent`): executord 대역. circulusd 가 생성한 protobuf 타입과 connect-go 클라이언트
+- `harness/sandbox/bin/sandboxd`: circulusd 의 `cmd/sandboxd` 를 그대로 크로스 컴파일한 것 (`corepack pnpm harness:sandbox:build`; `bin/` 은 git 에 들어가지 않음).
+- `harness/sandbox/agent` (Go, `harness/sandbox/bin/sandbox-agent`): executord 대역. circulusd 가 생성한 protobuf 타입과 connect-go 클라이언트
   (`api/generated/circulus/v1alpha`, `.../circulusv1alphaconnect`)를 그대로 import 해서 sandboxd 와 대화합니다. Go 의 internal 패키지 규칙
   때문에 import 할 수 없는 `internal/sandboxrpc` 의 request digest / nonce proof 규칙만 `protocol.go` 에 그대로 옮겨 두고
   `protocol_test.go` 로 고정했습니다(`corepack pnpm sandbox:test`). 에이전트는 WSL2 안에서 돌며 다음을 합니다.
@@ -96,9 +98,9 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
 (`apt install docker.io` + docker 그룹, 또는 Docker Desktop 의 WSL 통합). Windows 쪽에는 Go 툴체인.
 
 ```bash
-corepack pnpm sandbox:build      # sandboxd + sandbox-agent 를 GOOS=linux 로 빌드 → sandbox/bin/ (circulusd 저장소는 수정하지 않음)
-corepack pnpm sandbox:test       # 에이전트의 프로토콜 규칙 테스트 (Go)
-CIRCULUSD_TEST_SANDBOX_LAUNCHER=nsjail node --test backend/test/sandbox-live.test.ts   # 실제 sandboxd 로 라이브 테스트
+corepack pnpm harness:sandbox:build      # sandboxd + sandbox-agent 를 GOOS=linux 로 빌드 → harness/sandbox/bin/
+corepack pnpm harness:sandbox:test       # 에이전트의 프로토콜 규칙 테스트 (Go; 루트의 go test ./... 에도 포함됨)
+CIRCULUSD_TEST_SANDBOX_LAUNCHER=nsjail node --test harness/backend/test/sandbox-live.test.ts   # 실제 sandboxd 로 라이브 테스트
 ```
 
 라이브 테스트는 격리(uid, cwd `/workspace`, 호스트 파일·네트워크·환경 없음), 세션 간 workspace 분리, 제한 시간, 원장 예산에 따른

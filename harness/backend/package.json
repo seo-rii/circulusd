@@ -1,8 +1,9 @@
 {
-  "name": "@circulusd-test/backend",
+  "name": "@circulusd/harness-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "circulusd-test harness backend: drives the real pi-runtime engine with in-memory stand-ins for the unfinished platform pieces (not production)",
   "scripts": {
     "dev": "node --env-file-if-exists=../.env --watch --watch-path=src src/main.ts",
     "start": "node --env-file-if-exists=../.env src/main.ts",
@@ -10,12 +11,12 @@
     "test": "node --test test/agent.test.ts"
   },
   "dependencies": {
-    "@circulusd/pi-runtime": "link:../../circulusd/workers/pi-runtime",
-    "@circulusd/protocol-types": "link:../../circulusd/packages/protocol-types",
+    "@circulusd/pi-runtime": "workspace:*",
+    "@circulusd/protocol-types": "workspace:*",
     "@earendil-works/pi-ai": "0.84.3"
   },
   "devDependencies": {
-    "@types/node": "^24.3.0",
+    "@types/node": "26.3.0",
     "typescript": "7.0.2"
   }
 }

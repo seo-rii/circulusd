@@ -29,6 +29,14 @@ cut, including the accepted Unit 10 Phase 0A resource-qualification plan, is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md). Planned work does
 not change the evidence in [`docs/acceptance.md`](docs/acceptance.md).
 
+[`harness/`](harness/README.md) is a small, non-production test harness that
+drives the real `@circulusd/pi-runtime` engine end to end with in-memory
+stand-ins for the platform pieces that are not finished yet (session host,
+model gateway, executord). It runs the `python` tool inside the real
+`sandboxd`. It is part of the pnpm workspace and the Go module (`pnpm
+harness:dev`, `pnpm harness:sandbox:build`) but promotes no acceptance
+status.
+
 The development daemon is a separate, non-production executable:
 
 ```bash

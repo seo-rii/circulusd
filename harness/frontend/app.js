@@ -54,7 +54,7 @@ const state = {
 async function api(path, init = {}) {
   const response = await fetch(path, {
     ...init,
-    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+    headers: { "content-type": "application/json", ...init.headers },
   });
   // A proxy or a crashed backend may answer with HTML or nothing; report the
   // status rather than a JSON parse error.

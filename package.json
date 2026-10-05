@@ -13,7 +13,11 @@
     "fuzz": "python3 scripts/fuzz.py",
     "fuzz:list": "python3 scripts/fuzz.py --list",
     "generate:workerd-fixture": "esbuild internal/conformance/workerd/fixture/pi-worker.entry.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:sockets --outfile=internal/conformance/workerd/fixture/pi-worker.mjs",
-    "lint": "oxlint --deny-warnings --no-error-on-unmatched-pattern packages workers",
+    "harness:dev": "pnpm --filter @circulusd/harness-backend dev",
+    "harness:sandbox:build": "node harness/sandbox/build.mjs",
+    "harness:sandbox:test": "node harness/sandbox/build.mjs --test",
+    "harness:start": "pnpm --filter @circulusd/harness-backend start",
+    "lint": "oxlint --deny-warnings --no-error-on-unmatched-pattern packages workers harness",
     "test": "pnpm -r --if-present test",
     "test:unit": "pnpm -r --if-present test:unit"
   },

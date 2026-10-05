@@ -96,8 +96,9 @@ export function createApp(options: AppOptions): App {
   const dropSessionResources = (session: Session, reason: string): void => {
     // Streams first: the abort below makes the turn runner commit its final
     // events, which must not land on a response that has already been ended.
-    for (const close of [...(sseClients.get(session.id) ?? [])]) close();
-    sseClients.delete(session.id);
+    const closers = sseClients.get(session.id);
+    sseClients.delete(session.id); // before closing: close() would otherwise edit the set being iterated
+    if (closers !== undefined) for (const close of closers) close();
     session.activeTurn?.controller.abort();
     log(`session ${session.id} ${reason}`);
     options.onSessionDeleted?.(session.id).catch((error: unknown) => {
@@ -426,10 +427,9 @@ export function createApp(options: AppOptions): App {
       });
     },
     close() {
-      for (const clients of [...sseClients.values()]) {
-        for (const close of [...clients]) close();
-      }
+      const closers = Array.from(sseClients.values(), (clients) => Array.from(clients)).flat();
       sseClients.clear();
+      for (const close of closers) close();
       for (const session of store.list()) session.activeTurn?.controller.abort();
       return new Promise((resolveClose) => {
         server.close(() => resolveClose());
