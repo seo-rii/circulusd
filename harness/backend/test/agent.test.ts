@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
 import { test } from "node:test";
 
 import { buildAdapterConfiguration, engineIdentity, runtimeRevisionDigest } from "../src/agent-config.ts";
@@ -443,6 +444,37 @@ test("history injection keeps the newest whole turns that fit the context window
   // The mock window is 32768 tokens with 4096 reserved for the answer: 28672 tokens of room.
   const budget = historyBudgetChars({ messages: [] }, MOCK_MODEL);
   assert.ok(budget > 100_000 && budget < 28_672 * 4, `budget ${budget}`);
+});
+
+test("HTTP API: the frontend is served from its directory only (no path traversal, no caching surprises)", async () => {
+  const app = createApp({
+    provider: new MockModelProvider({ deltaDelayMs: 0 }),
+    tools: testTools,
+    frontendDirectory: resolve(import.meta.dirname, "../../frontend"),
+    historyInjection: false,
+    log: () => undefined,
+  });
+  const { port } = await app.listen("127.0.0.1", 0);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const index = await fetch(`${base}/`);
+    assert.equal(index.status, 200);
+    assert.equal(index.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.match(await index.text(), /<title>circulusd-test<\/title>/);
+    assert.equal((await fetch(`${base}/app.js`)).headers.get("content-type"), "text/javascript; charset=utf-8");
+    const head = await fetch(`${base}/style.css`, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), "");
+    // An encoded slash survives URL normalisation and decodes to "../": it must not leave the frontend root.
+    for (const path of ["/..%2fpackage.json", "/..%2f..%2fpackage.json", "/%2e%2e%2fbackend/package.json"]) {
+      assert.equal((await fetch(`${base}${path}`)).status, 404, path);
+    }
+    assert.equal((await fetch(`${base}/%ZZ`)).status, 400, "malformed percent-encoding");
+    assert.equal((await fetch(`${base}/missing.js`)).status, 404);
+    assert.equal((await fetch(`${base}/v1/nope`)).status, 404, "API 404s are not static lookups");
+  } finally {
+    await app.close();
+  }
 });
 
 test("HTTP API: deleting or evicting a session ends its event streams and runs the cleanup hook", async () => {
