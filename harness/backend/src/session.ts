@@ -182,8 +182,18 @@ export class Session {
     return this.turns.find((turn) => turn.turnId === turnId);
   }
 
-  idempotentTurnId(key: string): string | undefined {
-    return this.#idempotency.get(key);
+  /**
+   * The turn an Idempotency-Key was first used for, when the key is reused
+   * with the same prompt. A reuse with a different prompt is a conflict, not a
+   * replay (SPEC §53.16): the caller is confused, and silently answering with
+   * the first turn would hide it.
+   */
+  idempotentTurnId(key: string, prompt: string): { readonly turnId: string } | { readonly conflict: string } | undefined {
+    const turnId = this.#idempotency.get(key);
+    if (turnId === undefined) return undefined;
+    const turn = this.findTurn(turnId);
+    if (turn === undefined) return undefined;
+    return turn.prompt === prompt ? { turnId } : { conflict: turnId };
   }
 
   rememberIdempotency(key: string, turnId: string): void {

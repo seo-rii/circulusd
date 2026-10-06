@@ -274,11 +274,19 @@ export function createApp(options: AppOptions): App {
       throw new HttpError(400, "INVALID_IDEMPOTENCY_KEY", `Idempotency-Key exceeds ${MAX_IDEMPOTENCY_KEY_CHARS} characters`);
     }
     if (idempotencyKey !== undefined && idempotencyKey !== "") {
-      const existing = session.idempotentTurnId(idempotencyKey);
+      const existing = session.idempotentTurnId(idempotencyKey, prompt);
+      if (existing !== undefined && "conflict" in existing) {
+        throw new HttpError(
+          409,
+          "IDEMPOTENCY_CONFLICT",
+          `Idempotency-Key was already used for turn ${existing.conflict} with a different prompt`,
+          { turnId: existing.conflict },
+        );
+      }
       if (existing !== undefined) {
         sendJson(response, 202, {
           sessionId: session.id,
-          turnId: existing,
+          turnId: existing.turnId,
           status: "accepted",
           replayed: true,
           eventsUrl: `/v1/sessions/${session.id}/events`,

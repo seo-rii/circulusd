@@ -282,6 +282,16 @@ test("HTTP API: session creation, idempotent turn submission, SSE replay with La
     assert.equal(accepted.replayed, false);
     const replayed = await submit();
     assert.deepEqual(replayed, { ...replayed, turnId: accepted.turnId, replayed: true });
+    // The same key with a different prompt is a caller mistake, not a replay.
+    const conflict = await fetch(`${base}/v1/sessions/${created.sessionId}/turns`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "turn-key-1" },
+      body: JSON.stringify({ prompt: "echo something else" }),
+    });
+    assert.equal(conflict.status, 409);
+    const conflictBody = (await conflict.json()) as { error: { code: string; turnId: string } };
+    assert.equal(conflictBody.error.code, "IDEMPOTENCY_CONFLICT");
+    assert.equal(conflictBody.error.turnId, accepted.turnId);
 
     const events = await readSse(
       `${base}/v1/sessions/${created.sessionId}/events`,
@@ -388,7 +398,7 @@ test("a session keeps a bounded number of turn records and forgets their idempot
   }
   assert.equal(session.turns.length, MAX_TURNS_PER_SESSION);
   assert.equal(session.findTurn(firstTurnId), undefined, "the oldest turn was dropped");
-  assert.equal(session.idempotentTurnId("key-first"), undefined, "its key no longer replays a missing turn");
+  assert.equal(session.idempotentTurnId("key-first", "first"), undefined, "its key no longer replays a missing turn");
   assert.equal(session.turns[session.turns.length - 1]?.prompt, `turn ${MAX_TURNS_PER_SESSION - 1}`);
 });
 

@@ -127,7 +127,8 @@ GET    /v1/capabilities
 POST   /v1/sessions                                  -> 201 { sessionId, runtimeRevisionDigest, … }
 GET    /v1/sessions                                  -> { sessions: [{ sessionId, lastEventId, activeTurnId, turns, … }] } (요약만)
 GET    /v1/sessions/{id}                             -> snapshot (turns, transcript, lastEventId)
-POST   /v1/sessions/{id}/turns   Idempotency-Key: k  -> 202 { turnId }   body: {"messages":[{"role":"user","content":"…"}]}
+POST   /v1/sessions/{id}/turns   Idempotency-Key: k  -> 202 { turnId, replayed }   body: {"messages":[{"role":"user","content":"…"}]}
+                                                        같은 키 + 같은 프롬프트 = 기존 turn 재전송(replayed: true); 같은 키 + 다른 프롬프트 = 409 IDEMPOTENCY_CONFLICT
 GET    /v1/sessions/{id}/events  Last-Event-ID: n    -> text/event-stream
 POST   /v1/sessions/{id}/turns/{turnId}/abort        -> 202
 DELETE /v1/sessions/{id}                             -> 204
