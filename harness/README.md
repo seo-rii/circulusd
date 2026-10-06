@@ -53,7 +53,7 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
 - `harness/sandbox/agent` (Go, `harness/sandbox/bin/sandbox-agent`): executord 대역. circulusd 가 생성한 protobuf 타입과 connect-go 클라이언트
   (`api/generated/circulus/v1alpha`, `.../circulusv1alphaconnect`)를 그대로 import 해서 sandboxd 와 대화합니다. Go 의 internal 패키지 규칙
   때문에 import 할 수 없는 `internal/sandboxrpc` 의 request digest / nonce proof 규칙만 `protocol.go` 에 그대로 옮겨 두고
-  `protocol_test.go` 로 고정했습니다(`corepack pnpm sandbox:test`). 에이전트는 WSL2 안에서 돌며 다음을 합니다.
+  `protocol_test.go` 로 고정했습니다(`corepack pnpm harness:sandbox:test`). 에이전트는 WSL2 안에서 돌며 다음을 합니다.
   1. 32 바이트 일회용 nonce 를 만들어 sandboxd 가 요구하는 대로 fd 3 으로 넘기고, jail 안에서 `sandboxd --backend ...` 을 띄웁니다.
   2. `ControlService.Handshake` 로 nonce 를 소비하고 nonce proof 를 검증한 뒤, 호출마다 `SandboxProcessService.Spawn` →
      (`WriteStdin`/`CloseStdin`) → `Attach` 스트림으로 stdout/stderr/exit 를 받습니다. 요청 메타와 `DispatchPermit`/`WorkspaceProtectionPermit`
@@ -116,8 +116,8 @@ UI 는 코드와 전체 출력을 접이식 블록으로 보여 줍니다.
 검사와 테스트:
 
 ```bash
-corepack pnpm check        # tsc (circulusd 소스까지 함께 타입 검사)
-corepack pnpm test         # node --test: 도구, mock 라우팅, 엔진 end-to-end, abort, HTTP/SSE 재전송, 세션 상한/삭제 정리, 히스토리 예산
+corepack pnpm -r --if-present check                      # 워크스페이스 전체 tsc (하네스 포함)
+corepack pnpm --filter @circulusd/harness-backend test   # node --test: 도구, mock 라우팅, 엔진 end-to-end, abort, HTTP/SSE 재전송, 세션 상한/삭제 정리, 히스토리 예산 (루트 pnpm test 에도 포함)
 ```
 
 ## API 요약
