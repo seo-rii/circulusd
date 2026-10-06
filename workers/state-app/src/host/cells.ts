@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-import { parseNormalizedValue, type Digest } from "@circulusd/protocol-types";
+import { parseDigest, parseNormalizedValue, type Digest } from "@circulusd/protocol-types";
 
 import {
   applySessionCommand,
@@ -267,6 +267,19 @@ interface SessionEventsQuery extends AuthorizedControlQuery {
   readonly limit: number;
 }
 
+interface SessionBlobQuery extends AuthorizedControlQuery {
+  // Content digest of the externalized payload (a checkpoint's payloadDigest).
+  readonly digest: Digest;
+}
+
+// The hydrated form of one externalized payload. `null` when the current state
+// references no blob with that digest.
+export interface SessionBlobRead {
+  readonly digest: Digest;
+  readonly encodedBytes: number;
+  readonly bytes: Uint8Array;
+}
+
 function assertAuthorizedSessionRead(
   state: SessionAggregateState,
   query: AuthorizedControlQuery,
@@ -355,6 +368,35 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
           return state;
         },
       ),
+    );
+  }
+
+  // Hydrates one payload that `session.read` returned only a reference to
+  // (storage redesign stage B). Authorized exactly like `session.read`.
+  readSessionBlob(
+    request: unknown,
+  ): Promise<HostRpcResponse<SessionBlobRead | null>> {
+    return invokeHostRpc(
+      "session.read-blob",
+      request,
+      (payload) => {
+        const query = exactQueryPayload<SessionBlobQuery>(
+          payload,
+          ["authority", "now", "digest"],
+        );
+        return { ...query, digest: parseDigest(query.digest, "$digest") };
+      },
+      async (input) => {
+        const bytes = await this.kernel.queryBlob(
+          input,
+          assertAuthorizedSessionRead,
+          (query) => query.digest,
+        );
+        if (bytes === undefined) {
+          return null;
+        }
+        return { digest: input.digest, encodedBytes: bytes.byteLength, bytes };
+      },
     );
   }
 

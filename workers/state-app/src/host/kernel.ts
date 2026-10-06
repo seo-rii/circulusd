@@ -275,6 +275,27 @@ export class TransactionalAggregateKernel<State, Initialization, Command, Outcom
     return cloneBoundary(result, "read result");
   }
 
+  // Read one externalized payload blob (storage redesign stage B) inside the same
+  // transaction as the state it is authorized against: `authorize` sees the stored
+  // state and the query exactly like a `query` reader, and only then is the blob
+  // the query names looked up. Returns undefined when the current state does not
+  // reference that digest (a superseded or never-written payload), so a stale
+  // reference can never read another payload's bytes.
+  async queryBlob<Input>(
+    input: Input,
+    authorize: (state: State, input: Input) => void | Promise<void>,
+    digestOf: (input: Input) => Digest,
+  ): Promise<Uint8Array | undefined> {
+    const inputSnapshot = cloneBoundary(input, "read input");
+    const result = await this.transact(async (transaction) => {
+      const { record } = await this.loadInitialized(transaction);
+      const query = cloneBoundary(inputSnapshot, "read input");
+      await authorize(cloneBoundary(record.state, "stored aggregate state"), query);
+      return this.records.readBlob(transaction, digestOf(query));
+    });
+    return result === undefined ? undefined : cloneBoundary(result, "read result");
+  }
+
   private async loadInitialized(
     transaction: TransactionPort,
   ): Promise<StoredStateRecord<State>> {

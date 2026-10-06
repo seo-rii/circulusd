@@ -17,7 +17,7 @@ const INGRESS_SCHEMA_DIGEST =
   "sha256:6365dfa4e6e73b349508a46688cfcaacdeacece11cd11ed2d7f3e40af49ad3ee";
 const HOST_PROTOCOL = "circulus.v1alpha1";
 const HOST_SCHEMA_DIGEST =
-  "sha256:d095b5fe7cdc114c84996b4e6c66db9ede524a65d1acf96fa287bcc10af3d3a0";
+  "sha256:8c14969eace3ee0bf628aa6a2ab461fa9178ed563c96b023eae5000dcfb5577f";
 const HOST_CONTENT_TYPE = INGRESS_CONTENT_TYPE;
 const CURRENT_KEY_ID = "state-current-1";
 const PREVIOUS_KEY_ID = "state-previous-1";

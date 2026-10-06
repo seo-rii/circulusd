@@ -6,6 +6,7 @@ const OPERATIONS = Object.freeze([
   "session.initialize",
   "session.execute",
   "session.read",
+  "session.read-blob",
   "session.read-events",
   "workspace.initialize",
   "workspace.execute",

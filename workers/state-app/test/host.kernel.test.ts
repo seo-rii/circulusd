@@ -1396,6 +1396,66 @@ describe("named aggregate cells", () => {
     expect("load" in cell || "save" in cell || "patch" in cell).toBe(false);
   });
 
+  it("hydrates an externalized checkpoint through session.read-blob under session.read authority", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    await hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => cell.executeSessionCommand(request),
+    );
+    const snapshot = await hostRpcResult(
+      "session.read",
+      { authority: sessionAuthority(), now: 200 },
+      (request) => cell.readSession(request),
+    );
+    const checkpoint = snapshot.activeTurn?.checkpoint;
+    if (checkpoint === undefined) {
+      throw new Error("expected an active turn with an externalized checkpoint");
+    }
+    // session.read carries only the reference; the bytes come from read-blob and
+    // re-digest to the reference the state holds.
+    expect("payloadBytes" in checkpoint).toBe(false);
+    const read = await hostRpcResult(
+      "session.read-blob",
+      { authority: sessionAuthority(), now: 200, digest: checkpoint.payloadDigest },
+      (request) => cell.readSessionBlob(request),
+    );
+    expect(read).not.toBeNull();
+    expect(read?.digest).toBe(checkpoint.payloadDigest);
+    expect(read?.encodedBytes).toBe(checkpoint.payloadSize);
+    expect(read?.bytes).toBeInstanceOf(Uint8Array);
+    expect(read?.bytes.byteLength).toBe(checkpoint.payloadSize);
+    expect(await digestBytes(read!.bytes)).toBe(checkpoint.payloadDigest);
+
+    // A digest the state does not reference hydrates to null, never to another blob.
+    const unreferenced = await hostRpcResult(
+      "session.read-blob",
+      { authority: sessionAuthority(), now: 200, digest: await digestBytes(new Uint8Array([1, 2, 3])) },
+      (request) => cell.readSessionBlob(request),
+    );
+    expect(unreferenced).toBeNull();
+
+    // The same authority rules as session.read apply: a stale generation is refused
+    // before any blob is looked up.
+    const stale = await cell.readSessionBlob(hostRpcRequest(
+      "session.read-blob",
+      { authority: sessionAuthority({ currentAuthorizationGeneration: 7 }), now: 200, digest: checkpoint.payloadDigest },
+    ));
+    expect(stale.payload).toMatchObject({ ok: false, error: { code: "STALE_GENERATION" } });
+    // And a malformed digest is an invalid request, not a lookup.
+    const malformed = await cell.readSessionBlob(hostRpcRequest(
+      "session.read-blob",
+      { authority: sessionAuthority(), now: 200, digest: "sha256:nope" },
+    ));
+    expect(malformed.payload).toMatchObject({ ok: false, error: { code: "INVALID_ARGUMENT" } });
+  });
+
   it("gates turn admission on the trusted host clock, not the command's embedded time", async () => {
     // The command carries transactionTime 100 and leaseExpiresAt 1000 (see
     // enqueueSessionCommand). A queued or delayed command whose lease has since
