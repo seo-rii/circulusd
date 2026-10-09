@@ -1081,9 +1081,10 @@ durability gate; §53.4 and §53.9 stay `NOT_RUN`; `state.celld` stays `NOT_WIRE
   `PrepareRetry`, `SettleRecovery`). No non-test `DurableStore` implementation
   exists.
 - `internal/effectledger` is the subordinate invocation ledger (reference,
-  in-process only). `internal/stateappclient` wires only `ReadSessionEvents` and
-  `ClaimDispatchStart` to the authenticated state-app; the full turn/effect
-  surface is not wired.
+  in-process only). `internal/stateappclient` wires only `ReadSessionEvents`,
+  `ClaimDispatchStart`, and `ReadSessionBlob` (hydrating one externalized
+  payload by content digest; storage redesign stage B2.2) to the authenticated
+  state-app; the full turn/effect surface is not wired.
 
 ### Reference-first vs external-evidence split
 

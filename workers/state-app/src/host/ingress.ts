@@ -1,5 +1,6 @@
 import {
   decodeCanonicalCbor,
+  digestBytes,
   encodeCanonicalCbor,
   parseDigest,
   parseDispatchPermitClaims,
@@ -20,6 +21,7 @@ import {
   HOST_RPC_FALLBACK_REQUEST_ID,
   type HostRpcErrorCode,
 } from "./rpc.ts";
+import { MAX_BLOB_BYTES } from "./storage.ts";
 
 const INGRESS_PATH = "/circulusd/state/v1/session-events:read";
 const INGRESS_CONTENT_TYPE = "application/vnd.circulusd.state-ingress+cbor";
@@ -85,6 +87,34 @@ const DISPATCH_START_FENCE_FIELDS = Object.freeze([
 const DISPATCH_START_INGRESS_REQUEST_MAX_BYTES = 8_192;
 const DISPATCH_START_INGRESS_REQUEST_MAX_DEPTH = 4;
 const DISPATCH_START_INGRESS_REQUEST_MAX_ITEMS = 96;
+// Hydrates one externalized payload that `session.read` returned only a
+// reference to (storage redesign stage B2.2). Authorized exactly like the
+// public-event read: same ingress keys, same `session.read` permission, same
+// generation fence; only the MAC domain, path and content type differ.
+const BLOB_INGRESS_PATH = "/circulusd/state/v1/session-blob:read";
+const BLOB_INGRESS_CONTENT_TYPE =
+  "application/vnd.circulusd.state-blob-ingress+cbor";
+const BLOB_INGRESS_PROTOCOL = "circulus.state-blob-ingress.v1alpha1";
+const BLOB_INGRESS_SCHEMA_DIGEST =
+  "sha256:43de3ec79f1eb1a1d78e519e24b741630ea2f5bee0cf2ce9e02ee4416dd67aab";
+const BLOB_INGRESS_REQUEST_FIELDS = Object.freeze([
+  "protocol",
+  "major",
+  "minor",
+  "schemaDigest",
+  "requestId",
+  "sentAtUnixMs",
+  "tenantId",
+  "actorSubjectId",
+  "sessionId",
+  "expectedAuthorizationGeneration",
+  "digest",
+] as const);
+const BLOB_INGRESS_REQUEST_MAX_BYTES = 4_096;
+const BLOB_INGRESS_REQUEST_MAX_DEPTH = 2;
+const BLOB_INGRESS_REQUEST_MAX_ITEMS = 32;
+const BLOB_REQUEST_MAC_DOMAIN = "circulusd.state-blob-ingress.request.v1";
+const BLOB_RESPONSE_MAC_DOMAIN = "circulusd.state-blob-ingress.response.v1";
 const KEY_ID_HEADER = "x-circulus-state-key-id";
 const SIGNATURE_HEADER = "x-circulus-state-signature";
 const REQUEST_MAC_DOMAIN = "circulusd.state-ingress.request.v1";
@@ -107,6 +137,7 @@ const EFFECT_ID_PATTERN = /^effect_[A-Z2-7]{25}[AEIMQUY4]$/;
 const INVOCATION_ID_PATTERN = /^inv_[A-Z2-7]{25}[AEIMQUY4]$/;
 const HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-events"];
 const DISPATCH_START_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.execute"];
+const BLOB_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-blob"];
 const ZERO_DIGEST = `sha256:${"0".repeat(64)}` as const;
 const textEncoder = new TextEncoder();
 
@@ -160,7 +191,7 @@ interface CapturedDirectionalKeys {
 type HostContract = (typeof HOST_RPC_CONTRACTS)[keyof typeof HOST_RPC_CONTRACTS];
 
 interface IngressWireContract {
-  readonly kind: "read-events" | "claim-dispatch-start";
+  readonly kind: "read-events" | "claim-dispatch-start" | "read-blob";
   readonly path: string;
   readonly contentType: string;
   readonly protocol: string;
@@ -189,6 +220,16 @@ interface IngressRequest {
   readonly expectedAuthorizationGeneration: number;
   readonly afterSequence: number;
   readonly limit: number;
+}
+
+interface BlobIngressRequest {
+  readonly requestId: string;
+  readonly sentAtUnixMs: number;
+  readonly tenantId: string;
+  readonly actorSubjectId: string;
+  readonly sessionId: string;
+  readonly expectedAuthorizationGeneration: number;
+  readonly digest: Digest;
 }
 
 interface DispatchStartIngressRequest {
@@ -244,6 +285,21 @@ const DISPATCH_START_INGRESS = Object.freeze({
   requestMacDomain: DISPATCH_START_REQUEST_MAC_DOMAIN,
   responseMacDomain: DISPATCH_START_RESPONSE_MAC_DOMAIN,
   hostContract: DISPATCH_START_HOST_CONTRACT,
+} as const satisfies IngressWireContract);
+
+const BLOB_INGRESS = Object.freeze({
+  kind: "read-blob",
+  path: BLOB_INGRESS_PATH,
+  contentType: BLOB_INGRESS_CONTENT_TYPE,
+  protocol: BLOB_INGRESS_PROTOCOL,
+  schemaDigest: BLOB_INGRESS_SCHEMA_DIGEST,
+  requestFields: BLOB_INGRESS_REQUEST_FIELDS,
+  requestMaxBytes: BLOB_INGRESS_REQUEST_MAX_BYTES,
+  requestMaxDepth: BLOB_INGRESS_REQUEST_MAX_DEPTH,
+  requestMaxItems: BLOB_INGRESS_REQUEST_MAX_ITEMS,
+  requestMacDomain: BLOB_REQUEST_MAC_DOMAIN,
+  responseMacDomain: BLOB_RESPONSE_MAC_DOMAIN,
+  hostContract: BLOB_HOST_CONTRACT,
 } as const satisfies IngressWireContract);
 
 function ordinaryBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -484,11 +540,42 @@ async function signedFailure(
   }
 }
 
+// Shape-checks a `session.read-blob` success. The content digest of `bytes` is
+// verified asynchronously by the caller; this only pins the exact field set,
+// the echoed digest, the declared length, and the host blob bound.
+function sanitizedBlobResult(
+  result: NormalizedValue,
+  expectedBlob: BlobIngressRequest,
+): NormalizedValue {
+  if (result === null) {
+    return null;
+  }
+  if (
+    !isRecord(result) ||
+    !hasExactFields(result, ["digest", "encodedBytes", "bytes"]) ||
+    result.digest !== expectedBlob.digest ||
+    !(result.bytes instanceof Uint8Array) ||
+    result.bytes.byteLength < 1 ||
+    result.bytes.byteLength > MAX_BLOB_BYTES ||
+    result.encodedBytes !== result.bytes.byteLength
+  ) {
+    throw new Error("invalid read-blob Host RPC success");
+  }
+  const bytes = new Uint8Array(result.bytes.byteLength);
+  bytes.set(result.bytes);
+  return {
+    digest: expectedBlob.digest,
+    encodedBytes: bytes.byteLength,
+    bytes,
+  };
+}
+
 function sanitizeHostResponse(
   unknownResponse: unknown,
   requestId: string,
   ingress: IngressWireContract,
   expectedDispatchStart?: DispatchStartIngressRequest,
+  expectedBlob?: BlobIngressRequest,
 ): NormalizedValue {
   const envelope = parseRpcEnvelope(
     unknownResponse,
@@ -602,6 +689,19 @@ function sanitizeHostResponse(
         },
       };
     }
+    if (expectedBlob !== undefined) {
+      return {
+        protocol: PROTOCOL_NAME,
+        major: PROTOCOL_MAJOR,
+        minor: PROTOCOL_MINOR,
+        schemaDigest: ingress.hostContract.schemaDigest,
+        requestId,
+        payload: {
+          ok: true,
+          result: sanitizedBlobResult(payload.result!, expectedBlob),
+        },
+      };
+    }
     return {
       protocol: PROTOCOL_NAME,
       major: PROTOCOL_MAJOR,
@@ -652,6 +752,8 @@ export async function handleStateIngress(
     wireContract = READ_EVENTS_INGRESS;
   } else if (url.pathname === DISPATCH_START_INGRESS.path) {
     wireContract = DISPATCH_START_INGRESS;
+  } else if (url.pathname === BLOB_INGRESS.path) {
+    wireContract = BLOB_INGRESS;
   } else {
     return unsignedResponse(404);
   }
@@ -996,6 +1098,132 @@ export async function handleStateIngress(
       return signedFailure(
         502,
         dispatchStart.requestId,
+        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
+        responseContext,
+      );
+    }
+  } else if (wireContract.kind === "read-blob") {
+    let blob: BlobIngressRequest;
+    let digest: Digest;
+    if (
+      !isRecord(decoded) ||
+      !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol ||
+      decoded.major !== 1 ||
+      decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest ||
+      typeof decoded.requestId !== "string" ||
+      !REQUEST_ID_PATTERN.test(decoded.requestId) ||
+      typeof decoded.sentAtUnixMs !== "number" ||
+      !Number.isSafeInteger(decoded.sentAtUnixMs) ||
+      decoded.sentAtUnixMs < 0 ||
+      decoded.sentAtUnixMs < now - INGRESS_MAX_CLOCK_SKEW_MS ||
+      decoded.sentAtUnixMs > now + INGRESS_MAX_CLOCK_SKEW_MS ||
+      typeof decoded.tenantId !== "string" ||
+      !TENANT_ID_PATTERN.test(decoded.tenantId) ||
+      typeof decoded.actorSubjectId !== "string" ||
+      !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
+      typeof decoded.sessionId !== "string" ||
+      !SESSION_ID_PATTERN.test(decoded.sessionId) ||
+      typeof decoded.expectedAuthorizationGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) ||
+      decoded.expectedAuthorizationGeneration < 1
+    ) {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    try {
+      digest = parseDigest(decoded.digest, "$ingress.digest");
+    } catch {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    if (digest === ZERO_DIGEST) {
+      return signedFailure(
+        400,
+        errorRequestId,
+        "INVALID_ARGUMENT",
+        responseContext,
+      );
+    }
+    if (!Number.isSafeInteger(now + 1)) {
+      return signedFailure(
+        500,
+        decoded.requestId,
+        "INTERNAL_ERROR",
+        responseContext,
+      );
+    }
+    blob = {
+      requestId: decoded.requestId,
+      sentAtUnixMs: decoded.sentAtUnixMs,
+      tenantId: decoded.tenantId,
+      actorSubjectId: decoded.actorSubjectId,
+      sessionId: decoded.sessionId,
+      expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
+      digest,
+    };
+    const hostRequest = {
+      protocol: PROTOCOL_NAME,
+      major: PROTOCOL_MAJOR,
+      minor: PROTOCOL_MINOR,
+      schemaDigest: wireContract.hostContract.schemaDigest,
+      requestId: blob.requestId,
+      payload: {
+        authority: {
+          serviceBinding: "state",
+          tenantId: blob.tenantId,
+          actorUserId: blob.actorSubjectId,
+          subjectKind: "session",
+          subjectId: blob.sessionId,
+          roles: [],
+          permissions: ["session.read"],
+          authorizationGeneration: blob.expectedAuthorizationGeneration,
+          currentAuthorizationGeneration: blob.expectedAuthorizationGeneration,
+          issuedAt: now,
+          expiresAt: now + 1,
+        },
+        now,
+        digest: blob.digest,
+      },
+    };
+    responseRequestId = blob.requestId;
+    try {
+      const session = environment.SESSION_CELL.getByName(
+        sessionCellName(blob.tenantId, blob.sessionId),
+      );
+      const unknownResponse = await session.readSessionBlob(hostRequest);
+      sanitizedResponse = sanitizeHostResponse(
+        unknownResponse,
+        blob.requestId,
+        wireContract,
+        undefined,
+        blob,
+      );
+      // The storage layer re-digests reassembled chunks, but the Durable Object
+      // boundary is still a trust boundary for the signed public response:
+      // never sign bytes that do not hash to the digest the caller asked for.
+      const hydrated = (sanitizedResponse as {
+        readonly payload: { readonly result?: NormalizedValue };
+      }).payload.result;
+      if (
+        isRecord(hydrated!) &&
+        (await digestBytes(hydrated.bytes as Uint8Array)) !== blob.digest
+      ) {
+        throw new Error("read-blob Host RPC bytes do not match their digest");
+      }
+    } catch (error) {
+      return signedFailure(
+        502,
+        blob.requestId,
         isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
         responseContext,
       );
