@@ -98,7 +98,12 @@ func (configuration Configuration) Validate() error {
 	state := configuration.State
 	if !stateKeyIDPattern.MatchString(state.ReadKeyID) ||
 		!stateKeyIDPattern.MatchString(state.DispatchStartKeyID) ||
+		!stateKeyIDPattern.MatchString(state.AdmissionKeyID) ||
+		!stateKeyIDPattern.MatchString(state.BrokerKeyID) ||
 		state.ReadKeyID == state.DispatchStartKeyID ||
+		state.AdmissionKeyID == state.ReadKeyID ||
+		state.AdmissionKeyID == state.DispatchStartKeyID ||
+		state.BrokerKeyID == state.ReadKeyID || state.BrokerKeyID == state.DispatchStartKeyID || state.BrokerKeyID == state.AdmissionKeyID ||
 		state.HTTPTimeout.Duration() <= 0 ||
 		state.HTTPTimeout.Duration() > maximumStateHTTPTimeout ||
 		state.DispatchStartTimeout.Duration() <= 0 ||
@@ -113,6 +118,8 @@ func (configuration Configuration) Validate() error {
 	stateFiles := []string{
 		state.ReadRootKeyFile,
 		state.DispatchStartRootKeyFile,
+		state.AdmissionRootKeyFile,
+		state.BrokerRootKeyFile,
 		state.ProductionEvidenceFile,
 		state.ConformanceRootsFile,
 		state.RuntimeRootsFile,

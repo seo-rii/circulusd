@@ -22,8 +22,11 @@ import (
 	"github.com/hancomac/circulusd/internal/config"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/release"
+	"github.com/hancomac/circulusd/internal/sessionadmission"
 	"github.com/hancomac/circulusd/internal/sessionevent"
 	"github.com/hancomac/circulusd/internal/stateappadapter"
+	"github.com/hancomac/circulusd/internal/stateappadmission"
+	"github.com/hancomac/circulusd/internal/stateappbroker"
 	"github.com/hancomac/circulusd/internal/stateappclient"
 )
 
@@ -43,6 +46,8 @@ type Files struct {
 type Graph interface {
 	SessionEventReader() dependency.Verified[sessionevent.SessionEventPageReader]
 	DispatchStartClaimer() dependency.Verified[broker.DispatchStartClaimer]
+	SessionBroker(context.Context, stateappbroker.Config) (dependency.Verified[stateappbroker.ProductionDurableStore], error)
+	SessionAdmission(context.Context, stateappadmission.PlannerConfig) (dependency.Verified[sessionadmission.SessionTurnStore], error)
 	Descriptor() dependency.Descriptor
 	DispatchStartTimeout() time.Duration
 	Close()
@@ -56,6 +61,9 @@ type graph struct {
 	client               *stateappclient.Client
 	closeClient          func(*stateappclient.Client)
 	closeOnce            sync.Once
+	verifier             *dependency.Verifier
+	evidence             dependency.Evidence
+	requirements         dependency.Requirements
 }
 
 func (*graph) String() string   { return "production-state-graph<redacted>" }
@@ -73,6 +81,70 @@ func (graph *graph) DispatchStartClaimer() dependency.Verified[broker.DispatchSt
 		return dependency.Verified[broker.DispatchStartClaimer]{}
 	}
 	return graph.dispatchStartClaimer
+}
+
+// SessionBroker constructs and independently challenges the operational Store
+// for one immutable Session scope. The client stays private and every returned
+// broker is bound to the same qualified atomic domain as the event reader.
+func (graph *graph) SessionBroker(ctx context.Context, config stateappbroker.Config) (dependency.Verified[stateappbroker.ProductionDurableStore], error) {
+	var empty dependency.Verified[stateappbroker.ProductionDurableStore]
+	store, evidence, requirements, err := graph.sessionBrokerInputs(ctx, config)
+	if err != nil {
+		return empty, err
+	}
+	verified, err := dependency.VerifyDependency[stateappbroker.ProductionDurableStore](ctx, graph.verifier, store, evidence, requirements)
+	if err != nil {
+		return empty, err
+	}
+	if _, err := dependency.RequireAtomicDomain([]dependency.AtomicGroup{dependency.AtomicCommandReceipt, dependency.AtomicEffectLifecycle}, verified, graph.sessionEventReader); err != nil {
+		return empty, err
+	}
+	return verified, nil
+}
+
+// NativeSessionBroker independently challenges an exact concrete Session Store
+// for consumers that require its authenticated operation lookup boundary.
+// It preserves Graph's existing interface and never converts interface proofs
+// into concrete proofs or accepts a caller-provided state client.
+func NativeSessionBroker(ctx context.Context, boundary Graph, config stateappbroker.Config) (dependency.Verified[*stateappbroker.Store], error) {
+	var empty dependency.Verified[*stateappbroker.Store]
+	graph, ok := boundary.(*graph)
+	if !ok {
+		return empty, ErrInvalidConfiguration
+	}
+	store, evidence, requirements, err := graph.sessionBrokerInputs(ctx, config)
+	if err != nil {
+		return empty, err
+	}
+	verified, err := dependency.VerifyDependency(ctx, graph.verifier, store, evidence, requirements)
+	if err != nil {
+		return empty, err
+	}
+	if _, err := dependency.RequireAtomicDomain([]dependency.AtomicGroup{dependency.AtomicCommandReceipt, dependency.AtomicEffectLifecycle}, verified, graph.sessionEventReader); err != nil {
+		return empty, err
+	}
+	return verified, nil
+}
+
+func (graph *graph) sessionBrokerInputs(ctx context.Context, config stateappbroker.Config) (*stateappbroker.Store, dependency.Evidence, dependency.Requirements, error) {
+	var evidence dependency.Evidence
+	var requirements dependency.Requirements
+	if graph == nil || ctx == nil || graph.verifier == nil || graph.client == nil {
+		return nil, evidence, requirements, ErrInvalidConfiguration
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, evidence, requirements, err
+	}
+	store, err := stateappbroker.New(graph.client, config)
+	if err != nil {
+		return nil, evidence, requirements, err
+	}
+	evidence = graph.evidence
+	evidence.Descriptor.AtomicGroups = append([]dependency.AtomicGroup(nil), graph.evidence.Descriptor.AtomicGroups...)
+	evidence.Signature = append([]byte(nil), graph.evidence.Signature...)
+	requirements = graph.requirements
+	requirements.RequiredAtomicGroups = append([]dependency.AtomicGroup(nil), graph.requirements.RequiredAtomicGroups...)
+	return store, evidence, requirements, nil
 }
 
 func (graph *graph) Descriptor() dependency.Descriptor {
@@ -108,6 +180,10 @@ type stateConfiguration struct {
 	readRootKeyFile          string
 	dispatchStartKeyID       string
 	dispatchStartRootKeyFile string
+	admissionKeyID           string
+	admissionRootKeyFile     string
+	brokerKeyID              string
+	brokerRootKeyFile        string
 	httpTimeout              time.Duration
 	dispatchStartTimeout     time.Duration
 	instanceID               string
@@ -181,6 +257,10 @@ func Load(ctx context.Context, files Files) (Graph, error) {
 				readRootKeyFile:          state.ReadRootKeyFile,
 				dispatchStartKeyID:       state.DispatchStartKeyID,
 				dispatchStartRootKeyFile: state.DispatchStartRootKeyFile,
+				admissionKeyID:           state.AdmissionKeyID,
+				admissionRootKeyFile:     state.AdmissionRootKeyFile,
+				brokerKeyID:              state.BrokerKeyID,
+				brokerRootKeyFile:        state.BrokerRootKeyFile,
 				httpTimeout:              state.HTTPTimeout.Duration(),
 				dispatchStartTimeout:     state.DispatchStartTimeout.Duration(),
 				instanceID:               state.InstanceID,
@@ -362,6 +442,10 @@ func loadWithSources(ctx context.Context, files Files, sources bootstrapSources)
 		Endpoint: state.endpoint, KeyID: state.readKeyID, RootKeyFile: state.readRootKeyFile,
 		DispatchStartKeyID:       state.dispatchStartKeyID,
 		DispatchStartRootKeyFile: state.dispatchStartRootKeyFile,
+		AdmissionKeyID:           state.admissionKeyID,
+		AdmissionRootKeyFile:     state.admissionRootKeyFile,
+		BrokerKeyID:              state.brokerKeyID,
+		BrokerRootKeyFile:        state.brokerRootKeyFile,
 		Timeout:                  state.httpTimeout,
 	})
 	clientOwned := client != nil
@@ -445,10 +529,14 @@ func loadWithSources(ctx context.Context, files Files, sources bootstrapSources)
 		return nil, fmt.Errorf("verify joint state transaction domain: %w", err)
 	}
 	descriptor.AtomicGroups = append([]dependency.AtomicGroup(nil), descriptor.AtomicGroups...)
+	evidence.Descriptor.AtomicGroups = append([]dependency.AtomicGroup(nil), evidence.Descriptor.AtomicGroups...)
+	evidence.Signature = append([]byte(nil), evidence.Signature...)
+	requirements.RequiredAtomicGroups = append([]dependency.AtomicGroup(nil), requirements.RequiredAtomicGroups...)
 	result := &graph{
 		sessionEventReader: verifiedReader, dispatchStartClaimer: verifiedClaimer,
 		descriptor: descriptor, dispatchStartTimeout: state.dispatchStartTimeout,
 		client: client, closeClient: sources.closeClient,
+		verifier: verifier, evidence: evidence, requirements: requirements,
 	}
 	clientOwned = false
 	return result, nil

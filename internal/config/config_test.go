@@ -23,6 +23,10 @@ state:
   readRootKeyFile: /run/credentials/pi-platform/state-read.key
   dispatchStartKeyId: state-dispatch-current-1
   dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key
+  admissionKeyId: state-admission-current-1
+  admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key
+  brokerKeyId: state-broker-current-1
+  brokerRootKeyFile: /run/credentials/pi-platform/state-broker.key
   httpTimeout: 5s
   dispatchStartTimeout: 30s
   instanceId: state-node-1
@@ -167,6 +171,8 @@ func TestParseAcceptsReferenceConfiguration(t *testing.T) {
 		configuration.State.ReadRootKeyFile != "/run/credentials/pi-platform/state-read.key" ||
 		configuration.State.DispatchStartKeyID != "state-dispatch-current-1" ||
 		configuration.State.DispatchStartRootKeyFile != "/run/credentials/pi-platform/state-dispatch-start.key" ||
+		configuration.State.AdmissionKeyID != "state-admission-current-1" ||
+		configuration.State.AdmissionRootKeyFile != "/run/credentials/pi-platform/state-admission.key" ||
 		configuration.State.HTTPTimeout.Duration() != 5*time.Second ||
 		configuration.State.DispatchStartTimeout.Duration() != 30*time.Second ||
 		configuration.State.InstanceID != "state-node-1" ||
@@ -224,6 +230,10 @@ func TestParseRequiresEveryStateProductionField(t *testing.T) {
 		"  readRootKeyFile: /run/credentials/pi-platform/state-read.key\n",
 		"  dispatchStartKeyId: state-dispatch-current-1\n",
 		"  dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key\n",
+		"  admissionKeyId: state-admission-current-1\n",
+		"  admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key\n",
+		"  brokerKeyId: state-broker-current-1\n",
+		"  brokerRootKeyFile: /run/credentials/pi-platform/state-broker.key\n",
 		"  httpTimeout: 5s\n",
 		"  dispatchStartTimeout: 30s\n",
 		"  instanceId: state-node-1\n",
@@ -272,6 +282,18 @@ func TestParseRejectsUnsafeStateProductionConfiguration(t *testing.T) {
 		{name: "uppercase read key ID", old: "readKeyId: state-read-current-1", new: "readKeyId: State-Read-Current-1"},
 		{name: "oversized read key ID", old: "readKeyId: state-read-current-1", new: "readKeyId: " + strings.Repeat("a", 65)},
 		{name: "shared operation key ID", old: "dispatchStartKeyId: state-dispatch-current-1", new: "dispatchStartKeyId: state-read-current-1"},
+		{name: "admission shares read key ID", old: "admissionKeyId: state-admission-current-1", new: "admissionKeyId: state-read-current-1"},
+		{name: "admission shares dispatch key ID", old: "admissionKeyId: state-admission-current-1", new: "admissionKeyId: state-dispatch-current-1"},
+		{name: "invalid admission key ID", old: "admissionKeyId: state-admission-current-1", new: "admissionKeyId: INVALID"},
+		{name: "broker shares read key ID", old: "brokerKeyId: state-broker-current-1", new: "brokerKeyId: state-read-current-1"},
+		{name: "broker shares dispatch key ID", old: "brokerKeyId: state-broker-current-1", new: "brokerKeyId: state-dispatch-current-1"},
+		{name: "broker shares admission key ID", old: "brokerKeyId: state-broker-current-1", new: "brokerKeyId: state-admission-current-1"},
+		{name: "broker shares admission file", old: "brokerRootKeyFile: /run/credentials/pi-platform/state-broker.key", new: "brokerRootKeyFile: /run/credentials/pi-platform/state-admission.key"},
+		{name: "invalid broker key ID", old: "brokerKeyId: state-broker-current-1", new: "brokerKeyId: INVALID"},
+		{name: "admission shares read file", old: "admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key", new: "admissionRootKeyFile: /run/credentials/pi-platform/state-read.key"},
+		{name: "admission shares dispatch file", old: "admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key", new: "admissionRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key"},
+		{name: "admission shares proof file", old: "admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key", new: "admissionRootKeyFile: /etc/pi-platform/state/celld-evidence.json"},
+		{name: "relative admission file", old: "admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key", new: "admissionRootKeyFile: credentials/state-admission.key"},
 		{name: "relative read key file", old: "readRootKeyFile: /run/credentials/pi-platform/state-read.key", new: "readRootKeyFile: credentials/state-read.key"},
 		{name: "noncanonical dispatch key file", old: "dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key", new: "dispatchStartRootKeyFile: /run/credentials/../state-dispatch-start.key"},
 		{name: "root credential path", old: "readRootKeyFile: /run/credentials/pi-platform/state-read.key", new: "readRootKeyFile: /"},

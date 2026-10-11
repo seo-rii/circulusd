@@ -182,6 +182,10 @@ func newBootstrapFixture(t *testing.T) *bootstrapFixture {
 			readRootKeyFile:          "/run/credentials/state-read.key",
 			dispatchStartKeyID:       "state-dispatch-bootstrap-test",
 			dispatchStartRootKeyFile: "/run/credentials/state-dispatch.key",
+			admissionKeyID:           "state-admission-bootstrap-test",
+			admissionRootKeyFile:     "/run/credentials/state-admission.key",
+			brokerKeyID:              "state-broker-bootstrap-test",
+			brokerRootKeyFile:        "/run/credentials/state-broker.key",
 			httpTimeout:              time.Second, dispatchStartTimeout: 30 * time.Second,
 			instanceID: descriptor.InstanceID, transactionDomainID: descriptor.TransactionDomainID,
 			minimumProbeEpoch: descriptor.ProbeEpoch, maximumEvidenceAge: time.Hour,
@@ -297,6 +301,10 @@ func newTestSources(
 				config.RootKeyFile != fixture.state.readRootKeyFile ||
 				config.DispatchStartKeyID != fixture.state.dispatchStartKeyID ||
 				config.DispatchStartRootKeyFile != fixture.state.dispatchStartRootKeyFile ||
+				config.AdmissionKeyID != fixture.state.admissionKeyID ||
+				config.AdmissionRootKeyFile != fixture.state.admissionRootKeyFile ||
+				config.BrokerKeyID != fixture.state.brokerKeyID ||
+				config.BrokerRootKeyFile != fixture.state.brokerRootKeyFile ||
 				config.Timeout != fixture.state.httpTimeout {
 				t.Errorf("credential client config = %#v", config)
 			}

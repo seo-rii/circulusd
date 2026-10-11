@@ -4886,6 +4886,10 @@ state:
   readRootKeyFile: /run/credentials/pi-platform/state-read.key
   dispatchStartKeyId: state-dispatch-current-1
   dispatchStartRootKeyFile: /run/credentials/pi-platform/state-dispatch-start.key
+  admissionKeyId: state-admission-current-1
+  admissionRootKeyFile: /run/credentials/pi-platform/state-admission.key
+  brokerKeyId: state-broker-current-1
+  brokerRootKeyFile: /run/credentials/pi-platform/state-broker.key
   httpTimeout: 5s
   dispatchStartTimeout: 30s
   instanceId: state-node-1

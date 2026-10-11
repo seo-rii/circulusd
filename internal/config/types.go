@@ -209,6 +209,10 @@ type StateConfiguration struct {
 	ReadRootKeyFile          string   `yaml:"readRootKeyFile"`
 	DispatchStartKeyID       string   `yaml:"dispatchStartKeyId"`
 	DispatchStartRootKeyFile string   `yaml:"dispatchStartRootKeyFile"`
+	AdmissionKeyID           string   `yaml:"admissionKeyId"`
+	AdmissionRootKeyFile     string   `yaml:"admissionRootKeyFile"`
+	BrokerKeyID              string   `yaml:"brokerKeyId"`
+	BrokerRootKeyFile        string   `yaml:"brokerRootKeyFile"`
 	HTTPTimeout              Duration `yaml:"httpTimeout"`
 	DispatchStartTimeout     Duration `yaml:"dispatchStartTimeout"`
 	InstanceID               string   `yaml:"instanceId"`
