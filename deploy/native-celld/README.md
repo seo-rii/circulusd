@@ -9,6 +9,14 @@ does not certify celld durability or grant platform admission.
 and clean tree before applying `celld-native.patch` and copying the proof crate.
 The patch adds no Worker signing key or application-authenticated probe.
 
+The owned Durable Object RPC path waits for the existing native output gate
+after serializing its reply, including writes performed during serialization.
+It retains the actor event until the gate succeeds; a gate failure rejects the
+call. Routed RPC keeps its existing host output gate. The reviewed patch and
+build validation include `crates/celld/js/harness.js`, including staged edits.
+The prior storage-only fetch qualification does not qualify this Session RPC
+path or any newly built executable.
+
 The native public listener reserves both production probe paths before
 WebSocket upgrades and Worker dispatch. Valid canonical challenges receive
 unsigned `404` until an independent conformance proof is published. Successful
@@ -82,9 +90,15 @@ manifest to imply that the stock celld binary has this producer.
 Focused validation:
 
 ```sh
+python3 -m unittest discover -s deploy/native-celld -p test_build.py -v
+CIRCULUSD_NATIVE_CELLD_SOURCE=/absolute/patched-checkout node --test scripts/tests/native-rpc-output-gate.test.mjs
 cargo +1.97.0 test --offline --manifest-path deploy/native-celld/Cargo.toml --jobs 1
 cargo +1.97.0 clippy --offline --manifest-path deploy/native-celld/Cargo.toml --all-targets --jobs 1 -- -D warnings
 ```
+
+The RPC tests run the complete selected harness with controlled native-op
+fixtures. They verify reply ordering and gate failures; they do not certify an
+actual storage provider, native Loader, process isolation or served graph.
 
 The fork build uses Rust 1.97.0, satisfies upstream's minimum 1.94.1, and uses
 one Cargo job with release debug disabled, incremental compilation disabled and

@@ -96,6 +96,84 @@ index a690314..6e0d2c6 100644
      pub script_name: String,
      pub asset_binding: Option<String>,
      pub assets: Option<crate::assets::AssetResolver>,
+diff --git a/crates/celld/js/harness.js b/crates/celld/js/harness.js
+index a2ed440..4f7be91 100644
+--- a/crates/celld/js/harness.js
++++ b/crates/celld/js/harness.js
+@@ -3175,7 +3175,7 @@ class DurableObjectNamespace {
+       if (__cell.owned[scope])
+         return async (...args) => invoke(
+           async () => __rpcDes(await __dispatchRpc(
+-            scope, prop, __rpcOut(args, true))),
++            scope, prop, __rpcOut(args, true), true)),
+         );
+       // The routed channel also lifts: same-process dispatch
+       // re-enters this isolate, where the markers revive; bytes
+@@ -3344,33 +3344,45 @@ const __rpcTargetMethod = async (scope, method) => {
+ // isolate (the owned fast path and same-process routed dispatch)
+ // and fail loudly on use anywhere else. Callee exceptions cross in
+ // the error envelope on every flavor.
+-globalThis.__dispatchRpc = async (scope, method, args) => {
++globalThis.__dispatchRpc = async (scope, method, args, inline = false) => {
+   __actorEventStack.push(scope);
+   try {
++    // Owned RPC bypasses the host's routed output gate, just like owned
++    // fetch. Sample before activation and retain the actor event until the
++    // fully serialized reply's committed-write position has been gated.
++    const gateBefore = inline ? __writePosition(scope) : null;
++    let reply;
+     // A string is the legacy JSON flavor (test harness, old cross-node
+     // envelope); bytes are V8 structured clone. Answer in kind.
+     if (typeof args === "string") {
+       const [inst, fn] = await __rpcTargetMethod(scope, method);
+       const result = await fn.apply(inst, JSON.parse(args));
+-      return JSON.stringify(result) ?? "null";
++      reply = JSON.stringify(result) ?? "null";
++    } else {
++      reply = await __ctxRun(undefined, () => (async () => {
++        const decoded = __rpcDesArgs(args);
++        try {
++          return await __rpcRun(async () => {
++            // A broken actor (JS-flavored ctx.abort) rejects every
++            // later call with the reason. One gated field read.
++            if (__brokenActors.size !== 0) {
++              const broken = __brokenActors.get(scope);
++              if (broken !== undefined) throw broken;
++            }
++            const [inst, fn] = await __rpcTargetMethod(scope, method);
++            return fn.apply(inst, decoded.args);
++          }, true);
++        } finally {
++          for (const handle of decoded.received) __disposeStub(handle);
++        }
++      })());
+     }
+-    return await __ctxRun(undefined, () => (async () => {
+-      const decoded = __rpcDesArgs(args);
+-      try {
+-        return await __rpcRun(async () => {
+-          // A broken actor (JS-flavored ctx.abort) rejects every
+-          // later call with the reason. One gated field read.
+-          if (__brokenActors.size !== 0) {
+-            const broken = __brokenActors.get(scope);
+-            if (broken !== undefined) throw broken;
+-          }
+-          const [inst, fn] = await __rpcTargetMethod(scope, method);
+-          return fn.apply(inst, decoded.args);
+-        }, true);
+-      } finally {
+-        for (const handle of decoded.received) __disposeStub(handle);
+-      }
+-    })());
++    if (inline) {
++      const after = __writePosition(scope);
++      const wrote = after !== null && after > (gateBefore ?? 0);
++      await __gateWrite(scope, wrote ? after : null);
++    }
++    return reply;
+   } finally {
+     if (__actorEventStack[__actorEventStack.length - 1] === scope)
+       __actorEventStack.pop();
 diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
 index f35c641..05ee930 100644
 --- a/crates/celld/lib.rs

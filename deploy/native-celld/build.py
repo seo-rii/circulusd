@@ -41,12 +41,12 @@ def validate_source(source):
     patch = subprocess.check_output([
         "git", "-C", str(source), "diff", COMMIT, "--", "crates/celld/Cargo.toml",
         "crates/celld/lib.rs", "crates/celld/fleet.rs", "crates/celld/main.rs",
-        "crates/celld/control_plane.rs",
+        "crates/celld/control_plane.rs", "crates/celld/js/harness.js",
     ])
     if patch != (package / "celld-native.patch").read_bytes():
         raise ValueError("native source patch differs from reviewed patch")
     changed = set(subprocess.check_output(["git", "-C", str(source), "diff", COMMIT, "--name-only"], text=True).splitlines())
-    allowed = {"Cargo.lock", "crates/celld/Cargo.toml", "crates/celld/lib.rs", "crates/celld/fleet.rs", "crates/celld/main.rs", "crates/celld/control_plane.rs"}
+    allowed = {"Cargo.lock", "crates/celld/Cargo.toml", "crates/celld/lib.rs", "crates/celld/fleet.rs", "crates/celld/main.rs", "crates/celld/control_plane.rs", "crates/celld/js/harness.js"}
     if not changed <= allowed:
         raise ValueError("unexpected source edits")
     return {"patchDigest": digest(package / "celld-native.patch"), "nativeProofSourceDigest": digest(payload), "cargoLockDigest": digest(source / "Cargo.lock")}
