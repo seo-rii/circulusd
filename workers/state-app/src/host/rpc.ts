@@ -70,7 +70,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
   Object.freeze({
     "session.initialize": Object.freeze({
       schemaDigest:
-        "sha256:08a932591b57f378afc0187d9a3cffdbba0b9b3709583681613073e11bae0908",
+        "sha256:f76dd542e329a477e6ba0cd1e286159b12dbb65e9fe53daa15d3118b4bf72cc6",
       requestMaxEncodedBytes: 2 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -78,7 +78,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "session.execute": Object.freeze({
       schemaDigest:
-        "sha256:f83528ea0db0f1608046c9a44b770b06a89eaea348a1379106a39271d5381c90",
+        "sha256:741952d1ff30e2051b270c73fd1131e08f0c8ed3df628fa205e6735328862381",
       requestMaxEncodedBytes: 9 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 9 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -86,7 +86,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "session.read": Object.freeze({
       schemaDigest:
-        "sha256:2dbea60b23caacd8516f2b116f5f4518a283886d8e96298d2c1308ca2bad295c",
+        "sha256:5e8c1c8e51eaec4b7393f52402714d761626f09ebbd587fe39f39fac2c87cd0d",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 4 * MEBIBYTE,
@@ -97,7 +97,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     // envelope.
     "session.read-blob": Object.freeze({
       schemaDigest:
-        "sha256:b06366cdf19b231e67ad5913d7c0259001de0eee343964d1b49b11c3ddc8219d",
+        "sha256:be200bea7083edc23b6a7f03f09773843edd145b1d3c75a76963f32e0a74a469",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 4 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -105,7 +105,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "session.read-events": Object.freeze({
       schemaDigest:
-        "sha256:4aa0f7c0399fe8aec4dd7dad61763c12c08eb6a7283a727d83ede867050d0466",
+        "sha256:05afa03e8a8617ca76092a0bbb27641b10d078fc30913c7088817372274f0863",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -113,7 +113,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "workspace.initialize": Object.freeze({
       schemaDigest:
-        "sha256:54817fc2004e254b4508da091a572c2ace92f95d2aeffbe8d1bf37904f12fc61",
+        "sha256:6c75f780b6f46192cbdfbcd72213d224c94ab220b4c95149ed079c41a8f57ac6",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -121,7 +121,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "workspace.execute": Object.freeze({
       schemaDigest:
-        "sha256:52edd4d1749afca1aa911e7eb7b057e34b15c45670d2226638c4147645dc3d43",
+        "sha256:d83dea8b5a703e2e82fa4f1b8c9dac280c3d795ea68e29b8945d15e1d6b5c35a",
       requestMaxEncodedBytes: 9 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 9 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -129,7 +129,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "workspace.lookup-invocation": Object.freeze({
       schemaDigest:
-        "sha256:0417a8112bf934c8fcb3c3f144ca1f46b183e20c8423f4e196d2e664d8d7aa77",
+        "sha256:cee282319ffb818c4c860c88a078993f4bc31d4238982b22906b7425649fb585",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 9 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -137,7 +137,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "user.initialize": Object.freeze({
       schemaDigest:
-        "sha256:823e93ed0ca576ae903255559bd5a07811287c0cc48956684e785d559d963512",
+        "sha256:0aa5094d21a843a20278e0524cb4ce390a9abcbdef455d0136f91ea2df70d23c",
       requestMaxEncodedBytes: 3 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -145,7 +145,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "user.execute": Object.freeze({
       schemaDigest:
-        "sha256:305aa45309c66ee55265585a1511dae427b8587b1881e95d9f4c5097cc92eeee",
+        "sha256:b848dc67359208a87e1940cae13a65e0c6bf2085dc02a484c1042472101ef04e",
       requestMaxEncodedBytes: 3 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -153,7 +153,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "user.read": Object.freeze({
       schemaDigest:
-        "sha256:9d7a8932bf476a245479a9bba5672be21c83daac0d798f03650c02fcb3b240b0",
+        "sha256:b7402184c8f7f474d51386b1b51396d2a4e06d936d89d26acc1685ebe3646565",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 2 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -161,7 +161,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "extension-state.initialize": Object.freeze({
       schemaDigest:
-        "sha256:70bd9c4bb13ad241453a303a956cc4b133195db2adc63f37bac66db134f67723",
+        "sha256:a125803e136e8c8ab3cf4178e325734853ea55745931caf139f964d9076cccaa",
       requestMaxEncodedBytes: 3 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -169,7 +169,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "extension-state.execute": Object.freeze({
       schemaDigest:
-        "sha256:a358b040e73456c104f46daa8a2f5ad8811202915dadff08ee30226e876308c7",
+        "sha256:2256a50a463533a494348c715b144977c8759536cd5a827d4217689d9420a8af",
       requestMaxEncodedBytes: 3 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -177,7 +177,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "extension-state.read": Object.freeze({
       schemaDigest:
-        "sha256:e0d1417628aa378060f48eb911e7f3ab2c6117b7724119511641c7d116d44958",
+        "sha256:fb2f94041105d842aceb12640e4322f27ca4d51c64c0e10e497873131355eb3a",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 2 * MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -185,7 +185,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "capability-generation.initialize": Object.freeze({
       schemaDigest:
-        "sha256:b9cd8b89a3ecedccbf55e163d3c15502af1af32b500b7a8e36266980ee991d89",
+        "sha256:3739783e231fb67d6ee7c234df7eccd600630abd93a73d816d65d86e5c769c9d",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -193,7 +193,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "capability-generation.execute": Object.freeze({
       schemaDigest:
-        "sha256:fea75874413bb4cdf04f95beecce9dc4c0328f233dfd7c5cfc0aec99c3fe97e7",
+        "sha256:42978a04b3b31502ff45cb22f1862eeb1378a985787d306f842396d80968e348",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -201,7 +201,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "capability-generation.assert-current": Object.freeze({
       schemaDigest:
-        "sha256:81b5e709bf3e488d0757637508849e3c11934031efe7f9c98771349f7cc722cb",
+        "sha256:f845b556ac1222fb1b5ce89ee7058e1cdb9f013036236785cd051de51c5d51c8",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -209,7 +209,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "audit.initialize": Object.freeze({
       schemaDigest:
-        "sha256:214b16a647ccba67eb2ec1e82eddc06d37f7f0bb282a6608467dbc90cc69071e",
+        "sha256:a64f0b74be3eea02335c71b367d19a0dca6dee56c73bd1d28eac56a20ce1f2be",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -217,7 +217,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "audit.execute": Object.freeze({
       schemaDigest:
-        "sha256:0c188d1ffcc3a7d8997d0a64ad22bee7a9259b3dcfa63e95aeabba402990d485",
+        "sha256:26c77288d53f72b62db85a73f7bf752776c175d4e863a9663da09357cc9d78ed",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
@@ -225,7 +225,7 @@ const HOST_RPC_SIZE_CONTRACTS: Readonly<
     }),
     "audit.read": Object.freeze({
       schemaDigest:
-        "sha256:c16f88e04516c05e41847c092c4a039bff31ea04909bc5d093cc211be0355cb0",
+        "sha256:df25fcde28a4e2667cf308216a8b94b1ef6b21909003a22bcc68f45a8a34d941",
       requestMaxEncodedBytes: MEBIBYTE + ENVELOPE_HEADROOM_BYTES,
       requestMaxDepth: STANDARD_MAX_DEPTH,
       responseMaxEncodedBytes: 4 * MEBIBYTE,

@@ -2085,8 +2085,9 @@ export async function applyWorkspaceCommand(
   // Authority/expiry decisions use the host's trusted transaction time (mirrors the
   // session aggregate). command.now stays validated and part of the command
   // identity/digest and is only the fallback when no host context is supplied.
-  // Settlement (commit_workspace) deliberately keeps command.now to preserve the
-  // durable recovery contract.
+  // Exact original settlement snapshots replay at the recorded commit time.
+  // Fresh commits and renewed recovery snapshots require live authority at the
+  // trusted transaction time.
   const now = context?.transactionTime ?? command.now;
 
   let commandDigest;
@@ -2105,11 +2106,33 @@ export async function applyWorkspaceCommand(
 
   if (command.kind === "commit_workspace") {
     validatedFence(command.leaseFence);
-    const authority = validatedAuthority(
+    const prior = invocationRecord(state, command.leaseFence.invocationId);
+    const snapshot = validatedAuthority(
       command.authority,
       state,
       "authority",
-      command.now,
+      null,
+      null,
+      "settlement",
+    );
+    const exactOriginalSnapshot = prior !== undefined && WORKSPACE_AUTHORITY_FIELDS.every(
+      (field) => field === "effectivePermissions"
+        ? snapshot.effectivePermissions.length === prior.commitAuthority.effectivePermissions.length &&
+          snapshot.effectivePermissions.every(
+            (permission, index) => permission === prior.commitAuthority.effectivePermissions[index],
+          )
+        : snapshot[field] === prior.commitAuthority[field],
+    );
+    const authorityTime = exactOriginalSnapshot ? validatedInteger(
+      state.revisions[prior.result.revision]?.committedAt,
+      "committed workspace revision time",
+      0,
+    ) : now;
+    const authority = validatedAuthority(
+      snapshot,
+      state,
+      "authority",
+      authorityTime,
       null,
       "settlement",
     );
@@ -2129,7 +2152,6 @@ export async function applyWorkspaceCommand(
       state,
       referencedObjectDigests,
     );
-    const prior = invocationRecord(state, command.leaseFence.invocationId);
     if (prior !== undefined) {
       if (prior.requestDigest !== command.leaseFence.requestDigest) {
         workspaceError(
@@ -2975,14 +2997,14 @@ export async function applyWorkspaceCommand(
         command.authority,
         next,
         "authority",
-        command.now,
+        now,
         null,
         "settlement",
       );
       if (!authorityCanSettleLease(authority, lease)) {
         workspaceError("STALE_GENERATION", "workspace settlement authority is stale");
       }
-      if (command.now >= lease.expiresAt) {
+      if (now >= lease.expiresAt) {
         workspaceError("LEASE_EXPIRED", "the workspace write lease has expired");
       }
       const ticketId = validatedIdentifier(
@@ -3064,7 +3086,7 @@ export async function applyWorkspaceCommand(
         requestDigest: lease.requestDigest,
         referencedObjectDigests: [...referencedObjectDigests],
         pendingProtectionPermitIds: [...permitIds],
-        committedAt: command.now,
+        committedAt: now,
       };
       const ledger: WorkspaceInvocationRecord = {
         invocationId: lease.invocationId,
@@ -3098,7 +3120,7 @@ export async function applyWorkspaceCommand(
         status: "committed",
       });
       next.activeWriteLease = null;
-      advanceLeaseQueue(next, command.now);
+      advanceLeaseQueue(next, now);
       return committedResult(
         state,
         next,
