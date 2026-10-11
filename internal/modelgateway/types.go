@@ -333,6 +333,7 @@ type ProductionDependencies struct {
 	Quota        dependency.Verified[ProductionQuotaAdmitter]
 	Dispatches   dependency.Verified[ProductionDispatchCoordinator]
 	Providers    map[string]Provider
+	factory      *NativeFactory
 }
 
 type AdmissionRequest struct {

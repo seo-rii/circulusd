@@ -72,6 +72,9 @@ func NewProductionGateway(configuration Configuration, dependencies ProductionDe
 	if configuration.AllowReferenceMemory {
 		return nil, fmt.Errorf("%w: production gateway cannot enable reference memory", ErrInvalidConfiguration)
 	}
+	if dependencies.factory == nil || !reflect.DeepEqual(configuration, dependencies.factory.configuration) || dependencies.factory.validateDependencies(dependencies) != nil {
+		return nil, ErrStateDependenciesNotDurable
+	}
 	authority, _, err := dependencies.Authority.Open()
 	if err != nil {
 		return nil, ErrStateDependenciesNotDurable
@@ -104,28 +107,9 @@ func NewProductionGateway(configuration Configuration, dependencies ProductionDe
 }
 
 func newGateway(configuration Configuration, dependencies Dependencies, verifiedProduction bool) (*Gateway, error) {
-	bounds := configuration.Bounds
-	streamCloseTimeout := configuration.StreamCloseTimeout
-	if streamCloseTimeout == 0 {
-		streamCloseTimeout = defaultStreamCloseTimeout
-	}
-	if streamCloseTimeout <= 0 || streamCloseTimeout > maximumStreamCloseTimeout {
-		return nil, fmt.Errorf("%w: stream close timeout exceeds its supported range", ErrInvalidConfiguration)
-	}
-	if bounds.MaxAuthorityBytes == 0 || bounds.MaxAuthorityBytes > hardMaxAuthorityBytes ||
-		bounds.MaxMessages == 0 || bounds.MaxMessages > hardMaxMessages ||
-		bounds.MaxMessageBytes == 0 || bounds.MaxMessageBytes > hardMaxMessageBytes ||
-		bounds.MaxInputBytes == 0 || bounds.MaxInputBytes > hardMaxInputBytes ||
-		bounds.MaxModelBytes == 0 || bounds.MaxModelBytes > hardMaxIdentifierBytes ||
-		bounds.MaxProviderIDBytes == 0 || bounds.MaxProviderIDBytes > hardMaxIdentifierBytes ||
-		bounds.MaxProviderRequestIDBytes == 0 || bounds.MaxProviderRequestIDBytes > hardMaxProviderRequestIDBytes ||
-		bounds.MaxEventBytes == 0 || bounds.MaxEventBytes > hardMaxEventBytes ||
-		bounds.MaxEvents == 0 || bounds.MaxEvents > hardMaxEvents ||
-		bounds.MaxStreamBytes == 0 || bounds.MaxStreamBytes > hardMaxStreamBytes ||
-		bounds.MaxResponseBytes == 0 || bounds.MaxResponseBytes > hardMaxResponseBytes ||
-		bounds.MaxReasonBytes == 0 || bounds.MaxReasonBytes > hardMaxReasonBytes ||
-		bounds.MaxMessageBytes > bounds.MaxInputBytes || bounds.MaxEvents < 4 {
-		return nil, fmt.Errorf("%w: every input and event bound must be positive, internally consistent, and below its hard ceiling", ErrInvalidConfiguration)
+	gateway, err := newGatewayConfiguration(configuration, dependencies.Providers)
+	if err != nil {
+		return nil, err
 	}
 	missingTrustedDependency := false
 	for _, dependency := range []any{dependencies.Authority, dependencies.TokenCounter, dependencies.Quota, dependencies.Dispatches} {
@@ -164,8 +148,39 @@ func newGateway(configuration Configuration, dependencies Dependencies, verified
 		(!verifiedProduction && (!authorityIsAllowedReference || !quotaIsAllowedReference || !dispatchIsAllowedReference)) {
 		return nil, ErrStateDependenciesNotDurable
 	}
-	providers := make(map[string]Provider, len(dependencies.Providers))
-	for providerID, provider := range dependencies.Providers {
+	gateway.authority = dependencies.Authority
+	gateway.tokenCounter = dependencies.TokenCounter
+	gateway.quota = dependencies.Quota
+	gateway.dispatches = dependencies.Dispatches
+	return gateway, nil
+}
+
+func newGatewayConfiguration(configuration Configuration, providerRegistry map[string]Provider) (*Gateway, error) {
+	bounds := configuration.Bounds
+	streamCloseTimeout := configuration.StreamCloseTimeout
+	if streamCloseTimeout == 0 {
+		streamCloseTimeout = defaultStreamCloseTimeout
+	}
+	if streamCloseTimeout <= 0 || streamCloseTimeout > maximumStreamCloseTimeout {
+		return nil, fmt.Errorf("%w: stream close timeout exceeds its supported range", ErrInvalidConfiguration)
+	}
+	if bounds.MaxAuthorityBytes == 0 || bounds.MaxAuthorityBytes > hardMaxAuthorityBytes ||
+		bounds.MaxMessages == 0 || bounds.MaxMessages > hardMaxMessages ||
+		bounds.MaxMessageBytes == 0 || bounds.MaxMessageBytes > hardMaxMessageBytes ||
+		bounds.MaxInputBytes == 0 || bounds.MaxInputBytes > hardMaxInputBytes ||
+		bounds.MaxModelBytes == 0 || bounds.MaxModelBytes > hardMaxIdentifierBytes ||
+		bounds.MaxProviderIDBytes == 0 || bounds.MaxProviderIDBytes > hardMaxIdentifierBytes ||
+		bounds.MaxProviderRequestIDBytes == 0 || bounds.MaxProviderRequestIDBytes > hardMaxProviderRequestIDBytes ||
+		bounds.MaxEventBytes == 0 || bounds.MaxEventBytes > hardMaxEventBytes ||
+		bounds.MaxEvents == 0 || bounds.MaxEvents > hardMaxEvents ||
+		bounds.MaxStreamBytes == 0 || bounds.MaxStreamBytes > hardMaxStreamBytes ||
+		bounds.MaxResponseBytes == 0 || bounds.MaxResponseBytes > hardMaxResponseBytes ||
+		bounds.MaxReasonBytes == 0 || bounds.MaxReasonBytes > hardMaxReasonBytes ||
+		bounds.MaxMessageBytes > bounds.MaxInputBytes || bounds.MaxEvents < 4 {
+		return nil, fmt.Errorf("%w: every input and event bound must be positive, internally consistent, and below its hard ceiling", ErrInvalidConfiguration)
+	}
+	providers := make(map[string]Provider, len(providerRegistry))
+	for providerID, provider := range providerRegistry {
 		providerIsNil := provider == nil
 		if !providerIsNil {
 			providerValue := reflect.ValueOf(provider)
@@ -202,16 +217,7 @@ func newGateway(configuration Configuration, dependencies Dependencies, verified
 		}
 		grants[key] = grant
 	}
-	return &Gateway{
-		bounds:             bounds,
-		streamCloseTimeout: streamCloseTimeout,
-		grants:             grants,
-		authority:          dependencies.Authority,
-		tokenCounter:       dependencies.TokenCounter,
-		quota:              dependencies.Quota,
-		dispatches:         dependencies.Dispatches,
-		providers:          providers,
-	}, nil
+	return &Gateway{bounds: bounds, streamCloseTimeout: streamCloseTimeout, grants: grants, providers: providers}, nil
 }
 
 func (gateway *Gateway) Admit(ctx context.Context, request AdmissionRequest) (Effect, error) {

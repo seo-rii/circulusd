@@ -13,7 +13,7 @@ import (
 	releasecontract "github.com/hancomac/circulusd/internal/release/contracttest"
 )
 
-func TestProductionGatewayAcceptsOnlyVerifiedAdapterInstances(t *testing.T) {
+func TestProductionGatewayRejectsIndependentlyVerifiedArbitraryAdapters(t *testing.T) {
 	t.Parallel()
 
 	fixture := newFixture(t)
@@ -36,12 +36,8 @@ func TestProductionGatewayAcceptsOnlyVerifiedAdapterInstances(t *testing.T) {
 		Providers:    raw.Providers,
 	}
 
-	gateway, err := NewProductionGateway(configuration, dependencies)
-	if err != nil {
-		t.Fatalf("NewProductionGateway() error = %v", err)
-	}
-	if _, err := gateway.Admit(context.Background(), fixture.admissionRequest()); err != nil {
-		t.Fatalf("Admit() through verified adapters error = %v", err)
+	if gateway, err := NewProductionGateway(configuration, dependencies); gateway != nil || !errors.Is(err, ErrStateDependenciesNotDurable) {
+		t.Fatalf("arbitrary verified adapters obtained a factory seal: gateway=%v err=%v", gateway, err)
 	}
 }
 
