@@ -283,9 +283,12 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 		}
 	}
 	key := nativeWireKey(provider.id, command.InvocationID, command.Attempt)
+	id := nativeWireRequestID("tools/call", provider.factory.policyDigest, key)
+	message, serializationErr := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": map[string]any{"name": command.ToolName, "arguments": input}})
 	type claim struct {
-		Row   nativeWireInvocation
-		Fresh bool
+		Row     nativeWireInvocation
+		Fresh   bool
+		NotSent bool
 	}
 	claimed, err := nativeStateOperation(ctx, provider.factory.repository, func(state *nativeRepositoryState) (claim, error) {
 		session, err := provider.authorize(state, nativeNegotiation(command))
@@ -317,24 +320,30 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 		} else if start.Proof != OpaqueProviderStartPermit(command.Session.Proof) || start.EffectRevision != session.StartEventSequence || start.ClaimGeneration != 1 || session.ReplayPolicy != broker.ReplayPolicy(command.ReplayPolicy) || provider.factory.repository.now().UnixNano() >= session.DeadlineUnixNano {
 			return claim{}, ErrDispatchNotDurable
 		}
+		// Check the actual JSON envelope before claiming external dispatch.
+		// CBOR admission bounds do not include JSON escaping or RPC overhead.
+		// Returning a fact instead of an error preserves the native read
+		// barrier before this invocation can be proven definitely not sent.
+		if serializationErr != nil || len(message) > provider.transport.config.MaximumRequestBytes {
+			return claim{Row: row, NotSent: true}, nil
+		}
 		row.Start = start
 		row.StartClaimed = true
 		state.WireInvocations[key] = row
-		return claim{row, true}, nil
+		return claim{Row: row, Fresh: true}, nil
 	})
 	if err != nil {
 		return ProviderStartResult{}, err
+	}
+	if claimed.NotSent {
+		failure, _ := NewProviderDispatchError(DispatchDefinitelyNotSent, "MCP request exceeds HTTP wire bounds before dispatch", ErrInvalidRequest)
+		return ProviderStartResult{}, failure
 	}
 	if !claimed.Fresh {
 		return nativeRetainedCall(claimed.Row)
 	}
 	if provider.factory.repository.now().UnixNano() >= claimed.Row.Start.LeaseExpiresAtUnixNano {
 		return ProviderStartResult{}, ErrDispatchNotDurable
-	}
-	id := nativeWireRequestID("tools/call", provider.factory.policyDigest, key)
-	message, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": map[string]any{"name": command.ToolName, "arguments": input}})
-	if err != nil {
-		return ProviderStartResult{}, ErrInvalidRequest
 	}
 	response, err := provider.transport.Exchange(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, ConnectionRef: claimed.Row.ConnectionRef, MessageJSON: message})
 	if err != nil {
