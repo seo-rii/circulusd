@@ -10,11 +10,13 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import tomllib
+import tracemalloc
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "test-isolated-codex.py"
@@ -285,35 +287,82 @@ class IsolatedCodexTest(unittest.TestCase):
     def test_authentication_output_is_rejected_before_log_write(self):
         auth = self.auth()
         runner.private_json(self.run / "home" / ".codex" / "auth.json", auth)
-        process = Mock(pid=12345, returncode=0)
-        process.communicate.return_value = ("output " + auth["tokens"]["access_token"], "")
-        with patch.object(runner.subprocess, "Popen", return_value=process):
-            with self.assertRaisesRegex(RuntimeError, "authentication"):
-                runner.invoke(self.run, ["/opt/codex", "exec"])
+        with self.assertRaisesRegex(RuntimeError, "authentication"):
+            self.invoke_child("print(" + repr("output " + auth["tokens"]["access_token"]) + ")")
         self.assertFalse((self.run / "last-child.stderr").exists())
 
     def test_refreshed_authentication_is_also_rejected_before_log_write(self):
         auth_path = self.run / "home" / ".codex" / "auth.json"
         runner.private_json(auth_path, self.auth())
         refreshed = self.auth(tokens={"access_token": "synthetic-refreshed-access-token"})
-        process = Mock(pid=12345, returncode=0)
-        def communicate(**kwargs):
-            runner.private_json(auth_path, refreshed)
-            return "", "unexpected " + refreshed["tokens"]["access_token"]
-        process.communicate.side_effect = communicate
-        with patch.object(runner.subprocess, "Popen", return_value=process):
-            with self.assertRaisesRegex(RuntimeError, "authentication"):
-                runner.invoke(self.run, ["/opt/codex", "exec"])
+        source = "import pathlib,sys; pathlib.Path(" + repr(str(auth_path)) + ").write_text(" + repr(json.dumps(refreshed)) + "); sys.stderr.write(" + repr("unexpected " + refreshed["tokens"]["access_token"]) + ")"
+        with self.assertRaisesRegex(RuntimeError, "authentication"):
+            self.invoke_child(source)
         self.assertFalse((self.run / "last-child.stderr").exists())
 
     def test_timeout_kills_and_reaps_isolated_process_group(self):
-        process = Mock(pid=12345)
-        process.communicate.side_effect = [subprocess.TimeoutExpired("synthetic", 1), ("", "")]
-        with patch.object(runner.subprocess, "Popen", return_value=process), patch.object(runner.os, "killpg") as kill:
+        with patch.object(runner.os, "killpg", wraps=os.killpg) as kill:
             with self.assertRaisesRegex(RuntimeError, "time limit"):
-                runner.invoke(self.run, ["/opt/codex", "exec"], timeout=1)
-        kill.assert_called_once_with(12345, signal.SIGKILL)
-        self.assertEqual(process.communicate.call_count, 2)
+                self.invoke_child("import time; time.sleep(30)", timeout=0.05)
+        self.assertEqual(kill.call_count, 1)
+        self.assertEqual(kill.call_args.args[1], signal.SIGKILL)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(kill.call_args.args[0], os.WNOHANG)
+        self.assertFalse((self.run / "last-child.stderr").exists())
+
+    def invoke_child(self, source, timeout=5):
+        # Only the mount wrapper is replaced. Pipe capture, limits, process
+        # groups and authentication inspection use the real implementation.
+        with patch.object(runner, "sandbox_arguments", side_effect=lambda run, command, online: command):
+            return runner.invoke(self.run, [sys.executable, "-c", source], timeout=timeout)
+
+    def test_output_overflow_stops_and_reaps_before_complete_capture(self):
+        for descriptor, limit in [(1, 4 * 1024**2), (2, 1024**2)]:
+            with self.subTest(descriptor=descriptor):
+                completed = self.run / ("completed-" + str(descriptor))
+                source = "import os,pathlib\nchunk=b'x'*(64*1024)\nfor _ in range(" + str(2 * limit // (64 * 1024)) + "):\n os.write(" + str(descriptor) + ",chunk)\npathlib.Path(" + repr(str(completed)) + ").write_text('completed')\n"
+                tracemalloc.start()
+                try:
+                    with patch.object(runner.os, "killpg", wraps=os.killpg) as kill:
+                        with self.assertRaisesRegex(RuntimeError, "output limit"):
+                            self.invoke_child(source)
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+                self.assertFalse(completed.exists())
+                self.assertEqual(kill.call_count, 1)
+                self.assertEqual(kill.call_args.args[1], signal.SIGKILL)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(kill.call_args.args[0], os.WNOHANG)
+                self.assertLess(peak, 2 * limit + 256 * 1024)
+                self.assertFalse((self.run / "last-child.stderr").exists())
+
+    def test_both_streams_are_drained_and_unicode_is_preserved(self):
+        source = "import os\nfor _ in range(64):\n os.write(2,b'e'*8192)\n os.write(1,('\u2603'*2048).encode())\n"
+        output, _ = self.invoke_child(source)
+        self.assertEqual(output, "\u2603" * (64 * 2048))
+        self.assertEqual((self.run / "last-child.stderr").read_text(), "e" * (64 * 8192))
+
+    def test_exact_output_allowances_are_accepted(self):
+        output, _ = self.invoke_child("import os\nfor _ in range(64):\n os.write(1,b'x'*65536)\nfor _ in range(16):\n os.write(2,b'e'*65536)\n")
+        self.assertEqual(len(output), 4 * 1024**2)
+        self.assertEqual((self.run / "last-child.stderr").stat().st_size, 1024**2)
+
+    def test_stdout_limit_counts_utf8_bytes_before_text_decoding(self):
+        with self.assertRaisesRegex(RuntimeError, "output limit"):
+            self.invoke_child("import os\nfor _ in range(128):\n os.write(1,('\u2603'*16384).encode())\n")
+        self.assertFalse((self.run / "last-child.stderr").exists())
+
+    def test_closed_pipes_do_not_disable_the_process_time_limit(self):
+        closed = self.run / "pipes-closed"
+        source = "import os,pathlib,time; pathlib.Path(" + repr(str(closed)) + ").write_text('closed'); os.close(1); os.close(2); time.sleep(30)"
+        with patch.object(runner.os, "killpg", wraps=os.killpg) as kill:
+            with self.assertRaisesRegex(RuntimeError, "time limit"):
+                self.invoke_child(source, timeout=0.5)
+        self.assertTrue(closed.exists())
+        self.assertEqual(kill.call_count, 1)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(kill.call_args.args[0], os.WNOHANG)
 
     def test_fast_worker_completion_is_not_overwritten_by_launcher(self):
         def launch(*args, **kwargs):

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import selectors
 import shlex
 import shutil
 import signal
@@ -157,17 +158,44 @@ def invoke(run, command, online=False, timeout=25):
     process = subprocess.Popen(
         sandbox_arguments(run, command, online), cwd=run,
         env={"PATH": "/usr/bin:/bin", "CIRCULUSD_ISOLATION_CANARY": "must-not-inherit"},
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, preexec_fn=child_limits,
     )
+    captured = [bytearray(), bytearray()]
+    deadline = started + timeout
     try:
-        output, error = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise RuntimeError("isolated child exceeded its time limit") from None
-    if len(output.encode()) > 4 * 1024**2 or len(error.encode()) > 1024**2:
-        raise RuntimeError("isolated child exceeded its output limit")
+        with process.stdout, process.stderr, selectors.DefaultSelector() as streams:
+            for index, (pipe, limit) in enumerate([(process.stdout, 4 * 1024**2), (process.stderr, 1024**2)]):
+                os.set_blocking(pipe.fileno(), False)
+                streams.register(pipe, selectors.EVENT_READ, (index, limit))
+            while streams.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in streams.select(remaining):
+                    index, limit = key.data
+                    # Read at most one byte beyond the allowance to detect an
+                    # overflow without buffering the rest of a noisy child.
+                    chunk = os.read(key.fd, min(64 * 1024, limit - len(captured[index]) + 1))
+                    if not chunk:
+                        streams.unregister(key.fileobj)
+                    elif len(captured[index]) + len(chunk) > limit:
+                        raise RuntimeError("isolated child exceeded its output limit")
+                    else:
+                        captured[index].extend(chunk)
+            # EOF can precede process exit; closing both pipes must not evade
+            # the original wall-clock deadline.
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+    except BaseException as failure:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        if isinstance(failure, subprocess.TimeoutExpired):
+            raise RuntimeError("isolated child exceeded its time limit") from None
+        raise
+    output, error = [value.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n") for value in captured]
     if secrets and not auth_file.exists():
         raise RuntimeError("isolated authentication disappeared before output inspection")
     secrets += authentication_secrets(auth_file)
