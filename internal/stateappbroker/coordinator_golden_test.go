@@ -76,6 +76,8 @@ func (c *coordinatorGoldenClient) ExecuteSessionBroker(ctx context.Context, requ
 		if c.current == scenario+".settled" {
 			name = scenario + ".resume-grant"
 		}
+	case "prepare-retry":
+		name, next = scenario+".preparation", scenario+".renewed"
 	case "commit-step":
 		name, next = scenario+".commit", scenario+".prepared"
 	case "dispatch":
@@ -389,5 +391,75 @@ func TestCoordinatorActualSessionRecoveryMatrix(t *testing.T) {
 				t.Fatal(d.err)
 			}
 		})
+	}
+}
+
+func TestCoordinatorActualSessionExpiredPreparationRenewal(t *testing.T) {
+	fixture := loadCoordinatorGolden(t)
+	groups := []dependency.AtomicGroup{dependency.AtomicEffectLifecycle}
+	qualified := proof.NewProductionProofs(t, groups)
+	client := &coordinatorGoldenClient{ProductionProofs: qualified, t: t, scope: fixture.Authority,
+		rows: map[string]struct{ RequestCborHex, ResponseCborHex string }{}, blobs: map[string][]byte{}, current: "renewal.expired", receipts: map[string]canonical.Value{}}
+	for _, row := range fixture.Responses {
+		client.rows[row.Name] = struct{ RequestCborHex, ResponseCborHex string }{row.RequestCborHex, row.ResponseCborHex}
+	}
+	for _, blob := range fixture.Blobs {
+		client.blobs[blob.Digest], _ = hex.DecodeString(blob.Bytes.Hex)
+	}
+	d := decoder{}
+	active := client.response(client.current)
+	store, err := newStore(client, Config{Scope: fixture.Authority, UserID: d.id(identity.Subject, active["userId"], false),
+		EngineStepLimits: d.budget(active["engineStepLimits"]), Results: proof.Verify[ResultResolver](t, qualified, &testResults{ProductionProofs: qualified}, groups)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := store.ReadTurn(context.Background(), d.id(identity.Session, active["sessionId"], false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := *turn.ActiveEffect.PreparationPermit
+	body := client.request("renewal.preparation")
+	now := d.time(body["nowUnixMs"])
+	authority := broker.ValidatedTurnFence{TenantID: turn.TenantID, WorkspaceID: turn.WorkspaceID, SessionID: turn.SessionID, TurnID: turn.TurnID, Generations: turn.Generations, ExpiresAt: turn.LeaseExpiresAt}
+	coordinator, err := broker.NewCoordinator(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := broker.RecoveryRequest{Authority: authority, Now: now, EffectID: old.EffectID, InvocationID: old.InvocationID, RequestDigest: old.RequestDigest,
+		OperationKey: "renewal-recover", OperationDigest: d.digest(body["operationDigest"]), Deadline: d.time(body["deadlineUnixMs"])}
+	decision, err := coordinator.RecoverEffect(context.Background(), request)
+	if err != nil || decision.Action != broker.RecoveryDispatch || decision.PreparationPermit == nil {
+		t.Fatalf("renewal=%+v,%v", decision, err)
+	}
+	preparation := *decision.PreparationPermit
+	if preparation.Opaque == old.Opaque || preparation.DispatchAttempt != 1 || preparation.EventSequence != turn.EventSequence+1 ||
+		!preparation.Deadline.Equal(now.Add(30*time.Second)) || preparation.Deadline.Equal(request.Deadline) {
+		t.Fatal("owner TTL or initial effect proof changed")
+	}
+	// Recovery after a response loss must read the newly persisted live permit,
+	// while the original commit/renewal receipts remain unchanged.
+	again, err := coordinator.RecoverEffect(context.Background(), request)
+	if err != nil || *again.PreparationPermit != preparation {
+		t.Fatalf("reread renewal=%+v,%v", again, err)
+	}
+	dispatchBody := client.request("renewal.dispatch")
+	dispatch, err := coordinator.AdmitDispatch(context.Background(), broker.DispatchRequest{Authority: authority, Now: now, EffectID: preparation.EffectID,
+		InvocationID: preparation.InvocationID, RequestDigest: preparation.RequestDigest, Service: preparation.Service, Operation: preparation.Operation,
+		OperationKey: dispatchBody["operationKey"].(string), OperationDigest: d.digest(dispatchBody["operationDigest"]), PreparationPermit: preparation,
+		ProviderRequestID: d.id(identity.Request, dispatchBody["providerRequestId"], false), ProviderRouteDigest: d.digest(dispatchBody["providerRouteDigest"]), Deadline: preparation.Deadline})
+	if err != nil || dispatch.DispatchAttempt != 1 {
+		t.Fatalf("renewed initial dispatch=%+v,%v", dispatch, err)
+	}
+	startRequest := broker.DispatchStartRequest{Authority: authority, Now: now, Dispatch: dispatch, CommandDigest: d.digest(client.request("renewal.start")["commandDigest"])}
+	start, err := coordinator.ClaimDispatchStart(context.Background(), startRequest)
+	if err != nil || !start.Fresh {
+		t.Fatalf("start=%+v,%v", start, err)
+	}
+	replay, err := coordinator.ClaimDispatchStart(context.Background(), startRequest)
+	if err != nil || replay.Fresh || replay.Permit.Opaque != start.Permit.Opaque {
+		t.Fatalf("start replay=%+v,%v", replay, err)
+	}
+	if d.err != nil {
+		t.Fatal(d.err)
 	}
 }

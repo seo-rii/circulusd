@@ -1392,6 +1392,11 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 	if store.retryPreparedAttempt != 0 {
 		return EffectPreparationPermit{}, ErrEffectInFlight
 	}
+	initial := store.snapshot.ActiveEffect.State == EffectPrepared
+	if initial && (store.snapshot.AbortRequested || store.snapshot.ActiveEffect.PreparationPermit == nil ||
+		command.Now.Before(store.snapshot.ActiveEffect.PreparationPermit.Deadline)) {
+		return EffectPreparationPermit{}, ErrInvalidEffectState
+	}
 	store.prepareRetryTransitions++
 	store.eventSequence++
 	store.snapshot.EventSequence = store.eventSequence
@@ -1404,7 +1409,13 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 		DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt + 1, Deadline: command.Deadline, EventSequence: store.eventSequence, Durable: true,
 	}
 	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
-	store.retryPreparedAttempt = permit.DispatchAttempt
+	if initial {
+		permit.Opaque = opaque(byte(store.eventSequence + 50))
+		persisted := permit
+		store.snapshot.ActiveEffect.PreparationPermit = &persisted
+	} else {
+		store.retryPreparedAttempt = permit.DispatchAttempt
+	}
 	store.preparations[command.OperationKey] = storedPreparation{digest: command.OperationDigest, permit: permit}
 	if store.losePrepareRetryResponseOnce {
 		store.losePrepareRetryResponseOnce = false
@@ -1561,4 +1572,114 @@ func (store *fakeStore) BlockEffect(ctx context.Context, command BlockCommand) (
 		return BlockReceipt{}, errors.New("simulated response loss after block commit")
 	}
 	return receipt, nil
+}
+
+// Actual SessionCell renewal, TTL and CAS behavior is covered by the shared
+// lifecycle fixture. These tests verify Coordinator admission and proof checks.
+func TestExpiredPreparedRecoveryRenewsAndReReadsAfterLostResponse(t *testing.T) {
+	now := time.Unix(1_800_000_800, 0).UTC()
+	snapshot := baseSnapshot(now)
+	snapshot.ActiveEffect = baseEffect(EffectPrepared)
+	snapshot.ActiveEffect.PreparationPermit.Deadline = now.Add(-time.Millisecond)
+	originalOpaque := snapshot.ActiveEffect.PreparationPermit.Opaque
+	store := newFakeStore(snapshot)
+	store.losePrepareRetryResponseOnce = true
+	coordinator := mustCoordinator(t, store, nil)
+	request := baseRecoveryRequest(now, "renew-expired")
+	if _, err := coordinator.RecoverEffect(context.Background(), request); err == nil {
+		t.Fatal("response loss was not injected")
+	}
+	decision, err := coordinator.RecoverEffect(context.Background(), request)
+	if err != nil || decision.Action != RecoveryDispatch || decision.PreparationPermit == nil ||
+		decision.PreparationPermit.DispatchAttempt != 1 || !now.Before(decision.PreparationPermit.Deadline) ||
+		decision.PreparationPermit.Opaque == originalOpaque {
+		t.Fatalf("renewal = %+v, %v", decision, err)
+	}
+	if store.prepareRetryTransitions != 1 {
+		t.Fatalf("renewal committed %d times", store.prepareRetryTransitions)
+	}
+	if store.snapshot.ActiveEffect.State != EffectPrepared || store.snapshot.ActiveEffect.DispatchAttempt != 0 {
+		t.Fatal("renewal dispatched the effect")
+	}
+}
+
+func TestExpiredPreparedRecoveryRejectsMissingOrOutOfScopeDeadline(t *testing.T) {
+	now := time.Unix(1_800_000_800, 0).UTC()
+	for _, test := range []struct {
+		name            string
+		deadline        time.Time
+		authorityExpiry time.Time
+		lease           time.Time
+		want            error
+	}{
+		{"missing", time.Time{}, now.Add(time.Minute), now.Add(time.Hour), ErrAdmissionExpired},
+		{"expired", now, now.Add(time.Minute), now.Add(time.Hour), ErrAdmissionExpired},
+		{"authority", now.Add(2 * time.Minute), now.Add(time.Minute), now.Add(time.Hour), ErrAdmissionExpired},
+		{"lease", now.Add(time.Minute), now.Add(time.Hour), now.Add(time.Second), ErrLeaseExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := baseSnapshot(now)
+			snapshot.LeaseExpiresAt = test.lease
+			snapshot.ActiveEffect = baseEffect(EffectPrepared)
+			snapshot.ActiveEffect.PreparationPermit.Deadline = now.Add(-time.Millisecond)
+			store := newFakeStore(snapshot)
+			coordinator := mustCoordinator(t, store, nil)
+			request := baseRecoveryRequest(now, "renew-invalid")
+			request.Deadline = test.deadline
+			request.Authority.ExpiresAt = test.authorityExpiry
+			if _, err := coordinator.RecoverEffect(context.Background(), request); !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+			if store.prepareRetryTransitions != 0 {
+				t.Fatal("invalid deadline mutated state")
+			}
+		})
+	}
+}
+
+type renewalCorruptingStore struct {
+	DurableStore
+	change func(*EffectPreparationPermit)
+}
+
+func (s renewalCorruptingStore) PrepareRetry(ctx context.Context, command PrepareRetryCommand) (EffectPreparationPermit, error) {
+	permit, err := s.DurableStore.PrepareRetry(ctx, command)
+	if err == nil {
+		s.change(&permit)
+	}
+	return permit, err
+}
+func TestExpiredPreparedRecoveryValidatesOwnerClippedProof(t *testing.T) {
+	now := time.Unix(1_800_000_800, 0).UTC()
+	for _, test := range []struct {
+		name   string
+		change func(*EffectPreparationPermit)
+		valid  bool
+	}{
+		{"clipped live deadline", func(p *EffectPreparationPermit) { p.Deadline = now.Add(time.Second) }, true},
+		{"expired", func(p *EffectPreparationPermit) { p.Deadline = now }, false},
+		{"extended", func(p *EffectPreparationPermit) { p.Deadline = now.Add(2 * time.Minute) }, false},
+		{"old opaque", func(p *EffectPreparationPermit) { p.Opaque = opaque(1) }, false},
+		{"old event sequence", func(p *EffectPreparationPermit) { p.EventSequence-- }, false},
+		{"second attempt", func(p *EffectPreparationPermit) { p.DispatchAttempt = 2 }, false},
+		{"other fence", func(p *EffectPreparationPermit) { p.Generations.Placement++ }, false},
+		{"other invocation", func(p *EffectPreparationPermit) { p.InvocationID = mustID(identity.Invocation, "other") }, false},
+		{"non durable", func(p *EffectPreparationPermit) { p.Durable = false }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := baseSnapshot(now)
+			snapshot.ActiveEffect = baseEffect(EffectPrepared)
+			snapshot.ActiveEffect.PreparationPermit.Deadline = now.Add(-time.Millisecond)
+			store := renewalCorruptingStore{DurableStore: newFakeStore(snapshot), change: test.change}
+			coordinator := mustCoordinator(t, store, nil)
+			decision, err := coordinator.RecoverEffect(context.Background(), baseRecoveryRequest(now, "renew-proof"))
+			if test.valid {
+				if err != nil || decision.PreparationPermit == nil || !decision.PreparationPermit.Deadline.Equal(now.Add(time.Second)) {
+					t.Fatalf("clipped proof = %+v,%v", decision, err)
+				}
+			} else if !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("invalid proof error=%v", err)
+			}
+		})
+	}
 }

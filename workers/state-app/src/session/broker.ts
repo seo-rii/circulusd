@@ -547,13 +547,21 @@ export async function applySessionBrokerCommand(state: SessionAggregateState, co
       assertLive(state, now);
       const effect = assertKey(next, request.body.key);
       assertNoStart(effect);
-      if (request.body.nowUnixMs > now || request.body.deadlineUnixMs <= now || request.body.deadlineUnixMs > next.activeTurn!.leaseExpiresAt ||
-        (effect.phase !== "dispatched" && effect.phase !== "blocked") ||
+      if (request.body.nowUnixMs > now || request.body.deadlineUnixMs <= now || request.body.deadlineUnixMs > next.activeTurn!.leaseExpiresAt) sessionError("FAILED_PRECONDITION", "effect preparation deadline is invalid");
+      const initial = effect.phase === "prepared";
+      if (initial) {
+        // Renew only an expired, never-dispatched reservation. Receipt replay
+        // remains the original proof; a fresh operation requires this exact CAS.
+        if (request.body.userConfirmed || broker.preparation === null || broker.preparation.retry ||
+          broker.preparation.permit.deadline > now || !same(broker.preparation.permit.fence, fence(next))) sessionError("FAILED_PRECONDITION", "initial preparation is absent, live or stale");
+      } else if ((effect.phase !== "dispatched" && effect.phase !== "blocked") ||
         (effect.replayPolicy !== "safe" && effect.replayPolicy !== "idempotency-key" &&
           !(effect.replayPolicy === "confirm" && effect.phase === "blocked" && request.body.userConfirmed))) sessionError("FAILED_PRECONDITION", "effect cannot reserve this retry");
-      const permit = newPreparation(next, effect, command.host.opaque, request.body.deadlineUnixMs, next.eventSequence + 1);
+      const deadline = initial ? Math.min(request.body.deadlineUnixMs, now + policy.preparationTTLms) : request.body.deadlineUnixMs;
+      brokerInteger(deadline, "preparation deadline", 1);
+      const permit = newPreparation(next, effect, command.host.opaque, deadline, next.eventSequence + 1);
       broker.preparation = { permit, sourceEventSequence: next.eventSequence, sourceDispatchAttempt: effect.dispatchAttempt,
-        sourceCheckpointDigest: await chainDigest(next), retry: true };
+        sourceCheckpointDigest: await chainDigest(next), retry: !initial };
       const receipt = await appendReceipt(next, identity, operationDigest, requestDigest, permit, blobs);
       return finish(state, next, command, requestDigest, receipt, blobs, context, "retry");
     }

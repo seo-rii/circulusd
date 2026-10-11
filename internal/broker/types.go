@@ -641,6 +641,14 @@ type BlockReceipt struct {
 	Durable         bool
 }
 
+// PrepareRetryCommand reserves a replay of a dispatched effect, or renews an
+// expired initial preparation without dispatching it. Initial renewal requires
+// a live turn, current snapshot/fences, no abort/start, and an expired persisted
+// permit. It retains effect/invocation identity and attempt 1. The owner may cap
+// the requested Deadline by its trusted preparation TTL, persists a new opaque
+// proof and receipt atomically, and rejects replacement of a live preparation.
+// Exact operation replays return the original receipt, including after expiry;
+// each subsequent renewal therefore needs a distinct operation key.
 type PrepareRetryCommand struct {
 	Snapshot        TurnSnapshot
 	Key             EffectKey

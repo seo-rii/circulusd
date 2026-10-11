@@ -78,7 +78,7 @@ func (host *sessionQuotaHost) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	host.mu.Lock()
 	defer host.mu.Unlock()
 	id := request["requestId"].(string)
-	response, _ := canonical.Encode(canonical.Map{"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0), "schemaDigest": "sha256:72359080c501a237cf9f02ff1fb7105eef76510ef696e0bfac84587f1f370b33", "requestId": id, "payload": canonical.Map{"ok": true, "result": host.result}}, canonical.DefaultOptions())
+	response, _ := canonical.Encode(canonical.Map{"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0), "schemaDigest": "sha256:0cfbf95ebc837225746cf03c0bef6f018a4452815e90d775bc4d6cd516a99656", "requestId": id, "payload": canonical.Map{"ok": true, "result": host.result}}, canonical.DefaultOptions())
 	const contentType = "application/vnd.circulusd.state-broker-ingress+cbor"
 	requestDigest, bodyDigest := sha256.Sum256(body), sha256.Sum256(response)
 	keyMAC := hmac.New(sha256.New, bytes.Repeat([]byte{4}, 32))

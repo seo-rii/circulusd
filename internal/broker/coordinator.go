@@ -560,8 +560,34 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 			decision.SettlementReceipt = &receipt
 			return decision, nil
 		}
+		preparation := effect.PreparationPermit
+		if !request.Now.Before(preparation.Deadline) {
+			if request.Deadline.IsZero() || !request.Now.Before(request.Deadline) || !request.Now.Before(request.Authority.ExpiresAt) || request.Deadline.After(request.Authority.ExpiresAt) {
+				return RecoveryDecision{}, ErrAdmissionExpired
+			}
+			if !request.Now.Before(snapshot.LeaseExpiresAt) || request.Deadline.After(snapshot.LeaseExpiresAt) {
+				return RecoveryDecision{}, ErrLeaseExpired
+			}
+			renewed, err := coordinator.store.PrepareRetry(ctx, PrepareRetryCommand{Snapshot: snapshot, Key: key,
+				OperationKey: request.OperationKey + ":prepare", OperationDigest: request.OperationDigest, Now: request.Now, Deadline: request.Deadline})
+			if err != nil {
+				return RecoveryDecision{}, fmt.Errorf("renew expired effect preparation: %w", err)
+			}
+			// The owner may shorten the caller's admission deadline using its
+			// trusted preparation TTL. It may never extend it or return an old,
+			// expired proof from an earlier renewal receipt.
+			if renewed.EffectKey != key || renewed.Opaque == "" || renewed.Opaque == preparation.Opaque || !renewed.Durable ||
+				renewed.EventSequence != snapshot.EventSequence+1 || renewed.TenantID != snapshot.TenantID || renewed.WorkspaceID != snapshot.WorkspaceID ||
+				renewed.UserID != snapshot.UserID || renewed.Service != effect.Service || renewed.Operation != effect.Operation ||
+				renewed.ParentOperationID != effect.ParentOperationID || renewed.ParentOperation != effect.ParentOperation || renewed.Ordinal != effect.Ordinal ||
+				renewed.ReplayPolicy != effect.ReplayPolicy || renewed.DispatchAttempt != 1 || renewed.Generations != snapshot.Generations ||
+				!request.Now.Before(renewed.Deadline) || renewed.Deadline.After(request.Deadline) {
+				return RecoveryDecision{}, fmt.Errorf("%w: invalid renewed preparation", ErrFenceMismatch)
+			}
+			preparation = &renewed
+		}
 		decision.Action = RecoveryDispatch
-		decision.PreparationPermit = effect.PreparationPermit
+		decision.PreparationPermit = preparation
 		return decision, nil
 	case EffectExternallyCommitted:
 		decision.Action = RecoverySettleOnly

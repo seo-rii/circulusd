@@ -29,8 +29,9 @@ async function vectors() {
   async function scenario(label: string, replayPolicy?: "safe" | "confirm" | "never", dispatchNow = true) {
     const storage = new RestartableDurableStorage();
     const physical = (name: string) => ({ toString: () => name, equals: (other: unknown) => String(other) === name });
+    let clock = NOW;
     const cell = new SessionCell({ storage, id: physical(sessionCellName(authority.tenantId, authority.sessionId)) } as never,
-      { SESSION_CELL: { idFromName: physical }, CIRCULUSD_STATE_BROKER_POLICY: policy } as never, () => NOW);
+      { SESSION_CELL: { idFromName: physical }, CIRCULUSD_STATE_BROKER_POLICY: policy } as never, () => clock);
     async function rpc<Result>(operation: HostRpcOperation, payload: unknown, invoke: (request: unknown) => Promise<HostRpcResponse<Result>>): Promise<Result> {
       const response = await invoke({ protocol: "circulus.v1alpha1", major: 1, minor: 0,
         schemaDigest: HOST_RPC_CONTRACTS[operation].schemaDigest, requestId: id("req"), payload });
@@ -92,7 +93,7 @@ async function vectors() {
       operationKey: `${label}-dispatch`, operationDigest: digest("e"), preparationOpaque: committed.preparation!.opaque, providerRequestId: id("req"),
       providerRouteDigest: digest("f"), nowUnixMs: NOW, deadlineUnixMs: committed.preparation!.deadline } }) : null;
     const current = dispatchNow ? await read("dispatched") : prepared;
-    return { call, read, snapshot, key, dispatch: dispatch!, current, abort };
+    return { call, read, snapshot, key, dispatch: dispatch!, current, abort, preparation: committed.preparation!, advance: (elapsed: number) => { clock += elapsed; } };
   }
   const main = await scenario("success");
   const claimBody = { snapshot: main.snapshot(main.current), key: main.key, dispatchOpaque: main.dispatch.opaque as Uint8Array, commandDigest: digest("7"), nowUnixMs: NOW };
@@ -158,6 +159,22 @@ async function vectors() {
       operationKey: `${label}-recover`, operationDigest: digest("4"), kind: abort ? "interrupted_unknown" : "failed", error } });
     await source.read("settled");
   }
+  const renewal = await scenario("renewal", "never", false);
+  renewal.advance(policy.preparationTTLms + 1);
+  const expired = await renewal.read("expired");
+  const renewed = await renewal.call<SessionBrokerPreparationPermit>("preparation", { operation: "prepare-retry", body: {
+    snapshot: renewal.snapshot(expired), key: renewal.key, operationKey: "renewal-recover:prepare", operationDigest: digest("5"),
+    nowUnixMs: NOW + 30_001, deadlineUnixMs: NOW + 100_000, userConfirmed: false } });
+  const renewedState = await renewal.read("renewed");
+  await renewal.call("dispatch", { operation: "dispatch", body: { snapshot: renewal.snapshot(renewedState), key: renewal.key,
+    operationKey: "renewal-dispatch", operationDigest: digest("e"), preparationOpaque: renewed.opaque, providerRequestId: id("req"),
+    providerRouteDigest: digest("f"), nowUnixMs: NOW + 30_001, deadlineUnixMs: renewed.deadline } });
+  const dispatchedRenewal = await renewal.read("dispatched");
+  const start = { snapshot: renewal.snapshot(dispatchedRenewal), key: renewal.key,
+    dispatchOpaque: dispatchedRenewal.dispatch!.opaque, commandDigest: digest("7"), nowUnixMs: NOW + 30_001 };
+  await renewal.call("start", { operation: "claim-start", body: start });
+  await renewal.call("start-replay", { operation: "claim-start", body: start });
+  await renewal.read("started");
   return { version: 1, authority, policy, responses, blobs: [...blobs.values()].sort((a, b) => a.digest.localeCompare(b.digest)) };
 }
 

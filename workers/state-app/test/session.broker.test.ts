@@ -385,6 +385,106 @@ describe("Session broker authoritative transaction", () => {
     expect((await f.state()).terminalTurns[0]!.status).toBe("aborted");
   });
 
+
+  it("durably renews an expired initial preparation after response loss without changing its effect", async () => {
+    const f = await fixture();
+    const first = await f.prepare("never");
+    const initial = await f.read();
+    const effect = initial.activeEffect!;
+    const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
+    const live = { snapshot: f.snapshot(initial), key, operationKey: "renew-live", operationDigest: d("a"),
+      nowUnixMs: 1_000, deadlineUnixMs: 100_000, userConfirmed: false };
+    await expect(f.call({ operation: "prepare-retry", body: live })).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    f.advance(20_001);
+    f.restart();
+    await expect(f.dispatch(first.preparation!, undefined, "expired-dispatch")).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    const body = { ...live, operationKey: "renew", nowUnixMs: 21_001 };
+    f.storage.backing.injectCrashOnce("after-commit-before-result");
+    await expect(f.call({ operation: "prepare-retry", body })).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
+    f.restart();
+    const revision = f.storage.backing.durableRevision;
+    const renewed = await f.call<SessionBrokerPreparationPermit>({ operation: "prepare-retry", body });
+    expect(f.storage.backing.durableRevision).toBe(revision);
+    expect(renewed.opaque).not.toEqual(first.preparation!.opaque);
+    expect(renewed.deadline).toBe(41_001); // trusted host policy caps the requested deadline
+    expect(renewed.dispatchAttempt).toBe(1);
+    expect(renewed.eventSequence).toBe(initial.eventSequence + 1);
+    expect(renewed.fence).toEqual(first.preparation!.fence);
+    const current = await f.read();
+    expect(current.activeEffect).toEqual(initial.activeEffect);
+    expect(current.checkpointDigest).toBe(initial.checkpointDigest);
+    expect(current.preparation).toEqual(renewed);
+    await expect(f.dispatch(first.preparation!, undefined, "superseded-dispatch")).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    const dispatch = await f.dispatch(renewed, undefined, "renewed-dispatch");
+    expect(dispatch.permit.dispatchAttempt).toBe(1);
+    const claim = { snapshot: f.snapshot(await f.read()), key, dispatchOpaque: dispatch.permit.opaque, commandDigest: d("b"), nowUnixMs: 21_001 };
+    const started = await f.call<SessionBrokerDispatchStartClaim>({ operation: "claim-start", body: claim });
+    expect(started.fresh).toBe(true);
+    expect(await f.call({ operation: "claim-start", body: claim })).toEqual({ ...started, fresh: false });
+    await expect(f.call({ operation: "prepare-retry", body: { ...body, snapshot: f.snapshot(await f.read()), operationKey: "after-start" } })).rejects.toMatchObject({ code: "DISPATCH_ALREADY_STARTED" });
+  });
+
+  it("keeps renewal receipts stable across later expiry and rejects superseded snapshots and old proofs", async () => {
+    const f = await fixture();
+    const prepared = await f.prepare();
+    f.advance(20_001);
+    const expired = await f.read();
+    const effect = expired.activeEffect!;
+    const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
+    const body = { snapshot: f.snapshot(expired), key, operationKey: "renew-1", operationDigest: d("a"), nowUnixMs: 21_001, deadlineUnixMs: 100_000, userConfirmed: false };
+    const race = await Promise.allSettled([
+      f.call<SessionBrokerPreparationPermit>({ operation: "prepare-retry", body }),
+      f.call<SessionBrokerPreparationPermit>({ operation: "prepare-retry", body: { ...body, operationKey: "renew-concurrent" } }),
+      f.dispatch(prepared.preparation!, undefined, "concurrent-expired-dispatch"),
+    ]);
+    expect(race.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    const winner = race.find(result => result.status === "fulfilled") as PromiseFulfilledResult<SessionBrokerPreparationPermit>;
+    const first = winner.value;
+    const winnerBody = race[0]!.status === "fulfilled" ? body : { ...body, operationKey: "renew-concurrent" };
+    const current = await f.read();
+    await expect(f.call({ operation: "prepare-retry", body: { ...body, operationKey: "stale", snapshot: body.snapshot } })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(f.call({ operation: "prepare-retry", body: { ...body, operationKey: "stale-fence", snapshot: { ...f.snapshot(current),
+      fence: { ...current.fence, turnLeaseGeneration: current.fence.turnLeaseGeneration - 1 } } } })).rejects.toMatchObject({ code: "STALE_GENERATION" });
+    f.advance(20_001);
+    f.restart();
+    const second = await f.call<SessionBrokerPreparationPermit>({ operation: "prepare-retry", body: { ...body, snapshot: f.snapshot(await f.read()),
+      operationKey: "renew-2", nowUnixMs: 41_002 } });
+    const revision = f.storage.backing.durableRevision;
+    expect(await f.call({ operation: "prepare-retry", body: winnerBody })).toEqual(first);
+    expect(f.storage.backing.durableRevision).toBe(revision);
+    expect((await f.read()).preparation).toEqual(second);
+    await expect(f.dispatch(first, undefined, "old-renewal-dispatch")).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    expect((await f.dispatch(second, undefined, "second-renewal-dispatch")).permit.dispatchAttempt).toBe(1);
+  });
+
+  it("serializes renewal against cancellation and refuses renewal after the lease expires", async () => {
+    const f = await fixture();
+    await f.prepare();
+    f.advance(20_001);
+    const before = await f.read();
+    const effect = before.activeEffect!;
+    const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
+    const renew = { snapshot: f.snapshot(before), key, operationKey: "renew", operationDigest: d("a"), nowUnixMs: 21_001, deadlineUnixMs: 100_000, userConfirmed: false };
+    const result = await Promise.allSettled([
+      f.call({ operation: "prepare-retry", body: renew }),
+      f.executeRaw({ kind: "request_abort", commandId: "abort-race", expectedEventSequence: before.eventSequence,
+        turnId: before.turnId, fence: before.fence, transactionTime: 21_001, reason: "cancel" }),
+    ]);
+    expect(result.filter(entry => entry.status === "fulfilled")).toHaveLength(1);
+    const current = await f.read();
+    if (!current.abortRequested) await f.executeRaw({ kind: "request_abort", commandId: "abort-after-renew", expectedEventSequence: current.eventSequence,
+      turnId: current.turnId, fence: current.fence, transactionTime: 21_001, reason: "cancel" });
+    await expect(f.call({ operation: "prepare-retry", body: { ...renew, snapshot: f.snapshot(await f.read()), operationKey: "after-abort" } })).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    const g = await fixture();
+    await g.prepare();
+    g.advance(999_000);
+    const expired = await g.read();
+    const old = expired.activeEffect!;
+    await expect(g.call({ operation: "prepare-retry", body: { ...renew, snapshot: g.snapshot(expired),
+      key: { turnId: old.turnId, effectId: old.effectId, invocationId: old.invocationId, requestDigest: old.requestDigest },
+      nowUnixMs: 1_000_000, deadlineUnixMs: 1_001_000 } })).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+  });
+
   it("migrates schema6 by version only and fails closed on an archived receipt row corruption", async () => {
     const f = await fixture();
     const previous = await f.state();

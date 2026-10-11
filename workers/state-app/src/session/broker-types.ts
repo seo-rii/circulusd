@@ -253,6 +253,10 @@ export interface SessionBrokerSettle extends EffectMutationBase {
 export interface SessionBrokerBlock extends EffectMutationBase {
   reason: SessionBrokerPublicError;
 }
+// prepare-retry also renews an expired initial preparation. The owner caps
+// that initial deadline by preparationTTLms, retains dispatch attempt 1 and
+// requires a new operation key for each subsequent expiry. Dispatched retries
+// retain their replay-policy and user-confirmation checks.
 export interface SessionBrokerRetry extends EffectMutationBase {
   nowUnixMs: number;
   deadlineUnixMs: number;

@@ -398,6 +398,24 @@ object or JSON string with exactly this shape:
 {"engineStepLimits":{"maximumEvents":1,"maximumEphemeralBytes":1048576,"maximumWallClockMs":5000},"preparationTTLms":30000}
 ```
 
+A crash after preparing an effect and before dispatch does not require a new
+Pi boundary. If its initial preparation expires while the turn lease and
+validated authority remain live, `Coordinator.RecoverEffect` renews it through
+`prepare-retry` using the current Session snapshot. Only this expired
+never-dispatched case accepts any replay policy: it retains the same effect,
+invocation, request and first dispatch attempt. The Session owner caps the new
+deadline by `preparationTTLms` and persists a fresh opaque proof and original
+receipt; live reservations, aborts and stale fences cannot be renewed. Supply a
+fresh future `RecoveryRequest.Deadline` within the turn lease and authority
+expiry for this renewal. A live original preparation needs no new deadline.
+
+After a lost response, read the authoritative turn and use its current
+preparation. Replaying the original commit or an earlier renewal returns that
+operation's original receipt, so a superseded proof cannot dispatch. Each later
+expiry needs a distinct recovery operation key. Renewal advances the durable
+event sequence but leaves the Pi checkpoint and effect identity unchanged;
+dispatch then uses a fresh snapshot and the returned permit deadline.
+
 Missing policy fails closed. The Store's immutable limits must match this host
 policy. Times and budgets use integral milliseconds; callers must supply
 millisecond-aligned clocks rather than rely on truncation. All scope IDs are
