@@ -245,10 +245,37 @@ func (transport *StreamableHTTPTransport) Exchange(ctx context.Context, request 
 	}
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), transport.config.MaximumResponseBytes+1)
+	// SSE recognizes CR, LF, and CRLF. Consume CR immediately so a complete
+	// event does not wait for another byte or EOF; swallow its optional LF on
+	// the next split, including when the pair crosses an HTTP read boundary.
+	skipLF := false
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		start := 0
+		if skipLF && len(data) != 0 {
+			skipLF = false
+			if data[0] == '\n' {
+				start = 1
+			}
+		}
+		if end := bytes.IndexAny(data[start:], "\r\n"); end >= 0 {
+			end += start
+			skipLF = data[end] == '\r'
+			return end + 1, data[start:end], nil
+		}
+		if atEOF && len(data) > start {
+			return len(data), data[start:], nil
+		}
+		return start, nil, nil
+	})
 	var data []byte
 	events := 0
+	firstLine := true
 	for scanner.Scan() {
 		line := scanner.Text()
+		if firstLine {
+			line = strings.TrimPrefix(line, "\uFEFF")
+			firstLine = false
+		}
 		if line == "" {
 			if len(data) == 0 {
 				continue
