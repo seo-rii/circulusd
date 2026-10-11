@@ -568,3 +568,51 @@ service SessionStateService {
   rpc RenewTurnAuthority(RenewTurnAuthorityRequest) returns (RenewTurnAuthorityResponse);
   rpc AbortTurn(AbortTurnRequest) returns (AbortTurnResponse);
 }
+
+// Reference-only private workload handoff. The receiver authenticates the local
+// platformd peer; decoding this message does not mint broker start authority or
+// establish crash durability. The Session authority remains the single-start
+// owner, and an ambiguous RPC must never be retried as a new provider start.
+message ReferenceWorkloadClaim {
+  DispatchPermit dispatch = 1;
+  OpaqueId workspace_id = 2;
+  bytes start_proof = 3;
+  Digest command_digest = 4;
+  uint64 claimed_event_sequence = 5;
+  uint64 dispatch_event_sequence = 6;
+  OpaqueId provider_request_id = 7;
+  Digest provider_route_digest = 8;
+
+  reserved 9 to 15;
+}
+
+message StartClaimedWorkloadRequest {
+  RpcRequestMeta meta = 1;
+  ReferenceWorkloadClaim claim = 2;
+  bytes command = 3;
+
+  reserved 4 to 15;
+}
+
+message ReferenceWorkloadResult {
+  OpaqueId external_commit_id = 1;
+  OpaqueId result_ref = 2;
+  bytes result = 3;
+  Digest result_digest = 4;
+
+  reserved 5 to 15;
+}
+
+message StartClaimedWorkloadResponse {
+  RpcResponseMeta meta = 1;
+  ReferenceWorkloadClaim claim = 2;
+  ReferenceWorkloadResult result = 3;
+  Digest request_digest = 4;
+  bool reference_only = 5;
+
+  reserved 6 to 15;
+}
+
+service ReferenceWorkloadService {
+  rpc StartClaimedWorkload(StartClaimedWorkloadRequest) returns (StartClaimedWorkloadResponse);
+}

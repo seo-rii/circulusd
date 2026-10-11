@@ -23,6 +23,8 @@ const _ = connect.IsAtLeastVersion1_13_0
 const (
 	// SessionStateServiceName is the fully-qualified name of the SessionStateService service.
 	SessionStateServiceName = "circulus.api.v1alpha.SessionStateService"
+	// ReferenceWorkloadServiceName is the fully-qualified name of the ReferenceWorkloadService service.
+	ReferenceWorkloadServiceName = "circulus.api.v1alpha.ReferenceWorkloadService"
 )
 
 // These constants are the fully-qualified names of the RPCs defined in this package. They're
@@ -66,6 +68,9 @@ const (
 	// SessionStateServiceAbortTurnProcedure is the fully-qualified name of the SessionStateService's
 	// AbortTurn RPC.
 	SessionStateServiceAbortTurnProcedure = "/circulus.api.v1alpha.SessionStateService/AbortTurn"
+	// ReferenceWorkloadServiceStartClaimedWorkloadProcedure is the fully-qualified name of the
+	// ReferenceWorkloadService's StartClaimedWorkload RPC.
+	ReferenceWorkloadServiceStartClaimedWorkloadProcedure = "/circulus.api.v1alpha.ReferenceWorkloadService/StartClaimedWorkload"
 )
 
 // SessionStateServiceClient is a client for the circulus.api.v1alpha.SessionStateService service.
@@ -398,4 +403,77 @@ func (UnimplementedSessionStateServiceHandler) RenewTurnAuthority(context.Contex
 
 func (UnimplementedSessionStateServiceHandler) AbortTurn(context.Context, *connect.Request[v1alpha.AbortTurnRequest]) (*connect.Response[v1alpha.AbortTurnResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("circulus.api.v1alpha.SessionStateService.AbortTurn is not implemented"))
+}
+
+// ReferenceWorkloadServiceClient is a client for the circulus.api.v1alpha.ReferenceWorkloadService
+// service.
+type ReferenceWorkloadServiceClient interface {
+	StartClaimedWorkload(context.Context, *connect.Request[v1alpha.StartClaimedWorkloadRequest]) (*connect.Response[v1alpha.StartClaimedWorkloadResponse], error)
+}
+
+// NewReferenceWorkloadServiceClient constructs a client for the
+// circulus.api.v1alpha.ReferenceWorkloadService service. By default, it uses the Connect protocol
+// with the binary Protobuf Codec, asks for gzipped responses, and sends uncompressed requests. To
+// use the gRPC or gRPC-Web protocols, supply the connect.WithGRPC() or connect.WithGRPCWeb()
+// options.
+//
+// The URL supplied here should be the base URL for the Connect or gRPC server (for example,
+// http://api.acme.com or https://acme.com/grpc).
+func NewReferenceWorkloadServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) ReferenceWorkloadServiceClient {
+	baseURL = strings.TrimRight(baseURL, "/")
+	referenceWorkloadServiceMethods := v1alpha.File_circulus_v1alpha_session_proto.Services().ByName("ReferenceWorkloadService").Methods()
+	return &referenceWorkloadServiceClient{
+		startClaimedWorkload: connect.NewClient[v1alpha.StartClaimedWorkloadRequest, v1alpha.StartClaimedWorkloadResponse](
+			httpClient,
+			baseURL+ReferenceWorkloadServiceStartClaimedWorkloadProcedure,
+			connect.WithSchema(referenceWorkloadServiceMethods.ByName("StartClaimedWorkload")),
+			connect.WithClientOptions(opts...),
+		),
+	}
+}
+
+// referenceWorkloadServiceClient implements ReferenceWorkloadServiceClient.
+type referenceWorkloadServiceClient struct {
+	startClaimedWorkload *connect.Client[v1alpha.StartClaimedWorkloadRequest, v1alpha.StartClaimedWorkloadResponse]
+}
+
+// StartClaimedWorkload calls circulus.api.v1alpha.ReferenceWorkloadService.StartClaimedWorkload.
+func (c *referenceWorkloadServiceClient) StartClaimedWorkload(ctx context.Context, req *connect.Request[v1alpha.StartClaimedWorkloadRequest]) (*connect.Response[v1alpha.StartClaimedWorkloadResponse], error) {
+	return c.startClaimedWorkload.CallUnary(ctx, req)
+}
+
+// ReferenceWorkloadServiceHandler is an implementation of the
+// circulus.api.v1alpha.ReferenceWorkloadService service.
+type ReferenceWorkloadServiceHandler interface {
+	StartClaimedWorkload(context.Context, *connect.Request[v1alpha.StartClaimedWorkloadRequest]) (*connect.Response[v1alpha.StartClaimedWorkloadResponse], error)
+}
+
+// NewReferenceWorkloadServiceHandler builds an HTTP handler from the service implementation. It
+// returns the path on which to mount the handler and the handler itself.
+//
+// By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
+// and JSON codecs. They also support gzip compression.
+func NewReferenceWorkloadServiceHandler(svc ReferenceWorkloadServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
+	referenceWorkloadServiceMethods := v1alpha.File_circulus_v1alpha_session_proto.Services().ByName("ReferenceWorkloadService").Methods()
+	referenceWorkloadServiceStartClaimedWorkloadHandler := connect.NewUnaryHandler(
+		ReferenceWorkloadServiceStartClaimedWorkloadProcedure,
+		svc.StartClaimedWorkload,
+		connect.WithSchema(referenceWorkloadServiceMethods.ByName("StartClaimedWorkload")),
+		connect.WithHandlerOptions(opts...),
+	)
+	return "/circulus.api.v1alpha.ReferenceWorkloadService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case ReferenceWorkloadServiceStartClaimedWorkloadProcedure:
+			referenceWorkloadServiceStartClaimedWorkloadHandler.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+// UnimplementedReferenceWorkloadServiceHandler returns CodeUnimplemented from all methods.
+type UnimplementedReferenceWorkloadServiceHandler struct{}
+
+func (UnimplementedReferenceWorkloadServiceHandler) StartClaimedWorkload(context.Context, *connect.Request[v1alpha.StartClaimedWorkloadRequest]) (*connect.Response[v1alpha.StartClaimedWorkloadResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("circulus.api.v1alpha.ReferenceWorkloadService.StartClaimedWorkload is not implemented"))
 }

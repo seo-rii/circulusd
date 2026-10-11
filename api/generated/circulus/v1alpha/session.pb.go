@@ -3922,6 +3922,314 @@ func (x *AbortTurnResponse) GetCommittedEventSequence() uint64 {
 	return 0
 }
 
+// Reference-only private workload handoff. The receiver authenticates the local
+// platformd peer; decoding this message does not mint broker start authority or
+// establish crash durability. The Session authority remains the single-start
+// owner, and an ambiguous RPC must never be retried as a new provider start.
+type ReferenceWorkloadClaim struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	Dispatch              *DispatchPermit        `protobuf:"bytes,1,opt,name=dispatch,proto3" json:"dispatch,omitempty"`
+	WorkspaceId           *OpaqueId              `protobuf:"bytes,2,opt,name=workspace_id,json=workspaceId,proto3" json:"workspace_id,omitempty"`
+	StartProof            []byte                 `protobuf:"bytes,3,opt,name=start_proof,json=startProof,proto3" json:"start_proof,omitempty"`
+	CommandDigest         *Digest                `protobuf:"bytes,4,opt,name=command_digest,json=commandDigest,proto3" json:"command_digest,omitempty"`
+	ClaimedEventSequence  uint64                 `protobuf:"varint,5,opt,name=claimed_event_sequence,json=claimedEventSequence,proto3" json:"claimed_event_sequence,omitempty"`
+	DispatchEventSequence uint64                 `protobuf:"varint,6,opt,name=dispatch_event_sequence,json=dispatchEventSequence,proto3" json:"dispatch_event_sequence,omitempty"`
+	ProviderRequestId     *OpaqueId              `protobuf:"bytes,7,opt,name=provider_request_id,json=providerRequestId,proto3" json:"provider_request_id,omitempty"`
+	ProviderRouteDigest   *Digest                `protobuf:"bytes,8,opt,name=provider_route_digest,json=providerRouteDigest,proto3" json:"provider_route_digest,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *ReferenceWorkloadClaim) Reset() {
+	*x = ReferenceWorkloadClaim{}
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReferenceWorkloadClaim) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReferenceWorkloadClaim) ProtoMessage() {}
+
+func (x *ReferenceWorkloadClaim) ProtoReflect() protoreflect.Message {
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReferenceWorkloadClaim.ProtoReflect.Descriptor instead.
+func (*ReferenceWorkloadClaim) Descriptor() ([]byte, []int) {
+	return file_circulus_v1alpha_session_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *ReferenceWorkloadClaim) GetDispatch() *DispatchPermit {
+	if x != nil {
+		return x.Dispatch
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadClaim) GetWorkspaceId() *OpaqueId {
+	if x != nil {
+		return x.WorkspaceId
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadClaim) GetStartProof() []byte {
+	if x != nil {
+		return x.StartProof
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadClaim) GetCommandDigest() *Digest {
+	if x != nil {
+		return x.CommandDigest
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadClaim) GetClaimedEventSequence() uint64 {
+	if x != nil {
+		return x.ClaimedEventSequence
+	}
+	return 0
+}
+
+func (x *ReferenceWorkloadClaim) GetDispatchEventSequence() uint64 {
+	if x != nil {
+		return x.DispatchEventSequence
+	}
+	return 0
+}
+
+func (x *ReferenceWorkloadClaim) GetProviderRequestId() *OpaqueId {
+	if x != nil {
+		return x.ProviderRequestId
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadClaim) GetProviderRouteDigest() *Digest {
+	if x != nil {
+		return x.ProviderRouteDigest
+	}
+	return nil
+}
+
+type StartClaimedWorkloadRequest struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Meta          *RpcRequestMeta         `protobuf:"bytes,1,opt,name=meta,proto3" json:"meta,omitempty"`
+	Claim         *ReferenceWorkloadClaim `protobuf:"bytes,2,opt,name=claim,proto3" json:"claim,omitempty"`
+	Command       []byte                  `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartClaimedWorkloadRequest) Reset() {
+	*x = StartClaimedWorkloadRequest{}
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartClaimedWorkloadRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartClaimedWorkloadRequest) ProtoMessage() {}
+
+func (x *StartClaimedWorkloadRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartClaimedWorkloadRequest.ProtoReflect.Descriptor instead.
+func (*StartClaimedWorkloadRequest) Descriptor() ([]byte, []int) {
+	return file_circulus_v1alpha_session_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *StartClaimedWorkloadRequest) GetMeta() *RpcRequestMeta {
+	if x != nil {
+		return x.Meta
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadRequest) GetClaim() *ReferenceWorkloadClaim {
+	if x != nil {
+		return x.Claim
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadRequest) GetCommand() []byte {
+	if x != nil {
+		return x.Command
+	}
+	return nil
+}
+
+type ReferenceWorkloadResult struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	ExternalCommitId *OpaqueId              `protobuf:"bytes,1,opt,name=external_commit_id,json=externalCommitId,proto3" json:"external_commit_id,omitempty"`
+	ResultRef        *OpaqueId              `protobuf:"bytes,2,opt,name=result_ref,json=resultRef,proto3" json:"result_ref,omitempty"`
+	Result           []byte                 `protobuf:"bytes,3,opt,name=result,proto3" json:"result,omitempty"`
+	ResultDigest     *Digest                `protobuf:"bytes,4,opt,name=result_digest,json=resultDigest,proto3" json:"result_digest,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ReferenceWorkloadResult) Reset() {
+	*x = ReferenceWorkloadResult{}
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReferenceWorkloadResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReferenceWorkloadResult) ProtoMessage() {}
+
+func (x *ReferenceWorkloadResult) ProtoReflect() protoreflect.Message {
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReferenceWorkloadResult.ProtoReflect.Descriptor instead.
+func (*ReferenceWorkloadResult) Descriptor() ([]byte, []int) {
+	return file_circulus_v1alpha_session_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *ReferenceWorkloadResult) GetExternalCommitId() *OpaqueId {
+	if x != nil {
+		return x.ExternalCommitId
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadResult) GetResultRef() *OpaqueId {
+	if x != nil {
+		return x.ResultRef
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadResult) GetResult() []byte {
+	if x != nil {
+		return x.Result
+	}
+	return nil
+}
+
+func (x *ReferenceWorkloadResult) GetResultDigest() *Digest {
+	if x != nil {
+		return x.ResultDigest
+	}
+	return nil
+}
+
+type StartClaimedWorkloadResponse struct {
+	state         protoimpl.MessageState   `protogen:"open.v1"`
+	Meta          *RpcResponseMeta         `protobuf:"bytes,1,opt,name=meta,proto3" json:"meta,omitempty"`
+	Claim         *ReferenceWorkloadClaim  `protobuf:"bytes,2,opt,name=claim,proto3" json:"claim,omitempty"`
+	Result        *ReferenceWorkloadResult `protobuf:"bytes,3,opt,name=result,proto3" json:"result,omitempty"`
+	RequestDigest *Digest                  `protobuf:"bytes,4,opt,name=request_digest,json=requestDigest,proto3" json:"request_digest,omitempty"`
+	ReferenceOnly bool                     `protobuf:"varint,5,opt,name=reference_only,json=referenceOnly,proto3" json:"reference_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartClaimedWorkloadResponse) Reset() {
+	*x = StartClaimedWorkloadResponse{}
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartClaimedWorkloadResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartClaimedWorkloadResponse) ProtoMessage() {}
+
+func (x *StartClaimedWorkloadResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_circulus_v1alpha_session_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartClaimedWorkloadResponse.ProtoReflect.Descriptor instead.
+func (*StartClaimedWorkloadResponse) Descriptor() ([]byte, []int) {
+	return file_circulus_v1alpha_session_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *StartClaimedWorkloadResponse) GetMeta() *RpcResponseMeta {
+	if x != nil {
+		return x.Meta
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadResponse) GetClaim() *ReferenceWorkloadClaim {
+	if x != nil {
+		return x.Claim
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadResponse) GetResult() *ReferenceWorkloadResult {
+	if x != nil {
+		return x.Result
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadResponse) GetRequestDigest() *Digest {
+	if x != nil {
+		return x.RequestDigest
+	}
+	return nil
+}
+
+func (x *StartClaimedWorkloadResponse) GetReferenceOnly() bool {
+	if x != nil {
+		return x.ReferenceOnly
+	}
+	return false
+}
+
 var File_circulus_v1alpha_session_proto protoreflect.FileDescriptor
 
 const file_circulus_v1alpha_session_proto_rawDesc = "" +
@@ -4258,7 +4566,33 @@ const file_circulus_v1alpha_session_proto_rawDesc = "" +
 	"\x11AbortTurnResponse\x129\n" +
 	"\x04meta\x18\x01 \x01(\v2%.circulus.api.v1alpha.RpcResponseMetaR\x04meta\x123\n" +
 	"\x04turn\x18\x02 \x01(\v2\x1f.circulus.api.v1alpha.TurnStateR\x04turn\x128\n" +
-	"\x18committed_event_sequence\x18\x03 \x01(\x04R\x16committedEventSequenceJ\x04\b\x04\x10\x10*\xfa\x01\n" +
+	"\x18committed_event_sequence\x18\x03 \x01(\x04R\x16committedEventSequenceJ\x04\b\x04\x10\x10\"\x99\x04\n" +
+	"\x16ReferenceWorkloadClaim\x12@\n" +
+	"\bdispatch\x18\x01 \x01(\v2$.circulus.api.v1alpha.DispatchPermitR\bdispatch\x12A\n" +
+	"\fworkspace_id\x18\x02 \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\vworkspaceId\x12\x1f\n" +
+	"\vstart_proof\x18\x03 \x01(\fR\n" +
+	"startProof\x12C\n" +
+	"\x0ecommand_digest\x18\x04 \x01(\v2\x1c.circulus.api.v1alpha.DigestR\rcommandDigest\x124\n" +
+	"\x16claimed_event_sequence\x18\x05 \x01(\x04R\x14claimedEventSequence\x126\n" +
+	"\x17dispatch_event_sequence\x18\x06 \x01(\x04R\x15dispatchEventSequence\x12N\n" +
+	"\x13provider_request_id\x18\a \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\x11providerRequestId\x12P\n" +
+	"\x15provider_route_digest\x18\b \x01(\v2\x1c.circulus.api.v1alpha.DigestR\x13providerRouteDigestJ\x04\b\t\x10\x10\"\xbb\x01\n" +
+	"\x1bStartClaimedWorkloadRequest\x128\n" +
+	"\x04meta\x18\x01 \x01(\v2$.circulus.api.v1alpha.RpcRequestMetaR\x04meta\x12B\n" +
+	"\x05claim\x18\x02 \x01(\v2,.circulus.api.v1alpha.ReferenceWorkloadClaimR\x05claim\x12\x18\n" +
+	"\acommand\x18\x03 \x01(\fR\acommandJ\x04\b\x04\x10\x10\"\x87\x02\n" +
+	"\x17ReferenceWorkloadResult\x12L\n" +
+	"\x12external_commit_id\x18\x01 \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\x10externalCommitId\x12=\n" +
+	"\n" +
+	"result_ref\x18\x02 \x01(\v2\x1e.circulus.api.v1alpha.OpaqueIdR\tresultRef\x12\x16\n" +
+	"\x06result\x18\x03 \x01(\fR\x06result\x12A\n" +
+	"\rresult_digest\x18\x04 \x01(\v2\x1c.circulus.api.v1alpha.DigestR\fresultDigestJ\x04\b\x05\x10\x10\"\xd6\x02\n" +
+	"\x1cStartClaimedWorkloadResponse\x129\n" +
+	"\x04meta\x18\x01 \x01(\v2%.circulus.api.v1alpha.RpcResponseMetaR\x04meta\x12B\n" +
+	"\x05claim\x18\x02 \x01(\v2,.circulus.api.v1alpha.ReferenceWorkloadClaimR\x05claim\x12E\n" +
+	"\x06result\x18\x03 \x01(\v2-.circulus.api.v1alpha.ReferenceWorkloadResultR\x06result\x12C\n" +
+	"\x0erequest_digest\x18\x04 \x01(\v2\x1c.circulus.api.v1alpha.DigestR\rrequestDigest\x12%\n" +
+	"\x0ereference_only\x18\x05 \x01(\bR\rreferenceOnlyJ\x04\b\x06\x10\x10*\xfa\x01\n" +
 	"\rSessionStatus\x12\x1e\n" +
 	"\x1aSESSION_STATUS_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16SESSION_STATUS_CREATED\x10\x01\x12\x1b\n" +
@@ -4325,7 +4659,9 @@ const file_circulus_v1alpha_session_proto_rawDesc = "" +
 	"\fSettleEffect\x12).circulus.api.v1alpha.SettleEffectRequest\x1a*.circulus.api.v1alpha.SettleEffectResponse\x12b\n" +
 	"\vBlockEffect\x12(.circulus.api.v1alpha.BlockEffectRequest\x1a).circulus.api.v1alpha.BlockEffectResponse\x12w\n" +
 	"\x12RenewTurnAuthority\x12/.circulus.api.v1alpha.RenewTurnAuthorityRequest\x1a0.circulus.api.v1alpha.RenewTurnAuthorityResponse\x12\\\n" +
-	"\tAbortTurn\x12&.circulus.api.v1alpha.AbortTurnRequest\x1a'.circulus.api.v1alpha.AbortTurnResponseBNZLgithub.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alphab\x06proto3"
+	"\tAbortTurn\x12&.circulus.api.v1alpha.AbortTurnRequest\x1a'.circulus.api.v1alpha.AbortTurnResponse2\x99\x01\n" +
+	"\x18ReferenceWorkloadService\x12}\n" +
+	"\x14StartClaimedWorkload\x121.circulus.api.v1alpha.StartClaimedWorkloadRequest\x1a2.circulus.api.v1alpha.StartClaimedWorkloadResponseBNZLgithub.com/hancomac/circulusd/api/generated/circulus/v1alpha;circulusv1alphab\x06proto3"
 
 var (
 	file_circulus_v1alpha_session_proto_rawDescOnce sync.Once
@@ -4340,7 +4676,7 @@ func file_circulus_v1alpha_session_proto_rawDescGZIP() []byte {
 }
 
 var file_circulus_v1alpha_session_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_circulus_v1alpha_session_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
+var file_circulus_v1alpha_session_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_circulus_v1alpha_session_proto_goTypes = []any{
 	(SessionStatus)(0),                            // 0: circulus.api.v1alpha.SessionStatus
 	(TurnStatus)(0),                               // 1: circulus.api.v1alpha.TurnStatus
@@ -4386,213 +4722,233 @@ var file_circulus_v1alpha_session_proto_goTypes = []any{
 	(*RenewTurnAuthorityResponse)(nil),            // 41: circulus.api.v1alpha.RenewTurnAuthorityResponse
 	(*AbortTurnRequest)(nil),                      // 42: circulus.api.v1alpha.AbortTurnRequest
 	(*AbortTurnResponse)(nil),                     // 43: circulus.api.v1alpha.AbortTurnResponse
-	(*OpaqueId)(nil),                              // 44: circulus.api.v1alpha.OpaqueId
-	(*Digest)(nil),                                // 45: circulus.api.v1alpha.Digest
-	(ExecutionBackend)(0),                         // 46: circulus.api.v1alpha.ExecutionBackend
-	(*RpcRequestMeta)(nil),                        // 47: circulus.api.v1alpha.RpcRequestMeta
-	(*AuthorityHandle)(nil),                       // 48: circulus.api.v1alpha.AuthorityHandle
-	(*RpcResponseMeta)(nil),                       // 49: circulus.api.v1alpha.RpcResponseMeta
-	(*Empty)(nil),                                 // 50: circulus.api.v1alpha.Empty
-	(*PublicError)(nil),                           // 51: circulus.api.v1alpha.PublicError
+	(*ReferenceWorkloadClaim)(nil),                // 44: circulus.api.v1alpha.ReferenceWorkloadClaim
+	(*StartClaimedWorkloadRequest)(nil),           // 45: circulus.api.v1alpha.StartClaimedWorkloadRequest
+	(*ReferenceWorkloadResult)(nil),               // 46: circulus.api.v1alpha.ReferenceWorkloadResult
+	(*StartClaimedWorkloadResponse)(nil),          // 47: circulus.api.v1alpha.StartClaimedWorkloadResponse
+	(*OpaqueId)(nil),                              // 48: circulus.api.v1alpha.OpaqueId
+	(*Digest)(nil),                                // 49: circulus.api.v1alpha.Digest
+	(ExecutionBackend)(0),                         // 50: circulus.api.v1alpha.ExecutionBackend
+	(*RpcRequestMeta)(nil),                        // 51: circulus.api.v1alpha.RpcRequestMeta
+	(*AuthorityHandle)(nil),                       // 52: circulus.api.v1alpha.AuthorityHandle
+	(*RpcResponseMeta)(nil),                       // 53: circulus.api.v1alpha.RpcResponseMeta
+	(*Empty)(nil),                                 // 54: circulus.api.v1alpha.Empty
+	(*PublicError)(nil),                           // 55: circulus.api.v1alpha.PublicError
 }
 var file_circulus_v1alpha_session_proto_depIdxs = []int32{
-	44,  // 0: circulus.api.v1alpha.RuntimePointer.active_revision:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 1: circulus.api.v1alpha.RuntimePointer.active_revision_digest:type_name -> circulus.api.v1alpha.Digest
-	44,  // 2: circulus.api.v1alpha.RuntimePointer.candidate_revision:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 3: circulus.api.v1alpha.RuntimePointer.previous_revision:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 4: circulus.api.v1alpha.TurnLease.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 5: circulus.api.v1alpha.TurnLease.owner_agentd:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 6: circulus.api.v1alpha.TurnLease.owner_shard:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 0: circulus.api.v1alpha.RuntimePointer.active_revision:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 1: circulus.api.v1alpha.RuntimePointer.active_revision_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 2: circulus.api.v1alpha.RuntimePointer.candidate_revision:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 3: circulus.api.v1alpha.RuntimePointer.previous_revision:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 4: circulus.api.v1alpha.TurnLease.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 5: circulus.api.v1alpha.TurnLease.owner_agentd:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 6: circulus.api.v1alpha.TurnLease.owner_shard:type_name -> circulus.api.v1alpha.OpaqueId
 	3,   // 7: circulus.api.v1alpha.AgentCheckpoint.kind:type_name -> circulus.api.v1alpha.CheckpointKind
 	2,   // 8: circulus.api.v1alpha.AgentCheckpoint.engine_kind:type_name -> circulus.api.v1alpha.EngineKind
-	45,  // 9: circulus.api.v1alpha.AgentCheckpoint.runtime_revision_digest:type_name -> circulus.api.v1alpha.Digest
-	44,  // 10: circulus.api.v1alpha.AgentCheckpoint.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 11: circulus.api.v1alpha.AgentCheckpoint.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 12: circulus.api.v1alpha.AgentCheckpoint.predecessor_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 9: circulus.api.v1alpha.AgentCheckpoint.runtime_revision_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 10: circulus.api.v1alpha.AgentCheckpoint.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 11: circulus.api.v1alpha.AgentCheckpoint.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 12: circulus.api.v1alpha.AgentCheckpoint.predecessor_digest:type_name -> circulus.api.v1alpha.Digest
 	4,   // 13: circulus.api.v1alpha.AgentCheckpoint.payload_encoding:type_name -> circulus.api.v1alpha.CheckpointPayloadEncoding
-	45,  // 14: circulus.api.v1alpha.AgentCheckpoint.payload_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 14: circulus.api.v1alpha.AgentCheckpoint.payload_digest:type_name -> circulus.api.v1alpha.Digest
 	5,   // 15: circulus.api.v1alpha.EffectIntent.service:type_name -> circulus.api.v1alpha.EffectService
 	7,   // 16: circulus.api.v1alpha.EffectIntent.replay_policy:type_name -> circulus.api.v1alpha.ReplayPolicy
-	45,  // 17: circulus.api.v1alpha.EffectIntent.request_digest:type_name -> circulus.api.v1alpha.Digest
-	44,  // 18: circulus.api.v1alpha.EffectIntent.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 19: circulus.api.v1alpha.EffectRecord.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 20: circulus.api.v1alpha.EffectRecord.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 21: circulus.api.v1alpha.EffectRecord.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 22: circulus.api.v1alpha.EffectRecord.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 23: circulus.api.v1alpha.EffectRecord.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 24: circulus.api.v1alpha.EffectRecord.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 25: circulus.api.v1alpha.EffectRecord.request_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 17: circulus.api.v1alpha.EffectIntent.request_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 18: circulus.api.v1alpha.EffectIntent.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 19: circulus.api.v1alpha.EffectRecord.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 20: circulus.api.v1alpha.EffectRecord.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 21: circulus.api.v1alpha.EffectRecord.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 22: circulus.api.v1alpha.EffectRecord.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 23: circulus.api.v1alpha.EffectRecord.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 24: circulus.api.v1alpha.EffectRecord.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 25: circulus.api.v1alpha.EffectRecord.request_digest:type_name -> circulus.api.v1alpha.Digest
 	5,   // 26: circulus.api.v1alpha.EffectRecord.service:type_name -> circulus.api.v1alpha.EffectService
 	7,   // 27: circulus.api.v1alpha.EffectRecord.replay_policy:type_name -> circulus.api.v1alpha.ReplayPolicy
-	44,  // 28: circulus.api.v1alpha.EffectRecord.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 28: circulus.api.v1alpha.EffectRecord.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
 	6,   // 29: circulus.api.v1alpha.EffectRecord.state:type_name -> circulus.api.v1alpha.EffectState
-	44,  // 30: circulus.api.v1alpha.EffectRecord.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 31: circulus.api.v1alpha.EffectRecord.external_commit_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 32: circulus.api.v1alpha.EffectRecord.provider_request_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 33: circulus.api.v1alpha.TurnState.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 30: circulus.api.v1alpha.EffectRecord.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 31: circulus.api.v1alpha.EffectRecord.external_commit_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 32: circulus.api.v1alpha.EffectRecord.provider_request_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 33: circulus.api.v1alpha.TurnState.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
 	1,   // 34: circulus.api.v1alpha.TurnState.status:type_name -> circulus.api.v1alpha.TurnStatus
 	9,   // 35: circulus.api.v1alpha.TurnState.lease:type_name -> circulus.api.v1alpha.TurnLease
-	44,  // 36: circulus.api.v1alpha.TurnState.active_effect_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 36: circulus.api.v1alpha.TurnState.active_effect_id:type_name -> circulus.api.v1alpha.OpaqueId
 	10,  // 37: circulus.api.v1alpha.TurnState.checkpoint:type_name -> circulus.api.v1alpha.AgentCheckpoint
-	44,  // 38: circulus.api.v1alpha.SessionState.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 39: circulus.api.v1alpha.SessionState.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 40: circulus.api.v1alpha.SessionState.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 41: circulus.api.v1alpha.SessionState.workspace_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 38: circulus.api.v1alpha.SessionState.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 39: circulus.api.v1alpha.SessionState.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 40: circulus.api.v1alpha.SessionState.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 41: circulus.api.v1alpha.SessionState.workspace_id:type_name -> circulus.api.v1alpha.OpaqueId
 	8,   // 42: circulus.api.v1alpha.SessionState.runtime:type_name -> circulus.api.v1alpha.RuntimePointer
-	46,  // 43: circulus.api.v1alpha.SessionState.execution_backend:type_name -> circulus.api.v1alpha.ExecutionBackend
-	44,  // 44: circulus.api.v1alpha.SessionState.execution_environment_revision:type_name -> circulus.api.v1alpha.OpaqueId
+	50,  // 43: circulus.api.v1alpha.SessionState.execution_backend:type_name -> circulus.api.v1alpha.ExecutionBackend
+	48,  // 44: circulus.api.v1alpha.SessionState.execution_environment_revision:type_name -> circulus.api.v1alpha.OpaqueId
 	0,   // 45: circulus.api.v1alpha.SessionState.status:type_name -> circulus.api.v1alpha.SessionStatus
 	13,  // 46: circulus.api.v1alpha.SessionState.active_turn:type_name -> circulus.api.v1alpha.TurnState
-	44,  // 47: circulus.api.v1alpha.SessionState.latest_settled_turn:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 48: circulus.api.v1alpha.SessionState.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
-	45,  // 49: circulus.api.v1alpha.SessionState.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
-	47,  // 50: circulus.api.v1alpha.GetSessionStateRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 51: circulus.api.v1alpha.GetSessionStateRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 52: circulus.api.v1alpha.GetSessionStateRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	49,  // 53: circulus.api.v1alpha.GetSessionStateResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	48,  // 47: circulus.api.v1alpha.SessionState.latest_settled_turn:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 48: circulus.api.v1alpha.SessionState.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 49: circulus.api.v1alpha.SessionState.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
+	51,  // 50: circulus.api.v1alpha.GetSessionStateRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 51: circulus.api.v1alpha.GetSessionStateRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 52: circulus.api.v1alpha.GetSessionStateRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	53,  // 53: circulus.api.v1alpha.GetSessionStateResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	14,  // 54: circulus.api.v1alpha.GetSessionStateResponse.state:type_name -> circulus.api.v1alpha.SessionState
-	47,  // 55: circulus.api.v1alpha.AcceptTurnRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 56: circulus.api.v1alpha.AcceptTurnRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 57: circulus.api.v1alpha.AcceptTurnRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 58: circulus.api.v1alpha.AcceptTurnRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 59: circulus.api.v1alpha.AcceptTurnRequest.input_digest:type_name -> circulus.api.v1alpha.Digest
-	49,  // 60: circulus.api.v1alpha.AcceptTurnResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	51,  // 55: circulus.api.v1alpha.AcceptTurnRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 56: circulus.api.v1alpha.AcceptTurnRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 57: circulus.api.v1alpha.AcceptTurnRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 58: circulus.api.v1alpha.AcceptTurnRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 59: circulus.api.v1alpha.AcceptTurnRequest.input_digest:type_name -> circulus.api.v1alpha.Digest
+	53,  // 60: circulus.api.v1alpha.AcceptTurnResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	13,  // 61: circulus.api.v1alpha.AcceptTurnResponse.turn:type_name -> circulus.api.v1alpha.TurnState
-	48,  // 62: circulus.api.v1alpha.AcceptTurnResponse.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	52,  // 62: circulus.api.v1alpha.AcceptTurnResponse.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
 	10,  // 63: circulus.api.v1alpha.AcceptTurnResponse.genesis_checkpoint:type_name -> circulus.api.v1alpha.AgentCheckpoint
-	44,  // 64: circulus.api.v1alpha.EngineStepPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 65: circulus.api.v1alpha.EngineStepPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 66: circulus.api.v1alpha.EngineStepPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 67: circulus.api.v1alpha.EngineStepPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 68: circulus.api.v1alpha.EngineStepPermit.checkpoint_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 64: circulus.api.v1alpha.EngineStepPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 65: circulus.api.v1alpha.EngineStepPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 66: circulus.api.v1alpha.EngineStepPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 67: circulus.api.v1alpha.EngineStepPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 68: circulus.api.v1alpha.EngineStepPermit.checkpoint_digest:type_name -> circulus.api.v1alpha.Digest
 	19,  // 69: circulus.api.v1alpha.EngineStepPermit.budget:type_name -> circulus.api.v1alpha.EngineStepBudget
-	45,  // 70: circulus.api.v1alpha.EngineStepPermit.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
-	45,  // 71: circulus.api.v1alpha.EngineStepPermit.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
-	47,  // 72: circulus.api.v1alpha.AcquireEngineStepRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 73: circulus.api.v1alpha.AcquireEngineStepRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 74: circulus.api.v1alpha.AcquireEngineStepRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 75: circulus.api.v1alpha.AcquireEngineStepRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 70: circulus.api.v1alpha.EngineStepPermit.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 71: circulus.api.v1alpha.EngineStepPermit.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
+	51,  // 72: circulus.api.v1alpha.AcquireEngineStepRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 73: circulus.api.v1alpha.AcquireEngineStepRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 74: circulus.api.v1alpha.AcquireEngineStepRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 75: circulus.api.v1alpha.AcquireEngineStepRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
 	19,  // 76: circulus.api.v1alpha.AcquireEngineStepRequest.requested_budget:type_name -> circulus.api.v1alpha.EngineStepBudget
-	49,  // 77: circulus.api.v1alpha.AcquireEngineStepResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	53,  // 77: circulus.api.v1alpha.AcquireEngineStepResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	20,  // 78: circulus.api.v1alpha.AcquireEngineStepResponse.permit:type_name -> circulus.api.v1alpha.EngineStepPermit
 	10,  // 79: circulus.api.v1alpha.AcquireEngineStepResponse.checkpoint:type_name -> circulus.api.v1alpha.AgentCheckpoint
 	12,  // 80: circulus.api.v1alpha.AcquireEngineStepResponse.unconsumed_settlement:type_name -> circulus.api.v1alpha.EffectRecord
-	45,  // 81: circulus.api.v1alpha.TurnResult.value_digest:type_name -> circulus.api.v1alpha.Digest
-	45,  // 82: circulus.api.v1alpha.AgentError.details_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 81: circulus.api.v1alpha.TurnResult.value_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 82: circulus.api.v1alpha.AgentError.details_digest:type_name -> circulus.api.v1alpha.Digest
 	10,  // 83: circulus.api.v1alpha.EngineStepBoundary.checkpoint:type_name -> circulus.api.v1alpha.AgentCheckpoint
-	50,  // 84: circulus.api.v1alpha.EngineStepBoundary.checkpoint_only:type_name -> circulus.api.v1alpha.Empty
+	54,  // 84: circulus.api.v1alpha.EngineStepBoundary.checkpoint_only:type_name -> circulus.api.v1alpha.Empty
 	11,  // 85: circulus.api.v1alpha.EngineStepBoundary.effect_request:type_name -> circulus.api.v1alpha.EffectIntent
 	23,  // 86: circulus.api.v1alpha.EngineStepBoundary.turn_complete:type_name -> circulus.api.v1alpha.TurnResult
 	24,  // 87: circulus.api.v1alpha.EngineStepBoundary.turn_error:type_name -> circulus.api.v1alpha.AgentError
-	47,  // 88: circulus.api.v1alpha.CommitEngineEventRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	51,  // 88: circulus.api.v1alpha.CommitEngineEventRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
 	20,  // 89: circulus.api.v1alpha.CommitEngineEventRequest.permit:type_name -> circulus.api.v1alpha.EngineStepPermit
 	25,  // 90: circulus.api.v1alpha.CommitEngineEventRequest.boundary:type_name -> circulus.api.v1alpha.EngineStepBoundary
-	49,  // 91: circulus.api.v1alpha.CommitEngineEventResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	53,  // 91: circulus.api.v1alpha.CommitEngineEventResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	13,  // 92: circulus.api.v1alpha.CommitEngineEventResponse.turn:type_name -> circulus.api.v1alpha.TurnState
 	12,  // 93: circulus.api.v1alpha.CommitEngineEventResponse.prepared_effect:type_name -> circulus.api.v1alpha.EffectRecord
 	28,  // 94: circulus.api.v1alpha.CommitEngineEventResponse.preparation_permit:type_name -> circulus.api.v1alpha.EffectPreparationPermit
-	44,  // 95: circulus.api.v1alpha.EffectPreparationPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 96: circulus.api.v1alpha.EffectPreparationPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 97: circulus.api.v1alpha.EffectPreparationPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 98: circulus.api.v1alpha.EffectPreparationPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 99: circulus.api.v1alpha.EffectPreparationPermit.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 100: circulus.api.v1alpha.EffectPreparationPermit.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 101: circulus.api.v1alpha.EffectPreparationPermit.request_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 95: circulus.api.v1alpha.EffectPreparationPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 96: circulus.api.v1alpha.EffectPreparationPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 97: circulus.api.v1alpha.EffectPreparationPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 98: circulus.api.v1alpha.EffectPreparationPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 99: circulus.api.v1alpha.EffectPreparationPermit.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 100: circulus.api.v1alpha.EffectPreparationPermit.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 101: circulus.api.v1alpha.EffectPreparationPermit.request_digest:type_name -> circulus.api.v1alpha.Digest
 	5,   // 102: circulus.api.v1alpha.EffectPreparationPermit.service:type_name -> circulus.api.v1alpha.EffectService
 	7,   // 103: circulus.api.v1alpha.EffectPreparationPermit.replay_policy:type_name -> circulus.api.v1alpha.ReplayPolicy
-	44,  // 104: circulus.api.v1alpha.EffectPreparationPermit.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 105: circulus.api.v1alpha.DispatchPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 106: circulus.api.v1alpha.DispatchPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 107: circulus.api.v1alpha.DispatchPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 108: circulus.api.v1alpha.DispatchPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 109: circulus.api.v1alpha.DispatchPermit.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 110: circulus.api.v1alpha.DispatchPermit.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 111: circulus.api.v1alpha.DispatchPermit.request_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 104: circulus.api.v1alpha.EffectPreparationPermit.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 105: circulus.api.v1alpha.DispatchPermit.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 106: circulus.api.v1alpha.DispatchPermit.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 107: circulus.api.v1alpha.DispatchPermit.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 108: circulus.api.v1alpha.DispatchPermit.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 109: circulus.api.v1alpha.DispatchPermit.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 110: circulus.api.v1alpha.DispatchPermit.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 111: circulus.api.v1alpha.DispatchPermit.request_digest:type_name -> circulus.api.v1alpha.Digest
 	5,   // 112: circulus.api.v1alpha.DispatchPermit.service:type_name -> circulus.api.v1alpha.EffectService
 	7,   // 113: circulus.api.v1alpha.DispatchPermit.replay_policy:type_name -> circulus.api.v1alpha.ReplayPolicy
-	44,  // 114: circulus.api.v1alpha.DispatchPermit.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	47,  // 115: circulus.api.v1alpha.MarkEffectDispatchedRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	48,  // 114: circulus.api.v1alpha.DispatchPermit.parent_operation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	51,  // 115: circulus.api.v1alpha.MarkEffectDispatchedRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
 	28,  // 116: circulus.api.v1alpha.MarkEffectDispatchedRequest.preparation_permit:type_name -> circulus.api.v1alpha.EffectPreparationPermit
-	44,  // 117: circulus.api.v1alpha.MarkEffectDispatchedRequest.provider_request_id:type_name -> circulus.api.v1alpha.OpaqueId
-	49,  // 118: circulus.api.v1alpha.MarkEffectDispatchedResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	48,  // 117: circulus.api.v1alpha.MarkEffectDispatchedRequest.provider_request_id:type_name -> circulus.api.v1alpha.OpaqueId
+	53,  // 118: circulus.api.v1alpha.MarkEffectDispatchedResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	12,  // 119: circulus.api.v1alpha.MarkEffectDispatchedResponse.effect:type_name -> circulus.api.v1alpha.EffectRecord
 	29,  // 120: circulus.api.v1alpha.MarkEffectDispatchedResponse.dispatch_permit:type_name -> circulus.api.v1alpha.DispatchPermit
-	47,  // 121: circulus.api.v1alpha.PrepareEffectRetryRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 122: circulus.api.v1alpha.PrepareEffectRetryRequest.recovery_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 123: circulus.api.v1alpha.PrepareEffectRetryRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 124: circulus.api.v1alpha.PrepareEffectRetryRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 125: circulus.api.v1alpha.PrepareEffectRetryRequest.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 126: circulus.api.v1alpha.PrepareEffectRetryRequest.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 127: circulus.api.v1alpha.PrepareEffectRetryRequest.request_digest:type_name -> circulus.api.v1alpha.Digest
-	49,  // 128: circulus.api.v1alpha.PrepareEffectRetryResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	51,  // 121: circulus.api.v1alpha.PrepareEffectRetryRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 122: circulus.api.v1alpha.PrepareEffectRetryRequest.recovery_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 123: circulus.api.v1alpha.PrepareEffectRetryRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 124: circulus.api.v1alpha.PrepareEffectRetryRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 125: circulus.api.v1alpha.PrepareEffectRetryRequest.effect_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 126: circulus.api.v1alpha.PrepareEffectRetryRequest.invocation_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 127: circulus.api.v1alpha.PrepareEffectRetryRequest.request_digest:type_name -> circulus.api.v1alpha.Digest
+	53,  // 128: circulus.api.v1alpha.PrepareEffectRetryResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	12,  // 129: circulus.api.v1alpha.PrepareEffectRetryResponse.effect:type_name -> circulus.api.v1alpha.EffectRecord
 	28,  // 130: circulus.api.v1alpha.PrepareEffectRetryResponse.preparation_permit:type_name -> circulus.api.v1alpha.EffectPreparationPermit
-	47,  // 131: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 132: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	51,  // 131: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 132: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
 	29,  // 133: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.dispatch_permit:type_name -> circulus.api.v1alpha.DispatchPermit
-	44,  // 134: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.external_commit_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 135: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
-	49,  // 136: circulus.api.v1alpha.MarkEffectExternallyCommittedResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	48,  // 134: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.external_commit_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 135: circulus.api.v1alpha.MarkEffectExternallyCommittedRequest.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
+	53,  // 136: circulus.api.v1alpha.MarkEffectExternallyCommittedResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	12,  // 137: circulus.api.v1alpha.MarkEffectExternallyCommittedResponse.effect:type_name -> circulus.api.v1alpha.EffectRecord
-	47,  // 138: circulus.api.v1alpha.SettleEffectRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 139: circulus.api.v1alpha.SettleEffectRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	51,  // 138: circulus.api.v1alpha.SettleEffectRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 139: circulus.api.v1alpha.SettleEffectRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
 	28,  // 140: circulus.api.v1alpha.SettleEffectRequest.preparation_permit:type_name -> circulus.api.v1alpha.EffectPreparationPermit
 	29,  // 141: circulus.api.v1alpha.SettleEffectRequest.dispatch_permit:type_name -> circulus.api.v1alpha.DispatchPermit
-	44,  // 142: circulus.api.v1alpha.SettleEffectRequest.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
-	51,  // 143: circulus.api.v1alpha.SettleEffectRequest.error:type_name -> circulus.api.v1alpha.PublicError
-	49,  // 144: circulus.api.v1alpha.SettleEffectResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	48,  // 142: circulus.api.v1alpha.SettleEffectRequest.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
+	55,  // 143: circulus.api.v1alpha.SettleEffectRequest.error:type_name -> circulus.api.v1alpha.PublicError
+	53,  // 144: circulus.api.v1alpha.SettleEffectResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	12,  // 145: circulus.api.v1alpha.SettleEffectResponse.effect:type_name -> circulus.api.v1alpha.EffectRecord
 	13,  // 146: circulus.api.v1alpha.SettleEffectResponse.turn:type_name -> circulus.api.v1alpha.TurnState
-	47,  // 147: circulus.api.v1alpha.BlockEffectRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 148: circulus.api.v1alpha.BlockEffectRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	51,  // 147: circulus.api.v1alpha.BlockEffectRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 148: circulus.api.v1alpha.BlockEffectRequest.turn_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
 	29,  // 149: circulus.api.v1alpha.BlockEffectRequest.dispatch_permit:type_name -> circulus.api.v1alpha.DispatchPermit
-	51,  // 150: circulus.api.v1alpha.BlockEffectRequest.reason:type_name -> circulus.api.v1alpha.PublicError
-	49,  // 151: circulus.api.v1alpha.BlockEffectResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	55,  // 150: circulus.api.v1alpha.BlockEffectRequest.reason:type_name -> circulus.api.v1alpha.PublicError
+	53,  // 151: circulus.api.v1alpha.BlockEffectResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	12,  // 152: circulus.api.v1alpha.BlockEffectResponse.effect:type_name -> circulus.api.v1alpha.EffectRecord
 	13,  // 153: circulus.api.v1alpha.BlockEffectResponse.turn:type_name -> circulus.api.v1alpha.TurnState
-	47,  // 154: circulus.api.v1alpha.RenewTurnAuthorityRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 155: circulus.api.v1alpha.RenewTurnAuthorityRequest.current_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 156: circulus.api.v1alpha.RenewTurnAuthorityRequest.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 157: circulus.api.v1alpha.RenewTurnAuthorityRequest.user_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 158: circulus.api.v1alpha.RenewTurnAuthorityRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 159: circulus.api.v1alpha.RenewTurnAuthorityRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	45,  // 160: circulus.api.v1alpha.RenewTurnAuthorityRequest.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
-	45,  // 161: circulus.api.v1alpha.RenewTurnAuthorityRequest.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
-	49,  // 162: circulus.api.v1alpha.RenewTurnAuthorityResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
-	48,  // 163: circulus.api.v1alpha.RenewTurnAuthorityResponse.renewed_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	47,  // 164: circulus.api.v1alpha.AbortTurnRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
-	48,  // 165: circulus.api.v1alpha.AbortTurnRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
-	44,  // 166: circulus.api.v1alpha.AbortTurnRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
-	44,  // 167: circulus.api.v1alpha.AbortTurnRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
-	49,  // 168: circulus.api.v1alpha.AbortTurnResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	51,  // 154: circulus.api.v1alpha.RenewTurnAuthorityRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 155: circulus.api.v1alpha.RenewTurnAuthorityRequest.current_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 156: circulus.api.v1alpha.RenewTurnAuthorityRequest.tenant_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 157: circulus.api.v1alpha.RenewTurnAuthorityRequest.user_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 158: circulus.api.v1alpha.RenewTurnAuthorityRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 159: circulus.api.v1alpha.RenewTurnAuthorityRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 160: circulus.api.v1alpha.RenewTurnAuthorityRequest.policy_snapshot_digest:type_name -> circulus.api.v1alpha.Digest
+	49,  // 161: circulus.api.v1alpha.RenewTurnAuthorityRequest.emergency_overlay_digest:type_name -> circulus.api.v1alpha.Digest
+	53,  // 162: circulus.api.v1alpha.RenewTurnAuthorityResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	52,  // 163: circulus.api.v1alpha.RenewTurnAuthorityResponse.renewed_authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	51,  // 164: circulus.api.v1alpha.AbortTurnRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	52,  // 165: circulus.api.v1alpha.AbortTurnRequest.authority:type_name -> circulus.api.v1alpha.AuthorityHandle
+	48,  // 166: circulus.api.v1alpha.AbortTurnRequest.session_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 167: circulus.api.v1alpha.AbortTurnRequest.turn_id:type_name -> circulus.api.v1alpha.OpaqueId
+	53,  // 168: circulus.api.v1alpha.AbortTurnResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
 	13,  // 169: circulus.api.v1alpha.AbortTurnResponse.turn:type_name -> circulus.api.v1alpha.TurnState
-	15,  // 170: circulus.api.v1alpha.SessionStateService.GetSessionState:input_type -> circulus.api.v1alpha.GetSessionStateRequest
-	17,  // 171: circulus.api.v1alpha.SessionStateService.AcceptTurn:input_type -> circulus.api.v1alpha.AcceptTurnRequest
-	21,  // 172: circulus.api.v1alpha.SessionStateService.AcquireEngineStep:input_type -> circulus.api.v1alpha.AcquireEngineStepRequest
-	26,  // 173: circulus.api.v1alpha.SessionStateService.CommitEngineEvent:input_type -> circulus.api.v1alpha.CommitEngineEventRequest
-	32,  // 174: circulus.api.v1alpha.SessionStateService.PrepareEffectRetry:input_type -> circulus.api.v1alpha.PrepareEffectRetryRequest
-	30,  // 175: circulus.api.v1alpha.SessionStateService.MarkEffectDispatched:input_type -> circulus.api.v1alpha.MarkEffectDispatchedRequest
-	34,  // 176: circulus.api.v1alpha.SessionStateService.MarkEffectExternallyCommitted:input_type -> circulus.api.v1alpha.MarkEffectExternallyCommittedRequest
-	36,  // 177: circulus.api.v1alpha.SessionStateService.SettleEffect:input_type -> circulus.api.v1alpha.SettleEffectRequest
-	38,  // 178: circulus.api.v1alpha.SessionStateService.BlockEffect:input_type -> circulus.api.v1alpha.BlockEffectRequest
-	40,  // 179: circulus.api.v1alpha.SessionStateService.RenewTurnAuthority:input_type -> circulus.api.v1alpha.RenewTurnAuthorityRequest
-	42,  // 180: circulus.api.v1alpha.SessionStateService.AbortTurn:input_type -> circulus.api.v1alpha.AbortTurnRequest
-	16,  // 181: circulus.api.v1alpha.SessionStateService.GetSessionState:output_type -> circulus.api.v1alpha.GetSessionStateResponse
-	18,  // 182: circulus.api.v1alpha.SessionStateService.AcceptTurn:output_type -> circulus.api.v1alpha.AcceptTurnResponse
-	22,  // 183: circulus.api.v1alpha.SessionStateService.AcquireEngineStep:output_type -> circulus.api.v1alpha.AcquireEngineStepResponse
-	27,  // 184: circulus.api.v1alpha.SessionStateService.CommitEngineEvent:output_type -> circulus.api.v1alpha.CommitEngineEventResponse
-	33,  // 185: circulus.api.v1alpha.SessionStateService.PrepareEffectRetry:output_type -> circulus.api.v1alpha.PrepareEffectRetryResponse
-	31,  // 186: circulus.api.v1alpha.SessionStateService.MarkEffectDispatched:output_type -> circulus.api.v1alpha.MarkEffectDispatchedResponse
-	35,  // 187: circulus.api.v1alpha.SessionStateService.MarkEffectExternallyCommitted:output_type -> circulus.api.v1alpha.MarkEffectExternallyCommittedResponse
-	37,  // 188: circulus.api.v1alpha.SessionStateService.SettleEffect:output_type -> circulus.api.v1alpha.SettleEffectResponse
-	39,  // 189: circulus.api.v1alpha.SessionStateService.BlockEffect:output_type -> circulus.api.v1alpha.BlockEffectResponse
-	41,  // 190: circulus.api.v1alpha.SessionStateService.RenewTurnAuthority:output_type -> circulus.api.v1alpha.RenewTurnAuthorityResponse
-	43,  // 191: circulus.api.v1alpha.SessionStateService.AbortTurn:output_type -> circulus.api.v1alpha.AbortTurnResponse
-	181, // [181:192] is the sub-list for method output_type
-	170, // [170:181] is the sub-list for method input_type
-	170, // [170:170] is the sub-list for extension type_name
-	170, // [170:170] is the sub-list for extension extendee
-	0,   // [0:170] is the sub-list for field type_name
+	29,  // 170: circulus.api.v1alpha.ReferenceWorkloadClaim.dispatch:type_name -> circulus.api.v1alpha.DispatchPermit
+	48,  // 171: circulus.api.v1alpha.ReferenceWorkloadClaim.workspace_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 172: circulus.api.v1alpha.ReferenceWorkloadClaim.command_digest:type_name -> circulus.api.v1alpha.Digest
+	48,  // 173: circulus.api.v1alpha.ReferenceWorkloadClaim.provider_request_id:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 174: circulus.api.v1alpha.ReferenceWorkloadClaim.provider_route_digest:type_name -> circulus.api.v1alpha.Digest
+	51,  // 175: circulus.api.v1alpha.StartClaimedWorkloadRequest.meta:type_name -> circulus.api.v1alpha.RpcRequestMeta
+	44,  // 176: circulus.api.v1alpha.StartClaimedWorkloadRequest.claim:type_name -> circulus.api.v1alpha.ReferenceWorkloadClaim
+	48,  // 177: circulus.api.v1alpha.ReferenceWorkloadResult.external_commit_id:type_name -> circulus.api.v1alpha.OpaqueId
+	48,  // 178: circulus.api.v1alpha.ReferenceWorkloadResult.result_ref:type_name -> circulus.api.v1alpha.OpaqueId
+	49,  // 179: circulus.api.v1alpha.ReferenceWorkloadResult.result_digest:type_name -> circulus.api.v1alpha.Digest
+	53,  // 180: circulus.api.v1alpha.StartClaimedWorkloadResponse.meta:type_name -> circulus.api.v1alpha.RpcResponseMeta
+	44,  // 181: circulus.api.v1alpha.StartClaimedWorkloadResponse.claim:type_name -> circulus.api.v1alpha.ReferenceWorkloadClaim
+	46,  // 182: circulus.api.v1alpha.StartClaimedWorkloadResponse.result:type_name -> circulus.api.v1alpha.ReferenceWorkloadResult
+	49,  // 183: circulus.api.v1alpha.StartClaimedWorkloadResponse.request_digest:type_name -> circulus.api.v1alpha.Digest
+	15,  // 184: circulus.api.v1alpha.SessionStateService.GetSessionState:input_type -> circulus.api.v1alpha.GetSessionStateRequest
+	17,  // 185: circulus.api.v1alpha.SessionStateService.AcceptTurn:input_type -> circulus.api.v1alpha.AcceptTurnRequest
+	21,  // 186: circulus.api.v1alpha.SessionStateService.AcquireEngineStep:input_type -> circulus.api.v1alpha.AcquireEngineStepRequest
+	26,  // 187: circulus.api.v1alpha.SessionStateService.CommitEngineEvent:input_type -> circulus.api.v1alpha.CommitEngineEventRequest
+	32,  // 188: circulus.api.v1alpha.SessionStateService.PrepareEffectRetry:input_type -> circulus.api.v1alpha.PrepareEffectRetryRequest
+	30,  // 189: circulus.api.v1alpha.SessionStateService.MarkEffectDispatched:input_type -> circulus.api.v1alpha.MarkEffectDispatchedRequest
+	34,  // 190: circulus.api.v1alpha.SessionStateService.MarkEffectExternallyCommitted:input_type -> circulus.api.v1alpha.MarkEffectExternallyCommittedRequest
+	36,  // 191: circulus.api.v1alpha.SessionStateService.SettleEffect:input_type -> circulus.api.v1alpha.SettleEffectRequest
+	38,  // 192: circulus.api.v1alpha.SessionStateService.BlockEffect:input_type -> circulus.api.v1alpha.BlockEffectRequest
+	40,  // 193: circulus.api.v1alpha.SessionStateService.RenewTurnAuthority:input_type -> circulus.api.v1alpha.RenewTurnAuthorityRequest
+	42,  // 194: circulus.api.v1alpha.SessionStateService.AbortTurn:input_type -> circulus.api.v1alpha.AbortTurnRequest
+	45,  // 195: circulus.api.v1alpha.ReferenceWorkloadService.StartClaimedWorkload:input_type -> circulus.api.v1alpha.StartClaimedWorkloadRequest
+	16,  // 196: circulus.api.v1alpha.SessionStateService.GetSessionState:output_type -> circulus.api.v1alpha.GetSessionStateResponse
+	18,  // 197: circulus.api.v1alpha.SessionStateService.AcceptTurn:output_type -> circulus.api.v1alpha.AcceptTurnResponse
+	22,  // 198: circulus.api.v1alpha.SessionStateService.AcquireEngineStep:output_type -> circulus.api.v1alpha.AcquireEngineStepResponse
+	27,  // 199: circulus.api.v1alpha.SessionStateService.CommitEngineEvent:output_type -> circulus.api.v1alpha.CommitEngineEventResponse
+	33,  // 200: circulus.api.v1alpha.SessionStateService.PrepareEffectRetry:output_type -> circulus.api.v1alpha.PrepareEffectRetryResponse
+	31,  // 201: circulus.api.v1alpha.SessionStateService.MarkEffectDispatched:output_type -> circulus.api.v1alpha.MarkEffectDispatchedResponse
+	35,  // 202: circulus.api.v1alpha.SessionStateService.MarkEffectExternallyCommitted:output_type -> circulus.api.v1alpha.MarkEffectExternallyCommittedResponse
+	37,  // 203: circulus.api.v1alpha.SessionStateService.SettleEffect:output_type -> circulus.api.v1alpha.SettleEffectResponse
+	39,  // 204: circulus.api.v1alpha.SessionStateService.BlockEffect:output_type -> circulus.api.v1alpha.BlockEffectResponse
+	41,  // 205: circulus.api.v1alpha.SessionStateService.RenewTurnAuthority:output_type -> circulus.api.v1alpha.RenewTurnAuthorityResponse
+	43,  // 206: circulus.api.v1alpha.SessionStateService.AbortTurn:output_type -> circulus.api.v1alpha.AbortTurnResponse
+	47,  // 207: circulus.api.v1alpha.ReferenceWorkloadService.StartClaimedWorkload:output_type -> circulus.api.v1alpha.StartClaimedWorkloadResponse
+	196, // [196:208] is the sub-list for method output_type
+	184, // [184:196] is the sub-list for method input_type
+	184, // [184:184] is the sub-list for extension type_name
+	184, // [184:184] is the sub-list for extension extendee
+	0,   // [0:184] is the sub-list for field type_name
 }
 
 func init() { file_circulus_v1alpha_session_proto_init() }
@@ -4617,9 +4973,9 @@ func file_circulus_v1alpha_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_circulus_v1alpha_session_proto_rawDesc), len(file_circulus_v1alpha_session_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   36,
+			NumMessages:   40,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_circulus_v1alpha_session_proto_goTypes,
 		DependencyIndexes: file_circulus_v1alpha_session_proto_depIdxs,

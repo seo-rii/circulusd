@@ -35,7 +35,7 @@ const (
 
 	MaximumProbeTimeout = 30 * time.Second
 
-	expectedDescriptorSHA256 = "693b865cbe6eadb0e6d43910707f8bd0cde0bd892642487e514416e8c0ebc1e0"
+	expectedDescriptorSHA256 = "c1cba7a6b81ec11a2ad328884012853f96ab658c69bb1be7b6244556faa97ebc"
 	maximumSocketPathBytes   = 107
 )
 

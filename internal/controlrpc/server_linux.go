@@ -56,6 +56,7 @@ type ServerConfig struct {
 	ServerPeer         v1.ProtocolPeer
 	Capabilities       []*v1.CapabilityStatus
 	CapabilityProvider CapabilityProvider
+	ReferenceWorkload  *ReferenceWorkloadService
 }
 
 type Server struct {
@@ -77,6 +78,7 @@ type controlHandler struct {
 	serverPeer   v1.ProtocolPeer
 	capabilities []*v1.CapabilityStatus
 	provider     CapabilityProvider
+	workload     *ReferenceWorkloadService
 	sessionKey   [sha256.Size]byte
 	sequence     atomic.Uint64
 }
@@ -109,6 +111,10 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	}
 	if !isKnownPeer(serverPeer) {
 		return nil, fmt.Errorf("controlrpc: server peer %d is invalid", serverPeer)
+	}
+	if config.ReferenceWorkload != nil && (config.ReferenceWorkload.receive == nil ||
+		(serverPeer != v1.ProtocolPeer_PROTOCOL_PEER_AGENTD && serverPeer != v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD)) {
+		return nil, fmt.Errorf("controlrpc: invalid reference workload server configuration")
 	}
 
 	allowedUIDs := make(map[uint32]struct{})
@@ -197,6 +203,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		serverPeer:   serverPeer,
 		capabilities: capabilities,
 		provider:     config.CapabilityProvider,
+		workload:     config.ReferenceWorkload,
 	}
 	if _, err := rand.Read(handler.sessionKey[:]); err != nil {
 		cleanup()
@@ -207,6 +214,15 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		connect.WithReadMaxBytes(maximumMessageBytes),
 		connect.WithSendMaxBytes(maximumMessageBytes),
 	)
+	_, workloadHandler := v1connect.NewReferenceWorkloadServiceHandler(handler,
+		connect.WithReadMaxBytes(maximumMessageBytes), connect.WithSendMaxBytes(maximumMessageBytes))
+	routeHandler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == v1connect.ReferenceWorkloadServiceStartClaimedWorkloadProcedure {
+			workloadHandler.ServeHTTP(w, request)
+			return
+		}
+		rpcHandler.ServeHTTP(w, request)
+	})
 	listener := &credentialListener{Listener: unixListener, allowedUIDs: allowedUIDs}
 	server := &Server{
 		socketPath: config.SocketPath,
@@ -214,7 +230,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		handler:    handler,
 	}
 	server.httpServer = &http.Server{
-		Handler:                      rpcHandler,
+		Handler:                      routeHandler,
 		ReadTimeout:                  controlHTTPIOTimeout,
 		ReadHeaderTimeout:            controlHTTPIOTimeout,
 		WriteTimeout:                 maximumRequestDeadline + controlHTTPIOTimeout,
