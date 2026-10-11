@@ -1,0 +1,244 @@
+diff --git a/crates/celld/Cargo.toml b/crates/celld/Cargo.toml
+index 7bf1689..a01b39e 100644
+--- a/crates/celld/Cargo.toml
++++ b/crates/celld/Cargo.toml
+@@ -18,6 +18,7 @@ level = "warn"
+ check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
+ 
+ [dependencies]
++circulusd-native-celld-proof = { path = "../circulusd-native-proof" }
+ aes.workspace = true
+ aes-gcm.workspace = true
+ cbc.workspace = true
+diff --git a/crates/celld/control_plane.rs b/crates/celld/control_plane.rs
+index 017bf72..df90ab2 100644
+--- a/crates/celld/control_plane.rs
++++ b/crates/celld/control_plane.rs
+@@ -46,6 +46,8 @@ fn restart_on_deployment_enabled() -> bool {
+ 
+ #[cfg(unix)]
+ fn restart_process(trigger: &'static str) -> ! {
++    // A qualified native graph may never preserve authority through re-exec.
++    if crate::circulusd_native::configured() { std::process::exit(75); }
+     use std::os::unix::process::CommandExt;
+     use std::process::Command;
+ 
+diff --git a/crates/celld/fleet.rs b/crates/celld/fleet.rs
+index a690314..6e0d2c6 100644
+--- a/crates/celld/fleet.rs
++++ b/crates/celld/fleet.rs
+@@ -571,8 +571,7 @@ async fn load_worker_from_pointer(
+         .map(str::to_string);
+     let script_name = manifest.script_name.clone();
+     let crons = manifest.crons.clone();
+-    Ok(LoadedDeployment {
+-        options: WorkerConfigOptions {
++    let options = WorkerConfigOptions {
+             src,
+             script_name: script_name.clone(),
+             do_classes: manifest.do_classes,
+@@ -584,7 +583,11 @@ async fn load_worker_from_pointer(
+             node,
+             modules,
+             compat,
+-        },
++        };
++    let native_measurement = native_deployment_measurement(&options, &services, &crons, &manifest.raw_metadata);
++    Ok(LoadedDeployment {
++        options,
++        native_measurement,
+         script_name,
+         asset_binding,
+         assets,
+@@ -593,6 +596,36 @@ async fn load_worker_from_pointer(
+     })
+ }
+ 
++fn native_deployment_measurement(
++    options: &WorkerConfigOptions,
++    services: &[(String, String, Option<String>)],
++    crons: &[String],
++    metadata: &serde_json::Value,
++) -> serde_json::Value {
++    let modules = options.modules.iter().map(|(name, module)| {
++        let (kind, bytes): (&str, &[u8]) = match module {
++            ModuleSource::Text(source) => ("text", source.as_bytes()),
++            ModuleSource::EsModule(source) => ("esm", source.as_bytes()),
++            ModuleSource::Wasm(source) => ("wasm", source.as_ref()),
++        };
++        serde_json::json!({"name":name,"kind":kind,"digest":crate::circulusd_native::digest_bytes(bytes)})
++    }).collect::<Vec<_>>();
++    serde_json::json!({
++        "scriptName":options.script_name,
++        "applicationDigest":crate::circulusd_native::digest_bytes(options.src.as_bytes()),
++        "modules":modules,"doClasses":options.do_classes,"bindings":options.bindings,
++        "r2Bindings":options.r2_bindings,"d1Bindings":options.d1_bindings,
++        "aiBinding":options.ai_binding,"vars":options.vars,"services":services,"crons":crons,
++        "metadata":metadata,
++        "compatibility":{
++            "deleteAllDeletesAlarm":options.compat.delete_all_deletes_alarm,
++            "jsRpc":options.compat.js_rpc,"fetcherGetPutDelete":options.compat.fetcher_get_put_delete,
++            "sqliteVec":options.compat.sqlite_vec,
++            "websocketStandardBinaryType":options.compat.websocket_standard_binary_type
++        }
++    })
++}
++
+ /// Apply celld's manifest-first precedence for the optional AI binding.
+ pub fn configured_ai_binding(manifest_binding: Option<String>) -> Option<String> {
+     manifest_binding
+@@ -602,6 +635,8 @@ pub fn configured_ai_binding(manifest_binding: Option<String>) -> Option<String>
+ 
+ pub struct LoadedDeployment {
+     pub options: WorkerConfigOptions,
++    /// Full actual loaded bytes and effective options, never the truncated deployment version.
++    pub native_measurement: serde_json::Value,
+     pub script_name: String,
+     pub asset_binding: Option<String>,
+     pub assets: Option<crate::assets::AssetResolver>,
+diff --git a/crates/celld/lib.rs b/crates/celld/lib.rs
+index f35c641..05ee930 100644
+--- a/crates/celld/lib.rs
++++ b/crates/celld/lib.rs
+@@ -66,6 +66,7 @@ mod fault {
+     include!(env!("CELLD_INTERNAL_SQLITE_FAULT"));
+ }
+ pub mod fleet;
++pub use circulusd_native_celld_proof as circulusd_native;
+ pub mod host_services;
+ pub mod js;
+ pub mod ltx_repl;
+diff --git a/crates/celld/main.rs b/crates/celld/main.rs
+index 3f757ce..2b4ec53 100644
+--- a/crates/celld/main.rs
++++ b/crates/celld/main.rs
+@@ -1627,6 +1627,48 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String)
+     }
+ }
+ 
++async fn circulusd_native_probe(request: Request<Incoming>, path: &str) -> HttpReply {
++    let native = celld::circulusd_native::content_type(path).expect("reserved native route");
++    let exact = |name: &str, value: &str| {
++        let values = request.headers().get_all(name).iter().collect::<Vec<_>>();
++        values.len() == 1 && values[0].as_bytes() == value.as_bytes()
++    };
++    if request.method() != hyper::Method::POST || request.uri().query().is_some()
++        || !exact("content-type", native) || !exact("accept", native) || !exact("cache-control", "no-store")
++        || request.headers().contains_key("content-encoding")
++        || request.headers().contains_key("upgrade")
++        || request.headers().contains_key("x-circulus-storage-key-id")
++        || request.headers().contains_key("x-circulus-storage-signature")
++        || request.headers().contains_key("x-circulus-state-key-id")
++        || request.headers().contains_key("x-circulus-state-signature") {
++        return response(StatusCode::BAD_REQUEST, "invalid native probe");
++    }
++    let mut incoming = request.into_body();
++    let held = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++        let mut body = Vec::new();
++        while let Some(frame) = incoming.frame().await {
++            let frame = frame.map_err(|_| ())?;
++            if let Some(data) = frame.data_ref() {
++                if body.len().saturating_add(data.len()) > 256 { return Err(()); }
++                body.extend_from_slice(data);
++            } else { return Err(()); }
++        }
++        Ok(body)
++    }).await;
++    let Ok(Ok(body)) = held else {return response(StatusCode::BAD_REQUEST, "invalid native probe");};
++    let Ok(nonce) = celld::circulusd_native::decode_challenge(path, &body) else {
++        return response(StatusCode::BAD_REQUEST, "invalid native probe");
++    };
++    match celld::circulusd_native::response(path, &nonce) {
++        Ok(Some(body)) => Response::builder().status(StatusCode::OK)
++            .header("content-type", native).header("cache-control", "no-store")
++            .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync())
++            .expect("static native CBOR response"),
++        Ok(None) => response(StatusCode::NOT_FOUND, "native proof unavailable"),
++        Err(_) => response(StatusCode::SERVICE_UNAVAILABLE, "native proof unavailable"),
++    }
++}
++
+ async fn handle_public(
+     request: Request<Incoming>,
+     app: AppHandle,
+@@ -1649,6 +1691,10 @@ async fn handle_public(
+         );
+         return Ok(refused);
+     }
++    // Reserved native routes run before WebSocket or any Worker dispatch.
++    if celld::circulusd_native::reserved(&path) {
++        return Ok(circulusd_native_probe(request, &path).await);
++    }
+     if path != "/__celld/health"
+         && app.runtime.is_some()
+         && fastwebsockets::upgrade::is_upgrade_request(&request)
+@@ -2215,6 +2261,19 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+         .or_else(|| std::env::var_os("CELLD_WATCH"))
+         .map(std::path::PathBuf::from)
+         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
++    if celld::circulusd_native::configured() {
++        anyhow::ensure!(settings.bucket.is_some() && settings.load_deployment
++            && !settings.control_plane && settings.storage_probe
++            && celld::env_vars::flag("CELLD_OUTPUT_GATE", true)?
++            && std::env::var("CELLD_DURABILITY").as_deref() == Ok("bucket")
++            && !settings.unsafe_public_advertise && !settings.trust_forwarded_headers
++            && listen.parse::<std::net::SocketAddr>()?.ip().is_loopback()
++            && advertise.parse::<std::net::SocketAddr>()?.ip().is_loopback()
++            && !std::env::vars_os().any(|(key,_)| key.to_string_lossy().starts_with("CELLD_TEST_")),
++            "circulusd native qualification requires real immutable bucket replication");
++    }
++    let mut native_graph = Vec::new();
++    let mut native_application_digest = None;
+     let mut deploy_agent = None;
+     let (runtime, ownership, peer_key, wake_scan, assets, asset_script) = if let Some(bucket) =
+         settings.bucket.clone().filter(|_| settings.load_deployment)
+@@ -2249,6 +2308,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+         }
+         let peer_key = peer_auth::load_or_create(&client).await?;
+         let mut deployment = fleet::load_current_worker(&client, node.clone()).await?;
++        native_application_digest = Some(celld::circulusd_native::digest_bytes(deployment.options.src.as_bytes()));
++        native_graph.push(deployment.native_measurement.clone());
+         let primary_script = deployment.script_name.clone();
+         let mut asset_resolvers = HashMap::new();
+         if let Some(resolver) = deployment.assets.take() {
+@@ -2274,6 +2335,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+                     loaded.script_name
+                 );
+             }
++            native_graph.push(loaded.native_measurement.clone());
+             queue.extend(loaded.services.iter().map(|(_, script, _)| script.clone()));
+             // A node runs the schedule of the deployment it was given and
+             // of no other. The reserved class is one key, so a second
+@@ -2493,6 +2555,32 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
+             None,
+         )
+     };
++    if celld::circulusd_native::configured() {
++        anyhow::ensure!(runtime.as_ref().and_then(RuntimeManager::replication).is_some(),
++            "native qualification requires active replication");
++        native_graph.sort_by(|a,b| a["scriptName"].as_str().cmp(&b["scriptName"].as_str()));
++        let authority_environment = std::env::vars().filter(|(key,_)|
++            (key.starts_with("CELLD_") && !matches!(key.as_str(), "CELLD_CIRCULUSD_NATIVE_CONFIG" | "CELLD_NODE" | "CELLD_WATCH"))
++            || matches!(key.as_str(), "AWS_ACCESS_KEY_ID" | "AWS_SECRET_ACCESS_KEY" | "AWS_SESSION_TOKEN"))
++            .map(|(key,value)| (key,celld::circulusd_native::digest_bytes(value.as_bytes())))
++            .collect::<BTreeMap<_,_>>();
++        celld::circulusd_native::install(native_application_digest.context("missing actual loaded application")?,
++            serde_json::json!({"workers":native_graph,"bucket":settings.bucket,"endpoint":settings.endpoint,
++                "region":settings.region,"listen":listen,"internalAdvertise":advertise,
++                "outputGate":true,"storageProbe":settings.storage_probe,"durability":"bucket",
++                "loaderBinding":worker_loader_binding(),"authorityEnvironment":authority_environment}))?;
++        if celld::circulusd_native::attestation_pending() {
++            tokio::spawn(async {
++                loop {
++                    match celld::circulusd_native::publish_once() {
++                        Ok(true) => {tracing::info!("circulusd native proof published"); break;}
++                        Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
++                        Err(_) => {tracing::error!("circulusd native proof handoff rejected"); exit_flushed(78);}
++                    }
++                }
++            });
++        }
++    }
+     if let Some(config) = &telemetry_config {
+         let sink_bucket = match config.sink {
+             celld::telemetry::SinkChoice::Bucket => {
