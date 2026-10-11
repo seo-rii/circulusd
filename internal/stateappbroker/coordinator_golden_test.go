@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
@@ -67,31 +68,32 @@ func (c *coordinatorGoldenClient) ExecuteSessionBroker(ctx context.Context, requ
 		return canonical.Map{"found": found, "kind": request.Body["kind"], "operationDigest": request.Body["operationDigest"], "receipt": receipt}, nil
 	}
 	var name, next string
+	scenario := strings.Split(c.current, ".")[0]
 	switch request.Operation {
 	case "acquire-step":
-		name = "success.acquire"
-		if c.current == "success.settled" {
-			name = "success.resume-grant"
+		name = scenario + ".acquire"
+		if c.current == scenario+".settled" {
+			name = scenario + ".resume-grant"
 		}
 	case "commit-step":
-		name, next = "success.commit", "success.prepared"
+		name, next = scenario+".commit", scenario+".prepared"
 	case "dispatch":
-		name, next = "success.dispatch", "success.dispatched"
+		name, next = scenario+".dispatch", scenario+".dispatched"
 	case "claim-start":
-		name, next = "success.start", "success.started"
+		name, next = scenario+".start", scenario+".started"
 		if c.claims != 0 {
-			name = "success.start-replay"
+			name = scenario + ".start-replay"
 		}
 		c.claims++
 	case "confirm":
-		name, next = "success.confirmation", "success.confirmed"
+		name, next = scenario+".confirmation", scenario+".confirmed"
 	case "settle":
-		name, next = "success.settlement", "success.settled"
+		name, next = scenario+".settlement", scenario+".settled"
 	default:
 		c.t.Fatalf("unexpected operation %q", request.Operation)
 	}
 	want := c.request(name)
-	if name == "success.start-replay" {
+	if name == scenario+".start-replay" {
 		// The Coordinator re-reads after the first claim. The recorded replay
 		// uses the original snapshot; Session excludes this CAS snapshot from
 		// receipt identity and returns the original proof in either case.
@@ -165,10 +167,16 @@ func loadCoordinatorGolden(t *testing.T) coordinatorGoldenFixture {
 }
 
 func TestCoordinatorActualSessionLifecycle(t *testing.T) {
+	for _, scenario := range []string{"success", "error"} {
+		t.Run(scenario, func(t *testing.T) { testCoordinatorActualSessionLifecycle(t, scenario) })
+	}
+}
+
+func testCoordinatorActualSessionLifecycle(t *testing.T, scenario string) {
 	fixture := loadCoordinatorGolden(t)
 	groups := []dependency.AtomicGroup{dependency.AtomicEffectLifecycle}
 	qualified := proof.NewProductionProofs(t, groups)
-	client := &coordinatorGoldenClient{ProductionProofs: qualified, t: t, scope: fixture.Authority, rows: map[string]struct{ RequestCborHex, ResponseCborHex string }{}, blobs: map[string][]byte{}, current: "success.active", receipts: map[string]canonical.Value{}}
+	client := &coordinatorGoldenClient{ProductionProofs: qualified, t: t, scope: fixture.Authority, rows: map[string]struct{ RequestCborHex, ResponseCborHex string }{}, blobs: map[string][]byte{}, current: scenario + ".active", receipts: map[string]canonical.Value{}}
 	for _, row := range fixture.Responses {
 		client.rows[row.Name] = struct{ RequestCborHex, ResponseCborHex string }{row.RequestCborHex, row.ResponseCborHex}
 	}
@@ -180,9 +188,9 @@ func TestCoordinatorActualSessionLifecycle(t *testing.T) {
 		client.blobs[blob.Digest] = body
 	}
 	d := decoder{}
-	active := client.response("success.active")
+	active := client.response(scenario + ".active")
 	limits := d.budget(active["engineStepLimits"])
-	settlementBody := client.request("success.settlement")
+	settlementBody := client.request(scenario + ".settlement")
 	outcome := settlementBody["settlement"].(canonical.Map)
 	results := &testResults{ProductionProofs: qualified, body: coordinatorGoldenBytes(t, outcome["result"])}
 	store, err := newStore(client, Config{Scope: fixture.Authority, UserID: d.id(identity.Subject, active["userId"], false), EngineStepLimits: limits, Results: proof.Verify[ResultResolver](t, qualified, results, groups)})
@@ -199,13 +207,13 @@ func TestCoordinatorActualSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	acquire := client.request("success.acquire")
+	acquire := client.request(scenario + ".acquire")
 	now := d.time(acquire["nowUnixMs"])
 	permit, err := coordinator.AcquireEngineStep(ctx, broker.EngineStepRequest{Authority: authority, Now: now, Budget: limits, OperationKey: acquire["operationKey"].(string)})
 	if err != nil {
 		t.Fatalf("acquire actual genesis: %v", err)
 	}
-	commit := client.request("success.commit")
+	commit := client.request(scenario + ".commit")
 	step := commit["step"].(canonical.Map)
 	checkpoint, err := stateappcodec.CheckpointFromValue(step["checkpoint"])
 	if err != nil {
@@ -236,12 +244,12 @@ func TestCoordinatorActualSessionLifecycle(t *testing.T) {
 		t.Fatalf("commit actual Pi boundary: %v", err)
 	}
 	preparation := *committed.PreparationPermit
-	dispatchBody := client.request("success.dispatch")
+	dispatchBody := client.request(scenario + ".dispatch")
 	dispatch, err := coordinator.AdmitDispatch(ctx, broker.DispatchRequest{Authority: authority, Now: now, EffectID: preparation.EffectID, InvocationID: preparation.InvocationID, RequestDigest: preparation.RequestDigest, Service: preparation.Service, Operation: preparation.Operation, OperationKey: dispatchBody["operationKey"].(string), OperationDigest: d.digest(dispatchBody["operationDigest"]), PreparationPermit: preparation, ProviderRequestID: d.id(identity.Request, dispatchBody["providerRequestId"], false), ProviderRouteDigest: d.digest(dispatchBody["providerRouteDigest"]), Deadline: preparation.Deadline})
 	if err != nil {
 		t.Fatalf("dispatch actual prepared effect: %v", err)
 	}
-	claimRequest := broker.DispatchStartRequest{Authority: authority, Now: now, Dispatch: dispatch, CommandDigest: d.digest(client.request("success.start")["commandDigest"])}
+	claimRequest := broker.DispatchStartRequest{Authority: authority, Now: now, Dispatch: dispatch, CommandDigest: d.digest(client.request(scenario + ".start")["commandDigest"])}
 	claim, err := coordinator.ClaimDispatchStart(ctx, claimRequest)
 	if err != nil || !claim.Fresh {
 		t.Fatalf("claim actual dispatch start: %v", err)
@@ -250,22 +258,22 @@ func TestCoordinatorActualSessionLifecycle(t *testing.T) {
 	if err != nil || replayedClaim.Fresh || replayedClaim.Permit.Opaque != claim.Permit.Opaque {
 		t.Fatalf("replay actual dispatch start: %v", err)
 	}
-	confirmationBody := client.request("success.confirmation")
-	ledger.record = broker.LedgerRecord{Status: broker.LedgerCommitted, TenantID: authority.TenantID, WorkspaceID: authority.WorkspaceID, EffectID: dispatch.EffectID, InvocationID: dispatch.InvocationID, RequestDigest: dispatch.RequestDigest, Service: dispatch.Service, Operation: dispatch.Operation, DispatchAttempt: dispatch.DispatchAttempt, ProviderRequestID: dispatch.ProviderRequestID, ProviderRouteDigest: dispatch.ProviderRouteDigest, ExternalCommitID: d.id(identity.Commit, confirmationBody["externalCommitId"], false), ResultRef: d.id(identity.Artifact, confirmationBody["resultRef"], false)}
+	confirmationBody := client.request(scenario + ".confirmation")
+	ledger.record = broker.LedgerRecord{Status: broker.LedgerCommitted, TenantID: authority.TenantID, WorkspaceID: authority.WorkspaceID, EffectID: dispatch.EffectID, InvocationID: dispatch.InvocationID, RequestDigest: dispatch.RequestDigest, Service: dispatch.Service, Operation: dispatch.Operation, DispatchAttempt: dispatch.DispatchAttempt, ProviderRequestID: dispatch.ProviderRequestID, ProviderRouteDigest: dispatch.ProviderRouteDigest, ExternalCommitID: d.id(identity.Commit, confirmationBody["externalCommitId"], false), ResultRef: d.id(identity.Artifact, confirmationBody["resultRef"], true)}
 	confirmed, err := coordinator.ConfirmExternalCommit(ctx, broker.ConfirmationRequest{Authority: authority, Now: now, EffectID: dispatch.EffectID, InvocationID: dispatch.InvocationID, RequestDigest: dispatch.RequestDigest, Service: dispatch.Service, Operation: dispatch.Operation, DispatchAttempt: dispatch.DispatchAttempt, ProviderRequestID: dispatch.ProviderRequestID, OperationKey: confirmationBody["operationKey"].(string), OperationDigest: d.digest(confirmationBody["operationDigest"])})
 	if err != nil || ledger.calls != 1 {
 		t.Fatalf("confirm actual invocation: %v", err)
 	}
-	settleRequest := broker.SettlementRequest{Authority: authority, Now: now, EffectID: dispatch.EffectID, InvocationID: dispatch.InvocationID, RequestDigest: dispatch.RequestDigest, DispatchAttempt: dispatch.DispatchAttempt, ExternalCommitID: confirmed.ExternalCommitID, ResultRef: confirmed.ResultRef, OperationKey: settlementBody["operationKey"].(string), SettlementDigest: d.digest(settlementBody["operationDigest"])}
+	settleRequest := broker.SettlementRequest{Authority: authority, Now: now, EffectID: dispatch.EffectID, InvocationID: dispatch.InvocationID, RequestDigest: dispatch.RequestDigest, DispatchAttempt: dispatch.DispatchAttempt, ExternalCommitID: confirmed.ExternalCommitID, ResultRef: confirmed.ResultRef, Error: d.publicError(settlementBody["error"]), OperationKey: settlementBody["operationKey"].(string), SettlementDigest: d.digest(settlementBody["operationDigest"])}
 	settled, err := coordinator.SettleEffect(ctx, settleRequest)
 	if err != nil {
 		t.Fatalf("settle actual model result: %v", err)
 	}
 	replayedSettlement, err := coordinator.SettleEffect(ctx, settleRequest)
-	if err != nil || !proto.Equal(replayedSettlement.Effect, settled.Effect) || replayedSettlement.EventSequence != settled.EventSequence || results.calls != 1 {
+	if err != nil || !proto.Equal(replayedSettlement.Effect, settled.Effect) || replayedSettlement.EventSequence != settled.EventSequence || results.calls != map[string]int{"success": 1, "error": 0}[scenario] || !proto.Equal(settled.Error, settleRequest.Error) {
 		t.Fatalf("settlement replay lost original receipt or resolved result again: %v", err)
 	}
-	resumeBody := client.request("success.resume-grant")
+	resumeBody := client.request(scenario + ".resume-grant")
 	resume, err := coordinator.AcquireEngineStep(ctx, broker.EngineStepRequest{Authority: authority, Now: now, Budget: limits, OperationKey: resumeBody["operationKey"].(string)})
 	if err != nil {
 		t.Fatalf("resume actual settled turn: %v", err)

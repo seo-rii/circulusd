@@ -533,8 +533,12 @@ export async function applySessionBrokerCommand(state: SessionAggregateState, co
         effect.resultRef !== request.body.resultRef || effect.dispatchAttempt !== request.body.dispatchAttempt) sessionError("FAILED_PRECONDITION", "settlement lacks the exact external commit proof");
       if ((request.body.error === null) !== (request.body.settlement.kind === "success") ||
         (request.body.error === null && request.body.resultRef === null)) sessionError("INVALID_ARGUMENT", "settlement outcome does not match its result/error proof");
+      // Keep the full PublicError in the original receipt while only the fixed,
+      // bounded engine-facing projection enters Pi state. This matches the Go
+      // Store and does not copy arbitrarily large provider diagnostics to Pi.
       if (request.body.error !== null && (request.body.settlement.kind !== "error" ||
-        request.body.settlement.message !== request.body.error.message || request.body.settlement.retryable !== request.body.error.retryable)) sessionError("INVALID_ARGUMENT", "settlement error body does not match its public error");
+        request.body.settlement.code !== "effect.failed" || request.body.settlement.message !== "The effect failed." ||
+        request.body.settlement.retryable !== request.body.error.retryable)) sessionError("INVALID_ARGUMENT", "settlement error body does not match its public error");
       core = { ...common, ...request.body.key, kind: "settle_effect", dispatchAttempt: request.body.dispatchAttempt, settlement: request.body.settlement };
       finalize = async (candidate, ingested) => settlementReceipt(candidate, request.body.key, operationDigest, request.body.error, null, ingested);
       break;

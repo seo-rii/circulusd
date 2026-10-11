@@ -185,7 +185,13 @@ describe("Session broker authoritative transaction", () => {
     const error: SessionBrokerPublicError = { code: 7, reason: "PROVIDER_FAILED", message: "x".repeat(4096), retryable: true,
       retryAfterMs: 500, metadata: { route: "primary", diagnostic: "preserved" }, requestId: "request-original" };
     const settle = { snapshot: f.snapshot(await f.read()), key: dispatched.body.key, operationKey: "settle", operationDigest: d("c"), dispatchAttempt: 1,
-      externalCommitId: "external-commit", resultRef: null, error, settlement: { kind: "error" as const, code: error.reason, message: error.message, retryable: error.retryable } };
+      externalCommitId: "external-commit", resultRef: null, error, settlement: { kind: "error" as const, code: "effect.failed", message: "The effect failed.", retryable: error.retryable } };
+    for (const changed of [
+      { code: "provider.failed" }, { message: error.message }, { retryable: false },
+    ]) {
+      await expect(f.call({ operation: "settle", body: { ...settle,
+        settlement: { ...settle.settlement, ...changed } } })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    }
     const settled = await f.call<SessionBrokerSettlementReceipt>({ operation: "settle", body: settle });
     expect(settled.error).toEqual(error);
     expect(settled.resultRef).toBeNull();

@@ -103,6 +103,26 @@ async function vectors() {
   const settled = await main.read("settled");
   await main.call("resume-grant", { operation: "acquire-step", body: { snapshot: main.snapshot(settled), operationKey: "resume", nowUnixMs: NOW, budget: policy.engineStepLimits } });
 
+  const failed = await scenario("error");
+  const failedClaim = { snapshot: failed.snapshot(failed.current), key: failed.key,
+    dispatchOpaque: failed.dispatch.opaque as Uint8Array, commandDigest: digest("7"), nowUnixMs: NOW };
+  await failed.call("start", { operation: "claim-start", body: failedClaim });
+  await failed.call("start-replay", { operation: "claim-start", body: failedClaim });
+  const publicError = { code: 7, reason: "provider_failed", message: "Provider diagnostics: " + "x".repeat(8192),
+    retryable: true, retryAfterMs: 500, metadata: { route: "original", diagnostic: "preserved" }, requestId: id("req") };
+  await failed.call("confirmation", { operation: "confirm", body: { snapshot: failed.snapshot(await failed.read("started")),
+    key: failed.key, operationKey: "error-confirm", operationDigest: digest("8"), dispatchAttempt: 1,
+    providerRequestId: id("req"), providerRouteDigest: digest("f"), externalCommitId: id("commit"), resultRef: null } });
+  await failed.call("settlement", { operation: "settle", body: { snapshot: failed.snapshot(await failed.read("confirmed")),
+    key: failed.key, operationKey: "error-settle", operationDigest: digest("9"), dispatchAttempt: 1,
+    externalCommitId: id("commit"), resultRef: null, error: publicError,
+    settlement: { kind: "error", code: "effect.failed", message: "The effect failed.", retryable: true } } });
+  await failed.call("lookup-settlement", { operation: "lookup-operation", body: { kind: "settlement", operationKey: "error-settle", operationDigest: digest("9") } });
+  await failed.call("lookup-missing", { operation: "lookup-operation", body: { kind: "settlement", operationKey: "missing", operationDigest: digest("9") } });
+  const failedSettled = await failed.read("settled");
+  await failed.call("resume-grant", { operation: "acquire-step", body: { snapshot: failed.snapshot(failedSettled),
+    operationKey: "resume-error", nowUnixMs: NOW, budget: policy.engineStepLimits } });
+
   const retry = await scenario("retry", "safe");
   const reservation = await retry.call<SessionBrokerPreparationPermit>("preparation", { operation: "prepare-retry", body: { snapshot: retry.snapshot(retry.current), key: retry.key,
     operationKey: "retry-prepare", operationDigest: digest("1"), nowUnixMs: NOW, deadlineUnixMs: NOW + 60_000, userConfirmed: false } });
