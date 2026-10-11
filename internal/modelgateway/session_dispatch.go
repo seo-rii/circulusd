@@ -411,7 +411,8 @@ func (starter *SessionDispatchStarter) validateSessionBinding(dispatch broker.Di
 		dispatch.Generations.Sandbox == 0 || dispatch.DispatchAttempt == 0 ||
 		dispatch.DispatchAttempt > math.MaxUint32 || uint32(dispatch.DispatchAttempt) != effect.Attempt ||
 		dispatch.WorkspaceID.Kind() != identity.Workspace || dispatch.Operation != sessionDispatchOperation ||
-		dispatch.Ordinal == 0 || dispatch.Deadline.IsZero() ||
+		(dispatch.ParentOperationID == (identity.ID{}) && dispatch.ParentOperation == "" && dispatch.Ordinal != 0) ||
+		dispatch.Ordinal >= 1<<53 || dispatch.Deadline.IsZero() ||
 		(dispatch.ProviderRequestID != (identity.ID{}) && dispatch.ProviderRequestID.Kind() != identity.Request) {
 		return ErrAuthorityMismatch
 	}

@@ -1,6 +1,5 @@
-// Package effectledger provides a process-local reference ledger for tests and
-// development adapters. It is deliberately not a production durability or
-// availability implementation.
+// Package effectledger records subordinate provider observations. Reference
+// ledgers are process-local; native ledgers require a qualified concrete source.
 package effectledger
 
 import (
@@ -16,11 +15,13 @@ import (
 
 	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/identity"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
 	maximumReferenceBytes       = 16 << 20
 	maximumProviderRequestBytes = 4 << 10
+	maximumOccurrenceOrdinal    = (1 << 53) - 1
 )
 
 var (
@@ -74,8 +75,8 @@ const (
 	TerminalUnknown   TerminalStatus = "unknown"
 )
 
-// Terminal retains bounded service result bytes in the subordinate reference
-// ledger. Lookup exposes only the broker-safe identity projection.
+// Terminal retains bounded service result bytes in the subordinate ledger.
+// Lookup exposes only the broker-safe identity projection.
 type Terminal struct {
 	Status           TerminalStatus
 	ExternalCommitID identity.ID
@@ -103,6 +104,7 @@ var observationSeal = new(struct{})
 // the only restart-oriented minting path.
 type Observation struct {
 	store         *ReferenceStore
+	native        *NativeLedger
 	key           attemptKey
 	service       broker.EffectService
 	routeDigest   broker.Digest
@@ -140,9 +142,8 @@ func (claimed ClaimedCommand) Observation() (Observation, bool) {
 func (ClaimedCommand) String() string   { return "claimed-effect-command<redacted>" }
 func (ClaimedCommand) GoString() string { return "claimed-effect-command<redacted>" }
 
-// Ledger is the reference adapter contract consumed by model, MCP, and fake
-// effect starters. Implementations must not infer provider-start authority from
-// an Observation.
+// Ledger is the subordinate observation contract consumed by effect starters.
+// Implementations must not infer provider-start authority from an Observation.
 type Ledger interface {
 	// Limits returns immutable byte caps that remain fixed for the ledger's lifetime.
 	Limits() ReferenceLimits
@@ -310,19 +311,8 @@ func (ledger *ReferenceLedger) RecordAccepted(ctx context.Context, observation O
 	if ledger == nil || ledger.store == nil {
 		return ErrInvalidConfiguration
 	}
-	invalidProviderID := externalProviderRequestID == "" || !utf8.ValidString(externalProviderRequestID) ||
-		len(externalProviderRequestID) > maximumProviderRequestBytes ||
-		strings.TrimSpace(externalProviderRequestID) != externalProviderRequestID
-	if !invalidProviderID {
-		for _, codePoint := range externalProviderRequestID {
-			if unicode.IsControl(codePoint) || unicode.In(codePoint, unicode.Cf) {
-				invalidProviderID = true
-				break
-			}
-		}
-	}
-	if invalidProviderID {
-		return ErrInvalidCommand
+	if err := validateProviderRequestID(externalProviderRequestID); err != nil {
+		return err
 	}
 	ledger.store.mu.Lock()
 	defer ledger.store.mu.Unlock()
@@ -341,6 +331,24 @@ func (ledger *ReferenceLedger) RecordAccepted(ctx context.Context, observation O
 	}
 	record.externalProviderRequestID = externalProviderRequestID
 	record.state = StateAccepted
+	return nil
+}
+
+func validateProviderRequestID(externalProviderRequestID string) error {
+	invalidProviderID := externalProviderRequestID == "" || !utf8.ValidString(externalProviderRequestID) ||
+		len(externalProviderRequestID) > maximumProviderRequestBytes ||
+		strings.TrimSpace(externalProviderRequestID) != externalProviderRequestID
+	if !invalidProviderID {
+		for _, codePoint := range externalProviderRequestID {
+			if unicode.IsControl(codePoint) || unicode.In(codePoint, unicode.Cf) {
+				invalidProviderID = true
+				break
+			}
+		}
+	}
+	if invalidProviderID {
+		return ErrInvalidCommand
+	}
 	return nil
 }
 
@@ -539,6 +547,10 @@ func (ledger *ReferenceLedger) recordForObservationLocked(observation Observatio
 }
 
 func (ledger *ReferenceLedger) validateLookup(lookup broker.LedgerLookup) error {
+	return validateLookupBinding(lookup, ledger.service, ledger.routeDigest)
+}
+
+func validateLookupBinding(lookup broker.LedgerLookup, service broker.EffectService, route broker.Digest) error {
 	if lookup.TenantID.Kind() != identity.Tenant || lookup.WorkspaceID.Kind() != identity.Workspace ||
 		lookup.SessionID.Kind() != identity.Session || lookup.TurnID.Kind() != identity.Turn ||
 		lookup.EffectID.Kind() != identity.Effect || lookup.InvocationID.Kind() != identity.Invocation ||
@@ -548,7 +560,7 @@ func (ledger *ReferenceLedger) validateLookup(lookup broker.LedgerLookup) error 
 		lookup.ProviderRouteDigest == (broker.Digest{}) {
 		return ErrInvalidCommand
 	}
-	if lookup.Service != ledger.service || lookup.ProviderRouteDigest != ledger.routeDigest {
+	if lookup.Service != service || lookup.ProviderRouteDigest != route {
 		return ErrBindingMismatch
 	}
 	return nil
@@ -569,19 +581,29 @@ func validateCommand(command Command) error {
 }
 
 func validateDispatch(dispatch broker.DispatchPermit) error {
+	return validateDispatchCore(dispatch, true)
+}
+
+func validateDispatchCore(dispatch broker.DispatchPermit, requireOpaque bool) error {
 	if dispatch.SessionID.Kind() != identity.Session || dispatch.TurnID.Kind() != identity.Turn ||
 		dispatch.EffectID.Kind() != identity.Effect || dispatch.InvocationID.Kind() != identity.Invocation ||
-		dispatch.RequestDigest == (broker.Digest{}) || dispatch.Opaque == "" ||
+		dispatch.RequestDigest == (broker.Digest{}) || (requireOpaque && dispatch.Opaque == "") ||
 		dispatch.TenantID.Kind() != identity.Tenant || dispatch.WorkspaceID.Kind() != identity.Workspace ||
 		dispatch.UserID.Kind() != identity.Subject || !validService(dispatch.Service) || dispatch.Operation == "" ||
 		(dispatch.ParentOperationID != (identity.ID{}) && dispatch.ParentOperationID.Kind() != identity.Operation) ||
-		dispatch.Ordinal == 0 || !validReplayPolicy(dispatch.ReplayPolicy) ||
+		(dispatch.ParentOperationID != (identity.ID{}) && dispatch.ParentOperation != "") ||
+		(dispatch.ParentOperationID == (identity.ID{}) && dispatch.ParentOperation == "" && dispatch.Ordinal != 0) ||
+		dispatch.Ordinal > maximumOccurrenceOrdinal || !validReplayPolicy(dispatch.ReplayPolicy) ||
 		dispatch.Generations.TurnLease == 0 || dispatch.Generations.Placement == 0 ||
 		dispatch.Generations.Sandbox == 0 || dispatch.Generations.Authorization == 0 ||
 		dispatch.DispatchAttempt == 0 ||
 		(dispatch.ProviderRequestID != (identity.ID{}) && dispatch.ProviderRequestID.Kind() != identity.Request) ||
 		dispatch.ProviderRouteDigest == (broker.Digest{}) || dispatch.Deadline.IsZero() ||
 		dispatch.EventSequence == 0 || !dispatch.Durable {
+		return ErrInvalidCommand
+	}
+	if parent := dispatch.ParentOperation; parent != "" && (len(parent) > 256 || !utf8.ValidString(parent) ||
+		!norm.NFC.IsNormalString(parent) || strings.IndexFunc(parent, unicode.IsControl) >= 0) {
 		return ErrInvalidCommand
 	}
 	return nil

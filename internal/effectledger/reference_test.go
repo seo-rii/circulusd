@@ -73,6 +73,84 @@ func TestReferenceLedgerPrepareCopiesBoundsAndConflicts(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerAcceptsZeroBasedOccurrencesAndBindsOriginalParent(t *testing.T) {
+	for _, name := range []string{"top level", "typed first child", "raw first child", "largest child ordinal"} {
+		t.Run(name, func(t *testing.T) {
+			command := referenceCommand(t, 100)
+			command.Dispatch.Ordinal = 0
+			switch name {
+			case "top level":
+				command.Dispatch.ParentOperationID = identity.ID{}
+			case "raw first child":
+				command.Dispatch.ParentOperationID = identity.ID{}
+				command.Dispatch.ParentOperation = "sha256:" + strings.Repeat("a", 64)
+			case "largest child ordinal":
+				command.Dispatch.Ordinal = (1 << 53) - 1
+			}
+			ledger := referenceLedger(t, effectledger.NewReferenceStore(), command.Dispatch.Service, command.Dispatch.ProviderRouteDigest)
+			if err := ledger.Prepare(context.Background(), command); err != nil {
+				t.Fatalf("Prepare(valid occurrence): %v", err)
+			}
+			changed := cloneCommand(command)
+			if changed.Dispatch.ParentOperationID != (identity.ID{}) {
+				changed.Dispatch.ParentOperationID = testID(t, identity.Operation, 199)
+			} else {
+				changed.Dispatch.ParentOperation = "sha256:" + strings.Repeat("b", 64)
+			}
+			if err := ledger.Prepare(context.Background(), changed); !errors.Is(err, effectledger.ErrPrepareConflict) {
+				t.Fatalf("Prepare(relabeled parent): %v", err)
+			}
+			if _, err := ledger.ClaimStart(context.Background(), mintClaim(t, changed)); !errors.Is(err, effectledger.ErrBindingMismatch) {
+				t.Fatalf("ClaimStart(relabeled parent): %v", err)
+			}
+			claimed, err := ledger.ClaimStart(context.Background(), mintClaim(t, command))
+			if err != nil {
+				t.Fatalf("ClaimStart(original occurrence): %v", err)
+			}
+			opened, ok := claimed.Open()
+			want := command.Dispatch
+			want.Opaque = ""
+			if !ok || opened.Dispatch != want {
+				t.Fatal("original parent/ordinal was not retained exactly")
+			}
+		})
+	}
+}
+
+func TestReferenceLedgerRejectsInvalidOccurrenceBindings(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*broker.DispatchPermit)
+	}{
+		{"orphan ordinal", func(d *broker.DispatchPermit) { d.ParentOperationID = identity.ID{} }},
+		{"unsafe ordinal", func(d *broker.DispatchPermit) { d.Ordinal = 1 << 53 }},
+		{"both parents", func(d *broker.DispatchPermit) { d.ParentOperation = "raw-parent" }},
+		{"wrong typed kind", func(d *broker.DispatchPermit) { d.ParentOperationID = testID(t, identity.Turn, 101) }},
+		{"oversized raw parent", func(d *broker.DispatchPermit) {
+			d.ParentOperationID = identity.ID{}
+			d.ParentOperation = strings.Repeat("é", 129)
+		}},
+		{"non NFC raw parent", func(d *broker.DispatchPermit) { d.ParentOperationID = identity.ID{}; d.ParentOperation = "e\u0301" }},
+		{"control raw parent", func(d *broker.DispatchPermit) {
+			d.ParentOperationID = identity.ID{}
+			d.ParentOperation = "parent\nother"
+		}},
+		{"invalid UTF8 raw parent", func(d *broker.DispatchPermit) {
+			d.ParentOperationID = identity.ID{}
+			d.ParentOperation = string([]byte{0xff})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := referenceCommand(t, 101)
+			test.mutate(&command.Dispatch)
+			ledger := referenceLedger(t, effectledger.NewReferenceStore(), command.Dispatch.Service, command.Dispatch.ProviderRouteDigest)
+			if err := ledger.Prepare(context.Background(), command); !errors.Is(err, effectledger.ErrInvalidCommand) {
+				t.Fatalf("Prepare(invalid occurrence): %v", err)
+			}
+		})
+	}
+}
+
 func TestReferenceLedgerNeverRetainsDispatchOpaque(t *testing.T) {
 	store := effectledger.NewReferenceStore()
 	command := referenceCommand(t, 70)

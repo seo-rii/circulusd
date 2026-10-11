@@ -72,6 +72,35 @@ func TestReferenceSessionDispatchUsesFreshBrokerClaimWithoutSecondDispatchAuthor
 	}
 }
 
+func TestReferenceSessionDispatchAcceptsFirstChildWithOriginalParent(t *testing.T) {
+	for _, parentKind := range []string{"typed", "raw Pi"} {
+		t.Run(parentKind, func(t *testing.T) {
+			test := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{completedSessionProviderEvent()}}, nil, true)
+			test.dispatch.Ordinal = 0
+			if parentKind == "typed" {
+				test.dispatch.ParentOperationID = mustID(t, identity.Operation, 'o')
+			} else {
+				test.dispatch.ParentOperation = "sha256:" + strings.Repeat("a", 64)
+			}
+			digest, err := test.starter.Prepare(context.Background(), test.dispatch, test.transition)
+			if err != nil {
+				t.Fatalf("Prepare(first child): %v", err)
+			}
+			consumer, _ := test.consumer(t, digest)
+			if _, err := consumer.StartExactAttempt(context.Background(), test.startRequest(digest)); err != nil {
+				t.Fatalf("StartExactAttempt(first child): %v", err)
+			}
+			_, calls := test.provider.snapshot()
+			facts, err := test.ledger.Inspect(context.Background(), sessionLookup(test.dispatch))
+			want := test.dispatch
+			want.Opaque = ""
+			if err != nil || calls != 1 || facts.Command.Dispatch != want {
+				t.Fatalf("first child parent/ordinal changed or provider did not start once: calls=%d err=%v", calls, err)
+			}
+		})
+	}
+}
+
 func TestReferenceSessionDispatchPrepareDefensivelyCopiesTheTransition(t *testing.T) {
 	t.Parallel()
 	test := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{completedSessionProviderEvent()}}, nil, true)
@@ -347,7 +376,7 @@ func newSessionDispatchTest(t *testing.T, stream ProviderStream, dispatchErr err
 		},
 		Opaque: broker.OpaquePermit("session-dispatch-secret"), TenantID: transition.Effect.Scope.TenantID,
 		WorkspaceID: mustID(t, identity.Workspace, 'w'), UserID: transition.Effect.Scope.UserID,
-		Service: broker.ServiceModel, Operation: "model.generate", Ordinal: 1, ReplayPolicy: broker.ReplayNever,
+		Service: broker.ServiceModel, Operation: "model.generate", Ordinal: 0, ReplayPolicy: broker.ReplayNever,
 		Generations: broker.Generations{
 			TurnLease: transition.Effect.Scope.Generations.TurnLease, Placement: transition.Effect.Scope.Generations.Placement,
 			Sandbox: 4, Authorization: transition.Effect.Scope.Generations.Policy,
