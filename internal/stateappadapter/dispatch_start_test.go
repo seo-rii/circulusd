@@ -23,6 +23,19 @@ type recordingDispatchStartClient struct {
 	probe    func(context.Context, dependency.ProbeChallenge) (dependency.ProbeResponse, error)
 }
 
+func TestLegacyDispatchStartRefusesToDropRawPiParent(t *testing.T) {
+	request := validBrokerDispatchStartRequest(t, 1)
+	request.Dispatch.ParentOperation = "sha256:" + fmt.Sprintf("%064x", 1)
+	client := &recordingDispatchStartClient{}
+	claimer := &DispatchStartClaimer{client: client}
+	if _, err := claimer.ClaimDispatchStart(context.Background(), request); !errors.Is(err, broker.ErrInvalidRequest) {
+		t.Fatalf("raw parent was silently omitted: %v", err)
+	}
+	if len(client.requestsSnapshot()) != 0 {
+		t.Fatal("unsupported parent reached legacy ingress")
+	}
+}
+
 func (client *recordingDispatchStartClient) ClaimDispatchStart(
 	ctx context.Context,
 	request stateappclient.ClaimDispatchStartRequest,

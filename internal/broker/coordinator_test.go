@@ -1186,8 +1186,20 @@ func (store *fakeStore) CommitEngineStep(ctx context.Context, command CommitStep
 		operation := "run"
 		replayPolicy := ReplaySafe
 		requestDigest := digest(105)
+		var parentOperationID identity.ID
+		var parentOperation string
+		var parentOrdinal uint64
 		if intent := command.Boundary.Message.GetEffectRequest(); intent != nil {
 			operation = intent.Operation
+			parentOrdinal = intent.Ordinal
+			if intent.ParentOperationId != nil {
+				parent := string(intent.ParentOperationId.Value)
+				if typed, err := identity.Parse(identity.Operation, parent); err == nil {
+					parentOperationID = typed
+				} else {
+					parentOperation = parent
+				}
+			}
 			copy(requestDigest[:], intent.RequestDigest.Value)
 			switch intent.Service {
 			case v1.EffectService_EFFECT_SERVICE_EXECUTOR:
@@ -1206,8 +1218,11 @@ func (store *fakeStore) CommitEngineStep(ctx context.Context, command CommitStep
 			operation = command.Boundary.Effect.Operation
 			replayPolicy = command.Boundary.Effect.ReplayPolicy
 			requestDigest = command.Boundary.Effect.RequestDigest
+			parentOperationID = command.Boundary.Effect.ParentOperationID
+			parentOperation = command.Boundary.Effect.ParentOperation
+			parentOrdinal = command.Boundary.Effect.Ordinal
 		}
-		preparation := EffectPreparationPermit{EffectKey: EffectKey{SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: requestDigest}, Opaque: opaque(9), TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID, Service: service, Operation: operation, ReplayPolicy: replayPolicy, Generations: command.Snapshot.Generations, DispatchAttempt: 1, Deadline: command.Permit.Deadline, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
+		preparation := EffectPreparationPermit{EffectKey: EffectKey{SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID, EffectID: effectID, InvocationID: invocationID, RequestDigest: requestDigest}, Opaque: opaque(9), TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID, Service: service, Operation: operation, ParentOperationID: parentOperationID, ParentOperation: parentOperation, Ordinal: parentOrdinal, ReplayPolicy: replayPolicy, Generations: command.Snapshot.Generations, DispatchAttempt: 1, Deadline: command.Permit.Deadline, EventSequence: store.eventSequence, Durable: !store.forceNonDurable}
 		store.applyReceiptRouteCorruption(&preparation.TenantID, &preparation.WorkspaceID)
 		if store.corruptPreparedReceipt {
 			preparation.InvocationID = mustID(identity.Invocation, "bad-prepared")
@@ -1222,6 +1237,12 @@ func (store *fakeStore) CommitEngineStep(ctx context.Context, command CommitStep
 			SandboxGeneration: command.Snapshot.Generations.Sandbox, AuthorizationGeneration: command.Snapshot.Generations.Authorization,
 			DeadlineUnixMs: uint64(command.Permit.Deadline.UnixMilli()),
 		}
+		if parentOperationID != (identity.ID{}) {
+			receipt.PreparedEffect.ParentOperationId = &v1.OpaqueId{Value: []byte(parentOperationID.String())}
+		} else if parentOperation != "" {
+			receipt.PreparedEffect.ParentOperationId = &v1.OpaqueId{Value: []byte(parentOperation)}
+		}
+		receipt.PreparedEffect.Ordinal = parentOrdinal
 		receipt.PreparationPermit = &preparation
 	}
 	store.stepCommits[command.OperationKey] = storedStepCommit{digest: command.RequestDigest, receipt: receipt}
@@ -1260,7 +1281,7 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 		EffectKey: command.Key, Opaque: opaque(byte(store.snapshot.ActiveEffect.DispatchAttempt + 20)),
 		TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID,
 		Service: command.Service, Operation: command.Operation, ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy,
-		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, Ordinal: store.snapshot.ActiveEffect.Ordinal,
+		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, ParentOperation: store.snapshot.ActiveEffect.ParentOperation, Ordinal: store.snapshot.ActiveEffect.Ordinal,
 		Generations: command.Snapshot.Generations, DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt,
 		ProviderRequestID: command.ProviderRequestID, ProviderRouteDigest: command.ProviderRouteDigest, Deadline: command.Deadline,
 		EventSequence: store.eventSequence, Durable: !store.forceNonDurable,
@@ -1378,7 +1399,7 @@ func (store *fakeStore) PrepareRetry(ctx context.Context, command PrepareRetryCo
 		EffectKey: command.Key, Opaque: opaque(byte(store.snapshot.ActiveEffect.DispatchAttempt + 1)),
 		TenantID: store.snapshot.TenantID, WorkspaceID: store.snapshot.WorkspaceID, UserID: store.snapshot.UserID,
 		Service: store.snapshot.ActiveEffect.Service, Operation: store.snapshot.ActiveEffect.Operation,
-		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, Ordinal: store.snapshot.ActiveEffect.Ordinal,
+		ParentOperationID: store.snapshot.ActiveEffect.ParentOperationID, ParentOperation: store.snapshot.ActiveEffect.ParentOperation, Ordinal: store.snapshot.ActiveEffect.Ordinal,
 		ReplayPolicy: store.snapshot.ActiveEffect.ReplayPolicy, Generations: store.snapshot.Generations,
 		DispatchAttempt: store.snapshot.ActiveEffect.DispatchAttempt + 1, Deadline: command.Deadline, EventSequence: store.eventSequence, Durable: true,
 	}

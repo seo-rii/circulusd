@@ -63,6 +63,12 @@ func (claimer *DispatchStartClaimer) ClaimDispatchStart(
 	}
 
 	permit := request.Dispatch
+	// The legacy claim ingress represents only typed operation IDs. Raw Pi
+	// parent identifiers use the complete Session broker Store; never omit one
+	// while constructing the legacy command digest or persisted claims.
+	if permit.ParentOperation != "" {
+		return broker.DispatchStartClaim{}, broker.ErrInvalidRequest
+	}
 	now := request.Now
 	deadlineUnixMS := permit.Deadline.UnixMilli()
 	providerRequestID := ""

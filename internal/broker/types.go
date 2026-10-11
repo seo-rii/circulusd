@@ -99,6 +99,9 @@ type EffectSnapshot struct {
 	Service           EffectService
 	Operation         string
 	ParentOperationID identity.ID
+	// ParentOperation preserves a non-op-ID Pi parent identifier; it is empty
+	// when ParentOperationID is set. Store adapters validate the original text.
+	ParentOperation   string
 	Ordinal           uint64
 	ReplayPolicy      ReplayPolicy
 	State             EffectState
@@ -136,6 +139,9 @@ type TurnSnapshot struct {
 	ActiveEffect         *EffectSnapshot
 	Checkpoint           *v1.AgentCheckpoint
 	UnconsumedSettlement *v1.EffectRecord
+	// ResumeSettlement is the actual canonical-CBOR EngineSettlement. The
+	// EffectRecord carries metadata only; an artifact ID cannot replace this body.
+	ResumeSettlement []byte
 }
 
 type EngineStepBudget struct {
@@ -167,6 +173,7 @@ type EngineStepPermit struct {
 	Durable               bool
 	Checkpoint            *v1.AgentCheckpoint
 	UnconsumedSettlement  *v1.EffectRecord
+	ResumeSettlement      []byte
 }
 
 type BoundaryKind string
@@ -185,7 +192,10 @@ type EffectIntent struct {
 	RequestDigest     Digest
 	Payload           []byte
 	ParentOperationID identity.ID
-	Ordinal           uint64
+	// ParentOperation preserves a non-op-ID Pi parent identifier; it is empty
+	// when ParentOperationID is set. Store adapters validate the original text.
+	ParentOperation string
+	Ordinal         uint64
 }
 
 type EngineBoundary struct {
@@ -222,13 +232,16 @@ type EffectPreparationPermit struct {
 	Service           EffectService
 	Operation         string
 	ParentOperationID identity.ID
-	Ordinal           uint64
-	ReplayPolicy      ReplayPolicy
-	Generations       Generations
-	DispatchAttempt   uint64
-	Deadline          time.Time
-	EventSequence     uint64
-	Durable           bool
+	// ParentOperation preserves a non-op-ID Pi parent identifier; it is empty
+	// when ParentOperationID is set. Store adapters validate the original text.
+	ParentOperation string
+	Ordinal         uint64
+	ReplayPolicy    ReplayPolicy
+	Generations     Generations
+	DispatchAttempt uint64
+	Deadline        time.Time
+	EventSequence   uint64
+	Durable         bool
 }
 
 type EffectKey struct {
@@ -257,13 +270,16 @@ type DispatchRequest struct {
 
 type DispatchPermit struct {
 	EffectKey
-	Opaque              OpaquePermit
-	TenantID            identity.ID
-	WorkspaceID         identity.ID
-	UserID              identity.ID
-	Service             EffectService
-	Operation           string
-	ParentOperationID   identity.ID
+	Opaque            OpaquePermit
+	TenantID          identity.ID
+	WorkspaceID       identity.ID
+	UserID            identity.ID
+	Service           EffectService
+	Operation         string
+	ParentOperationID identity.ID
+	// ParentOperation preserves a non-op-ID Pi parent identifier; it is empty
+	// when ParentOperationID is set. Store adapters validate the original text.
+	ParentOperation     string
 	Ordinal             uint64
 	ReplayPolicy        ReplayPolicy
 	Generations         Generations
