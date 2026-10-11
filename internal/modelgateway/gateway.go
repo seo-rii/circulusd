@@ -282,6 +282,12 @@ func (gateway *Gateway) Admit(ctx context.Context, request AdmissionRequest) (Ef
 		if _, supported := provider.(ProviderRequestRetriever); !supported {
 			return Effect{}, fmt.Errorf("%w: provider advertised durable retrieval without implementing its contract", ErrProviderUnavailable)
 		}
+		// Each pre-dispatch retry consumes two events. The final attempt
+		// must also leave room for acceptance, cancellation, classification,
+		// and retrieval of an uncertain result before reserving quota.
+		if uint64(gateway.bounds.MaxEvents) < uint64(grant.MaxPreDispatchRetries)*2+5 {
+			return Effect{}, fmt.Errorf("%w: event budget cannot support durable retrieval and all permitted attempts", ErrInvalidConfiguration)
+		}
 	}
 
 	quotaRequest := QuotaRequest{
