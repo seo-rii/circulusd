@@ -26,45 +26,45 @@ const MEBIBYTE = 1_048_576;
 
 const GOLDEN_SCHEMA_DIGESTS = {
   "session.initialize":
-    "sha256:5a0b28de7fefe0e49f7f6909e60ccb3dde33b5c8ad4db49df9657509cdd19142",
+    "sha256:08a932591b57f378afc0187d9a3cffdbba0b9b3709583681613073e11bae0908",
   "session.execute":
-    "sha256:0cfbf95ebc837225746cf03c0bef6f018a4452815e90d775bc4d6cd516a99656",
+    "sha256:f83528ea0db0f1608046c9a44b770b06a89eaea348a1379106a39271d5381c90",
   "session.read":
-    "sha256:59ecd31cb67d77f2a54917fbda8453b86db517abfba484fca55e6891026b40c6",
+    "sha256:2dbea60b23caacd8516f2b116f5f4518a283886d8e96298d2c1308ca2bad295c",
   "session.read-blob":
-    "sha256:f35122bf697af5d0d53f34b8f0a20b1c2d1be7dc00b35bcf03e95a5ab25f9209",
+    "sha256:b06366cdf19b231e67ad5913d7c0259001de0eee343964d1b49b11c3ddc8219d",
   "session.read-events":
-    "sha256:da3da23fa27c8b45de68448dc572299e2472b6a2f10508b4336761ce57a086ab",
+    "sha256:4aa0f7c0399fe8aec4dd7dad61763c12c08eb6a7283a727d83ede867050d0466",
   "workspace.initialize":
-    "sha256:d7ef22ff43b37ff8150fa6138ef113c9e5d5123040233f2a8b2ca6cca74c7301",
+    "sha256:54817fc2004e254b4508da091a572c2ace92f95d2aeffbe8d1bf37904f12fc61",
   "workspace.execute":
-    "sha256:89d0e251a92b55242b75c8b45cef215afd261b5bac981bcd9d332e65b15b7bb4",
+    "sha256:52edd4d1749afca1aa911e7eb7b057e34b15c45670d2226638c4147645dc3d43",
   "workspace.lookup-invocation":
-    "sha256:f1268c61bcd1624f461b832714667a931336cef4e73dbdee8f39273efeddfb5d",
+    "sha256:0417a8112bf934c8fcb3c3f144ca1f46b183e20c8423f4e196d2e664d8d7aa77",
   "user.initialize":
-    "sha256:b26cef99b675b8889cc0a88c16779ed2b4c632b1092efdbe11fc6327d3aeb644",
+    "sha256:823e93ed0ca576ae903255559bd5a07811287c0cc48956684e785d559d963512",
   "user.execute":
-    "sha256:a3bb3106eecf9304cffe4c7500edc7334128b43cd1cb050ed55ca0800432d93d",
+    "sha256:305aa45309c66ee55265585a1511dae427b8587b1881e95d9f4c5097cc92eeee",
   "user.read":
-    "sha256:3eb6a796e2567dbd32d074c9a40bb032bee69aff701520defedc9aede7fa6bd1",
+    "sha256:9d7a8932bf476a245479a9bba5672be21c83daac0d798f03650c02fcb3b240b0",
   "extension-state.initialize":
-    "sha256:e6494189db2fb6603569a3db306622a014f407f648b6449604e0aa701a1f31c8",
+    "sha256:70bd9c4bb13ad241453a303a956cc4b133195db2adc63f37bac66db134f67723",
   "extension-state.execute":
-    "sha256:030f3b464bf29d55bb59ec8dd2d904704ca5f9225c8b4b4efe4b89e5d53c765b",
+    "sha256:a358b040e73456c104f46daa8a2f5ad8811202915dadff08ee30226e876308c7",
   "extension-state.read":
-    "sha256:5efab07d67db445d57b5935b770199e4c8f953a5e4fd10d46075ee61f586aafe",
+    "sha256:e0d1417628aa378060f48eb911e7f3ab2c6117b7724119511641c7d116d44958",
   "capability-generation.initialize":
-    "sha256:4ae137539e26d04e13b6c216e5351af8cfb4e9e4f5076ffe248f580d2c5155a5",
+    "sha256:b9cd8b89a3ecedccbf55e163d3c15502af1af32b500b7a8e36266980ee991d89",
   "capability-generation.execute":
-    "sha256:cac82ff983468bc42b17e0147d33768db37cbdb3d1f1d3eccb529b9933a171a5",
+    "sha256:fea75874413bb4cdf04f95beecce9dc4c0328f233dfd7c5cfc0aec99c3fe97e7",
   "capability-generation.assert-current":
-    "sha256:735d65c15fb6e3b45e55649042d4142b3c998fd25804388b732ffead97eb82c4",
+    "sha256:81b5e709bf3e488d0757637508849e3c11934031efe7f9c98771349f7cc722cb",
   "audit.initialize":
-    "sha256:40ee9be774c1071c52acabc4c50ae9a5b55ff791231ccec71b97e962092e2976",
+    "sha256:214b16a647ccba67eb2ec1e82eddc06d37f7f0bb282a6608467dbc90cc69071e",
   "audit.execute":
-    "sha256:c8bab2fac9991bdf8de4c4924c74d5c78004271359e8358dade86d1d8091f55b",
+    "sha256:0c188d1ffcc3a7d8997d0a64ad22bee7a9259b3dcfa63e95aeabba402990d485",
   "audit.read":
-    "sha256:8af03551bbf92e3d4611488b50d7f12393768df274a2aa129308d30b279b9b89",
+    "sha256:c16f88e04516c05e41847c092c4a039bff31ea04909bc5d093cc211be0355cb0",
 } as const satisfies Record<HostRpcOperation, `sha256:${string}`>;
 
 function requestEnvelope(

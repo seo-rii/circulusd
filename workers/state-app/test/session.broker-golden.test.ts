@@ -156,7 +156,7 @@ async function vectors() {
     if (abort) await source.abort();
     const before = await source.read("before-recovery");
     await source.call("settlement", { operation: "settle-recovery", body: { snapshot: source.snapshot(before), key: source.key,
-      operationKey: `${label}-recover`, operationDigest: digest("4"), kind: abort ? "interrupted_unknown" : "failed", error } });
+      operationKey: `${label}-recover`, operationDigest: digest("4"), kind: abort ? "interrupted_unknown" : "failed", error: abort ? error : { ...error, reason: "r".repeat(300), message: "x".repeat(8192) } } });
     await source.read("settled");
   }
   const renewal = await scenario("renewal", "never", false);

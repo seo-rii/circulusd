@@ -592,8 +592,8 @@ export async function applySessionBrokerCommand(state: SessionAggregateState, co
         next.status = "running";
       }
       effect.phase = "settled";
-      effect.settlement = request.body.kind === "failed" ? { kind: "error", code: request.body.error.reason || `BROKER_ERROR_${request.body.error.code}`,
-        message: request.body.error.message, retryable: request.body.error.retryable } :
+      effect.settlement = request.body.kind === "failed" ? { kind: "error", code: "effect.failed",
+        message: "The effect failed.", retryable: request.body.error.retryable } :
         { kind: "interrupted_unknown", reason: request.body.error.reason || "uncertain dispatch interrupted" };
       appendBrokerPublicEvent(next, effect, effect.service === "model" ? "model.settled" : "tool.settled");
       result = await settlementReceipt(next, request.body.key, operationDigest, request.body.error, request.body.kind, blobs, next.eventSequence + 1);

@@ -241,7 +241,8 @@ describe("Session broker authoritative transaction", () => {
       if (started) await f.call({ operation: "claim-start", body: { snapshot: f.snapshot(await f.read()), key,
         dispatchOpaque: dispatched.permit.opaque, commandDigest: d("a"), nowUnixMs: 1_000 } });
     }
-    const error: SessionBrokerPublicError = { code: 7, reason: "RECOVERED", message: "original failure", retryable: false,
+    const error: SessionBrokerPublicError = { code: 7, reason: kind === "failed" ? "r".repeat(300) : "RECOVERED",
+      message: kind === "failed" ? "x".repeat(8192) : "original failure", retryable: false,
       retryAfterMs: 500, metadata: { original: "retained" }, requestId: "original-request" };
     if (phase === "blocked") await f.call({ operation: "block", body: { snapshot: f.snapshot(await f.read()), key,
       operationKey: "block", operationDigest: d("b"), reason: error } });
@@ -266,7 +267,7 @@ describe("Session broker authoritative transaction", () => {
       expect((await f.state()).terminalTurns[0]!.status).toBe("aborted");
     } else {
       const resumed = await f.acquire("resume");
-      expect(resumed.grant.unconsumedSettlement!.settlement.kind).toBe("error");
+      expect(resumed.grant.unconsumedSettlement!.settlement).toEqual({ kind: "error", code: "effect.failed", message: "The effect failed.", retryable: error.retryable });
       await f.commit(resumed.grant, { kind: "turn_complete", checkpoint: await f.checkpoint(await f.read()), result: { recovered: true } }, "complete");
       expect((await f.read()).active).toBe(false);
     }
