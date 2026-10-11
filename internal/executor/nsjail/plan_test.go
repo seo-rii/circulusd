@@ -394,3 +394,47 @@ func validRequest(t *testing.T) Request {
 		},
 	}
 }
+
+func TestExplicitRlimitsDoNotRaiseCgroupLimitsAndAreSealed(t *testing.T) {
+	planner, err := NewPlanner(validConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(t)
+	original, err := planner.Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Resources.AddressSpaceBytes = 4 << 30
+	request.Resources.MaximumUserProcesses = 512
+	raised, err := planner.Build(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"rlimit_as: 4096\n", "rlimit_nproc: 512\n", "cgroup_mem_max: 268435456\n", "cgroup_pids_max: 64\n"} {
+		if !strings.Contains(string(raised.Configuration()), text) {
+			t.Fatalf("missing %q", text)
+		}
+	}
+	if original.Digest() == raised.Digest() {
+		t.Fatal("explicit rlimits are not bound by plan digest")
+	}
+	request.Resources.AddressSpaceBytes = 0
+	request.Resources.MaximumUserProcesses = 0
+	restored, err := planner.Build(request)
+	if err != nil || restored.Digest() != original.Digest() {
+		t.Fatal("zero options changed existing plan contract")
+	}
+	for _, mutate := range []func(*ResourceLimits){func(l *ResourceLimits) { l.AddressSpaceBytes = l.MemoryBytes - 1 }, func(l *ResourceLimits) { l.AddressSpaceBytes = 1<<50 + 1 }, func(l *ResourceLimits) { l.MaximumUserProcesses = l.MaximumProcesses - 1 }, func(l *ResourceLimits) { l.MaximumUserProcesses = 1<<20 + 1 }} {
+		r := validRequest(t)
+		mutate(&r.Resources)
+		if _, err := planner.Build(r); err == nil {
+			t.Fatal("invalid explicit rlimit accepted")
+		}
+	}
+	copy := raised.Configuration()
+	copy[0] ^= 1
+	if err := raised.Validate(); err != nil {
+		t.Fatal("configuration clone mutated sealed plan")
+	}
+}

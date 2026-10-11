@@ -39,8 +39,8 @@ var (
 )
 
 // launchCommand is the complete exec boundary. Environment is always a
-// non-nil empty slice, and ExtraFiles contains only the anonymous nonce read
-// end, which becomes descriptor 3 in the child.
+// non-nil empty slice. ExtraFiles contains the anonymous nonce read end (fd 3)
+// and, for a digest-pinned launch, the sealed ELF executable (fd 4).
 type launchCommand struct {
 	Executable  string
 	Arguments   []string
@@ -163,6 +163,14 @@ func (launcher *Launcher) Start(ctx context.Context, plan LaunchPlan) (*Instance
 	defer unix.Close(binaryFD)
 	if err := verifyTrustedRegular(binaryFD, true); err != nil {
 		return nil, fmt.Errorf("%w: NsJail binary: %w", ErrUnsafeArtifact, err)
+	}
+	var pinnedBinary *os.File
+	if plan.binaryDigest != "" {
+		pinnedBinary, err = snapshotPinnedExecutable(binaryFD, plan.binaryDigest)
+		if err != nil {
+			return nil, err
+		}
+		defer pinnedBinary.Close()
 	}
 
 	environmentFD, err := openTrustedAbsolute(plan.environmentRoot, uint64(unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC))
@@ -485,6 +493,12 @@ func (launcher *Launcher) Start(ctx context.Context, plan LaunchPlan) (*Instance
 		Arguments:   arguments,
 		Environment: make([]string, 0),
 		ExtraFiles:  []*os.File{nonceReader},
+	}
+	if pinnedBinary != nil {
+		// fd 3 remains the single-use nonce; fd 4 is the verified, immutable
+		// ELF snapshot. No pathname re-open can substitute executable bytes.
+		command.Executable = "/proc/self/fd/4"
+		command.ExtraFiles = append(command.ExtraFiles, pinnedBinary)
 	}
 	process, startErr := launcher.starter.Start(command)
 	_ = nonceReader.Close()

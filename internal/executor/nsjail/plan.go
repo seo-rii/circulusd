@@ -41,7 +41,10 @@ var (
 // These values must never be populated from an extension manifest or tool
 // request.
 type Config struct {
-	BinaryPath      string
+	BinaryPath string
+	// BinaryDigest, when set, requires a sealed snapshot of this exact ELF
+	// executable. Qualification runs must set it from signed release metadata.
+	BinaryDigest    string
 	EnvironmentRoot string
 	SandboxRoot     string
 	CgroupRoot      string
@@ -68,8 +71,12 @@ const (
 // NsJail's cgroup v2 controls are authoritative for memory, process count,
 // and CPU; rlimits and bounded tmpfs mounts are additional defenses.
 type ResourceLimits struct {
-	MemoryBytes            uint64
-	MaximumProcesses       uint64
+	MemoryBytes      uint64
+	MaximumProcesses uint64
+	// Optional rlimit ceilings. Zero preserves the cgroup-aligned defaults.
+	// They never alter the authoritative cgroup memory or PID limits.
+	AddressSpaceBytes      uint64
+	MaximumUserProcesses   uint64
 	CPUMillisPerSecond     uint32
 	ScratchBytes           uint64
 	TemporaryBytes         uint64
@@ -102,6 +109,7 @@ type Request struct {
 // exact bytes for audit.
 type LaunchPlan struct {
 	executable    string
+	binaryDigest  string
 	arguments     []string
 	configPath    string
 	configuration []byte
@@ -171,6 +179,12 @@ type Planner struct {
 
 // NewPlanner validates and snapshots trusted bootstrap configuration.
 func NewPlanner(config Config) (*Planner, error) {
+	if config.BinaryDigest != "" {
+		decoded, err := hex.DecodeString(strings.TrimPrefix(config.BinaryDigest, "sha256:"))
+		if err != nil || len(decoded) != sha256.Size || config.BinaryDigest != "sha256:"+hex.EncodeToString(decoded) {
+			return nil, fmt.Errorf("%w: NsJail binary digest must be canonical SHA-256", ErrInvalidConfig)
+		}
+	}
 	hostPaths := []struct {
 		name  string
 		value string
@@ -282,8 +296,18 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 		return LaunchPlan{}, fmt.Errorf("%w: only isolated network mode is implemented", ErrInvalidRequest)
 	}
 	limits := request.Resources
+	addressSpace := limits.AddressSpaceBytes
+	if addressSpace == 0 {
+		addressSpace = limits.MemoryBytes
+	}
+	userProcesses := limits.MaximumUserProcesses
+	if userProcesses == 0 {
+		userProcesses = limits.MaximumProcesses
+	}
 	if limits.MemoryBytes == 0 || limits.MemoryBytes > 1<<50 ||
 		limits.MaximumProcesses == 0 || limits.MaximumProcesses > 1<<20 ||
+		addressSpace < limits.MemoryBytes || addressSpace > 1<<50 ||
+		userProcesses < limits.MaximumProcesses || userProcesses > 1<<20 ||
 		limits.CPUMillisPerSecond == 0 || limits.CPUMillisPerSecond > 1_000_000 ||
 		limits.ScratchBytes == 0 || limits.ScratchBytes > 1<<50 ||
 		limits.TemporaryBytes == 0 || limits.TemporaryBytes > 1<<40 ||
@@ -333,12 +357,12 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 	_, _ = configuration.WriteString("daemon: false\nkeep_env: false\nkeep_caps: false\ndisable_no_new_privs: false\n")
 	_, _ = configuration.WriteString("skip_setsid: false\nforward_signals: false\n")
 	_, _ = fmt.Fprintf(&configuration, "pass_fd: %d\n", handshakeNonceFD)
-	_, _ = fmt.Fprintf(&configuration, "rlimit_as: %d\nrlimit_as_type: VALUE\n", (limits.MemoryBytes+mebibyte-1)/mebibyte)
+	_, _ = fmt.Fprintf(&configuration, "rlimit_as: %d\nrlimit_as_type: VALUE\n", (addressSpace+mebibyte-1)/mebibyte)
 	_, _ = configuration.WriteString("rlimit_core: 0\nrlimit_core_type: VALUE\n")
 	_, _ = fmt.Fprintf(&configuration, "rlimit_cpu: %d\nrlimit_cpu_type: VALUE\n", limits.MaximumLifetimeSeconds)
 	_, _ = fmt.Fprintf(&configuration, "rlimit_fsize: %d\nrlimit_fsize_type: VALUE\n", limits.MaximumFileBytes/mebibyte)
 	_, _ = fmt.Fprintf(&configuration, "rlimit_nofile: %d\nrlimit_nofile_type: VALUE\n", limits.MaximumOpenFiles)
-	_, _ = fmt.Fprintf(&configuration, "rlimit_nproc: %d\nrlimit_nproc_type: VALUE\n", limits.MaximumProcesses)
+	_, _ = fmt.Fprintf(&configuration, "rlimit_nproc: %d\nrlimit_nproc_type: VALUE\n", userProcesses)
 	_, _ = configuration.WriteString("clone_newnet: true\nclone_newuser: true\nclone_newns: true\n")
 	_, _ = configuration.WriteString("clone_newpid: true\nclone_newipc: true\nclone_newuts: true\nclone_newcgroup: true\n")
 	_, _ = fmt.Fprintf(&configuration, "uidmap {\n  inside_id: \"0\"\n  outside_id: %s\n  count: 1\n  use_newidmap: false\n}\n", strconv.Quote(strconv.FormatUint(uint64(request.HostUID), 10)))
@@ -373,6 +397,7 @@ func (planner *Planner) Build(request Request) (LaunchPlan, error) {
 
 	plan := LaunchPlan{
 		executable:           planner.config.BinaryPath,
+		binaryDigest:         planner.config.BinaryDigest,
 		arguments:            []string{"--config", configPath},
 		configPath:           configPath,
 		configuration:        []byte(configuration.String()),
@@ -401,6 +426,9 @@ func digestLaunchPlan(plan LaunchPlan) string {
 	fields := [][]byte{
 		[]byte(plan.executable),
 		[]byte(strconv.Itoa(len(plan.arguments))),
+	}
+	if plan.binaryDigest != "" {
+		fields = append(fields, []byte("pinned-elf-v1"), []byte(plan.binaryDigest))
 	}
 	for _, argument := range plan.arguments {
 		fields = append(fields, []byte(argument))
