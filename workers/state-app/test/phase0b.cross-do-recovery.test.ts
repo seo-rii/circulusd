@@ -1,4 +1,4 @@
-import type { Digest } from "@circulusd/protocol-types";
+import { digestBytes, encodeCanonicalCbor, type Digest } from "@circulusd/protocol-types";
 import { describe, expect, it } from "vitest";
 
 import { replaySessionPublicEvents } from "../src/session/index.ts";
@@ -88,6 +88,7 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
     });
     expect(recovered.workspace.revisions).toHaveLength(2);
     expect(recovered.workspace.invocationLedger).toHaveLength(1);
+    const settlementBytes = encodeCanonicalCbor(recoveries[0]!.workspaceResult);
     expect(recovered.session).toMatchObject({
       eventSequence: 5,
       publicEventSequence: 4,
@@ -98,13 +99,19 @@ describe("Phase 0B reference-only cross-Durable-Object recovery", () => {
           externalCommitId: "phase0b-workspace-commit",
           settlement: {
             kind: "success",
-            result: {
-              workspaceCommitId: "phase0b-workspace-commit",
-              revision: 1,
+            resultPayloadRef: {
+              encoding: "canonical-cbor-v1",
+              digest: await digestBytes(settlementBytes),
+              encodedBytes: settlementBytes.byteLength,
+              encodedItems: 7,
             },
           },
         },
       ],
+    });
+    expect(recovered.session.commandReceipts.at(-1)?.outcome).toEqual({
+      kind: "effect_settled", effectId: recovered.session.effects[0]!.effectId,
+      settlement: recovered.session.effects[0]!.settlement,
     });
     expect(recovered.session.commandReceipts).toHaveLength(5);
     expect(

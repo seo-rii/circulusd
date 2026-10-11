@@ -1157,6 +1157,18 @@ var PERMIT_FIELDS = [
   "providerRouteDigest",
   "deadline"
 ];
+function parseAgentError(value, path = "$agentError") {
+  const error = exactRecord(value, ["code", "message", "retryable"], ["details"], path);
+  if (typeof error.retryable !== "boolean") {
+    validationError(`${path}.retryable`, "must be a boolean");
+  }
+  const parsedError = {
+    code: operation(error.code, `${path}.code`),
+    message: nfcString(error.message, `${path}.message`, { maxBytes: 4096 }),
+    retryable: error.retryable
+  };
+  return hasOwn(error, "details") ? { ...parsedError, details: normalizeProtocolValue(error.details) } : parsedError;
+}
 function parseEngineStepResult(value) {
   const preliminary = plainRecord(value, "$engineStepResult");
   switch (preliminary.kind) {
@@ -1224,26 +1236,10 @@ function parseEngineStepResult(value) {
         [],
         "$engineStepResult"
       );
-      const error = exactRecord(
-        record.error,
-        ["code", "message", "retryable"],
-        ["details"],
-        "$engineStepResult.error"
-      );
-      if (typeof error.retryable !== "boolean") {
-        validationError("$engineStepResult.error.retryable", "must be a boolean");
-      }
-      const parsedError = {
-        code: operation(error.code, "$engineStepResult.error.code"),
-        message: nfcString(error.message, "$engineStepResult.error.message", {
-          maxBytes: 4096
-        }),
-        retryable: error.retryable
-      };
       return {
         kind: "turn_error",
         checkpoint: parseAgentCheckpoint(record.checkpoint),
-        error: hasOwn(error, "details") ? { ...parsedError, details: normalizeProtocolValue(error.details) } : parsedError
+        error: parseAgentError(record.error, "$engineStepResult.error")
       };
     }
     default:
@@ -16009,11 +16005,154 @@ var writeSchema = typebox_exports.Object({
   content: typebox_exports.String({ description: "Content to write to the file" })
 });
 
+// workers/pi-runtime/src/pi-json-codec.ts
+var PI_NUMBER_WRAPPER_KEY = "$pi.number.v1";
+var maximumDepth = 64;
+var maximumItems = 1e6;
+function invalid(path, message) {
+  throw new PiRuntimeError("INVALID_CONTEXT", `${path} ${message}`);
+}
+function walkPiJson(value, path, depth, traversal) {
+  if (depth > maximumDepth) invalid(path, `exceeds maximum depth ${maximumDepth}`);
+  if (traversal.items >= maximumItems) invalid(path, `exceeds encoded item limit ${maximumItems}`);
+  traversal.items += 1;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    assertUnicodeScalarString(value, path);
+    return value.normalize("NFC");
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) invalid(path, "must be a finite JSON number");
+    if (Object.is(value, -0)) invalid(path, "negative zero is unsupported");
+    if (Number.isSafeInteger(value)) return value;
+    if (traversal.mode === "decode") invalid(path, "durable numbers must be safe integers or wrappers");
+    if (traversal.mode === "validate") return value;
+    if (depth + 1 > maximumDepth) invalid(path, `exceeds maximum depth ${maximumDepth}`);
+    if (traversal.items + 2 > maximumItems) invalid(path, `exceeds encoded item limit ${maximumItems}`);
+    traversal.items += 2;
+    return { [PI_NUMBER_WRAPPER_KEY]: value.toString() };
+  }
+  if (value instanceof Uint8Array) invalid(path, "must be JSON, not bytes");
+  if (typeof value !== "object") invalid(path, `has an unsupported ${typeof value} value`);
+  if (traversal.seen.has(value)) invalid(path, "cyclic or repeated object references are unsupported");
+  traversal.seen.add(value);
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) invalid(path, "must be a plain array");
+    if (value.length > maximumItems - traversal.items) invalid(path, `exceeds encoded item limit ${maximumItems}`);
+    const keys2 = Reflect.ownKeys(value);
+    if (keys2.length !== value.length + 1) invalid(path, "sparse or custom arrays are unsupported");
+    for (const key of keys2) {
+      if (key === "length") continue;
+      if (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= value.length) {
+        invalid(path, "arrays cannot have custom properties");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === void 0 || !descriptor.enumerable || !("value" in descriptor)) {
+        invalid(`${path}[${key}]`, "must be an enumerable data property");
+      }
+    }
+    const result2 = [];
+    for (let index3 = 0; index3 < value.length; index3 += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index3));
+      if (descriptor === void 0 || !("value" in descriptor)) invalid(path, "sparse arrays are unsupported");
+      result2.push(walkPiJson(descriptor.value, `${path}[${index3}]`, depth + 1, traversal));
+    }
+    return result2;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) invalid(path, "must be a plain object");
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > maximumItems - traversal.items) invalid(path, `exceeds encoded item limit ${maximumItems}`);
+  const entries = [];
+  const normalizedKeys = /* @__PURE__ */ new Set();
+  for (const key of keys) {
+    if (typeof key !== "string") invalid(path, "symbol keys are unsupported");
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === void 0 || !descriptor.enumerable || !("value" in descriptor)) {
+      invalid(`${path}.${key}`, "must be an enumerable data property");
+    }
+    assertUnicodeScalarString(key, path);
+    const normalizedKey = key.normalize("NFC");
+    if (normalizedKeys.has(normalizedKey)) invalid(path, `has duplicate normalized key ${JSON.stringify(normalizedKey)}`);
+    normalizedKeys.add(normalizedKey);
+    entries.push([normalizedKey, descriptor.value]);
+  }
+  traversal.items += keys.length;
+  if (normalizedKeys.has(PI_NUMBER_WRAPPER_KEY)) {
+    if (traversal.mode !== "decode") invalid(path, `uses the reserved key ${PI_NUMBER_WRAPPER_KEY}`);
+    if (entries.length !== 1) invalid(path, "misuses the reserved number-wrapper key");
+    const decimal = walkPiJson(entries[0][1], `${path}.${PI_NUMBER_WRAPPER_KEY}`, depth + 1, traversal);
+    if (typeof decimal !== "string" || decimal.length > 32) invalid(path, "number wrapper must hold a bounded decimal string");
+    const restored = Number(decimal);
+    if (!Number.isFinite(restored) || Object.is(restored, -0) || Number.isSafeInteger(restored) || restored.toString() !== decimal) invalid(path, "number wrapper is not a canonical non-safe-integer decimal");
+    return restored;
+  }
+  const result = {};
+  for (const [key, entry] of entries) {
+    Object.defineProperty(result, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: walkPiJson(entry, `${path}.${key}`, depth + 1, traversal)
+    });
+  }
+  return result;
+}
+function validatePiJson(value) {
+  return walkPiJson(value, "$", 0, { mode: "validate", seen: /* @__PURE__ */ new WeakSet(), items: 0 });
+}
+function encodePiJson(value) {
+  return normalizeProtocolValue(
+    walkPiJson(value, "$", 0, { mode: "encode", seen: /* @__PURE__ */ new WeakSet(), items: 0 }),
+    { maxDepth: maximumDepth, maxItems: maximumItems }
+  );
+}
+function decodePiJson(value) {
+  return walkPiJson(value, "$", 0, { mode: "decode", seen: /* @__PURE__ */ new WeakSet(), items: 0 });
+}
+
 // workers/pi-runtime/src/pi-cost-codec.ts
 var PI_AGENT_CORE_MODEL_PROTOCOL_VERSION = 2;
 var PI_AGENT_CORE_COST_ENCODING = "pi-cost-decimal-v1";
 var maximumValueBytes = 4 << 20;
 var costFields = ["input", "output", "cacheRead", "cacheWrite", "total"];
+var PiToolArgumentsEncodingError = class extends PiRuntimeError {
+  constructor(cause) {
+    super("INVALID_CONTEXT", "Pi tool call arguments are not valid encoded JSON", { cause });
+    this.name = "PiToolArgumentsEncodingError";
+  }
+};
+function assistantContent(content, encode) {
+  let source;
+  try {
+    source = encode ? validatePiJson(content) : content;
+  } catch (error) {
+    throw new PiToolArgumentsEncodingError(error);
+  }
+  if (!Array.isArray(source)) return source;
+  return source.map((block) => {
+    if (block === null || typeof block !== "object" || Array.isArray(block) || block instanceof Uint8Array || !("type" in block) || block.type !== "toolCall" || !("arguments" in block)) return block;
+    try {
+      return {
+        ...block,
+        arguments: encode ? encodePiJson(block.arguments) : decodePiJson(block.arguments)
+      };
+    } catch (error) {
+      throw new PiToolArgumentsEncodingError(error);
+    }
+  });
+}
+function contextTools(tools, encode) {
+  const source = encode ? validatePiJson(tools) : tools;
+  if (!Array.isArray(source)) return source;
+  return source.map((tool) => {
+    if (tool === null || typeof tool !== "object" || Array.isArray(tool) || tool instanceof Uint8Array || !("parameters" in tool)) return tool;
+    return {
+      ...tool,
+      parameters: encode ? encodePiJson(tool.parameters) : decodePiJson(tool.parameters)
+    };
+  });
+}
 function assistantRecords(value) {
   const message = exactRecord2(
     value,
@@ -16065,6 +16204,7 @@ function encodePiAgentCoreAssistantMessage(value) {
   const encodedCost = Object.fromEntries(costFields.map((field) => [field, checkedCost(cost[field]).toString()]));
   return boundedProtocolValue({
     ...message,
+    content: assistantContent(message.content, true),
     usage: { ...usage, cost: { encoding: PI_AGENT_CORE_COST_ENCODING, ...encodedCost } }
   }, maximumValueBytes, "piModel.encodedMessage", "INVALID_CONTEXT");
 }
@@ -16090,7 +16230,7 @@ function decodePiAgentCoreAssistantMessage(value) {
   return {
     ...message,
     role: "assistant",
-    content: message.content,
+    content: assistantContent(message.content, false),
     api: message.api,
     provider: message.provider,
     model: message.model,
@@ -16121,7 +16261,8 @@ function decodePiAgentCoreModelSettlement(value) {
 function encodePiAgentCoreModelContext(value) {
   return boundedProtocolValue({
     ...value,
-    messages: value.messages.map((message) => message.role === "assistant" ? encodePiAgentCoreAssistantMessage(message) : message)
+    messages: value.messages.map((message) => message.role === "assistant" ? encodePiAgentCoreAssistantMessage(message) : message),
+    ...value.tools === void 0 ? {} : { tools: contextTools(value.tools, true) }
   }, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
 }
 function decodePiAgentCoreModelContext(value) {
@@ -16132,29 +16273,51 @@ function decodePiAgentCoreModelContext(value) {
   }
   return {
     ...context,
-    messages: context.messages.map((message) => message !== null && typeof message === "object" && message.role === "assistant" ? decodePiAgentCoreAssistantMessage(message) : message)
+    messages: context.messages.map((message) => message !== null && typeof message === "object" && message.role === "assistant" ? decodePiAgentCoreAssistantMessage(message) : message),
+    ...context.tools === void 0 ? {} : { tools: contextTools(context.tools, false) }
   };
+}
+function ownDataField(value, field) {
+  if (value === null || typeof value !== "object") return void 0;
+  const descriptor = Object.getOwnPropertyDescriptor(value, field);
+  return descriptor !== void 0 && "value" in descriptor ? descriptor.value : void 0;
+}
+function hasRawToolArgumentNumber(message) {
+  let content;
+  try {
+    content = validatePiJson(ownDataField(message, "content"));
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(content)) return false;
+  for (const block of content) {
+    if (ownDataField(block, "type") !== "toolCall") continue;
+    const pending = [ownDataField(block, "arguments")];
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (typeof value === "number" && !Number.isSafeInteger(value)) return true;
+      if (value !== null && typeof value === "object") {
+        for (const entry of Object.values(value)) pending.push(entry);
+      }
+    }
+  }
+  return false;
 }
 function normalizePiAgentCoreSettlement(value, request) {
   const payload = request?.payload;
   if (request?.service !== "model" || request.operation !== "complete" || payload === null || typeof payload !== "object" || Array.isArray(payload) || payload instanceof Uint8Array || payload.protocol !== "pi-agent-core" || payload.version !== 1 && payload.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) return value;
-  let candidate = value;
-  for (const field of ["outcome", "result", "message", "usage", "cost"]) {
-    if (candidate === null || typeof candidate !== "object") return value;
-    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
-    if (descriptor === void 0 || !("value" in descriptor)) return value;
-    candidate = descriptor.value;
-  }
-  if (candidate === null || typeof candidate !== "object" || !costFields.some((field) => {
-    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
-    return descriptor !== void 0 && "value" in descriptor && typeof descriptor.value === "number" && !Number.isSafeInteger(descriptor.value);
-  })) return value;
+  const message = ownDataField(ownDataField(ownDataField(value, "outcome"), "result"), "message");
+  const cost = ownDataField(ownDataField(message, "usage"), "cost");
+  const rawCost = costFields.some((field) => {
+    const number = ownDataField(cost, field);
+    return typeof number === "number" && !Number.isSafeInteger(number);
+  });
+  if (!rawCost && !hasRawToolArgumentNumber(message)) return value;
   const settlement = exactRecord2(value, ["requestDigest", "outcome"], [], "piModel.engineSettlement", "INVALID_CONTEXT");
   const outcome = exactRecord2(settlement.outcome, ["kind"], ["result", "code", "message", "retryable", "reason"], "piModel.outcome", "INVALID_CONTEXT");
   if (outcome.kind !== "success") return value;
   const result = exactRecord2(outcome.result, ["version", "message"], [], "piModel.settlement", "INVALID_CONTEXT");
-  const { cost } = assistantRecords(result.message);
-  if (result.version !== 1 || costFields.every((field) => Number.isSafeInteger(cost[field]))) return value;
+  if (result.version !== 1) return value;
   return {
     ...settlement,
     outcome: { ...outcome, result: encodePiAgentCoreModelSettlement(result.message) }
@@ -16174,9 +16337,37 @@ function createPiAgentCoreInitialState() {
     pendingToolCalls: []
   };
 }
+function wrapToolSchemaNumbers(configuration) {
+  const record = configuration;
+  const tools = record.tools;
+  if (!Array.isArray(tools)) {
+    return configuration;
+  }
+  return {
+    ...configuration,
+    tools: tools.map((tool) => {
+      if (tool === null || typeof tool !== "object" || Array.isArray(tool)) {
+        return tool;
+      }
+      const toolRecord = tool;
+      if (!("parameters" in toolRecord)) {
+        return tool;
+      }
+      try {
+        return { ...toolRecord, parameters: encodePiJson(toolRecord.parameters) };
+      } catch (error) {
+        throw new PiRuntimeError(
+          "INVALID_CONFIGURATION",
+          "Pi tool schema must be raw JSON without reserved wrapper keys",
+          { cause: error }
+        );
+      }
+    })
+  };
+}
 function createPiAgentCoreFactory(configuration) {
   const normalizedConfiguration = boundedProtocolValue(
-    configuration,
+    wrapToolSchemaNumbers(configuration),
     maximumAdapterValueBytes,
     "piAgentCore.configuration",
     "INVALID_CONFIGURATION"
@@ -16266,28 +16457,22 @@ function createPiAgentCoreFactory(configuration) {
         `piAgentCore.configuration.tools contains duplicate name ${toolRecord.name}`
       );
     }
-    const parameters = normalizeProtocolValue(toolRecord.parameters);
-    const schemaNodes = [parameters];
-    while (schemaNodes.length > 0) {
-      const node = schemaNodes.pop();
-      if (node instanceof Uint8Array) {
-        throw new PiRuntimeError(
-          "INVALID_CONFIGURATION",
-          `piAgentCore.configuration.tools[${index3}].parameters is not JSON`
-        );
-      }
-      if (Array.isArray(node)) {
-        schemaNodes.push(...node);
-      } else if (node !== null && typeof node === "object") {
-        schemaNodes.push(...Object.values(node));
-      }
+    const replayPolicy = toolRecord.replayPolicy;
+    let parameters;
+    try {
+      parameters = decodePiJson(toolRecord.parameters);
+    } catch {
+      throw new PiRuntimeError(
+        "INVALID_CONFIGURATION",
+        `piAgentCore.configuration.tools[${index3}].parameters is not JSON`
+      );
     }
     toolNames.add(toolRecord.name);
     return Object.freeze({
       name: toolRecord.name,
       description: toolRecord.description,
       parameters: structuredClone(parameters),
-      replayPolicy: toolRecord.replayPolicy
+      replayPolicy
     });
   });
   const toolRegistry = new Map(toolDefinitions.map((tool) => [tool.name, tool]));
@@ -16381,27 +16566,27 @@ function createPiAgentCoreFactory(configuration) {
               }
             };
           }
-          const inputRecord = exactRecord2(
-            context.input.input,
-            ["prompt", "timestamp"],
-            [],
-            "piAgentCore.turnInput",
-            "CORE_OUTPUT_INVALID"
-          );
-          if (typeof inputRecord.prompt !== "string") {
-            throw new Error("Pi turn prompt must be a string");
+          let timestamp2;
+          let prompts;
+          if (context.input.input !== null && typeof context.input.input === "object" && !Array.isArray(context.input.input) && Object.hasOwn(context.input.input, "messages")) {
+            const inputRecord = exactRecord2(context.input.input, ["messages"], [], "piAgentCore.turnInput", "CORE_OUTPUT_INVALID");
+            if (!Array.isArray(inputRecord.messages) || inputRecord.messages.length < 1 || inputRecord.messages.length > 1024) {
+              throw new Error("Pi public turn input requires bounded user messages");
+            }
+            timestamp2 = 0;
+            prompts = inputRecord.messages.map((value) => {
+              const message = exactRecord2(value, ["role", "content"], [], "piAgentCore.turnInput.message", "CORE_OUTPUT_INVALID");
+              if (message.role !== "user" || typeof message.content !== "string" || message.content.length === 0) {
+                throw new Error("Pi public turn input accepts only nonempty user messages");
+              }
+              return { role: "user", content: message.content, timestamp: timestamp2 };
+            });
+          } else {
+            const inputRecord = exactRecord2(context.input.input, ["prompt", "timestamp"], [], "piAgentCore.turnInput", "CORE_OUTPUT_INVALID");
+            if (typeof inputRecord.prompt !== "string") throw new Error("Pi turn prompt must be a string");
+            timestamp2 = boundedSafeInteger(inputRecord.timestamp, 0, "piAgentCore.turnInput.timestamp", "CORE_OUTPUT_INVALID");
+            prompts = [{ role: "user", content: inputRecord.prompt, timestamp: timestamp2 }];
           }
-          const timestamp2 = boundedSafeInteger(
-            inputRecord.timestamp,
-            0,
-            "piAgentCore.turnInput.timestamp",
-            "CORE_OUTPUT_INVALID"
-          );
-          const prompt = {
-            role: "user",
-            content: inputRecord.prompt,
-            timestamp: timestamp2
-          };
           let capturedContext;
           let modelCalls = 0;
           let modelMismatch = false;
@@ -16438,7 +16623,7 @@ function createPiAgentCoreFactory(configuration) {
             return stream;
           };
           await runAgentLoop(
-            [prompt],
+            prompts,
             { systemPrompt, messages: [], tools: runtimeTools },
             loopConfiguration,
             async () => void 0,
@@ -16520,6 +16705,17 @@ function createPiAgentCoreFactory(configuration) {
           try {
             decodedMessage = decodePiAgentCoreModelSettlement(settlementRecord);
           } catch (error) {
+            if (error instanceof PiToolArgumentsEncodingError) {
+              return {
+                kind: "turn_error",
+                state: { ...state2, phase: "failed" },
+                error: {
+                  code: "PI_TOOL_CALL_INVALID",
+                  message: "Pi tool call arguments are not valid encoded JSON",
+                  retryable: false
+                }
+              };
+            }
             throw new BoundaryFault("CORE_OUTPUT_INVALID", "Pi model settlement encoding is invalid", { cause: error });
           }
           const messageRecord = exactRecord2(
@@ -16736,32 +16932,15 @@ function createPiAgentCoreFactory(configuration) {
                   }
                 };
               }
-              const argumentNodes = [
-                normalizeProtocolValue(toolCallRecord.arguments)
-              ];
-              let containsNonJsonArgument = false;
-              while (argumentNodes.length > 0) {
-                const node = argumentNodes.pop();
-                if (node instanceof Uint8Array) {
-                  containsNonJsonArgument = true;
-                  break;
-                }
-                if (Array.isArray(node)) {
-                  argumentNodes.push(...node);
-                } else if (node !== null && typeof node === "object") {
-                  argumentNodes.push(...Object.values(node));
-                }
-              }
               let validatedArguments;
               try {
-                if (containsNonJsonArgument) throw new Error("tool arguments are not JSON");
                 const runtimeTool = runtimeTools.find((tool) => tool.name === toolCallRecord.name);
                 if (runtimeTool === void 0) throw new Error("registered runtime tool is missing");
-                validatedArguments = normalizeProtocolValue(validateToolArguments(
+                validatedArguments = encodePiJson(validateToolArguments(
                   runtimeTool,
                   {
                     ...toolCallRecord,
-                    arguments: structuredClone(toolCallRecord.arguments)
+                    arguments: validatePiJson(toolCallRecord.arguments)
                   }
                 ));
                 if (validatedArguments === null || typeof validatedArguments !== "object" || Array.isArray(validatedArguments) || validatedArguments instanceof Uint8Array) {
@@ -16783,7 +16962,10 @@ function createPiAgentCoreFactory(configuration) {
                 arguments: validatedArguments
               });
               toolCallIds.add(toolCallRecord.id);
-              toolCalls.push(normalizeProtocolValue(toolCallRecord));
+              toolCalls.push(normalizeProtocolValue({
+                ...toolCallRecord,
+                arguments: encodePiJson(toolCallRecord.arguments)
+              }));
               validatedToolCalls.set(toolCallRecord.id, validatedToolCall);
               continue;
             }

@@ -19,6 +19,13 @@ export class HostContractError extends Error {
   }
 }
 
+// A proposed archive transaction can be retried with a smaller immutable batch
+// before any of its writes reach storage. Other failures must never be retried
+// as capacity failures.
+export class ArchivePlanningLimitError extends HostContractError {
+  constructor(message: string) { super("INVALID_AGGREGATE_OUTPUT", message); }
+}
+
 export interface TransactionPort {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
@@ -87,7 +94,22 @@ export interface AggregateApplyContext {
   readonly transactionTime: number;
 }
 
-export interface AggregateAdapter<State, Initialization, Command, Outcome> {
+export interface AggregateOutcomeContext {
+  // Reads only blobs owned by the final hot state or its authenticated archive,
+  // inside the command transaction.
+  // Storage verifies content digests before returning independently owned bytes.
+  readBlob(digest: Digest): Promise<Uint8Array | undefined>;
+}
+
+export interface AggregateAdapter<
+  State,
+  Initialization,
+  Command,
+  StoredOutcome,
+  WireOutcome = StoredOutcome,
+  Context extends AggregateApplyContext = AggregateApplyContext,
+  Applied extends AggregateApplyResult<State, StoredOutcome> = AggregateApplyResult<State, StoredOutcome>,
+> {
   readonly kind: string;
   cellName?(initialization: Initialization): string;
   create(initialization: Initialization): State;
@@ -98,7 +120,13 @@ export interface AggregateAdapter<State, Initialization, Command, Outcome> {
   apply(
     state: State,
     command: Command,
-    context: AggregateApplyContext,
-  ): Promise<AggregateApplyResult<State, Outcome>>;
+    context: Context,
+  ): Promise<Applied>;
+  // Called for both new commands and receipt replays after the final state is
+  // available in the transaction. Failure rolls back state and blob mutations.
+  materializeOutcome?(
+    outcome: StoredOutcome,
+    context: AggregateOutcomeContext,
+  ): WireOutcome | Promise<WireOutcome>;
   version(state: State): number;
 }

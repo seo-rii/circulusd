@@ -568,7 +568,7 @@ type goldenFixture struct {
 
 func TestConfigExportsOnlyBoundedProductionInputs(t *testing.T) {
 	typeOfConfig := reflect.TypeOf(Config{})
-	want := []string{"Endpoint", "KeyID", "RootKey", "DispatchStartKeyID", "DispatchStartRootKey", "Timeout"}
+	want := []string{"BrokerKeyID", "BrokerRootKey", "AdmissionKeyID", "AdmissionRootKey", "Endpoint", "KeyID", "RootKey", "DispatchStartKeyID", "DispatchStartRootKey", "Timeout"}
 	if typeOfConfig.NumField() != len(want) {
 		t.Fatalf("Config fields = %d, want %d (%v)", typeOfConfig.NumField(), len(want), want)
 	}
@@ -1737,7 +1737,7 @@ func claimResultMap(
 func claimSuccessEnvelope(requestID string, result canonical.Value) canonical.Map {
 	return canonical.Map{
 		"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0),
-		"schemaDigest": "sha256:e5f2c8ddc295ab31eea5497eac9e267169ab661b3acb038757d745549827d59b",
+		"schemaDigest": "sha256:269b76ae56613d05fa420453cf5a1081ae55dff04a34a6170643359eb4523a6d",
 		"requestId":    requestID,
 		"payload":      canonical.Map{"ok": true, "result": result},
 	}
@@ -1791,7 +1791,7 @@ func requestIDFromBody(t *testing.T, body []byte) string {
 func baseEnvelope(requestID string, payload canonical.Map) canonical.Map {
 	return canonical.Map{
 		"protocol": "circulus.v1alpha1", "major": int64(1), "minor": int64(0),
-		"schemaDigest": "sha256:8c14969eace3ee0bf628aa6a2ab461fa9178ed563c96b023eae5000dcfb5577f",
+		"schemaDigest": "sha256:bb5496147e295b01d3a30889faa852a3567b1e09e4348a59ec1ce8b404d30ae6",
 		"requestId":    requestID, "payload": payload,
 	}
 }

@@ -9,11 +9,11 @@ import type {
   ExternalizedAgentCheckpoint,
   NormalizedValue,
 } from "@circulusd/protocol-types";
+import type { SessionBrokerCommand, SessionBrokerReceiptValue, SessionBrokerState, SessionBrokerStoredReceipt } from "./broker-types.ts";
 
-// Schema v5 (storage redesign stage B): checkpoints are stored in their
-// externalized form (payload bytes in a content-addressed blob) alongside the
-// precomputed checkpoint chain digest a successor must link to.
-export const SESSION_STATE_SCHEMA_VERSION = 5 as const;
+// Schema v7 adds optional broker grants/reservations and bounded receipt history.
+// Legacy inline fields and v6 typed blob references need no bulk rewrite.
+export const SESSION_STATE_SCHEMA_VERSION = 7 as const;
 export const SESSION_COMMAND_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const SESSION_CHECKPOINT_DIGEST_DOMAIN = "circulusd.session.agent-checkpoint" as const;
@@ -34,17 +34,39 @@ export const SESSION_STATE_MAX_ENCODED_BYTES = 3 * 1_048_576;
 // margin covers the wrapper. (Depth is already bounded by the canonical normalizer's
 // default, which is stricter than the host's depth limit.)
 export const SESSION_STATE_MAX_ENCODED_ITEMS = 99_936;
-// Worst-case durable growth a single turn's terminal transition can add on top of
-// the bounded state: a maximal result value plus a fixed budget covering the final
-// checkpoint delta, terminal metadata, command receipt, and public event. Turn
-// admission reserves this per not-yet-terminal turn so an accepted turn can always
-// store its completion; without a reservation the state could accept a turn and then
-// fail to persist its result (the completed-turn accumulation defect, review F01).
-// This is the interim admission guard; paged history/externalized payloads remain
-// the long-term layout.
-export const SESSION_TURN_COMPLETION_RESERVE_BYTES =
-  SESSION_VALUE_MAX_ENCODED_BYTES + 256 * 1024;
+// Payload bodies are externalized. Each reservation unit covers a bounded
+// transition's metadata, command receipt and public event at their maximum field
+// sizes. Two units per pending turn cover abort request plus terminal completion;
+// effects reserve additional dispatch, claim, external-commit and settlement units.
+// The final candidate (including receipts/events) must fit both limits with every
+// outstanding reservation before forward growth is accepted.
+export const SESSION_CAPACITY_RESERVE_UNIT_BYTES = 16 * 1024;
+export const SESSION_CAPACITY_RESERVE_UNIT_ITEMS = 1024;
+export const SESSION_TURN_COMPLETION_RESERVE_BYTES = 2 * SESSION_CAPACITY_RESERVE_UNIT_BYTES;
+export const SESSION_TURN_COMPLETION_RESERVE_ITEMS = 2 * SESSION_CAPACITY_RESERVE_UNIT_ITEMS;
 export const SESSION_PUBLIC_EVENT_REPLAY_MAX_EVENTS = 256 as const;
+
+export interface SessionPayloadRef {
+  readonly encoding: "canonical-cbor-v1";
+  readonly digest: Digest;
+  readonly encodedBytes: number;
+  readonly encodedItems: number;
+}
+
+export type StoredSessionInput =
+  | { input: NormalizedValue; inputRef?: never }
+  | { input?: never; inputRef: SessionPayloadRef };
+export type StoredSessionResult =
+  | { result: NormalizedValue; resultPayloadRef?: never }
+  | { result?: never; resultPayloadRef: SessionPayloadRef };
+export type StoredAgentError = Omit<AgentError, "details"> & (
+  | { readonly details?: NormalizedValue; readonly detailsRef?: never }
+  | { readonly details?: never; readonly detailsRef: SessionPayloadRef }
+);
+export type StoredSessionCheckpoint = AgentCheckpoint | ExternalizedAgentCheckpoint;
+type StoredTurnCheckpoint =
+  | { checkpoint: AgentCheckpoint; checkpointChainDigest?: Digest }
+  | { checkpoint: ExternalizedAgentCheckpoint; checkpointChainDigest: Digest };
 
 export type SessionStatus =
   | "created"
@@ -104,37 +126,31 @@ export interface CreateSessionStateInput extends SessionRuntimeConfiguration {
 interface TurnRecordBase {
   turnId: string;
   sequence: number;
-  input: NormalizedValue;
   inputDigest: Digest;
   // The latest checkpoint in its durable form; its payload bytes are the blob
   // keyed by checkpoint.payloadDigest.
-  checkpoint: ExternalizedAgentCheckpoint;
   // The chain digest of `checkpoint` (computed over its wire form at ingestion,
   // when the payload bytes were present). The next engine step's
   // predecessorDigest must equal it; storing it lets the aggregate verify the
   // chain without re-materializing the externalized payload.
-  checkpointChainDigest: Digest;
   turnLeaseGeneration: number;
   leaseExpiresAt: number;
 }
 
-export interface QueuedTurn extends TurnRecordBase {
-  status: "queued";
-}
+export type QueuedTurn = TurnRecordBase & StoredSessionInput & StoredTurnCheckpoint & { status: "queued" };
 
-export interface ActiveTurn extends TurnRecordBase {
+export type ActiveTurn = TurnRecordBase & StoredSessionInput & StoredTurnCheckpoint & {
   status: "active" | "needs_confirmation";
   abortRequested: boolean;
   abortReason: string | null;
   activeEffectId: string | null;
-}
+};
 
 interface TerminalTurnBase {
   turnId: string;
   sequence: number;
-  input: NormalizedValue;
   inputDigest: Digest;
-  finalCheckpoint: ExternalizedAgentCheckpoint;
+  finalCheckpoint: StoredSessionCheckpoint;
   turnLeaseGeneration: number;
   leaseExpiresAt: number;
   abortRequested: boolean;
@@ -142,17 +158,16 @@ interface TerminalTurnBase {
 }
 
 export type TerminalTurn =
-  | (TerminalTurnBase & {
+  | (TerminalTurnBase & StoredSessionInput & StoredSessionResult & {
       status: "completed";
-      result: NormalizedValue;
       error: null;
     })
-  | (TerminalTurnBase & {
+  | (TerminalTurnBase & StoredSessionInput & {
       status: "failed";
       result: null;
-      error: AgentError;
+      error: StoredAgentError;
     })
-  | (TerminalTurnBase & {
+  | (TerminalTurnBase & StoredSessionInput & {
       status: "aborted";
       result: null;
       error: null;
@@ -170,6 +185,10 @@ export type EffectSettlement =
     }
   | { readonly kind: "interrupted_unknown"; readonly reason: string }
   | { readonly kind: "abandoned"; readonly reason: string };
+
+export type StoredEffectSettlement =
+  | Exclude<EffectSettlement, { readonly kind: "success" }>
+  | ({ readonly kind: "success" } & StoredSessionResult);
 
 export interface EffectDispatchMetadata extends SessionFence {
   dispatchAttempt: number;
@@ -195,26 +214,30 @@ export interface DispatchStartPermitClaims {
   readonly claimedEventSequence: number;
 }
 
-export interface SessionEffect extends EffectClaim {
+export type SessionEffect = EffectClaim & {
   phase: EffectPhase;
   dispatchAttempt: number;
   lastDispatch: EffectDispatchMetadata | null;
-  requestPayload: NormalizedValue;
   externalCommitId: string | null;
   resultRef: string | null;
-  settlement: EffectSettlement | null;
+  settlement: StoredEffectSettlement | null;
   consumedAtCheckpointSequence: number | null;
   consumedByAbort: boolean;
-}
+} & (
+  | { requestPayload: NormalizedValue; requestPayloadRef?: never }
+  | { requestPayload?: never; requestPayloadRef: SessionPayloadRef }
+);
 
 export interface CommandReceipt {
   commandId: string;
   commandDigest: Digest;
   committedEventSequence: number;
-  outcome: SessionCommandOutcome;
+  outcome: StoredSessionCommandOutcome;
 }
 
 export interface PublicTurnAdmission {
+  readonly tenantId?: string;
+  readonly actorSubjectId?: string;
   readonly authorizationGeneration: number;
   readonly idempotencyKeyDigest: Digest;
   readonly requestDigest: Digest;
@@ -257,7 +280,7 @@ export interface SessionPublicToolExternallyCommittedEvent
   extends SessionPublicEffectEventBase {
   type: "tool.externally_committed";
   externalCommitId: string;
-  resultRef: string;
+  resultRef: string | null;
 }
 
 export interface SessionPublicEffectSettledEvent
@@ -320,6 +343,62 @@ export interface SessionAggregateState extends SessionRuntimeConfiguration {
   commandReceipts: CommandReceipt[];
   publicEvents: SessionPublicEvent[];
   turnAdmissionReceipts: TurnAdmissionReceipt[];
+  // Omitted by legacy full-history records. Every nonzero prefix is backed by
+  // the host's authenticated history index in the same storage transaction.
+  history?: SessionHistoryState;
+  broker?: SessionBrokerState;
+}
+
+export const SESSION_HISTORY_HOT_COMMANDS = 32;
+export const SESSION_HISTORY_HOT_PUBLIC_EVENTS = 32;
+export const SESSION_HISTORY_HOT_TERMINAL_TURNS = 8;
+export const SESSION_HISTORY_HOT_EFFECTS = 8;
+export const SESSION_HISTORY_MAX_RECORDS = 16;
+
+export interface SessionTurnIdentity { turnId: string; turnSequence: number }
+export interface SessionInvocationIdentity { invocationId: string; effectId: string }
+export interface SessionHistoryState {
+  commandThrough: number;
+  publicEventThrough: number;
+  turnThrough: number;
+  runtimePointerAtCommandThrough: RuntimePointer;
+  latestSettledTurnAtTurnThrough: string | null;
+  // Only evidence still referenced by hot entities survives in these anchors.
+  publicEventAnchors: SessionPublicEvent[];
+  dispatchStartReceipts: CommandReceipt[];
+  runtimeRevisionDigests: Digest[];
+}
+export interface SessionArchiveDelta {
+  commandReceipts: CommandReceipt[];
+  publicEvents: SessionPublicEvent[];
+  terminalTurns: TerminalTurn[];
+  effects: SessionEffect[];
+  turnAdmissionReceipts: TurnAdmissionReceipt[];
+  turnIdentities: SessionTurnIdentity[];
+  brokerReceipts?: SessionBrokerStoredReceipt[];
+}
+export interface SessionHistoryReadPlan {
+  commandId?: string;
+  idempotencyKeyDigest?: Digest;
+  turnId?: string;
+  effectId?: string;
+  invocationId?: string;
+  issuingEventSequence?: number;
+  brokerOperation?: { kind: SessionBrokerStoredReceipt["kind"]; operationKey: string; operationKeyDigest: Digest };
+}
+export interface SessionHistoryWitness {
+  command?: { commandId: string; receipt: CommandReceipt | null };
+  admission?: { idempotencyKeyDigest: Digest; receipt: TurnAdmissionReceipt | null };
+  turn?: { turnId: string; record: SessionTurnIdentity | null };
+  effect?: { effectId: string; record: SessionEffect | null };
+  invocation?: { invocationId: string; record: SessionInvocationIdentity | null };
+  issuingReceipt?: { eventSequence: number; receipt: CommandReceipt | null };
+  brokerOperation?: { kind: SessionBrokerStoredReceipt["kind"]; operationKey: string; operationKeyDigest: Digest; receipt: SessionBrokerStoredReceipt | null };
+}
+export interface SessionApplyContext {
+  readonly transactionTime: number;
+  readonly history?: SessionHistoryWitness;
+  readonly historyMaxRecords?: number;
 }
 
 interface SessionCommandBase {
@@ -384,7 +463,7 @@ export interface RecordExternalCommitCommand extends EffectCommandBase {
   readonly kind: "record_external_commit";
   readonly dispatchAttempt: number;
   readonly externalCommitId: string;
-  readonly resultRef: string;
+  readonly resultRef: string | null;
 }
 
 export interface SettleEffectCommand extends EffectCommandBase {
@@ -475,6 +554,7 @@ export interface RollbackRuntimeRevisionCommand extends SessionCommandBase {
 }
 
 export type SessionCommand =
+  | SessionBrokerCommand
   | EnqueueTurnCommand
   | CommitEngineStepCommand
   | DispatchEffectCommand
@@ -493,6 +573,8 @@ export type SessionCommand =
   | RollbackRuntimeRevisionCommand;
 
 export type SessionCommandOutcome =
+  | { readonly kind: "broker_result"; readonly result: SessionBrokerReceiptValue }
+  | { readonly kind: "broker_boundary"; readonly operation: "retry" | "block" | "recovery_settlement"; readonly effectId: string }
   | {
       readonly kind: "turn_enqueued";
       readonly turnId: string;
@@ -593,9 +675,18 @@ export type SessionCommandOutcome =
       readonly failureReceiptDigest: Digest;
     };
 
+export type StoredSessionCommandOutcome =
+  | Exclude<SessionCommandOutcome, { readonly kind: "effect_settled" | "broker_result" }>
+  | { readonly kind: "broker_result"; readonly receipt: SessionBrokerStoredReceipt; readonly replayedClaim: boolean }
+  | {
+      readonly kind: "effect_settled";
+      readonly effectId: string;
+      readonly settlement: StoredEffectSettlement;
+    };
+
 export interface ApplySessionCommandResult {
   readonly state: SessionAggregateState;
-  readonly outcome: SessionCommandOutcome;
+  readonly outcome: StoredSessionCommandOutcome;
   readonly commandDigest: Digest;
   readonly replayed: boolean;
   // Payload externalization side channel (see host AggregateBlobEffects): the new
@@ -604,4 +695,5 @@ export interface ApplySessionCommandResult {
   // the host persists nothing.
   readonly blobs?: ReadonlyMap<Digest, Uint8Array>;
   readonly referencedBlobs?: readonly Digest[];
+  readonly archiveDelta?: SessionArchiveDelta;
 }

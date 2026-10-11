@@ -26,33 +26,37 @@ type pinnedRootKeyFile struct {
 	status unix.Stat_t
 }
 
-func loadRootKeyPair(readPath, dispatchStartPath string) ([]byte, []byte, error) {
-	expectedOwnerUID := uint32(os.Geteuid())
-	readFile, err := openRootKeyFile(readPath, expectedOwnerUID)
-	if err != nil {
-		return nil, nil, err
+func loadRootKeyFiles(paths ...string) ([][]byte, error) {
+	files := make([]*pinnedRootKeyFile, 0, len(paths))
+	defer func() {
+		for _, pinned := range files {
+			_ = pinned.file.Close()
+		}
+	}()
+	for _, path := range paths {
+		pinned, err := openRootKeyFile(path, uint32(os.Geteuid()))
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, pinned)
+		for _, prior := range files[:len(files)-1] {
+			if prior.status.Dev == pinned.status.Dev && prior.status.Ino == pinned.status.Ino {
+				return nil, fmt.Errorf("%w: operation paths resolve to the same file", ErrInvalidCredentialFile)
+			}
+		}
 	}
-	defer readFile.file.Close()
-	dispatchStartFile, err := openRootKeyFile(dispatchStartPath, expectedOwnerUID)
-	if err != nil {
-		return nil, nil, err
+	keys := make([][]byte, 0, len(files))
+	for _, pinned := range files {
+		key, err := readPinnedRootKey(pinned)
+		if err != nil {
+			for _, loaded := range keys {
+				clear(loaded)
+			}
+			return nil, err
+		}
+		keys = append(keys, key)
 	}
-	defer dispatchStartFile.file.Close()
-	if readFile.status.Dev == dispatchStartFile.status.Dev &&
-		readFile.status.Ino == dispatchStartFile.status.Ino {
-		return nil, nil, fmt.Errorf("%w: read and dispatch-start paths resolve to the same file", ErrInvalidCredentialFile)
-	}
-
-	readRootKey, err := readPinnedRootKey(readFile)
-	if err != nil {
-		return nil, nil, err
-	}
-	dispatchStartRootKey, err := readPinnedRootKey(dispatchStartFile)
-	if err != nil {
-		clear(readRootKey)
-		return nil, nil, err
-	}
-	return readRootKey, dispatchStartRootKey, nil
+	return keys, nil
 }
 
 func loadRootKeyFile(path string, expectedOwnerUID uint32) ([]byte, error) {

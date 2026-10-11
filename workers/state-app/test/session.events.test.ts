@@ -1,5 +1,6 @@
 import {
   digestBytes,
+  encodeCanonicalCbor,
   type AgentCheckpoint,
   type Digest,
   type EngineAgentCheckpoint,
@@ -11,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   applySessionCommand,
   createSessionState,
+  checkpointDigest,
   effectRequestDigest,
   migrateSessionState,
   replaySessionPublicEvents,
@@ -19,6 +21,7 @@ import {
   type SessionAggregateState,
   type SessionFence,
 } from "../src/session/index.ts";
+import { SESSION_STATE_MAX_ENCODED_BYTES } from "../src/session/types.ts";
 import { inlineLegacyCheckpoints } from "./support/legacy-checkpoints.ts";
 
 const RUNTIME_DIGEST = `sha256:${"1".repeat(64)}` as Digest;
@@ -99,7 +102,7 @@ async function nextCheckpoint(
     sessionId: state.sessionId,
     turnId: state.activeTurn.turnId,
     checkpointSequence: state.activeTurn.checkpoint.checkpointSequence + 1,
-    predecessorDigest: state.activeTurn.checkpointChainDigest,
+    predecessorDigest: state.activeTurn.checkpointChainDigest ?? await checkpointDigest(state.activeTurn.checkpoint as AgentCheckpoint),
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),
@@ -546,17 +549,17 @@ describe("Session public durable event journal", () => {
   it("migrates schema-v1 and schema-v2 states without losing prior admission events", async () => {
     const admitted = await admit(newSession(), "turn-migrated", "9");
     // Pre-v5 states stored checkpoint payloads inline; rebuild that layout from the
-    // blobs the admission returned so the migration exercises real externalization.
+    // blobs the admission returned. Migration must retain them without new blobs
+    // or checkpoint-chain fields, even for a legacy record at its capacity limit.
     const schemaV2 = inlineLegacyCheckpoints(admitted.state, admitted.blobs);
     schemaV2.schemaVersion = 2;
     const migratedV2 = await migrateSessionState(schemaV2);
-    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 5 } });
-    expect(migratedV2.state.activeTurn?.checkpoint).toEqual(admitted.state.activeTurn?.checkpoint);
-    expect(migratedV2.state.activeTurn?.checkpointChainDigest).toBe(
-      admitted.state.activeTurn?.checkpointChainDigest,
-    );
-    expect([...(migratedV2.blobs?.keys() ?? [])]).toEqual(migratedV2.referencedBlobs);
-    expect(migratedV2.referencedBlobs).toEqual([admitted.state.activeTurn?.checkpoint.payloadDigest]);
+    expect(migratedV2).toMatchObject({ migrated: true, state: { schemaVersion: 7 } });
+    expect(migratedV2.state.activeTurn?.checkpoint).toEqual((schemaV2.activeTurn as Record<string, unknown>).checkpoint);
+    expect(migratedV2.state.activeTurn).not.toHaveProperty("checkpointChainDigest");
+    expect(migratedV2.blobs).toBeUndefined();
+    expect(migratedV2.referencedBlobs).toEqual([admitted.state.activeTurn?.inputRef?.digest]);
+    expect(migratedV2.state).toEqual({ ...schemaV2, schemaVersion: 7 });
     expect(migratedV2.state.publicEvents).toEqual(admitted.state.publicEvents);
     expect(migratedV2.state.turnAdmissionReceipts).toEqual(
       admitted.state.turnAdmissionReceipts,
@@ -582,7 +585,7 @@ describe("Session public durable event journal", () => {
     expect(migratedV1).toMatchObject({
       migrated: true,
       state: {
-        schemaVersion: 5,
+        schemaVersion: 7,
         publicEventSequence: 0,
         publicEvents: [],
         turnAdmissionReceipts: [],
@@ -596,6 +599,62 @@ describe("Session public durable event journal", () => {
       "migrated-v1",
     );
     expect(continuedV1.state.publicEvents).toEqual([]);
+  });
+
+  it("migrates more than 128 inline checkpoints at the record boundary without adding bytes or blobs", async () => {
+    const admitted = await admit(newSession(), "legacy-0", "9");
+    const legacy = inlineLegacyCheckpoints(admitted.state, admitted.blobs);
+    legacy.schemaVersion = 4;
+    const active = legacy.activeTurn as Record<string, unknown>;
+    delete active.inputRef;
+    active.input = { message: "legacy-0" };
+    const queued: Record<string, unknown>[] = [];
+    const knownTurnIds = ["legacy-0"];
+    for (let sequence = 1; sequence <= 128; sequence += 1) {
+      const turnId = `legacy-${sequence}`;
+      const input = { message: turnId };
+      queued.push({
+        turnId, sequence, status: "queued", input,
+        inputDigest: await turnInputDigest(input),
+        checkpoint: await genesis(admitted.state, turnId),
+        turnLeaseGeneration: sequence + 10, leaseExpiresAt: TRANSACTION_TIME + 100_000,
+      });
+      knownTurnIds.push(turnId);
+    }
+    legacy.queuedTurns = queued;
+    legacy.knownTurnIds = knownTurnIds;
+    legacy.nextTurnSequence = knownTurnIds.length;
+    const checkpoint = active.checkpoint as unknown as AgentCheckpoint;
+    const initialSize = encodeCanonicalCbor(legacy).byteLength;
+    // Leave sixteen bytes: adding even one chain digest would exceed the cap.
+    const payloadBytes = new Uint8Array(
+      checkpoint.payloadBytes.byteLength + SESSION_STATE_MAX_ENCODED_BYTES - initialSize - 20,
+    );
+    active.checkpoint = { ...checkpoint, payloadBytes, payloadDigest: await digestBytes(payloadBytes) };
+    const before = encodeCanonicalCbor(legacy).byteLength;
+    expect(before).toBeGreaterThan(SESSION_STATE_MAX_ENCODED_BYTES - 24);
+    expect(before).toBeLessThanOrEqual(SESSION_STATE_MAX_ENCODED_BYTES);
+    const migrated = await migrateSessionState(legacy);
+    expect(await digestBytes(encodeCanonicalCbor(migrated.state)))
+      .toBe(await digestBytes(encodeCanonicalCbor({ ...legacy, schemaVersion: 7 })));
+    expect(encodeCanonicalCbor(migrated.state).byteLength).toBe(before);
+    expect(migrated.blobs).toBeUndefined();
+    expect(migrated.referencedBlobs).toEqual([]);
+    expect(migrated.state.activeTurn).not.toHaveProperty("checkpointChainDigest");
+    await expect(validateSessionState(migrated.state)).resolves.toBeUndefined();
+  });
+
+  it("upgrades schema-v5 by changing only its version and validates retained inline payloads", async () => {
+    const admitted = await admit(newSession(), "legacy-v5", "9");
+    const legacy = structuredClone(admitted.state) as unknown as Record<string, unknown>;
+    legacy.schemaVersion = 5;
+    const active = legacy.activeTurn as Record<string, unknown>;
+    delete active.inputRef;
+    active.input = { message: "legacy-v5" };
+    const migrated = await migrateSessionState(legacy);
+    expect(migrated).toEqual({ migrated: true, state: { ...legacy, schemaVersion: 7 } });
+    expect(encodeCanonicalCbor(migrated.state).byteLength).toBe(encodeCanonicalCbor(legacy).byteLength);
+    await expect(validateSessionState(migrated.state)).resolves.toBeUndefined();
   });
 
   it("rejects gaps, unknown fields, and model/tool family mismatches in stored events", async () => {

@@ -12,6 +12,9 @@ import {
   type CellRoutePort,
   type TransactionPort,
 } from "./contracts.ts";
+import { validateSessionHistoryIndexRoot, type SessionHistoryIndexRoot } from "./session-history-index.ts";
+import { assertSessionHistoryAnchor, readArchivedSessionBlobReference } from "./session-history-store.ts";
+import type { SessionAggregateState } from "../session/types.ts";
 
 const MANIFEST_KEY = "circulusd.state-app.aggregate.v2.manifest";
 const ANCHOR_KEY = "circulusd.state-app.aggregate.v2.anchor";
@@ -35,7 +38,7 @@ export const MAX_RECORD_DEPTH = 72;
 export const MAX_BLOB_BYTES = MAX_RECORD_BYTES;
 const MAX_CHUNKS = Math.ceil(MAX_RECORD_BYTES / CHUNK_BYTES);
 const MAX_BLOB_CHUNKS = Math.ceil(MAX_BLOB_BYTES / CHUNK_BYTES);
-const MAX_TRANSACTION_MUTATED_KEYS = 128;
+export const MAX_TRANSACTION_MUTATED_KEYS = 128;
 const MAX_CELL_NAME_BYTES = 2_048;
 const MAX_PHYSICAL_ID_BYTES = 256;
 const MANIFEST_REQUIRED_KEYS = [
@@ -61,12 +64,12 @@ export interface StateRecord<State> {
 
 // A blob the current state references: its content digest (also its chunk-key
 // prefix) and its exact byte length, from which the chunk count is derived.
-interface BlobRecordRef {
+export interface BlobRecordRef {
   readonly digest: Digest;
   readonly encodedBytes: number;
 }
 
-interface StateManifest {
+export interface StateManifest {
   readonly formatVersion: typeof RECORD_FORMAT_VERSION;
   readonly aggregateKind: string;
   readonly initializationDigest: Digest;
@@ -78,6 +81,7 @@ interface StateManifest {
   // The complete set of externalized blob digests the stored state references.
   // Absent in legacy manifests written before stage B; read as an empty set.
   readonly referencedBlobs: readonly BlobRecordRef[];
+  readonly sessionHistory?: SessionHistoryIndexRoot;
 }
 
 interface StateAnchor {
@@ -159,7 +163,7 @@ function manifestRecord(value: unknown): Record<string, unknown> {
   }
   for (const key of keys as string[]) {
     if (
-      key !== "referencedBlobs" &&
+      key !== "referencedBlobs" && key !== "sessionHistory" &&
       !(MANIFEST_REQUIRED_KEYS as readonly string[]).includes(key)
     ) {
       throw new HostContractError("CORRUPT_STATE", "stored manifest shape is invalid");
@@ -328,7 +332,13 @@ export class ChunkedAggregateStorage<State> {
       chunkCount: candidate.chunkCount,
       encodedBytes: candidate.encodedBytes,
       referencedBlobs: parseReferencedBlobs(candidate.referencedBlobs),
+      ...(candidate.sessionHistory === undefined ? {} : {
+        sessionHistory: validateSessionHistoryIndexRoot(candidate.sessionHistory),
+      }),
     };
+    if (manifest.sessionHistory !== undefined && manifest.aggregateKind !== "session") {
+      throw new HostContractError("CORRUPT_STATE", "history root belongs to a non-Session aggregate");
+    }
     if (
       manifest.initializationDigest !== anchor.initializationDigest ||
       manifest.cellName !== anchor.cellName ||
@@ -450,6 +460,9 @@ export class ChunkedAggregateStorage<State> {
         state,
       } as StateRecord<State>;
       await this.#validateState(record.state);
+      if (this.#aggregateKind === "session") {
+        assertSessionHistoryAnchor(record.state as SessionAggregateState, manifest.sessionHistory);
+      }
     } catch (error) {
       throw new HostContractError("CORRUPT_STATE", "stored aggregate state is invalid", {
         cause: error,
@@ -474,12 +487,13 @@ export class ChunkedAggregateStorage<State> {
     previousManifest?: StateManifest,
     blobs?: ReadonlyMap<Digest, Uint8Array>,
     referencedBlobs?: readonly Digest[],
+    sessionHistory?: SessionHistoryIndexRoot,
   ): Promise<void> {
-    await this.#writeRecord(transaction, record, previousManifest, blobs, referencedBlobs);
+    await this.#writeRecord(transaction, record, previousManifest, blobs, referencedBlobs, sessionHistory);
   }
 
-  // Read one externalized blob by its content digest. Returns undefined when the
-  // current state does not reference that digest. The reassembled bytes are
+  // Read one externalized blob by its content digest. Returns undefined when
+  // neither the hot state nor its authenticated archive owns the digest. Bytes are
   // re-digested against the requested digest before returning, so a corrupt or
   // truncated chunk fails closed rather than yielding wrong content.
   async readBlob(
@@ -502,9 +516,16 @@ export class ChunkedAggregateStorage<State> {
       });
     }
     const candidate = manifestRecord(manifestSnapshot);
-    const reference = parseReferencedBlobs(candidate.referencedBlobs).find(
+    let reference = parseReferencedBlobs(candidate.referencedBlobs).find(
       (entry) => entry.digest === digest,
     );
+    if (reference === undefined && candidate.sessionHistory !== undefined) {
+      if (candidate.aggregateKind !== "session") {
+        throw new HostContractError("CORRUPT_STATE", "history root belongs to a non-Session aggregate");
+      }
+      reference = await readArchivedSessionBlobReference(transaction,
+        validateSessionHistoryIndexRoot(candidate.sessionHistory), digest) ?? undefined;
+    }
     if (reference === undefined) {
       return undefined;
     }
@@ -565,6 +586,7 @@ export class ChunkedAggregateStorage<State> {
     previousManifest?: StateManifest,
     blobs?: ReadonlyMap<Digest, Uint8Array>,
     referencedBlobs?: readonly Digest[],
+    sessionHistory?: SessionHistoryIndexRoot,
   ): Promise<StateManifest> {
     exactRecord(
       record,
@@ -594,10 +616,13 @@ export class ChunkedAggregateStorage<State> {
         { cause: error },
       );
     }
+    const history = sessionHistory ?? previousManifest?.sessionHistory;
     const { referencedEntries, blobsToCreate, blobsToDelete } = await this.#resolveBlobMutations(
+      transaction,
       previousManifest,
       blobs ?? new Map<Digest, Uint8Array>(),
       referencedBlobs ?? [],
+      history,
     );
     const chunkCount = Math.ceil(encoded.byteLength / CHUNK_BYTES);
     const oldChunkMutations =
@@ -652,6 +677,7 @@ export class ChunkedAggregateStorage<State> {
       chunkCount,
       encodedBytes: encoded.byteLength,
       referencedBlobs: referencedEntries,
+      ...(history === undefined ? {} : { sessionHistory: validateSessionHistoryIndexRoot(history) }),
     };
     if (previousManifest === undefined) {
       const anchor: StateAnchor = {
@@ -682,15 +708,16 @@ export class ChunkedAggregateStorage<State> {
   }
 
   // Reconcile the state's new blob reference set against the previously stored one.
-  // There is exactly one state per cell, so set membership is the reference count:
-  // a digest newly referenced must have its bytes provided now (and they must hash
-  // to that digest); a digest no longer referenced is deleted; a carried-over
-  // digest keeps its already-stored chunks. Content-addressing makes this idempotent
-  // and lets two references to the same payload share one blob.
+  // Hot membership plus an authenticated archive pin determines ownership. New
+  // bytes must match their content digest, and dropped hot references are deleted
+  // only after proving that no archive pin exists. Content addressing lets hot
+  // and archived references share one immutable blob.
   async #resolveBlobMutations(
+    transaction: TransactionPort,
     previousManifest: StateManifest | undefined,
     provided: ReadonlyMap<Digest, Uint8Array>,
     referencedBlobs: readonly Digest[],
+    history?: SessionHistoryIndexRoot,
   ): Promise<{
     readonly referencedEntries: BlobRecordRef[];
     readonly blobsToCreate: { digest: Digest; bytes: Uint8Array; chunkCount: number }[];
@@ -711,7 +738,20 @@ export class ChunkedAggregateStorage<State> {
     }
     const referencedEntries: BlobRecordRef[] = [];
     const blobsToCreate: { digest: Digest; bytes: Uint8Array; chunkCount: number }[] = [];
-    for (const digest of newReferences) {
+    const storedReferences = new Set(newReferences);
+    // A transition can create a terminal payload and archive its turn in the
+    // same commit. Its authenticated archive pin owns the new bytes even though
+    // the bounded hot manifest must not list that digest.
+    for (const [digest, bytes] of provided) {
+      if (newReferences.has(digest)) continue;
+      const archived = history === undefined ? null
+        : await readArchivedSessionBlobReference(transaction, history, digest);
+      if (archived === null || !(bytes instanceof Uint8Array) || archived.encodedBytes !== bytes.byteLength) {
+        throw new HostContractError("INVALID_AGGREGATE_OUTPUT", "aggregate provided an unreferenced blob");
+      }
+      storedReferences.add(digest);
+    }
+    for (const digest of storedReferences) {
       const carried = previousEntries.get(digest);
       if (carried !== undefined) {
         referencedEntries.push(carried);
@@ -719,6 +759,12 @@ export class ChunkedAggregateStorage<State> {
       }
       const bytes = provided.get(digest);
       if (bytes === undefined) {
+        const archived = history === undefined ? null
+          : await readArchivedSessionBlobReference(transaction, history, digest);
+        if (archived !== null) {
+          referencedEntries.push(archived);
+          continue;
+        }
         throw new HostContractError(
           "INVALID_AGGREGATE_OUTPUT",
           "aggregate referenced a blob whose bytes were not provided",
@@ -758,7 +804,7 @@ export class ChunkedAggregateStorage<State> {
           "provided blob exceeds the maximum blob chunk count",
         );
       }
-      referencedEntries.push({ digest, encodedBytes: bytes.byteLength });
+      if (newReferences.has(digest)) referencedEntries.push({ digest, encodedBytes: bytes.byteLength });
       blobsToCreate.push({ digest, bytes, chunkCount });
     }
     // Every provided blob must be newly referenced; a blob supplied for an
@@ -772,7 +818,12 @@ export class ChunkedAggregateStorage<State> {
     const blobsToDelete: BlobRecordRef[] = [];
     for (const [digest, entry] of previousEntries) {
       if (!newReferences.has(digest)) {
-        blobsToDelete.push(entry);
+        const archived = history === undefined ? null
+          : await readArchivedSessionBlobReference(transaction, history, digest);
+        if (archived === null) blobsToDelete.push(entry);
+        else if (archived.encodedBytes !== entry.encodedBytes) {
+          throw new HostContractError("CORRUPT_STATE", "archive blob pin length disagrees with hot reference");
+        }
       }
     }
     return { referencedEntries, blobsToCreate, blobsToDelete };

@@ -17,6 +17,7 @@ import {
   checkpointDigest,
   createSessionState,
   effectRequestDigest,
+  readSessionPayload,
   turnInputDigest,
   validateSessionState,
   type EffectSettlement,
@@ -106,7 +107,7 @@ async function nextCheckpoint(
     sessionId: state.sessionId,
     turnId: activeTurn.turnId,
     checkpointSequence: activeTurn.checkpoint.checkpointSequence + 1,
-    predecessorDigest: activeTurn.checkpointChainDigest,
+    predecessorDigest: activeTurn.checkpointChainDigest ?? await checkpointDigest(activeTurn.checkpoint as AgentCheckpoint),
     payloadEncoding: "opaque-v1",
     payloadBytes,
     payloadDigest: await digestBytes(payloadBytes),
@@ -235,14 +236,14 @@ describe("Session authoritative aggregate", () => {
     } as never)).toThrowError(expect.objectContaining({ code: "INVALID_ARGUMENT" }));
   });
 
-  it("rejects turn admission before acceptance when no capacity remains to persist its completion (F01)", async () => {
+  it("externalizes large admitted inputs instead of charging their bytes to durable metadata (F01)", async () => {
     const enqueueLarge = async (
       state: SessionAggregateState,
       turnId: string,
       commandId: string,
     ) => {
-      // Just under the 1 MiB per-value limit; two of these plus a completion
-      // reservation exceed the 3 MiB bounded state.
+      // Each input remains subject to the 1 MiB value limit, but only a bounded
+      // reference belongs in the hot state and its completion reservation.
       const input = { message: "x".repeat(1_000_000) };
       return applySessionCommand(state, {
         kind: "enqueue_turn",
@@ -259,13 +260,14 @@ describe("Session authoritative aggregate", () => {
     };
 
     const first = await enqueueLarge(newSession(), "turn_big_1", "enqueue_big_1");
-    // The second admission would leave less than one completion's reservation, so it
-    // must be rejected before acceptance rather than accepted and unable to complete.
-    await expect(enqueueLarge(first.state, "turn_big_2", "enqueue_big_2"))
-      .rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
-    // The rejected turn was never accepted.
-    expect(first.state.knownTurnIds).not.toContain("turn_big_2");
-    expect(first.state.queuedTurns.some((turn) => turn.turnId === "turn_big_2")).toBe(false);
+    const second = await enqueueLarge(first.state, "turn_big_2", "enqueue_big_2");
+    expect(second.state.knownTurnIds).toContain("turn_big_2");
+    expect(second.state.queuedTurns[0]?.inputRef).toEqual(first.state.activeTurn?.inputRef);
+    expect(second.state.activeTurn).not.toHaveProperty("input");
+    const ref = first.state.activeTurn!.inputRef!;
+    await expect(readSessionPayload(ref, async (digest) => first.blobs?.get(digest)))
+      .resolves.toEqual({ message: "x".repeat(1_000_000) });
+    expect(ref.encodedBytes).toBeGreaterThan(1_000_000);
   });
 
   it("requires trusted admission time, a live lease, and a positive lease generation", async () => {
@@ -419,7 +421,7 @@ describe("Session authoritative aggregate", () => {
       {
         turnId: "turn_01",
         sequence: 0,
-        input: { message: "turn_01" },
+        inputRef: first.state.activeTurn?.inputRef,
         inputDigest: await turnInputDigest({ message: "turn_01" }),
         finalCheckpoint: externalizeAgentCheckpoint(finalCheckpoint).checkpoint,
         turnLeaseGeneration: 10,
@@ -427,10 +429,12 @@ describe("Session authoritative aggregate", () => {
         status: "completed",
         abortRequested: false,
         abortReason: null,
-        result: { messageRef: "message_01" },
+        resultPayloadRef: complete.state.terminalTurns[0]?.resultPayloadRef,
         error: null,
       },
     ]);
+    await expect(readSessionPayload(complete.state.terminalTurns[0]!.resultPayloadRef!, async (digest) => complete.blobs?.get(digest)))
+      .resolves.toEqual({ messageRef: "message_01" });
     expect(complete.state.eventSequence).toBe(3);
     expect(() => assertSessionInvariants(complete.state)).not.toThrow();
   });
@@ -705,14 +709,14 @@ describe("Session authoritative aggregate", () => {
     expect(active.checkpoint).toEqual(externalizeAgentCheckpoint(genesis).checkpoint);
     expect(active.checkpoint).not.toHaveProperty("payloadBytes");
     expect(active.checkpointChainDigest).toBe(await checkpointDigest(genesis));
-    expect(admitted.referencedBlobs).toEqual([genesis.payloadDigest]);
+    expect(admitted.referencedBlobs).toEqual([genesis.payloadDigest, active.inputRef!.digest]);
     expect(admitted.blobs?.get(genesis.payloadDigest)).toEqual(genesis.payloadBytes);
 
-    // A stored checkpoint that still embeds payload bytes, or claims an implausible
-    // payload size, is rejected as durable state.
+    // Mixing inline and referenced checkpoint fields, or an implausible payload
+    // size, is rejected as durable state. Valid legacy inline checkpoints remain readable.
     const inlined = structuredClone(admitted.state);
     (inlined.activeTurn!.checkpoint as Record<string, unknown>).payloadBytes = genesis.payloadBytes;
-    await expect(validateSessionState(inlined)).rejects.toThrow(/payloadBytes/);
+    await expect(validateSessionState(inlined)).rejects.toThrow(/payloadSize/);
     const emptied = structuredClone(admitted.state);
     (emptied.activeTurn!.checkpoint as { payloadSize: number }).payloadSize = 0;
     await expect(validateSessionState(emptied)).rejects.toThrow(/payloadSize/);
@@ -731,7 +735,7 @@ describe("Session authoritative aggregate", () => {
       effectIdentity: null,
       step: { kind: "checkpoint", checkpoint: step },
     });
-    expect(committed.referencedBlobs).toEqual([step.payloadDigest]);
+    expect(committed.referencedBlobs).toEqual([step.payloadDigest, active.inputRef!.digest]);
     expect([...(committed.blobs?.keys() ?? [])]).toEqual([step.payloadDigest]);
     expect(committed.state.activeTurn?.checkpointChainDigest).toBe(await checkpointDigest(step));
   });
@@ -765,7 +769,7 @@ describe("Session authoritative aggregate", () => {
       {
         turnId: "turn_01",
         sequence: 0,
-        input: { message: "turn_01" },
+        inputRef: admitted.state.activeTurn?.inputRef,
         inputDigest: await turnInputDigest({ message: "turn_01" }),
         finalCheckpoint: externalizeAgentCheckpoint(finalCheckpoint).checkpoint,
         turnLeaseGeneration: 10,
@@ -778,10 +782,12 @@ describe("Session authoritative aggregate", () => {
           code: "MODEL_FAILED",
           message: "provider rejected request",
           retryable: false,
-          details: { provider: "test" },
+          detailsRef: failed.state.terminalTurns[0]?.error?.detailsRef,
         },
       },
     ]);
+    await expect(readSessionPayload(failed.state.terminalTurns[0]!.error!.detailsRef!, async (digest) => failed.blobs?.get(digest)))
+      .resolves.toEqual({ provider: "test" });
     expect(() => assertSessionInvariants(failed.state)).not.toThrow();
 
     const corruptTerminalCheckpoint = structuredClone(failed.state);
@@ -942,7 +948,8 @@ describe("Session authoritative aggregate", () => {
     if (nonCanonical.activeTurn === null) {
       throw new Error("active turn missing from corrupt test state");
     }
-    Reflect.set(nonCanonical.activeTurn.input, "message", "e\u0301");
+    Reflect.deleteProperty(nonCanonical.activeTurn, "inputRef");
+    Reflect.set(nonCanonical.activeTurn, "input", { message: "e\u0301" });
     expect(() => assertSessionInvariants(nonCanonical)).toThrow(/NFC-normalized/);
   });
 
@@ -1443,7 +1450,7 @@ describe("Session authoritative aggregate", () => {
     expect(finalized.state.terminalTurns).toEqual([
       expect.objectContaining({
         turnId: "turn_01",
-        input: { message: "turn_01" },
+        inputRef: prepared.state.activeTurn?.inputRef,
         finalCheckpoint: prepared.state.activeTurn?.checkpoint,
         status: "aborted",
         abortRequested: true,

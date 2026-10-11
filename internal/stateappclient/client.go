@@ -36,25 +36,15 @@ const (
 	ingressSchemaDigest = "sha256:6365dfa4e6e73b349508a46688cfcaacdeacece11cd11ed2d7f3e40af49ad3ee"
 
 	hostProtocol     = "circulus.v1alpha1"
-	hostSchemaDigest = "sha256:8c14969eace3ee0bf628aa6a2ab461fa9178ed563c96b023eae5000dcfb5577f"
+	hostSchemaDigest = "sha256:bb5496147e295b01d3a30889faa852a3567b1e09e4348a59ec1ce8b404d30ae6"
 
 	dispatchStartIngressPath         = "/circulusd/state/v1/session-dispatch-start:claim"
 	dispatchStartIngressContentType  = "application/vnd.circulusd.state-dispatch-start-ingress+cbor"
 	dispatchStartIngressProtocol     = "circulus.state-dispatch-start-ingress.v1alpha1"
 	dispatchStartIngressSchemaDigest = "sha256:a86295cc9ad723e50c8729318e4ec4994faa7b4c64c30a718696de8fa6edc724"
-	dispatchStartHostSchemaDigest    = "sha256:e5f2c8ddc295ab31eea5497eac9e267169ab661b3acb038757d745549827d59b"
+	dispatchStartHostSchemaDigest    = "sha256:269b76ae56613d05fa420453cf5a1081ae55dff04a34a6170643359eb4523a6d"
 	dispatchStartRequestMACDomain    = "circulusd.state-dispatch-start-ingress.request.v1"
 	dispatchStartResponseMACDomain   = "circulusd.state-dispatch-start-ingress.response.v1"
-
-	// Hydrates one externalized payload (storage redesign stage B2.2). Signed with
-	// the read ingress keys under its own MAC domain, path and content type.
-	blobIngressPath         = "/circulusd/state/v1/session-blob:read"
-	blobIngressContentType  = "application/vnd.circulusd.state-blob-ingress+cbor"
-	blobIngressProtocol     = "circulus.state-blob-ingress.v1alpha1"
-	blobIngressSchemaDigest = "sha256:43de3ec79f1eb1a1d78e519e24b741630ea2f5bee0cf2ce9e02ee4416dd67aab"
-	blobHostSchemaDigest    = "sha256:ecde7c59aafe4e2ce0e885be977535619401085346b47e59c7a5487de7b45f70"
-	blobRequestMACDomain    = "circulusd.state-blob-ingress.request.v1"
-	blobResponseMACDomain   = "circulusd.state-blob-ingress.response.v1"
 
 	keyIDHeader       = "X-Circulus-State-Key-Id"
 	signatureHeader   = "X-Circulus-State-Signature"
@@ -70,8 +60,6 @@ const (
 	maximumDispatchStartRequestDepth = 4
 	maximumDispatchStartRequestItems = 96
 	maximumResponseBytes             = 1_048_576 + 65_536
-	maximumBlobBytes                 = 4 * 1_048_576
-	maximumBlobResponseBytes         = maximumBlobBytes + 65_536
 	maximumResponseDepth             = 72
 	maximumResponseItems             = 100_000
 	maximumResponseHeaderBytes       = 16 << 10
@@ -88,10 +76,6 @@ var (
 	ErrInvalidResponse         = errors.New("state app client: invalid response")
 	ErrRemote                  = errors.New("state app client: remote failure")
 	ErrClientClosed            = errors.New("state app client: closed")
-	// ErrBlobNotReferenced reports an authenticated null read: the session's
-	// current state references no blob with the requested digest, so the caller
-	// holds a stale reference and must re-read the state before hydrating.
-	ErrBlobNotReferenced = errors.New("state app client: blob is not referenced by the current state")
 
 	keyIDPattern     = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 	signaturePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -110,6 +94,7 @@ var safeHostErrorMessages = map[string]string{
 	"STALE_DISPATCH_ATTEMPT":   "The supplied dispatch attempt is stale.",
 	"DIGEST_MISMATCH":          "A supplied digest does not match its value.",
 	"NEEDS_CONFIRMATION":       "The operation requires confirmation.",
+	"DISPATCH_ALREADY_STARTED": "The dispatch attempt already has a start claim.",
 	"ABORTED":                  "The operation was aborted.",
 	"LEASE_EXPIRED":            "The supplied lease has expired.",
 	"RESOURCE_EXHAUSTED":       "The RPC response exceeds its operation limit.",
@@ -124,6 +109,10 @@ var safeHostErrorMessages = map[string]string{
 }
 
 type Config struct {
+	BrokerKeyID          string
+	BrokerRootKey        []byte
+	AdmissionKeyID       string
+	AdmissionRootKey     []byte
 	Endpoint             string
 	KeyID                string
 	RootKey              []byte
@@ -139,23 +128,6 @@ type Request struct {
 	ExpectedAuthorizationGeneration uint64
 	AfterSequence                   uint64
 	Limit                           int
-}
-
-// BlobRequest hydrates one externalized payload that a session read returned
-// only a reference to. It is authorized exactly like a session-event read.
-type BlobRequest struct {
-	TenantID                        string
-	ActorSubjectID                  string
-	SessionID                       string
-	ExpectedAuthorizationGeneration uint64
-	Digest                          string
-}
-
-// SessionBlob is one hydrated payload whose bytes were verified to hash to the
-// requested digest before being returned.
-type SessionBlob struct {
-	Digest string
-	Bytes  []byte
 }
 
 type DispatchStartFence struct {
@@ -221,13 +193,15 @@ type ClaimDispatchStartResult struct {
 }
 
 type authenticatedIngressContract struct {
+	brokerCredentials        bool
+	admissionCredentials     bool
 	path                     string
 	contentType              string
 	requestMACDomain         string
 	responseMACDomain        string
 	hostSchemaDigest         string
 	requestOptions           canonical.Options
-	responseMaxBytes         int
+	maximumResponseBytes     int
 	dispatchStartCredentials bool
 }
 
@@ -249,6 +223,12 @@ func (failure *RemoteError) Error() string {
 func (failure *RemoteError) Unwrap() error { return ErrRemote }
 
 type Client struct {
+	brokerKeyID              string
+	brokerRequestKey         [sha256.Size]byte
+	brokerResponseKey        [sha256.Size]byte
+	admissionKeyID           string
+	admissionRequestKey      [sha256.Size]byte
+	admissionResponseKey     [sha256.Size]byte
 	endpoint                 string
 	keyID                    string
 	requestKey               [sha256.Size]byte
@@ -319,6 +299,15 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 	dispatchStartCredentialsValid := keyIDPattern.MatchString(config.DispatchStartKeyID) &&
 		len(config.DispatchStartRootKey) >= 32 && len(config.DispatchStartRootKey) <= 256 &&
 		config.DispatchStartKeyID != config.KeyID && !bytes.Equal(config.DispatchStartRootKey, config.RootKey)
+	admissionAbsent := config.AdmissionKeyID == "" && len(config.AdmissionRootKey) == 0
+	admissionValid := keyIDPattern.MatchString(config.AdmissionKeyID) &&
+		len(config.AdmissionRootKey) >= 32 && len(config.AdmissionRootKey) <= 256 &&
+		config.AdmissionKeyID != config.KeyID && config.AdmissionKeyID != config.DispatchStartKeyID &&
+		!bytes.Equal(config.AdmissionRootKey, config.RootKey) && !bytes.Equal(config.AdmissionRootKey, config.DispatchStartRootKey)
+	brokerAbsent := config.BrokerKeyID == "" && len(config.BrokerRootKey) == 0
+	brokerValid := keyIDPattern.MatchString(config.BrokerKeyID) && len(config.BrokerRootKey) >= 32 && len(config.BrokerRootKey) <= 256 &&
+		config.BrokerKeyID != config.KeyID && config.BrokerKeyID != config.DispatchStartKeyID && config.BrokerKeyID != config.AdmissionKeyID &&
+		!bytes.Equal(config.BrokerRootKey, config.RootKey) && !bytes.Equal(config.BrokerRootKey, config.DispatchStartRootKey) && !bytes.Equal(config.BrokerRootKey, config.AdmissionRootKey)
 	if err != nil || config.Endpoint == "" || config.Endpoint != strings.TrimSpace(config.Endpoint) ||
 		strings.Contains(config.Endpoint, "%") || parsed.Scheme != "http" ||
 		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
@@ -329,6 +318,8 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 		!keyIDPattern.MatchString(config.KeyID) ||
 		len(config.RootKey) < 32 || len(config.RootKey) > 256 ||
 		!dispatchStartCredentialsAbsent && !dispatchStartCredentialsValid ||
+		!admissionAbsent && !admissionValid ||
+		!brokerAbsent && !brokerValid ||
 		config.Timeout <= 0 || config.Timeout > maximumTimeout ||
 		sources.clock == nil || sources.newRequestID == nil {
 		return nil, ErrInvalidConfig
@@ -346,9 +337,25 @@ func newWithSources(config Config, sources clientSources) (*Client, error) {
 		clear(dispatchStartRootKey)
 	}
 
+	var admissionRequestKey, admissionResponseKey [sha256.Size]byte
+	if !admissionAbsent {
+		root := append([]byte(nil), config.AdmissionRootKey...)
+		admissionRequestKey = keyedDigest(root, []byte(requestKeyDomain))
+		admissionResponseKey = keyedDigest(root, []byte(responseKeyDomain))
+		clear(root)
+	}
+	var brokerRequestKey, brokerResponseKey [sha256.Size]byte
+	if !brokerAbsent {
+		root := append([]byte(nil), config.BrokerRootKey...)
+		brokerRequestKey = keyedDigest(root, []byte(requestKeyDomain))
+		brokerResponseKey = keyedDigest(root, []byte(responseKeyDomain))
+		clear(root)
+	}
 	sourceGate := make(chan struct{}, 1)
 	sourceGate <- struct{}{}
 	client := &Client{
+		brokerKeyID: config.BrokerKeyID, brokerRequestKey: brokerRequestKey, brokerResponseKey: brokerResponseKey,
+		admissionKeyID: config.AdmissionKeyID, admissionRequestKey: admissionRequestKey, admissionResponseKey: admissionResponseKey,
 		endpoint:                 config.Endpoint,
 		keyID:                    config.KeyID,
 		requestKey:               requestKey,
@@ -444,6 +451,10 @@ func (client *Client) Close() {
 	client.active.Wait()
 	client.transport.CloseIdleConnections()
 	client.lifecycleMu.Lock()
+	clear(client.admissionRequestKey[:])
+	clear(client.admissionResponseKey[:])
+	clear(client.brokerRequestKey[:])
+	clear(client.brokerResponseKey[:])
 	clear(client.requestKey[:])
 	clear(client.responseKey[:])
 	clear(client.dispatchStartRequestKey[:])
@@ -484,7 +495,6 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 			requestOptions: canonical.Options{
 				MaxBytes: maximumRequestBytes, MaxDepth: maximumRequestDepth, MaxItems: maximumRequestItems,
 			},
-			responseMaxBytes: maximumResponseBytes,
 		},
 		func(requestID string, sentAtUnixMS int64) canonical.Map {
 			return canonical.Map{
@@ -498,80 +508,6 @@ func (client *Client) ReadSessionEvents(ctx context.Context, request Request) (c
 			}
 		},
 	)
-}
-
-// ReadSessionBlob hydrates the externalized payload with the given content
-// digest. It returns ErrBlobNotReferenced when the session's current state
-// references no such blob, and ErrInvalidResponse when the authenticated
-// response echoes a different digest, misdeclares its length, exceeds the host
-// blob bound, or carries bytes that do not hash to the requested digest.
-func (client *Client) ReadSessionBlob(ctx context.Context, request BlobRequest) (SessionBlob, error) {
-	if ctx == nil {
-		return SessionBlob{}, ErrInvalidRequest
-	}
-	if err := ctx.Err(); err != nil {
-		return SessionBlob{}, err
-	}
-	if client == nil || client.httpClient == nil {
-		return SessionBlob{}, ErrInvalidConfig
-	}
-	if _, err := identity.Parse(identity.Tenant, request.TenantID); err != nil {
-		return SessionBlob{}, ErrInvalidRequest
-	}
-	if _, err := identity.Parse(identity.Subject, request.ActorSubjectID); err != nil {
-		return SessionBlob{}, ErrInvalidRequest
-	}
-	if _, err := identity.Parse(identity.Session, request.SessionID); err != nil ||
-		request.ExpectedAuthorizationGeneration < 1 ||
-		request.ExpectedAuthorizationGeneration > maximumSharedInteger ||
-		!digestPattern.MatchString(request.Digest) ||
-		request.Digest == "sha256:"+strings.Repeat("0", 64) {
-		return SessionBlob{}, ErrInvalidRequest
-	}
-	rawResult, err := client.invokeAuthenticatedIngress(
-		ctx,
-		authenticatedIngressContract{
-			path: blobIngressPath, contentType: blobIngressContentType,
-			requestMACDomain: blobRequestMACDomain, responseMACDomain: blobResponseMACDomain,
-			hostSchemaDigest: blobHostSchemaDigest,
-			requestOptions: canonical.Options{
-				MaxBytes: maximumRequestBytes, MaxDepth: maximumRequestDepth, MaxItems: maximumRequestItems,
-			},
-			responseMaxBytes: maximumBlobResponseBytes,
-		},
-		func(requestID string, sentAtUnixMS int64) canonical.Map {
-			return canonical.Map{
-				"protocol": blobIngressProtocol, "major": int64(1), "minor": int64(0),
-				"schemaDigest": blobIngressSchemaDigest,
-				"requestId":    requestID, "sentAtUnixMs": sentAtUnixMS,
-				"tenantId": request.TenantID, "actorSubjectId": request.ActorSubjectID,
-				"sessionId":                       request.SessionID,
-				"expectedAuthorizationGeneration": request.ExpectedAuthorizationGeneration,
-				"digest":                          request.Digest,
-			}
-		},
-	)
-	if err != nil {
-		return SessionBlob{}, err
-	}
-	if rawResult == nil {
-		return SessionBlob{}, ErrBlobNotReferenced
-	}
-	result, ok := rawResult.(canonical.Map)
-	if !ok || len(result) != 3 {
-		return SessionBlob{}, ErrInvalidResponse
-	}
-	encodedBytes, lengthOK := result["encodedBytes"].(int64)
-	payload, bytesOK := result["bytes"].(canonical.Bytes)
-	if result["digest"] != request.Digest || !lengthOK || !bytesOK ||
-		len(payload) < 1 || len(payload) > maximumBlobBytes || encodedBytes != int64(len(payload)) {
-		return SessionBlob{}, ErrInvalidResponse
-	}
-	actualDigest := sha256.Sum256(payload)
-	if "sha256:"+hex.EncodeToString(actualDigest[:]) != request.Digest {
-		return SessionBlob{}, ErrInvalidResponse
-	}
-	return SessionBlob{Digest: request.Digest, Bytes: append([]byte(nil), payload...)}, nil
 }
 
 func (client *Client) ClaimDispatchStart(
@@ -738,7 +674,6 @@ func (client *Client) ClaimDispatchStart(
 				MaxDepth: maximumDispatchStartRequestDepth,
 				MaxItems: maximumDispatchStartRequestItems,
 			},
-			responseMaxBytes:         maximumResponseBytes,
 			dispatchStartCredentials: true,
 		},
 		func(requestID string, sentAtUnixMS int64) canonical.Map {
@@ -812,6 +747,10 @@ func (client *Client) invokeAuthenticatedIngress(
 	contract authenticatedIngressContract,
 	bodyFor func(string, int64) canonical.Map,
 ) (canonical.Value, error) {
+	responseLimit := contract.maximumResponseBytes
+	if responseLimit == 0 {
+		responseLimit = maximumResponseBytes
+	}
 	keyID := client.keyID
 	requestKey := &client.requestKey
 	responseKey := &client.responseKey
@@ -822,6 +761,22 @@ func (client *Client) invokeAuthenticatedIngress(
 		keyID = client.dispatchStartKeyID
 		requestKey = &client.dispatchStartRequestKey
 		responseKey = &client.dispatchStartResponseKey
+	}
+	if contract.admissionCredentials {
+		if client.admissionKeyID == "" || contract.dispatchStartCredentials {
+			return nil, ErrInvalidConfig
+		}
+		keyID = client.admissionKeyID
+		requestKey = &client.admissionRequestKey
+		responseKey = &client.admissionResponseKey
+	}
+	if contract.brokerCredentials {
+		if client.brokerKeyID == "" || contract.dispatchStartCredentials || contract.admissionCredentials {
+			return nil, ErrInvalidConfig
+		}
+		keyID = client.brokerKeyID
+		requestKey = &client.brokerRequestKey
+		responseKey = &client.brokerResponseKey
 	}
 	requestContext, finish, err := client.beginActiveRequest(ctx)
 	if err != nil {
@@ -925,14 +880,10 @@ func (client *Client) invokeAuthenticatedIngress(
 		hasContentEncoding {
 		return nil, ErrUnauthenticatedResponse
 	}
-	responseMaxBytes := contract.responseMaxBytes
-	if responseMaxBytes < 1 || responseMaxBytes > maximumBlobResponseBytes {
-		return nil, ErrInvalidConfig
+	if response.ContentLength > int64(responseLimit) {
+		return nil, fmt.Errorf("%w: body exceeds %d bytes", ErrInvalidResponse, responseLimit)
 	}
-	if response.ContentLength > int64(responseMaxBytes) {
-		return nil, fmt.Errorf("%w: body exceeds %d bytes", ErrInvalidResponse, responseMaxBytes)
-	}
-	body, err = io.ReadAll(io.LimitReader(response.Body, int64(responseMaxBytes)+1))
+	body, err = io.ReadAll(io.LimitReader(response.Body, int64(responseLimit)+1))
 	if err != nil {
 		client.lifecycleMu.Lock()
 		closed := client.closed
@@ -945,8 +896,8 @@ func (client *Client) invokeAuthenticatedIngress(
 		}
 		return nil, fmt.Errorf("%w: cannot read complete response body", ErrInvalidResponse)
 	}
-	if len(body) > responseMaxBytes {
-		return nil, fmt.Errorf("%w: body exceeds %d bytes", ErrInvalidResponse, responseMaxBytes)
+	if len(body) > responseLimit {
+		return nil, fmt.Errorf("%w: body exceeds %d bytes", ErrInvalidResponse, responseLimit)
 	}
 	receivedSignature, err := hex.DecodeString(signatures[0])
 	if err != nil {
@@ -973,7 +924,7 @@ func (client *Client) invokeAuthenticatedIngress(
 	}
 
 	decoded, err := canonical.Decode(body, canonical.Options{
-		MaxBytes: responseMaxBytes, MaxDepth: maximumResponseDepth, MaxItems: maximumResponseItems,
+		MaxBytes: responseLimit, MaxDepth: maximumResponseDepth, MaxItems: maximumResponseItems,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: malformed canonical body", ErrInvalidResponse)

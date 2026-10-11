@@ -6,13 +6,17 @@ import {
   applySessionCommand,
   createSessionState,
   migrateSessionState,
+  readSessionPayload,
   replaySessionPublicEvents,
   validateSessionState,
   type CreateSessionStateInput,
   type SessionAggregateState,
   type SessionCommand,
   type SessionCommandOutcome,
+  type StoredSessionCommandOutcome,
   type SessionPublicEventReplay,
+  type SessionApplyContext,
+  type ApplySessionCommandResult,
 } from "../session/index.ts";
 import {
   applyWorkspaceCommand,
@@ -70,6 +74,12 @@ import {
 } from "./contracts.ts";
 import { AuditCellKernel } from "./audit-kernel.ts";
 import { TransactionalAggregateKernel } from "./kernel.ts";
+import { SessionHistoryStore, sessionHistoryCompanion } from "./session-history-store.ts";
+import { brokerCommand, brokerLookupKey, parseTypedBrokerPayload, sessionBrokerHostPolicy } from "./broker.ts";
+import { assertSessionAdmissionPlanningAuthority, parseSessionAdmissionPlanningRequest, planSessionAdmission,
+  sessionAdmissionHostPolicy, validateSessionAdmissionPlanningDigests } from "./admission.ts";
+import { assertSessionBrokerAuthority, materializeSessionBrokerReceipt, readSessionBrokerTurn, sessionBrokerLookupResult,
+  sessionError, type SessionBrokerPolicy, type SessionBrokerOperationReceipt, type SessionBrokerReceiptValue, type SessionBrokerTurn } from "../session/index.ts";
 import {
   capabilityGenerationCellName,
   extensionStateCellName,
@@ -87,7 +97,10 @@ const sessionAdapter: AggregateAdapter<
   SessionAggregateState,
   CreateSessionStateInput,
   SessionCommand,
-  SessionCommandOutcome
+  StoredSessionCommandOutcome,
+  SessionCommandOutcome,
+  SessionApplyContext,
+  ApplySessionCommandResult
 > = {
   kind: "session",
   cellName: (initialization) =>
@@ -96,6 +109,22 @@ const sessionAdapter: AggregateAdapter<
   migrate: migrateSessionState,
   validate: validateSessionState,
   apply: (state, command, context) => applySessionCommand(state, command, context),
+  materializeOutcome: async (outcome, { readBlob }) => {
+    if (outcome.kind === "broker_result") return { kind: "broker_result", result: await materializeSessionBrokerReceipt(outcome.receipt, readBlob, outcome.replayedClaim) };
+    if (outcome.kind !== "effect_settled") return outcome;
+    const settlement = outcome.settlement;
+    if (settlement.kind !== "success") return { ...outcome, settlement };
+    if (settlement.resultPayloadRef === undefined) {
+      return { ...outcome, settlement: { kind: "success", result: settlement.result } };
+    }
+    return {
+      ...outcome,
+      settlement: {
+        kind: "success",
+        result: await readSessionPayload(settlement.resultPayloadRef, readBlob),
+      },
+    };
+  },
   version: (state) => state.eventSequence,
 };
 
@@ -166,6 +195,8 @@ type StateBindingName =
   | "AUDIT_CELL";
 
 interface StateHostEnvironment {
+  readonly CIRCULUSD_STATE_ADMISSION_POLICY?: unknown;
+  readonly CIRCULUSD_STATE_BROKER_POLICY?: unknown;
   readonly SESSION_CELL: DurableObjectNamespacePort;
   readonly WORKSPACE_CELL: DurableObjectNamespacePort;
   readonly USER_CELL: DurableObjectNamespacePort;
@@ -310,11 +341,17 @@ interface AuditEntriesQuery extends AuthorizedControlQuery {
 
 export class SessionCell extends DurableObject<StateHostEnvironment> {
   static readonly hostProfile = CELLD_HOST_PROFILE;
+  private readonly brokerPolicy: SessionBrokerPolicy | null;
+  private readonly admissionTTLms: number | null;
+  private readonly admissionClock: () => number;
   private readonly kernel: TransactionalAggregateKernel<
     SessionAggregateState,
     CreateSessionStateInput,
     SessionCommand,
-    SessionCommandOutcome
+    StoredSessionCommandOutcome,
+    SessionCommandOutcome,
+    SessionApplyContext,
+    ApplySessionCommandResult
   >;
 
   constructor(
@@ -323,11 +360,15 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
     clock: () => number = Date.now,
   ) {
     super(state, environment);
+    this.admissionTTLms = sessionAdmissionHostPolicy(environment.CIRCULUSD_STATE_ADMISSION_POLICY);
+    this.admissionClock = clock;
+    this.brokerPolicy = sessionBrokerHostPolicy(environment.CIRCULUSD_STATE_BROKER_POLICY);
     this.kernel = new TransactionalAggregateKernel(
       state,
       sessionAdapter,
       cellRoute(state, environment, "SESSION_CELL"),
       clock,
+      sessionHistoryCompanion,
     );
   }
 
@@ -340,13 +381,56 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
     );
   }
 
+  planSessionTurnAdmission(request: unknown): Promise<HostRpcResponse<unknown>> {
+    return invokeHostRpc("session.execute", request, parseSessionAdmissionPlanningRequest, async (input) => {
+      const ttl = this.admissionTTLms;
+      if (ttl === null) sessionError("FAILED_PRECONDITION", "trusted Session admission policy is unavailable");
+      return this.kernel.query(input, async (state, query, context) => {
+        assertSessionAdmissionPlanningAuthority(state, query);
+        await validateSessionAdmissionPlanningDigests(query);
+        const receipt = state.turnAdmissionReceipts.find((candidate) => candidate.idempotencyKeyDigest === query.idempotencyKeyDigest) ??
+          await new SessionHistoryStore(context.transaction, context.stored.manifest.sessionHistory, state)
+            .admissionReceipt(query.idempotencyKeyDigest);
+        return planSessionAdmission(state, query, receipt, this.admissionClock(), ttl);
+      });
+    });
+  }
+
+  brokerSession(request: unknown): Promise<HostRpcResponse<SessionBrokerTurn | SessionBrokerOperationReceipt | SessionBrokerReceiptValue>> {
+    return invokeHostRpc("session.execute", request, parseTypedBrokerPayload, async (input) => {
+      const policy = this.brokerPolicy;
+      if (policy === null) sessionError("FAILED_PRECONDITION", "trusted Session broker runtime policy is unavailable");
+      if (input.operation === "read-turn" || input.operation === "lookup-operation") {
+        return this.kernel.query(input, async (state, query, context) => {
+          assertSessionBrokerAuthority(state, query.authority);
+          if (query.operation === "read-turn") return readSessionBrokerTurn(state, policy);
+          if (query.operation !== "lookup-operation") sessionError("INVALID_ARGUMENT", "broker query kind changed");
+          const operationKeyDigest = await brokerLookupKey(query.body.operationKey);
+          const receipt = state.broker?.receipts.find((candidate) => candidate.kind === query.body.kind && candidate.operationKeyDigest === operationKeyDigest) ??
+            await new SessionHistoryStore(context.transaction, context.stored.manifest.sessionHistory, state)
+              .brokerReceipt(query.body.kind, query.body.operationKey, operationKeyDigest);
+          return sessionBrokerLookupResult(query.body, receipt, context.readBlob);
+        });
+      }
+      const result = await this.kernel.execute(await brokerCommand(input, policy));
+      if (result.outcome.kind !== "broker_result") sessionError("FAILED_PRECONDITION", "broker operation returned another outcome kind");
+      return result.outcome.result;
+    });
+  }
+
   executeSessionCommand(
     request: unknown,
   ): Promise<HostRpcResponse<CommittedCommandResult<SessionCommandOutcome>>> {
     return invokeHostRpc(
       "session.execute",
       request,
-      typedPayload<SessionCommand>,
+      (payload) => {
+        const command = typedPayload<SessionCommand>(payload);
+        if (command !== null && typeof command === "object" && command.kind === "broker_operation") {
+          sessionError("INVALID_ARGUMENT", "broker operations require the typed authority-owned entrypoint");
+        }
+        return command;
+      },
       (command) => this.kernel.execute(command),
     );
   }
@@ -412,12 +496,15 @@ export class SessionCell extends DurableObject<StateHostEnvironment> {
       ),
       (input) => this.kernel.query(
         input,
-        (state, query) => {
+        async (state, query, context) => {
           assertAuthorizedSessionRead(state, query);
+          const archivedEvents = await new SessionHistoryStore(context.transaction,
+            context.stored.manifest.sessionHistory, state).events(state, query.afterSequence, query.limit);
           return replaySessionPublicEvents(
             state,
             query.afterSequence,
             query.limit,
+            archivedEvents,
           );
         },
       ),

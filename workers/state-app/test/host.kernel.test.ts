@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { DurableObject } from "cloudflare:workers";
 
+import { Buffer } from "node:buffer";
+
 import {
   PROTOCOL_MAJOR,
   PROTOCOL_MINOR,
@@ -48,6 +50,7 @@ import type {
 } from "../src/control/index.ts";
 import {
   applySessionCommand,
+  checkpointDigest,
   createSessionState,
   turnInputDigest,
   type CreateSessionStateInput,
@@ -1084,15 +1087,17 @@ describe("command host transactional kernel", () => {
     await kernel.execute({ add: [first], keep: [] });
     expect(blobKeys()).toHaveLength(2);
     const readFirst = await storage.transaction((tx) => reader.readBlob(tx, firstDigest));
-    expect(readFirst).toEqual(first);
+    expect(Buffer.compare(readFirst!, first)).toBe(0);
 
     // A second turn carries the first blob (without re-providing its bytes) and adds
     // a second; both are readable and the carried blob was not rewritten.
     const second = new Uint8Array(400_000).fill(9);
     const secondDigest = await digestBytes(second);
     await kernel.execute({ add: [second], keep: [firstDigest] });
-    expect(await storage.transaction((tx) => reader.readBlob(tx, firstDigest))).toEqual(first);
-    expect(await storage.transaction((tx) => reader.readBlob(tx, secondDigest))).toEqual(second);
+    const carriedFirst = await storage.transaction((tx) => reader.readBlob(tx, firstDigest));
+    const readSecond = await storage.transaction((tx) => reader.readBlob(tx, secondDigest));
+    expect(Buffer.compare(carriedFirst!, first)).toBe(0);
+    expect(Buffer.compare(readSecond!, second)).toBe(0);
     expect(blobKeys()).toHaveLength(3);
 
     // Dropping every reference deletes the blobs (set membership is the refcount).
@@ -1378,8 +1383,8 @@ describe("named aggregate cells", () => {
     expect(committed).toMatchObject({ version: 1, replayed: false });
     expect(replayed).toMatchObject({ version: 1, replayed: true });
     expect(replayed.outcome).toEqual(committed.outcome);
-    // anchor + manifest + one state chunk + the externalized genesis checkpoint blob
-    expect(storage.values.size).toBe(4);
+    // anchor + manifest + one state chunk + genesis checkpoint and input blobs
+    expect(storage.values.size).toBe(5);
     const snapshot = await hostRpcResult(
       "session.read",
       { authority: sessionAuthority(), now: 200 },
@@ -1504,13 +1509,17 @@ describe("named aggregate cells", () => {
       await enqueueSessionCommand(),
     ) as SessionCommand & { publicAdmission?: unknown };
     delete legacyCommand.publicAdmission;
+    if (legacyCommand.kind !== "enqueue_turn") throw new Error("enqueue fixture required");
     const committedLegacy = await applySessionCommand(
       createSessionState(initialization),
       legacyCommand,
     );
-    // A real schema-v1 record kept checkpoint payloads inline (no blobs, no chain
-    // digest); rebuild that layout so the migration externalizes it for real.
+    // A real schema-v1 record kept both input and checkpoint payloads inline,
+    // with no checkpoint chain digest or separately stored payload blobs.
     const legacyState = inlineLegacyCheckpoints(committedLegacy.state, committedLegacy.blobs);
+    const legacyTurn = legacyState.activeTurn as Record<string, unknown>;
+    legacyTurn.input = structuredClone(legacyCommand.input);
+    delete legacyTurn.inputRef;
     legacyState.schemaVersion = 1;
     delete legacyState.publicEventSequence;
     delete legacyState.publicEvents;
@@ -1545,22 +1554,30 @@ describe("named aggregate cells", () => {
     )).resolves.toEqual({ version: 1, replayed: true });
     expect(storage.revision).toBe(legacyRevision + 1);
 
-    await expect(hostRpcResult(
+    const migrated = await hostRpcResult(
       "session.read",
       { authority: sessionAuthority(), now: 200 },
       (request) => cell.readSession(request),
-    )).resolves.toMatchObject({
-      schemaVersion: 5,
+    );
+    expect(migrated).toMatchObject({
+      schemaVersion: 7,
       eventSequence: 1,
       activeTurn: {
         turnId: "turn-1",
-        checkpoint: committedLegacy.state.activeTurn?.checkpoint,
-        checkpointChainDigest: committedLegacy.state.activeTurn?.checkpointChainDigest,
+        input: legacyCommand.input,
+        inputDigest: legacyCommand.inputDigest,
+        checkpoint: legacyCommand.genesisCheckpoint,
       },
       publicEventSequence: 0,
       publicEvents: [],
       turnAdmissionReceipts: [],
     });
+    expect(migrated.activeTurn).not.toHaveProperty("inputRef");
+    expect(migrated.activeTurn).not.toHaveProperty("checkpointChainDigest");
+    expect(migrated.activeTurn?.checkpoint).not.toHaveProperty("payloadSize");
+    const inlineCheckpoint = migrated.activeTurn!.checkpoint;
+    if (!("payloadBytes" in inlineCheckpoint)) throw new Error("legacy inline checkpoint required");
+    expect(await digestBytes(inlineCheckpoint.payloadBytes)).toBe(legacyCommand.genesisCheckpoint.payloadDigest);
     const migratedRevision = storage.revision;
     await expect(readSessionPublicEvents(cell, {
       authority: sessionAuthority(),
@@ -1573,11 +1590,13 @@ describe("named aggregate cells", () => {
     });
     expect(storage.revision).toBe(migratedRevision);
 
-    await expect(hostRpcResult(
+    const legacyReplay = await hostRpcResult(
       "session.execute",
       legacyCommand,
       (request) => cell.executeSessionCommand(request),
-    )).resolves.toMatchObject({ version: 1, replayed: true });
+    );
+    expect(legacyReplay).toMatchObject({ version: 1, replayed: true, outcome: committedLegacy.outcome });
+    expect(storage.revision).toBe(migratedRevision);
     await expect(hostRpcResult(
       "session.execute",
       await enqueueSessionCommand({
@@ -1589,6 +1608,31 @@ describe("named aggregate cells", () => {
       }),
       (request) => cell.executeSessionCommand(request),
     )).resolves.toMatchObject({ version: 2, replayed: false });
+
+    // The first engine boundary derives the predecessor from the retained inline
+    // wire checkpoint, then writes the new external checkpoint normally.
+    const boundary: SessionCommand = {
+      kind: "commit_engine_step", commandId: "checkpoint-after-v1-migration",
+      expectedEventSequence: 2, turnId: "turn-1", transactionTime: 200,
+      fence: { turnLeaseGeneration: 10, placementGeneration: 4, sandboxGeneration: 5, authorizationGeneration: 6 },
+      consumedSettlementEffectId: null, effectIdentity: null,
+      step: {
+        kind: "checkpoint",
+        checkpoint: {
+          ...legacyCommand.genesisCheckpoint, kind: "engine", checkpointSequence: 1,
+          predecessorDigest: await checkpointDigest(legacyCommand.genesisCheckpoint),
+        },
+      },
+    };
+    const boundaryResult = await hostRpcResult(
+      "session.execute", boundary, (request) => cell.executeSessionCommand(request),
+    );
+    expect(boundaryResult).toMatchObject({ version: 3, replayed: false });
+    const boundaryRevision = storage.revision;
+    await expect(hostRpcResult(
+      "session.execute", boundary, (request) => cell.executeSessionCommand(request),
+    )).resolves.toEqual({ ...boundaryResult, replayed: true });
+    expect(storage.revision).toBe(boundaryRevision);
   });
 
   it("fails closed when a Session read authority is forged, expired, or stale", async () => {

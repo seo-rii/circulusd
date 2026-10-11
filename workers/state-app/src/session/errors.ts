@@ -1,5 +1,6 @@
 export type SessionAggregateErrorCode =
   | "INVALID_ARGUMENT"
+  | "PERMISSION_DENIED"
   | "NOT_FOUND"
   | "ALREADY_EXISTS"
   | "CONFLICT"
@@ -7,6 +8,7 @@ export type SessionAggregateErrorCode =
   | "FAILED_PRECONDITION"
   | "STALE_GENERATION"
   | "STALE_DISPATCH_ATTEMPT"
+  | "DISPATCH_ALREADY_STARTED"
   | "DIGEST_MISMATCH"
   | "NEEDS_CONFIRMATION"
   | "ABORTED";

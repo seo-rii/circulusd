@@ -491,7 +491,7 @@ describe("Phase 0B durable dispatch start claim", () => {
     };
     cleanLegacy.schemaVersion = 3;
     const cleanMigration = await migrateSessionState(cleanLegacy);
-    expect(cleanMigration).toMatchObject({ migrated: true, state: { schemaVersion: 5 } });
+    expect(cleanMigration).toMatchObject({ migrated: true, state: { schemaVersion: 7 } });
     await expect(validateSessionState(cleanMigration.state)).resolves.toBeUndefined();
 
     const { state } = await prepareDispatchedStorage();

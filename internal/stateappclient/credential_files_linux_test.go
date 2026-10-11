@@ -464,3 +464,70 @@ func writeRootKeyFile(t *testing.T, directory, name string, key []byte, mode os.
 	}
 	return path
 }
+
+func TestAdmissionCredentialFilesAreIndependentAndCleared(t *testing.T) {
+	directory := t.TempDir()
+	config := CredentialFileConfig{Endpoint: "http://127.0.0.1:1", KeyID: "read", DispatchStartKeyID: "dispatch", AdmissionKeyID: "admit", Timeout: time.Second}
+	config.RootKeyFile = writeRootKeyFile(t, directory, "read-admit-test", bytes.Repeat([]byte{0x31}, 32), 0o600)
+	config.DispatchStartRootKeyFile = writeRootKeyFile(t, directory, "dispatch-admit-test", bytes.Repeat([]byte{0x91}, 32), 0o600)
+	config.AdmissionRootKeyFile = writeRootKeyFile(t, directory, "admission", bytes.Repeat([]byte{0x72}, 32), 0o600)
+	var captured []byte
+	client, err := newFromCredentialFiles(config, func(value Config) (*Client, error) { captured = value.AdmissionRootKey; return New(value) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(captured, make([]byte, len(captured))) {
+		t.Fatal("loader retained admission root")
+	}
+	if client.admissionKeyID != "admit" || client.admissionRequestKey == ([32]byte{}) {
+		t.Fatal("admission key not derived")
+	}
+	client.Close()
+	if client.admissionRequestKey != ([32]byte{}) || client.admissionResponseKey != ([32]byte{}) {
+		t.Fatal("Close retained admission keys")
+	}
+	for _, path := range []string{config.RootKeyFile, config.DispatchStartRootKeyFile} {
+		alias := config
+		alias.AdmissionRootKeyFile = path
+		if _, err := NewFromCredentialFiles(alias); !errors.Is(err, ErrInvalidCredentialFile) {
+			t.Fatalf("file alias err=%v", err)
+		}
+	}
+	duplicate := config
+	duplicate.AdmissionRootKeyFile = writeRootKeyFile(t, directory, "duplicate", bytes.Repeat([]byte{0x91}, 32), 0o600)
+	if _, err := NewFromCredentialFiles(duplicate); !errors.Is(err, ErrInvalidCredentialFile) {
+		t.Fatalf("material alias err=%v", err)
+	}
+}
+
+func TestBrokerCredentialFilesAreIndependentAndCleared(t *testing.T) {
+	directory := t.TempDir()
+	config := CredentialFileConfig{Endpoint: "http://127.0.0.1:1", KeyID: "read", DispatchStartKeyID: "dispatch", AdmissionKeyID: "admit", BrokerKeyID: "broker", Timeout: time.Second}
+	config.RootKeyFile = writeRootKeyFile(t, directory, "read", bytes.Repeat([]byte{0x91}, 32), 0o600)
+	config.DispatchStartRootKeyFile = writeRootKeyFile(t, directory, "dispatch", bytes.Repeat([]byte{0x52}, 32), 0o600)
+	config.AdmissionRootKeyFile = writeRootKeyFile(t, directory, "admission", bytes.Repeat([]byte{0x72}, 32), 0o600)
+	config.BrokerRootKeyFile = writeRootKeyFile(t, directory, "broker", bytes.Repeat([]byte{0x82}, 32), 0o600)
+	var captured []byte
+	client, err := newFromCredentialFiles(config, func(value Config) (*Client, error) { captured = value.BrokerRootKey; return New(value) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if !bytes.Equal(captured, make([]byte, 32)) {
+		t.Fatal("loader retained broker key bytes")
+	}
+	for _, path := range []string{config.RootKeyFile, config.DispatchStartRootKeyFile, config.AdmissionRootKeyFile} {
+		alias := config
+		alias.BrokerRootKeyFile = path
+		if _, err := NewFromCredentialFiles(alias); err == nil {
+			t.Fatal("accepted aliased broker credential file")
+		}
+	}
+	for i, raw := range []byte{0x91, 0x52, 0x72} {
+		duplicate := config
+		duplicate.BrokerRootKeyFile = writeRootKeyFile(t, directory, "duplicate-broker-"+strconv.Itoa(i), bytes.Repeat([]byte{raw}, 32), 0o600)
+		if _, err := NewFromCredentialFiles(duplicate); err == nil {
+			t.Fatal("accepted duplicated broker key material")
+		}
+	}
+}

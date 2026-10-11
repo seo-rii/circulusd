@@ -1,6 +1,8 @@
 import {
   decodeCanonicalCbor,
   digestBytes,
+  digestStructuredValue,
+  parseAgentCheckpoint,
   encodeCanonicalCbor,
   parseDigest,
   parseDispatchPermitClaims,
@@ -16,12 +18,14 @@ import {
 } from "@circulusd/protocol-types";
 
 import { sessionCellName } from "./names.ts";
+import { MAX_BLOB_BYTES } from "./storage.ts";
+import { ADMISSION_PLANNING_FIELDS, parseSessionAdmissionPlanningRequest,
+  validateSessionAdmissionPlanningDigests } from "./admission.ts";
 import {
   HOST_RPC_CONTRACTS,
   HOST_RPC_FALLBACK_REQUEST_ID,
   type HostRpcErrorCode,
 } from "./rpc.ts";
-import { MAX_BLOB_BYTES } from "./storage.ts";
 
 const INGRESS_PATH = "/circulusd/state/v1/session-events:read";
 const INGRESS_CONTENT_TYPE = "application/vnd.circulusd.state-ingress+cbor";
@@ -47,6 +51,29 @@ const INGRESS_REQUEST_MAX_DEPTH = 2;
 const INGRESS_REQUEST_MAX_ITEMS = 32;
 const INGRESS_MAX_CLOCK_SKEW_MS = 30_000;
 const INGRESS_MAX_EVENT_LIMIT = 256;
+const BLOB_INGRESS_PATH = "/circulusd/state/v1/session-blob:read";
+const BLOB_INGRESS_CONTENT_TYPE = "application/vnd.circulusd.state-blob-ingress+cbor";
+const BLOB_INGRESS_PROTOCOL = "circulus.state-blob-ingress.v1alpha1";
+// SHA-256 of the following UTF-8 descriptor, concatenated without a newline:
+// circulus.state-blob-ingress.v1alpha1|major=1|minor=0|requestId:req|sentAtUnixMs:safe-uint|
+// tenantId:tenant|actorSubjectId:subject|sessionId:sess|expectedAuthorizationGeneration:positive-safe-uint|
+// digest:sha256|fields=protocol,major,minor,schemaDigest,requestId,sentAtUnixMs,tenantId,actorSubjectId,sessionId,
+// expectedAuthorizationGeneration,digest|maxBytes=4096|maxDepth=2|maxItems=32
+const BLOB_INGRESS_SCHEMA_DIGEST =
+  "sha256:d9402c455a2d37e51885684aa26ade9d26ff444cc5a15fb89c2ce2af372e40e5";
+const BLOB_INGRESS_REQUEST_FIELDS = Object.freeze([
+  "protocol",
+  "major",
+  "minor",
+  "schemaDigest",
+  "requestId",
+  "sentAtUnixMs",
+  "tenantId",
+  "actorSubjectId",
+  "sessionId",
+  "expectedAuthorizationGeneration",
+  "digest",
+] as const);
 const DISPATCH_START_INGRESS_PATH =
   "/circulusd/state/v1/session-dispatch-start:claim";
 const DISPATCH_START_INGRESS_CONTENT_TYPE =
@@ -87,34 +114,6 @@ const DISPATCH_START_FENCE_FIELDS = Object.freeze([
 const DISPATCH_START_INGRESS_REQUEST_MAX_BYTES = 8_192;
 const DISPATCH_START_INGRESS_REQUEST_MAX_DEPTH = 4;
 const DISPATCH_START_INGRESS_REQUEST_MAX_ITEMS = 96;
-// Hydrates one externalized payload that `session.read` returned only a
-// reference to (storage redesign stage B2.2). Authorized exactly like the
-// public-event read: same ingress keys, same `session.read` permission, same
-// generation fence; only the MAC domain, path and content type differ.
-const BLOB_INGRESS_PATH = "/circulusd/state/v1/session-blob:read";
-const BLOB_INGRESS_CONTENT_TYPE =
-  "application/vnd.circulusd.state-blob-ingress+cbor";
-const BLOB_INGRESS_PROTOCOL = "circulus.state-blob-ingress.v1alpha1";
-const BLOB_INGRESS_SCHEMA_DIGEST =
-  "sha256:43de3ec79f1eb1a1d78e519e24b741630ea2f5bee0cf2ce9e02ee4416dd67aab";
-const BLOB_INGRESS_REQUEST_FIELDS = Object.freeze([
-  "protocol",
-  "major",
-  "minor",
-  "schemaDigest",
-  "requestId",
-  "sentAtUnixMs",
-  "tenantId",
-  "actorSubjectId",
-  "sessionId",
-  "expectedAuthorizationGeneration",
-  "digest",
-] as const);
-const BLOB_INGRESS_REQUEST_MAX_BYTES = 4_096;
-const BLOB_INGRESS_REQUEST_MAX_DEPTH = 2;
-const BLOB_INGRESS_REQUEST_MAX_ITEMS = 32;
-const BLOB_REQUEST_MAC_DOMAIN = "circulusd.state-blob-ingress.request.v1";
-const BLOB_RESPONSE_MAC_DOMAIN = "circulusd.state-blob-ingress.response.v1";
 const KEY_ID_HEADER = "x-circulus-state-key-id";
 const SIGNATURE_HEADER = "x-circulus-state-signature";
 const REQUEST_MAC_DOMAIN = "circulusd.state-ingress.request.v1";
@@ -137,7 +136,6 @@ const EFFECT_ID_PATTERN = /^effect_[A-Z2-7]{25}[AEIMQUY4]$/;
 const INVOCATION_ID_PATTERN = /^inv_[A-Z2-7]{25}[AEIMQUY4]$/;
 const HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-events"];
 const DISPATCH_START_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.execute"];
-const BLOB_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-blob"];
 const ZERO_DIGEST = `sha256:${"0".repeat(64)}` as const;
 const textEncoder = new TextEncoder();
 
@@ -151,6 +149,7 @@ const SAFE_HOST_ERROR_MESSAGES = Object.freeze({
   FAILED_PRECONDITION: "A required precondition was not satisfied.",
   STALE_GENERATION: "The supplied generation is stale.",
   STALE_DISPATCH_ATTEMPT: "The supplied dispatch attempt is stale.",
+  DISPATCH_ALREADY_STARTED: "The dispatch attempt has already started.",
   DIGEST_MISMATCH: "A supplied digest does not match its value.",
   NEEDS_CONFIRMATION: "The operation requires confirmation.",
   ABORTED: "The operation was aborted.",
@@ -167,6 +166,14 @@ const SAFE_HOST_ERROR_MESSAGES = Object.freeze({
 } as const satisfies Readonly<Record<HostRpcErrorCode, string>>);
 
 type IngressSecretEnvironment = Env & {
+  readonly CIRCULUSD_STATE_BROKER_CURRENT_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_BROKER_CURRENT_KEY?: string;
+  readonly CIRCULUSD_STATE_BROKER_PREVIOUS_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_BROKER_PREVIOUS_KEY?: string;
+  readonly CIRCULUSD_STATE_ADMISSION_CURRENT_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_ADMISSION_CURRENT_KEY?: string;
+  readonly CIRCULUSD_STATE_ADMISSION_PREVIOUS_KEY_ID?: string;
+  readonly CIRCULUSD_STATE_ADMISSION_PREVIOUS_KEY?: string;
   readonly CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID?: string;
   readonly CIRCULUSD_STATE_INGRESS_CURRENT_KEY?: string;
   readonly CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID?: string;
@@ -191,7 +198,7 @@ interface CapturedDirectionalKeys {
 type HostContract = (typeof HOST_RPC_CONTRACTS)[keyof typeof HOST_RPC_CONTRACTS];
 
 interface IngressWireContract {
-  readonly kind: "read-events" | "claim-dispatch-start" | "read-blob";
+  readonly kind: "read-events" | "read-blob" | "claim-dispatch-start" | "admit-turn" | "plan-turn" | "broker";
   readonly path: string;
   readonly contentType: string;
   readonly protocol: string;
@@ -211,24 +218,21 @@ interface AuthenticatedResponseContext {
   readonly ingress: IngressWireContract;
 }
 
-interface IngressRequest {
+interface SessionReadIngressRequest {
   readonly requestId: string;
   readonly sentAtUnixMs: number;
   readonly tenantId: string;
   readonly actorSubjectId: string;
   readonly sessionId: string;
   readonly expectedAuthorizationGeneration: number;
+}
+
+interface IngressRequest extends SessionReadIngressRequest {
   readonly afterSequence: number;
   readonly limit: number;
 }
 
-interface BlobIngressRequest {
-  readonly requestId: string;
-  readonly sentAtUnixMs: number;
-  readonly tenantId: string;
-  readonly actorSubjectId: string;
-  readonly sessionId: string;
-  readonly expectedAuthorizationGeneration: number;
+interface BlobIngressRequest extends SessionReadIngressRequest {
   readonly digest: Digest;
 }
 
@@ -287,20 +291,80 @@ const DISPATCH_START_INGRESS = Object.freeze({
   hostContract: DISPATCH_START_HOST_CONTRACT,
 } as const satisfies IngressWireContract);
 
-const BLOB_INGRESS = Object.freeze({
+const READ_BLOB_INGRESS = Object.freeze({
   kind: "read-blob",
   path: BLOB_INGRESS_PATH,
   contentType: BLOB_INGRESS_CONTENT_TYPE,
   protocol: BLOB_INGRESS_PROTOCOL,
   schemaDigest: BLOB_INGRESS_SCHEMA_DIGEST,
   requestFields: BLOB_INGRESS_REQUEST_FIELDS,
-  requestMaxBytes: BLOB_INGRESS_REQUEST_MAX_BYTES,
-  requestMaxDepth: BLOB_INGRESS_REQUEST_MAX_DEPTH,
-  requestMaxItems: BLOB_INGRESS_REQUEST_MAX_ITEMS,
-  requestMacDomain: BLOB_REQUEST_MAC_DOMAIN,
-  responseMacDomain: BLOB_RESPONSE_MAC_DOMAIN,
-  hostContract: BLOB_HOST_CONTRACT,
+  requestMaxBytes: INGRESS_REQUEST_MAX_BYTES,
+  requestMaxDepth: INGRESS_REQUEST_MAX_DEPTH,
+  requestMaxItems: INGRESS_REQUEST_MAX_ITEMS,
+  requestMacDomain: "circulusd.state-blob-ingress.request.v1",
+  responseMacDomain: "circulusd.state-blob-ingress.response.v1",
+  hostContract: HOST_RPC_CONTRACTS["session.read-blob"],
 } as const satisfies IngressWireContract);
+
+// SHA-256 of this exact UTF-8 descriptor (without a trailing newline):
+// circulus.state-turn-ingress.v1alpha1|major=1|minor=0|enqueue_turn|scoped-public-admission|input=messages(user,content)|fields=protocol,major,minor,schemaDigest,requestId,sentAtUnixMs,tenantId,actorSubjectId,sessionId,expectedAuthorizationGeneration,commandId,expectedEventSequence,turnId,input,inputDigest,genesisCheckpoint,turnLeaseGeneration,leaseExpiresAt,idempotencyKeyDigest,requestDigest|maxBytes=8388608|maxDepth=72|maxItems=1000000
+const ADMISSION_INGRESS = Object.freeze({
+  kind: "admit-turn",
+  path: "/circulusd/state/v1/session-turn:admit",
+  contentType: "application/vnd.circulusd.state-turn-ingress+cbor",
+  protocol: "circulus.state-turn-ingress.v1alpha1",
+  schemaDigest: "sha256:eb2c41bda12d84937ea40811c3ae0d367653fcbf8e44aeebb9fc3a7363bcb228",
+  requestFields: ["protocol", "major", "minor", "schemaDigest", "requestId", "sentAtUnixMs", "tenantId", "actorSubjectId", "sessionId", "expectedAuthorizationGeneration", "commandId", "expectedEventSequence", "turnId", "input", "inputDigest", "genesisCheckpoint", "turnLeaseGeneration", "leaseExpiresAt", "idempotencyKeyDigest", "requestDigest"],
+  requestMaxBytes: 8 * 1_048_576,
+  requestMaxDepth: 72,
+  requestMaxItems: 1_000_000,
+  requestMacDomain: "circulusd.state-turn-ingress.request.v1",
+  responseMacDomain: "circulusd.state-turn-ingress.response.v1",
+  hostContract: HOST_RPC_CONTRACTS["session.execute"],
+} as const satisfies IngressWireContract);
+
+// Matches internal/stateappclient/broker.go's exact UTF-8 descriptor:
+// circulus.state-broker-ingress.v1alpha1|major=1|minor=0|typed-session-broker|operations=read-turn,lookup-operation,acquire-step,commit-step,dispatch,claim-start,confirm,settle,block,prepare-retry,settle-recovery|fields=protocol,major,minor,schemaDigest,requestId,sentAtUnixMs,tenantId,workspaceId,sessionId,actorSubjectId,expectedAuthorizationGeneration,operation,body|maxBytes=9437184|maxDepth=72|maxItems=100000
+// Descriptor: circulus.state-turn-plan-ingress.v1alpha1|major=1|minor=0|scoped-session-admission-plan|fields=protocol,major,minor,schemaDigest,requestId,sentAtUnixMs,tenantId,actorSubjectId,sessionId,expectedAuthorizationGeneration,proposedTurnId,input,inputDigest,idempotencyKeyDigest,requestDigest|maxBytes=2097152|maxDepth=72|maxItems=100000
+const ADMISSION_PLAN_INGRESS = Object.freeze({
+  kind: "plan-turn", path: "/circulusd/state/v1/session-turn:plan",
+  contentType: "application/vnd.circulusd.state-turn-plan-ingress+cbor",
+  protocol: "circulus.state-turn-plan-ingress.v1alpha1", schemaDigest: "sha256:cac41263233c9e12d45ba30a5c8321a161abfb5b43849ab805b9df98e54a2d08",
+  requestFields: ["protocol", "major", "minor", "schemaDigest", "requestId", "sentAtUnixMs", ...ADMISSION_PLANNING_FIELDS],
+  requestMaxBytes: 2_097_152, requestMaxDepth: 72, requestMaxItems: 100_000,
+  requestMacDomain: "circulusd.state-turn-plan-ingress.request.v1",
+  responseMacDomain: "circulusd.state-turn-plan-ingress.response.v1",
+  hostContract: DISPATCH_START_HOST_CONTRACT,
+} as const satisfies IngressWireContract);
+
+const BROKER_INGRESS = Object.freeze({
+  kind: "broker",
+  path: "/circulusd/state/v1/session-broker:execute",
+  contentType: "application/vnd.circulusd.state-broker-ingress+cbor",
+  protocol: "circulus.state-broker-ingress.v1alpha1",
+  schemaDigest: "sha256:cf0d52d18c7e797d834fc20d73cf0e8976a7e8eb67f9f28a85d87a5239bc1891",
+  requestFields: ["protocol", "major", "minor", "schemaDigest", "requestId", "sentAtUnixMs", "tenantId", "workspaceId", "sessionId", "actorSubjectId", "expectedAuthorizationGeneration", "operation", "body"],
+  requestMaxBytes: 9 * 1_048_576, requestMaxDepth: 72, requestMaxItems: 100_000,
+  requestMacDomain: "circulusd.state-broker-ingress.request.v1",
+  responseMacDomain: "circulusd.state-broker-ingress.response.v1",
+  hostContract: DISPATCH_START_HOST_CONTRACT,
+} as const satisfies IngressWireContract);
+
+// Body semantics and trusted policy are checked atomically by SessionCell.
+// This boundary only admits the fixed union, never a generic aggregate command.
+const BROKER_BODY_FIELDS = Object.freeze({
+  "read-turn": [],
+  "lookup-operation": ["kind", "operationKey", "operationDigest"],
+  "acquire-step": ["snapshot", "operationKey", "nowUnixMs", "budget"],
+  "commit-step": ["snapshot", "operationKey", "requestDigest", "permitOpaque", "nowUnixMs", "step"],
+  dispatch: ["snapshot", "key", "operationKey", "operationDigest", "preparationOpaque", "providerRequestId", "providerRouteDigest", "nowUnixMs", "deadlineUnixMs"],
+  "claim-start": ["snapshot", "key", "dispatchOpaque", "commandDigest", "nowUnixMs"],
+  confirm: ["snapshot", "key", "operationKey", "operationDigest", "dispatchAttempt", "providerRequestId", "providerRouteDigest", "externalCommitId", "resultRef"],
+  settle: ["snapshot", "key", "operationKey", "operationDigest", "dispatchAttempt", "externalCommitId", "resultRef", "error", "settlement"],
+  block: ["snapshot", "key", "operationKey", "operationDigest", "reason"],
+  "prepare-retry": ["snapshot", "key", "operationKey", "operationDigest", "nowUnixMs", "deadlineUnixMs", "userConfirmed"],
+  "settle-recovery": ["snapshot", "key", "operationKey", "operationDigest", "kind", "error"],
+} as const);
 
 function ordinaryBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
@@ -410,43 +474,41 @@ function selectConfiguredKey(
   requestedKeyId: string,
   ingress: IngressWireContract,
 ): ConfiguredKey | "invalid-config" | undefined {
-  const currentKeyId = ingress.kind === "claim-dispatch-start"
-    ? environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID
-    : environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID;
-  const currentKey = ingress.kind === "claim-dispatch-start"
-    ? environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY
-    : environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY;
-  const previousKeyId = ingress.kind === "claim-dispatch-start"
-    ? environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY_ID
-    : environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID;
-  const previousKey = ingress.kind === "claim-dispatch-start"
-    ? environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY
-    : environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY;
-  const current = configuredKey(
-    currentKeyId,
-    currentKey,
-  );
-  if (current === undefined) {
-    return "invalid-config";
-  }
-
-  const previousId = previousKeyId;
-  const previousHex = previousKey;
-  let previous: ConfiguredKey | undefined;
-  if (previousId !== undefined || previousHex !== undefined) {
-    previous = configuredKey(previousId, previousHex);
-    if (previous === undefined || previous.keyId === current.keyId) {
-      return "invalid-config";
+  const roles = [
+    [environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID, environment.CIRCULUSD_STATE_INGRESS_CURRENT_KEY,
+      environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID, environment.CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY],
+    [environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID, environment.CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY,
+      environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY_ID, environment.CIRCULUSD_STATE_DISPATCH_START_PREVIOUS_KEY],
+    [environment.CIRCULUSD_STATE_ADMISSION_CURRENT_KEY_ID, environment.CIRCULUSD_STATE_ADMISSION_CURRENT_KEY,
+      environment.CIRCULUSD_STATE_ADMISSION_PREVIOUS_KEY_ID, environment.CIRCULUSD_STATE_ADMISSION_PREVIOUS_KEY],
+    [environment.CIRCULUSD_STATE_BROKER_CURRENT_KEY_ID, environment.CIRCULUSD_STATE_BROKER_CURRENT_KEY,
+      environment.CIRCULUSD_STATE_BROKER_PREVIOUS_KEY_ID, environment.CIRCULUSD_STATE_BROKER_PREVIOUS_KEY],
+  ] as const;
+  const selectedRole = ingress.kind === "broker" ? 3
+    : ingress.kind === "admit-turn" || ingress.kind === "plan-turn" ? 2 : ingress.kind === "claim-dispatch-start" ? 1 : 0;
+  const ids = new Set<string>(), materials = new Set<string>();
+  let selected: ConfiguredKey | undefined;
+  for (const [role, [currentId, currentHex, previousId, previousHex]] of roles.entries()) {
+    if (role !== selectedRole && currentId === undefined && currentHex === undefined &&
+      previousId === undefined && previousHex === undefined) continue;
+    const current = configuredKey(currentId, currentHex);
+    if (current === undefined) return "invalid-config";
+    const keys = [current];
+    if (previousId !== undefined || previousHex !== undefined) {
+      const previous = configuredKey(previousId, previousHex);
+      if (previous === undefined) return "invalid-config";
+      keys.push(previous);
+    }
+    // Reject aliases from either direction: reader/admission requests also fail
+    // closed if their configured credential could exercise broker authority.
+    for (const key of keys) {
+      const material = hex(key.rootKey);
+      if (ids.has(key.keyId) || materials.has(material)) return "invalid-config";
+      ids.add(key.keyId); materials.add(material);
+      if (role === selectedRole && requestedKeyId === key.keyId) selected = key;
     }
   }
-
-  if (requestedKeyId === current.keyId) {
-    return current;
-  }
-  if (previous !== undefined && requestedKeyId === previous.keyId) {
-    return previous;
-  }
-  return undefined;
+  return selected;
 }
 
 function unsignedResponse(status: number): Response {
@@ -540,43 +602,14 @@ async function signedFailure(
   }
 }
 
-// Shape-checks a `session.read-blob` success. The content digest of `bytes` is
-// verified asynchronously by the caller; this only pins the exact field set,
-// the echoed digest, the declared length, and the host blob bound.
-function sanitizedBlobResult(
-  result: NormalizedValue,
-  expectedBlob: BlobIngressRequest,
-): NormalizedValue {
-  if (result === null) {
-    return null;
-  }
-  if (
-    !isRecord(result) ||
-    !hasExactFields(result, ["digest", "encodedBytes", "bytes"]) ||
-    result.digest !== expectedBlob.digest ||
-    !(result.bytes instanceof Uint8Array) ||
-    result.bytes.byteLength < 1 ||
-    result.bytes.byteLength > MAX_BLOB_BYTES ||
-    result.encodedBytes !== result.bytes.byteLength
-  ) {
-    throw new Error("invalid read-blob Host RPC success");
-  }
-  const bytes = new Uint8Array(result.bytes.byteLength);
-  bytes.set(result.bytes);
-  return {
-    digest: expectedBlob.digest,
-    encodedBytes: bytes.byteLength,
-    bytes,
-  };
-}
-
-function sanitizeHostResponse(
+async function sanitizeHostResponse(
   unknownResponse: unknown,
   requestId: string,
   ingress: IngressWireContract,
   expectedDispatchStart?: DispatchStartIngressRequest,
-  expectedBlob?: BlobIngressRequest,
-): NormalizedValue {
+  expectedBlobDigest?: Digest,
+  expectedAdmissionTurnId?: string,
+): Promise<NormalizedValue> {
   const envelope = parseRpcEnvelope(
     unknownResponse,
     parseNormalizedValue,
@@ -595,6 +628,35 @@ function sanitizeHostResponse(
     payload.ok === true &&
     hasExactFields(payload, ["ok", "result"])
   ) {
+    if (expectedAdmissionTurnId !== undefined) {
+      const result = payload.result;
+      if (!isRecord(result!) || !hasExactFields(result, ["outcome", "version", "replayed"]) ||
+        typeof result.version !== "number" || !Number.isSafeInteger(result.version) || result.version < 1 ||
+        typeof result.replayed !== "boolean" || !isRecord(result.outcome!) ||
+        !hasExactFields(result.outcome, ["kind", "turnId", "turnSequence", "activated"]) ||
+        result.outcome.kind !== "turn_enqueued" || typeof result.outcome.turnId !== "string" ||
+        !TURN_ID_PATTERN.test(result.outcome.turnId) ||
+        (!result.replayed && result.outcome.turnId !== expectedAdmissionTurnId) ||
+        typeof result.outcome.turnSequence !== "number" || !Number.isSafeInteger(result.outcome.turnSequence) ||
+        result.outcome.turnSequence < 0 || result.outcome.turnSequence >= result.version ||
+        typeof result.outcome.activated !== "boolean") throw new Error("invalid admission Host RPC success");
+    }
+    if (ingress.kind === "read-blob" && payload.result !== null) {
+      const result = payload.result;
+      if (
+        expectedBlobDigest === undefined ||
+        !isRecord(result!) ||
+        !hasExactFields(result, ["digest", "encodedBytes", "bytes"]) ||
+        result.digest !== expectedBlobDigest ||
+        !(result.bytes instanceof Uint8Array) ||
+        result.bytes.byteLength < 1 ||
+        result.bytes.byteLength > MAX_BLOB_BYTES ||
+        result.encodedBytes !== result.bytes.byteLength ||
+        await digestBytes(result.bytes) !== expectedBlobDigest
+      ) {
+        throw new Error("invalid blob Host RPC success");
+      }
+    }
     if (expectedDispatchStart !== undefined) {
       if (
         !isRecord(payload.result!) ||
@@ -689,19 +751,6 @@ function sanitizeHostResponse(
         },
       };
     }
-    if (expectedBlob !== undefined) {
-      return {
-        protocol: PROTOCOL_NAME,
-        major: PROTOCOL_MAJOR,
-        minor: PROTOCOL_MINOR,
-        schemaDigest: ingress.hostContract.schemaDigest,
-        requestId,
-        payload: {
-          ok: true,
-          result: sanitizedBlobResult(payload.result!, expectedBlob),
-        },
-      };
-    }
     return {
       protocol: PROTOCOL_NAME,
       major: PROTOCOL_MAJOR,
@@ -750,10 +799,16 @@ export async function handleStateIngress(
   let wireContract: IngressWireContract;
   if (url.pathname === READ_EVENTS_INGRESS.path) {
     wireContract = READ_EVENTS_INGRESS;
+  } else if (url.pathname === READ_BLOB_INGRESS.path) {
+    wireContract = READ_BLOB_INGRESS;
+  } else if (url.pathname === ADMISSION_INGRESS.path) {
+    wireContract = ADMISSION_INGRESS;
+  } else if (url.pathname === ADMISSION_PLAN_INGRESS.path) {
+    wireContract = ADMISSION_PLAN_INGRESS;
+  } else if (url.pathname === BROKER_INGRESS.path) {
+    wireContract = BROKER_INGRESS;
   } else if (url.pathname === DISPATCH_START_INGRESS.path) {
     wireContract = DISPATCH_START_INGRESS;
-  } else if (url.pathname === BLOB_INGRESS.path) {
-    wireContract = BLOB_INGRESS;
   } else {
     return unsignedResponse(404);
   }
@@ -916,7 +971,136 @@ export async function handleStateIngress(
 
   let sanitizedResponse: NormalizedValue;
   let responseRequestId: string;
-  if (wireContract.kind === "claim-dispatch-start") {
+  if (wireContract.kind === "plan-turn") {
+    if (!isRecord(decoded) || !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol || decoded.major !== 1 || decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest || typeof decoded.requestId !== "string" ||
+      !REQUEST_ID_PATTERN.test(decoded.requestId) || typeof decoded.sentAtUnixMs !== "number" ||
+      !Number.isSafeInteger(decoded.sentAtUnixMs) || decoded.sentAtUnixMs < 0 ||
+      Math.abs(decoded.sentAtUnixMs - now) > INGRESS_MAX_CLOCK_SKEW_MS) {
+      return signedFailure(400, errorRequestId, "INVALID_ARGUMENT", responseContext);
+    }
+    let input;
+    try {
+      input = parseSessionAdmissionPlanningRequest(Object.fromEntries(ADMISSION_PLANNING_FIELDS.map((field) => [field, decoded[field]])));
+      await validateSessionAdmissionPlanningDigests(input);
+    } catch { return signedFailure(400, decoded.requestId, "INVALID_ARGUMENT", responseContext); }
+    responseRequestId = decoded.requestId;
+    try {
+      const cell = environment.SESSION_CELL.getByName(sessionCellName(input.tenantId, input.sessionId)) as unknown as
+        { planSessionTurnAdmission(request: unknown): Promise<unknown> };
+      const unknownResponse = await cell.planSessionTurnAdmission({ protocol: PROTOCOL_NAME, major: PROTOCOL_MAJOR,
+        minor: PROTOCOL_MINOR, schemaDigest: wireContract.hostContract.schemaDigest, requestId: decoded.requestId, payload: input });
+      sanitizedResponse = await sanitizeHostResponse(unknownResponse, decoded.requestId, wireContract);
+    } catch (error) {
+      return signedFailure(502, decoded.requestId,
+        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR", responseContext);
+    }
+  } else if (wireContract.kind === "broker") {
+    if (!isRecord(decoded) || !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol || decoded.major !== 1 || decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest ||
+      typeof decoded.requestId !== "string" || !REQUEST_ID_PATTERN.test(decoded.requestId) ||
+      typeof decoded.sentAtUnixMs !== "number" || !Number.isSafeInteger(decoded.sentAtUnixMs) ||
+      decoded.sentAtUnixMs < 0 || Math.abs(decoded.sentAtUnixMs - now) > INGRESS_MAX_CLOCK_SKEW_MS ||
+      typeof decoded.tenantId !== "string" || !TENANT_ID_PATTERN.test(decoded.tenantId) ||
+      typeof decoded.workspaceId !== "string" || !WORKSPACE_ID_PATTERN.test(decoded.workspaceId) ||
+      typeof decoded.sessionId !== "string" || !SESSION_ID_PATTERN.test(decoded.sessionId) ||
+      typeof decoded.actorSubjectId !== "string" || !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
+      typeof decoded.expectedAuthorizationGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) || decoded.expectedAuthorizationGeneration < 1 ||
+      typeof decoded.operation !== "string" || !Object.hasOwn(BROKER_BODY_FIELDS, decoded.operation) ||
+      !isRecord(decoded.body!) ||
+      !hasExactFields(decoded.body, BROKER_BODY_FIELDS[decoded.operation as keyof typeof BROKER_BODY_FIELDS])) {
+      return signedFailure(400, errorRequestId, "INVALID_ARGUMENT", responseContext);
+    }
+    responseRequestId = decoded.requestId;
+    const hostRequest = {
+      protocol: PROTOCOL_NAME, major: PROTOCOL_MAJOR, minor: PROTOCOL_MINOR,
+      schemaDigest: wireContract.hostContract.schemaDigest, requestId: decoded.requestId,
+      payload: {
+        authority: {
+          tenantId: decoded.tenantId, workspaceId: decoded.workspaceId, sessionId: decoded.sessionId,
+          actorSubjectId: decoded.actorSubjectId, expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
+        },
+        operation: decoded.operation, body: decoded.body,
+      },
+    };
+    try {
+      const session = environment.SESSION_CELL.getByName(sessionCellName(decoded.tenantId, decoded.sessionId));
+      const sessionRpc = session as unknown as { brokerSession(request: unknown): Promise<unknown> };
+      const unknownResponse = await sessionRpc.brokerSession(hostRequest);
+      sanitizedResponse = await sanitizeHostResponse(unknownResponse, decoded.requestId, wireContract);
+    } catch (error) {
+      return signedFailure(502, decoded.requestId,
+        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR", responseContext);
+    }
+  } else if (wireContract.kind === "admit-turn") {
+    if (!isRecord(decoded) || !hasExactFields(decoded, wireContract.requestFields) ||
+      decoded.protocol !== wireContract.protocol || decoded.major !== 1 || decoded.minor !== 0 ||
+      decoded.schemaDigest !== wireContract.schemaDigest ||
+      typeof decoded.requestId !== "string" || !REQUEST_ID_PATTERN.test(decoded.requestId) ||
+      typeof decoded.sentAtUnixMs !== "number" || !Number.isSafeInteger(decoded.sentAtUnixMs) ||
+      decoded.sentAtUnixMs < 0 || Math.abs(decoded.sentAtUnixMs - now) > INGRESS_MAX_CLOCK_SKEW_MS ||
+      typeof decoded.tenantId !== "string" || !TENANT_ID_PATTERN.test(decoded.tenantId) ||
+      typeof decoded.actorSubjectId !== "string" || !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
+      typeof decoded.sessionId !== "string" || !SESSION_ID_PATTERN.test(decoded.sessionId) ||
+      typeof decoded.turnId !== "string" || !TURN_ID_PATTERN.test(decoded.turnId) ||
+      typeof decoded.commandId !== "string" || decoded.commandId.length === 0 ||
+      textEncoder.encode(decoded.commandId).byteLength > 256 || /\p{Cc}/u.test(decoded.commandId) ||
+      typeof decoded.expectedAuthorizationGeneration !== "number" ||
+      !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) || decoded.expectedAuthorizationGeneration < 1 ||
+      typeof decoded.expectedEventSequence !== "number" || !Number.isSafeInteger(decoded.expectedEventSequence) ||
+      decoded.expectedEventSequence < 0 || !Number.isSafeInteger(decoded.expectedEventSequence + 1) ||
+      typeof decoded.turnLeaseGeneration !== "number" || !Number.isSafeInteger(decoded.turnLeaseGeneration) || decoded.turnLeaseGeneration < 1 ||
+      typeof decoded.leaseExpiresAt !== "number" || !Number.isSafeInteger(decoded.leaseExpiresAt) || decoded.leaseExpiresAt <= now) {
+      return signedFailure(400, errorRequestId, "INVALID_ARGUMENT", responseContext);
+    }
+    let command;
+    try {
+      const input = decoded.input!;
+      if (!isRecord(input) || !hasExactFields(input, ["messages"]) || !Array.isArray(input.messages) ||
+        input.messages.length < 1 || input.messages.length > 1024) throw new Error("invalid public input");
+      const messages = input.messages.map((message) => {
+        if (!isRecord(message) || !hasExactFields(message, ["role", "content"]) || message.role !== "user" ||
+          typeof message.content !== "string" || message.content.length === 0) throw new Error("invalid public message");
+        return [message.role, message.content];
+      });
+      encodeCanonicalCbor(input, { maxBytes: 1_048_576, maxDepth: 64, maxItems: 100_000 });
+      const inputDigest = parseDigest(decoded.inputDigest);
+      const requestDigest = parseDigest(decoded.requestDigest);
+      const idempotencyKeyDigest = parseDigest(decoded.idempotencyKeyDigest);
+      if (await digestStructuredValue("circulusd.session.turn-input", 1, input) !== inputDigest ||
+        await digestStructuredValue("circulusd.public.turn.create", 1, { sessionId: decoded.sessionId, messages }) !== requestDigest) {
+        return signedFailure(400, decoded.requestId, "DIGEST_MISMATCH", responseContext);
+      }
+      const genesisCheckpoint = parseAgentCheckpoint(decoded.genesisCheckpoint);
+      if (genesisCheckpoint.sessionId !== decoded.sessionId || genesisCheckpoint.turnId !== decoded.turnId) {
+        throw new Error("checkpoint scope mismatch");
+      }
+      command = {
+        kind: "enqueue_turn", commandId: decoded.commandId, expectedEventSequence: decoded.expectedEventSequence,
+        transactionTime: 0, turnId: decoded.turnId, input, inputDigest, genesisCheckpoint,
+        turnLeaseGeneration: decoded.turnLeaseGeneration, leaseExpiresAt: decoded.leaseExpiresAt,
+        publicAdmission: { tenantId: decoded.tenantId, actorSubjectId: decoded.actorSubjectId,
+          authorizationGeneration: decoded.expectedAuthorizationGeneration, idempotencyKeyDigest, requestDigest },
+      };
+    } catch {
+      return signedFailure(400, decoded.requestId, "INVALID_ARGUMENT", responseContext);
+    }
+    responseRequestId = decoded.requestId;
+    try {
+      const session = environment.SESSION_CELL.getByName(sessionCellName(decoded.tenantId, decoded.sessionId));
+      const sessionRpc = session as unknown as { executeSessionCommand(request: unknown): Promise<unknown> };
+      const unknownResponse = await sessionRpc.executeSessionCommand({
+        protocol: PROTOCOL_NAME, major: PROTOCOL_MAJOR, minor: PROTOCOL_MINOR,
+        schemaDigest: wireContract.hostContract.schemaDigest, requestId: decoded.requestId, payload: command,
+      });
+      sanitizedResponse = await sanitizeHostResponse(unknownResponse, decoded.requestId, wireContract, undefined, undefined, decoded.turnId);
+    } catch (error) {
+      return signedFailure(502, decoded.requestId, isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR", responseContext);
+    }
+  } else if (wireContract.kind === "claim-dispatch-start") {
     let dispatchStart: DispatchStartIngressRequest;
     let requestDigest: Digest;
     let providerRouteDigest: Digest;
@@ -1088,7 +1272,7 @@ export async function handleStateIngress(
         executeSessionCommand(request: unknown): Promise<unknown>;
       };
       const unknownResponse = await sessionRpc.executeSessionCommand(hostRequest);
-      sanitizedResponse = sanitizeHostResponse(
+      sanitizedResponse = await sanitizeHostResponse(
         unknownResponse,
         dispatchStart.requestId,
         wireContract,
@@ -1102,9 +1286,8 @@ export async function handleStateIngress(
         responseContext,
       );
     }
-  } else if (wireContract.kind === "read-blob") {
-    let blob: BlobIngressRequest;
-    let digest: Digest;
+  } else {
+    let ingress: IngressRequest | BlobIngressRequest;
     if (
       !isRecord(decoded) ||
       !hasExactFields(decoded, wireContract.requestFields) ||
@@ -1136,148 +1319,36 @@ export async function handleStateIngress(
         responseContext,
       );
     }
-    try {
-      digest = parseDigest(decoded.digest, "$ingress.digest");
-    } catch {
-      return signedFailure(
-        400,
-        errorRequestId,
-        "INVALID_ARGUMENT",
-        responseContext,
-      );
-    }
-    if (digest === ZERO_DIGEST) {
-      return signedFailure(
-        400,
-        errorRequestId,
-        "INVALID_ARGUMENT",
-        responseContext,
-      );
-    }
-    if (!Number.isSafeInteger(now + 1)) {
-      return signedFailure(
-        500,
-        decoded.requestId,
-        "INTERNAL_ERROR",
-        responseContext,
-      );
-    }
-    blob = {
+    const common: SessionReadIngressRequest = {
       requestId: decoded.requestId,
       sentAtUnixMs: decoded.sentAtUnixMs,
       tenantId: decoded.tenantId,
       actorSubjectId: decoded.actorSubjectId,
       sessionId: decoded.sessionId,
       expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
-      digest,
     };
-    const hostRequest = {
-      protocol: PROTOCOL_NAME,
-      major: PROTOCOL_MAJOR,
-      minor: PROTOCOL_MINOR,
-      schemaDigest: wireContract.hostContract.schemaDigest,
-      requestId: blob.requestId,
-      payload: {
-        authority: {
-          serviceBinding: "state",
-          tenantId: blob.tenantId,
-          actorUserId: blob.actorSubjectId,
-          subjectKind: "session",
-          subjectId: blob.sessionId,
-          roles: [],
-          permissions: ["session.read"],
-          authorizationGeneration: blob.expectedAuthorizationGeneration,
-          currentAuthorizationGeneration: blob.expectedAuthorizationGeneration,
-          issuedAt: now,
-          expiresAt: now + 1,
-        },
-        now,
-        digest: blob.digest,
-      },
-    };
-    responseRequestId = blob.requestId;
-    try {
-      const session = environment.SESSION_CELL.getByName(
-        sessionCellName(blob.tenantId, blob.sessionId),
-      );
-      const unknownResponse = await session.readSessionBlob(hostRequest);
-      sanitizedResponse = sanitizeHostResponse(
-        unknownResponse,
-        blob.requestId,
-        wireContract,
-        undefined,
-        blob,
-      );
-      // The storage layer re-digests reassembled chunks, but the Durable Object
-      // boundary is still a trust boundary for the signed public response:
-      // never sign bytes that do not hash to the digest the caller asked for.
-      const hydrated = (sanitizedResponse as {
-        readonly payload: { readonly result?: NormalizedValue };
-      }).payload.result;
-      if (
-        isRecord(hydrated!) &&
-        (await digestBytes(hydrated.bytes as Uint8Array)) !== blob.digest
-      ) {
-        throw new Error("read-blob Host RPC bytes do not match their digest");
+    if (wireContract.kind === "read-blob") {
+      try {
+        const digest = parseDigest(decoded.digest, "$ingress.digest");
+        if (digest === ZERO_DIGEST) throw new Error("blob digest must be nonzero");
+        ingress = { ...common, digest };
+      } catch {
+        return signedFailure(400, errorRequestId, "INVALID_ARGUMENT", responseContext);
       }
-    } catch (error) {
-      return signedFailure(
-        502,
-        blob.requestId,
-        isEncodedSizeFailure(error) ? "RESOURCE_EXHAUSTED" : "INTERNAL_ERROR",
-        responseContext,
-      );
+    } else {
+      if (
+        typeof decoded.afterSequence !== "number" ||
+        !Number.isSafeInteger(decoded.afterSequence) ||
+        decoded.afterSequence < 0 ||
+        typeof decoded.limit !== "number" ||
+        !Number.isSafeInteger(decoded.limit) ||
+        decoded.limit < 1 ||
+        decoded.limit > INGRESS_MAX_EVENT_LIMIT
+      ) {
+        return signedFailure(400, errorRequestId, "INVALID_ARGUMENT", responseContext);
+      }
+      ingress = { ...common, afterSequence: decoded.afterSequence, limit: decoded.limit };
     }
-  } else {
-    let ingress: IngressRequest;
-    if (
-      !isRecord(decoded) ||
-      !hasExactFields(decoded, wireContract.requestFields) ||
-      decoded.protocol !== wireContract.protocol ||
-      decoded.major !== 1 ||
-      decoded.minor !== 0 ||
-      decoded.schemaDigest !== wireContract.schemaDigest ||
-      typeof decoded.requestId !== "string" ||
-      !REQUEST_ID_PATTERN.test(decoded.requestId) ||
-      typeof decoded.sentAtUnixMs !== "number" ||
-      !Number.isSafeInteger(decoded.sentAtUnixMs) ||
-      decoded.sentAtUnixMs < 0 ||
-      decoded.sentAtUnixMs < now - INGRESS_MAX_CLOCK_SKEW_MS ||
-      decoded.sentAtUnixMs > now + INGRESS_MAX_CLOCK_SKEW_MS ||
-      typeof decoded.tenantId !== "string" ||
-      !TENANT_ID_PATTERN.test(decoded.tenantId) ||
-      typeof decoded.actorSubjectId !== "string" ||
-      !SUBJECT_ID_PATTERN.test(decoded.actorSubjectId) ||
-      typeof decoded.sessionId !== "string" ||
-      !SESSION_ID_PATTERN.test(decoded.sessionId) ||
-      typeof decoded.expectedAuthorizationGeneration !== "number" ||
-      !Number.isSafeInteger(decoded.expectedAuthorizationGeneration) ||
-      decoded.expectedAuthorizationGeneration < 1 ||
-      typeof decoded.afterSequence !== "number" ||
-      !Number.isSafeInteger(decoded.afterSequence) ||
-      decoded.afterSequence < 0 ||
-      typeof decoded.limit !== "number" ||
-      !Number.isSafeInteger(decoded.limit) ||
-      decoded.limit < 1 ||
-      decoded.limit > INGRESS_MAX_EVENT_LIMIT
-    ) {
-      return signedFailure(
-        400,
-        errorRequestId,
-        "INVALID_ARGUMENT",
-        responseContext,
-      );
-    }
-    ingress = {
-      requestId: decoded.requestId,
-      sentAtUnixMs: decoded.sentAtUnixMs,
-      tenantId: decoded.tenantId,
-      actorSubjectId: decoded.actorSubjectId,
-      sessionId: decoded.sessionId,
-      expectedAuthorizationGeneration: decoded.expectedAuthorizationGeneration,
-      afterSequence: decoded.afterSequence,
-      limit: decoded.limit,
-    };
     if (!Number.isSafeInteger(now + 1)) {
       return signedFailure(
         500,
@@ -1307,8 +1378,9 @@ export async function handleStateIngress(
           expiresAt: now + 1,
         },
         now,
-        afterSequence: ingress.afterSequence,
-        limit: ingress.limit,
+        ...("digest" in ingress
+          ? { digest: ingress.digest }
+          : { afterSequence: ingress.afterSequence, limit: ingress.limit }),
       },
     };
     responseRequestId = ingress.requestId;
@@ -1316,11 +1388,15 @@ export async function handleStateIngress(
       const session = environment.SESSION_CELL.getByName(
         sessionCellName(ingress.tenantId, ingress.sessionId),
       );
-      const unknownResponse = await session.readSessionEvents(hostRequest);
-      sanitizedResponse = sanitizeHostResponse(
+      const unknownResponse = "digest" in ingress
+        ? await session.readSessionBlob(hostRequest)
+        : await session.readSessionEvents(hostRequest);
+      sanitizedResponse = await sanitizeHostResponse(
         unknownResponse,
         ingress.requestId,
         wireContract,
+        undefined,
+        "digest" in ingress ? ingress.digest : undefined,
       );
     } catch (error) {
       return signedFailure(

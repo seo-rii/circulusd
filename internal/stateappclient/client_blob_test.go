@@ -18,18 +18,26 @@ import (
 	"github.com/hancomac/circulusd/internal/canonical"
 )
 
-type blobGoldenFixture struct {
-	Protocol        string `json:"protocol"`
-	SchemaDigest    string `json:"schemaDigest"`
-	Method          string `json:"method"`
-	Path            string `json:"path"`
-	ContentType     string `json:"contentType"`
-	KeyID           string `json:"keyId"`
-	RootKeyHex      string `json:"rootKeyHex"`
-	RequestCBORHex  string `json:"requestCborHex"`
-	RequestMACHex   string `json:"requestMacHex"`
-	ResponseStatus  int    `json:"responseStatus"`
-	BlobHex         string `json:"blobHex"`
+type remoteBlobGoldenFixture struct {
+	Protocol       string `json:"protocol"`
+	SchemaDigest   string `json:"schemaDigest"`
+	Method         string `json:"method"`
+	Path           string `json:"path"`
+	ContentType    string `json:"contentType"`
+	KeyID          string `json:"keyId"`
+	RootKeyHex     string `json:"rootKeyHex"`
+	RequestCBORHex string `json:"requestCborHex"`
+	RequestMACHex  string `json:"requestMacHex"`
+	ResponseStatus int    `json:"responseStatus"`
+	Response       struct {
+		Payload struct {
+			Result struct {
+				Bytes struct {
+					Hex string `json:"hex"`
+				} `json:"bytes"`
+			} `json:"result"`
+		} `json:"payload"`
+	} `json:"response"`
 	ResponseCBORHex string `json:"responseCborHex"`
 	ResponseMACHex  string `json:"responseMacHex"`
 	Request         struct {
@@ -43,13 +51,13 @@ type blobGoldenFixture struct {
 	} `json:"request"`
 }
 
-func TestReadSessionBlobMatchesCrossLanguageGolden(t *testing.T) {
+func TestRemoteBlobMatchesCrossLanguageGolden(t *testing.T) {
 	fixturePath := filepath.Join("..", "..", "packages", "protocol-types", "fixtures", "state-app-blob-ingress-v1alpha1.json")
 	contents, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("read golden fixture: %v", err)
 	}
-	var fixture blobGoldenFixture
+	var fixture remoteBlobGoldenFixture
 	if err := json.Unmarshal(contents, &fixture); err != nil {
 		t.Fatalf("decode golden fixture: %v", err)
 	}
@@ -69,7 +77,7 @@ func TestReadSessionBlobMatchesCrossLanguageGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode response CBOR: %v", err)
 	}
-	wantBlob, err := hex.DecodeString(fixture.BlobHex)
+	wantBlob, err := hex.DecodeString(fixture.Response.Payload.Result.Bytes.Hex)
 	if err != nil {
 		t.Fatalf("decode blob: %v", err)
 	}
@@ -132,7 +140,7 @@ func TestReadSessionBlobMatchesCrossLanguageGolden(t *testing.T) {
 	}
 	t.Cleanup(client.Close)
 
-	blob, err := client.ReadSessionBlob(context.Background(), BlobRequest{
+	blob, err := client.ReadSessionBlob(context.Background(), ReadSessionBlobRequest{
 		TenantID:                        fixture.Request.TenantID,
 		ActorSubjectID:                  fixture.Request.ActorSubjectID,
 		SessionID:                       fixture.Request.SessionID,
@@ -142,31 +150,33 @@ func TestReadSessionBlobMatchesCrossLanguageGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSessionBlob() error = %v", err)
 	}
-	if blob.Digest != fixture.Request.Digest || !bytes.Equal(blob.Bytes, wantBlob) {
+	if blob == nil || blob.Digest != fixture.Request.Digest || !bytes.Equal(blob.Bytes, wantBlob) {
 		t.Fatalf("ReadSessionBlob() = %+v, want digest %s and %d fixture bytes", blob, fixture.Request.Digest, len(wantBlob))
 	}
 }
 
-func TestReadSessionBlobRejectsInvalidRequestBeforeDial(t *testing.T) {
+func TestRemoteBlobRejectsInvalidRequestBeforeDial(t *testing.T) {
 	endpoint := startLoopbackHTTPServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("an invalid blob request must not be dialed")
 	}))
 	client := newTestClient(t, endpoint, bytes.Repeat([]byte{0x31}, 32), func() (string, error) { return validID("req", 1), nil }, time.Second)
-	valid := validBlobRequest(1)
+	valid := remoteBlobRequest(1)
 	tests := []struct {
 		name string
-		edit func(*BlobRequest)
+		edit func(*ReadSessionBlobRequest)
 	}{
-		{name: "tenant", edit: func(request *BlobRequest) { request.TenantID = "tenant_invalid" }},
-		{name: "actor", edit: func(request *BlobRequest) { request.ActorSubjectID = validID("tenant", 1) }},
-		{name: "session", edit: func(request *BlobRequest) { request.SessionID = "" }},
-		{name: "zero generation", edit: func(request *BlobRequest) { request.ExpectedAuthorizationGeneration = 0 }},
-		{name: "generation beyond shared range", edit: func(request *BlobRequest) { request.ExpectedAuthorizationGeneration = maximumSharedInteger + 1 }},
-		{name: "empty digest", edit: func(request *BlobRequest) { request.Digest = "" }},
-		{name: "short digest", edit: func(request *BlobRequest) { request.Digest = "sha256:abc" }},
-		{name: "uppercase digest", edit: func(request *BlobRequest) { request.Digest = "sha256:" + strings.Repeat("A", 64) }},
-		{name: "zero digest", edit: func(request *BlobRequest) { request.Digest = "sha256:" + strings.Repeat("0", 64) }},
-		{name: "unprefixed digest", edit: func(request *BlobRequest) { request.Digest = strings.Repeat("a", 64) }},
+		{name: "tenant", edit: func(request *ReadSessionBlobRequest) { request.TenantID = "tenant_invalid" }},
+		{name: "actor", edit: func(request *ReadSessionBlobRequest) { request.ActorSubjectID = validID("tenant", 1) }},
+		{name: "session", edit: func(request *ReadSessionBlobRequest) { request.SessionID = "" }},
+		{name: "zero generation", edit: func(request *ReadSessionBlobRequest) { request.ExpectedAuthorizationGeneration = 0 }},
+		{name: "generation beyond shared range", edit: func(request *ReadSessionBlobRequest) {
+			request.ExpectedAuthorizationGeneration = maximumSharedInteger + 1
+		}},
+		{name: "empty digest", edit: func(request *ReadSessionBlobRequest) { request.Digest = "" }},
+		{name: "short digest", edit: func(request *ReadSessionBlobRequest) { request.Digest = "sha256:abc" }},
+		{name: "uppercase digest", edit: func(request *ReadSessionBlobRequest) { request.Digest = "sha256:" + strings.Repeat("A", 64) }},
+		{name: "zero digest", edit: func(request *ReadSessionBlobRequest) { request.Digest = "sha256:" + strings.Repeat("0", 64) }},
+		{name: "unprefixed digest", edit: func(request *ReadSessionBlobRequest) { request.Digest = strings.Repeat("a", 64) }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -187,12 +197,12 @@ func TestReadSessionBlobRejectsInvalidRequestBeforeDial(t *testing.T) {
 	}
 }
 
-func TestReadSessionBlobValidatesHydratedResultAndNull(t *testing.T) {
+func TestRemoteBlobValidatesHydratedResultAndNull(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x33}, 32)
 	payload := []byte("hydrated checkpoint payload bytes")
 	payloadDigest := sha256.Sum256(payload)
 	digest := "sha256:" + hex.EncodeToString(payloadDigest[:])
-	maximumPayload := bytes.Repeat([]byte{0x5a}, maximumBlobBytes)
+	maximumPayload := bytes.Repeat([]byte{0x5a}, maximumSessionBlobBytes)
 	maximumDigestSum := sha256.Sum256(maximumPayload)
 	maximumDigest := "sha256:" + hex.EncodeToString(maximumDigestSum[:])
 	hydrated := func(bytesValue []byte, digestValue string) canonical.Map {
@@ -208,10 +218,11 @@ func TestReadSessionBlobValidatesHydratedResultAndNull(t *testing.T) {
 		oversizedBody bool
 		wantBytes     []byte
 		want          error
+		wantNull      bool
 	}{
 		{name: "hydrated", requestDigest: digest, result: hydrated(payload, digest), wantBytes: payload},
 		{name: "maximum blob", requestDigest: maximumDigest, result: hydrated(maximumPayload, maximumDigest), wantBytes: maximumPayload},
-		{name: "null when unreferenced", requestDigest: digest, result: nil, want: ErrBlobNotReferenced},
+		{name: "null when unreferenced", requestDigest: digest, result: nil, wantNull: true},
 		{
 			name: "echoes another digest", requestDigest: digest,
 			result: hydrated(payload, "sha256:"+strings.Repeat("1", 64)), want: ErrInvalidResponse,
@@ -252,7 +263,7 @@ func TestReadSessionBlobValidatesHydratedResultAndNull(t *testing.T) {
 		{name: "non-object result", requestDigest: digest, result: int64(7), want: ErrInvalidResponse},
 		{
 			name: "exceeds the blob bound", requestDigest: digest,
-			result: hydrated(bytes.Repeat([]byte{0x5a}, maximumBlobBytes+1), digest), want: ErrInvalidResponse,
+			result: hydrated(bytes.Repeat([]byte{0x5a}, maximumSessionBlobBytes+1), digest), want: ErrInvalidResponse,
 		},
 		{
 			name: "exceeds the response bound", requestDigest: digest,
@@ -292,14 +303,14 @@ func TestReadSessionBlobValidatesHydratedResultAndNull(t *testing.T) {
 				})
 			}))
 			client := newTestClient(t, endpoint, rootKey, func() (string, error) { return validID("req", 2), nil }, 5*time.Second)
-			request := validBlobRequest(2)
+			request := remoteBlobRequest(2)
 			request.Digest = test.requestDigest
 			blob, err := client.ReadSessionBlob(context.Background(), request)
 			if test.want != nil {
 				if !errors.Is(err, test.want) {
 					t.Fatalf("ReadSessionBlob() error = %v, want %v", err, test.want)
 				}
-				if blob.Bytes != nil || blob.Digest != "" {
+				if blob != nil {
 					t.Fatalf("ReadSessionBlob() returned %+v alongside an error", blob)
 				}
 				return
@@ -307,14 +318,20 @@ func TestReadSessionBlobValidatesHydratedResultAndNull(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReadSessionBlob() error = %v", err)
 			}
-			if blob.Digest != test.requestDigest || !bytes.Equal(blob.Bytes, test.wantBytes) {
-				t.Fatalf("ReadSessionBlob() digest = %s, %d bytes; want %s, %d bytes", blob.Digest, len(blob.Bytes), test.requestDigest, len(test.wantBytes))
+			if test.wantNull {
+				if blob != nil {
+					t.Fatalf("ReadSessionBlob() returned %+v for an authenticated null", blob)
+				}
+				return
+			}
+			if blob == nil || blob.Digest != test.requestDigest || !bytes.Equal(blob.Bytes, test.wantBytes) {
+				t.Fatalf("ReadSessionBlob() = %+v; want digest %s and %d bytes", blob, test.requestDigest, len(test.wantBytes))
 			}
 		})
 	}
 }
 
-func TestReadSessionBlobRejectsReadEventsDomainSignatureAndSchema(t *testing.T) {
+func TestRemoteBlobRejectsReadEventsDomainSignatureAndSchema(t *testing.T) {
 	rootKey := bytes.Repeat([]byte{0x35}, 32)
 	payload := []byte("hydrated checkpoint payload bytes")
 	payloadDigest := sha256.Sum256(payload)
@@ -348,7 +365,7 @@ func TestReadSessionBlobRejectsReadEventsDomainSignatureAndSchema(t *testing.T) 
 				})
 			}))
 			client := newTestClient(t, endpoint, rootKey, func() (string, error) { return validID("req", 3), nil }, time.Second)
-			request := validBlobRequest(3)
+			request := remoteBlobRequest(3)
 			request.Digest = digest
 			if _, err := client.ReadSessionBlob(context.Background(), request); !errors.Is(err, test.want) {
 				t.Fatalf("ReadSessionBlob() error = %v, want %v", err, test.want)
@@ -357,8 +374,8 @@ func TestReadSessionBlobRejectsReadEventsDomainSignatureAndSchema(t *testing.T) 
 	}
 }
 
-func validBlobRequest(index uint64) BlobRequest {
-	return BlobRequest{
+func remoteBlobRequest(index uint64) ReadSessionBlobRequest {
+	return ReadSessionBlobRequest{
 		TenantID: validID("tenant", index), ActorSubjectID: validID("subject", index),
 		SessionID: validID("sess", index), ExpectedAuthorizationGeneration: 1,
 		Digest: "sha256:" + strings.Repeat("a", 64),

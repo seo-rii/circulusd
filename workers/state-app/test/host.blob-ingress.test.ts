@@ -1,662 +1,497 @@
 import { readFileSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   decodeCanonicalCbor,
   digestBytes,
   encodeCanonicalCbor,
-  type Digest,
   type NormalizedValue,
 } from "@circulusd/protocol-types";
 
 import worker from "../src/host/worker.ts";
+import { HOST_RPC_CONTRACTS } from "../src/host/rpc.ts";
 
-const INGRESS_PATH = "/circulusd/state/v1/session-blob:read";
-const INGRESS_CONTENT_TYPE = "application/vnd.circulusd.state-blob-ingress+cbor";
-const INGRESS_PROTOCOL = "circulus.state-blob-ingress.v1alpha1";
-const INGRESS_SCHEMA_DIGEST =
-  "sha256:43de3ec79f1eb1a1d78e519e24b741630ea2f5bee0cf2ce9e02ee4416dd67aab";
-const READ_EVENTS_PATH = "/circulusd/state/v1/session-events:read";
-const READ_EVENTS_CONTENT_TYPE = "application/vnd.circulusd.state-ingress+cbor";
-const REQUEST_MAC_DOMAIN = "circulusd.state-blob-ingress.request.v1";
-const RESPONSE_MAC_DOMAIN = "circulusd.state-blob-ingress.response.v1";
-const READ_EVENTS_REQUEST_MAC_DOMAIN = "circulusd.state-ingress.request.v1";
-const HOST_PROTOCOL = "circulus.v1alpha1";
-// session.read-blob host RPC contract digest (src/host/rpc.ts).
-const HOST_SCHEMA_DIGEST =
-  "sha256:ecde7c59aafe4e2ce0e885be977535619401085346b47e59c7a5487de7b45f70";
-const CURRENT_KEY_ID = "state-current-1";
-const CURRENT_KEY = new Uint8Array(32).fill(0x31);
-const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-const CANONICAL_BASE32_FINAL = "AEIMQUY4";
-const SIGNATURE_HEADER = "x-circulus-state-signature";
-const KEY_ID_HEADER = "x-circulus-state-key-id";
+const PATH = "/circulusd/state/v1/session-blob:read";
+const CONTENT_TYPE = "application/vnd.circulusd.state-blob-ingress+cbor";
+const PROTOCOL = "circulus.state-blob-ingress.v1alpha1";
+const SCHEMA_DIGEST =
+  "sha256:d9402c455a2d37e51885684aa26ade9d26ff444cc5a15fb89c2ce2af372e40e5";
+const KEY_ID = "state-current-1";
+const ROOT_KEY = new Uint8Array(32).fill(0x31);
 const MAX_BLOB_BYTES = 4 * 1_048_576;
-const ENVELOPE_HEADROOM_BYTES = 65_536;
-const ZERO_DIGEST = `sha256:${"0".repeat(64)}`;
-const BLOB = new TextEncoder().encode("hydrated checkpoint payload bytes");
+const MAX_RESPONSE_BYTES = MAX_BLOB_BYTES + 65_536;
+const HOST_CONTRACT = HOST_RPC_CONTRACTS["session.read-blob"];
+const text = (value: string) => new TextEncoder().encode(value);
+const hex = (value: Uint8Array) =>
+  [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+const identity = (kind: string) => `${kind}_${"A".repeat(26)}`;
+const fromHex = (value: string) => new Uint8Array(Buffer.from(value, "hex"));
 
-interface HostRequest {
-  readonly protocol: string;
-  readonly major: number;
-  readonly minor: number;
-  readonly schemaDigest: string;
-  readonly requestId: string;
-  readonly payload: {
-    readonly authority: {
-      readonly serviceBinding: string;
-      readonly tenantId: string;
-      readonly actorUserId: string;
-      readonly subjectKind: string;
-      readonly subjectId: string;
-      readonly roles: readonly string[];
-      readonly permissions: readonly string[];
-      readonly authorizationGeneration: number;
-      readonly currentAuthorizationGeneration: number;
-      readonly issuedAt: number;
-      readonly expiresAt: number;
-    };
-    readonly now: number;
-    readonly digest: string;
-  };
-}
-
-interface SessionStub {
-  readSessionBlob?(request: unknown): Promise<unknown>;
-  readSessionEvents?(request: unknown): Promise<unknown>;
-  initializeSession?(request: unknown): Promise<unknown>;
-  executeSessionCommand?(request: unknown): Promise<unknown>;
-  readSession?(request: unknown): Promise<unknown>;
-}
-
-interface TestEnvironment {
-  CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID?: string;
-  CIRCULUSD_STATE_INGRESS_CURRENT_KEY?: string;
-  CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID?: string;
-  CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY?: string;
-  SESSION_CELL: {
-    getByName(name: string): SessionStub;
-  };
-}
-
-type IngressPayload = Record<string, NormalizedValue>;
-
-function identity(kind: "req" | "tenant" | "subject" | "sess", index = 0): string {
-  const high = BASE32[Math.floor(index / CANONICAL_BASE32_FINAL.length)] ?? "A";
-  const low = CANONICAL_BASE32_FINAL[index % CANONICAL_BASE32_FINAL.length] ?? "A";
-  return `${kind}_${"A".repeat(24)}${high}${low}`;
-}
-
-async function blobDigest(bytes: Uint8Array = BLOB): Promise<Digest> {
-  return digestBytes(bytes);
-}
-
-async function ingressPayload(index = 0, sentAtUnixMs = Date.now()): Promise<IngressPayload> {
-  return {
-    protocol: INGRESS_PROTOCOL,
-    major: 1,
-    minor: 0,
-    schemaDigest: INGRESS_SCHEMA_DIGEST,
-    requestId: identity("req", index),
-    sentAtUnixMs,
-    tenantId: identity("tenant"),
-    actorSubjectId: identity("subject"),
-    sessionId: identity("sess"),
-    expectedAuthorizationGeneration: 7,
-    digest: await blobDigest(),
-  };
-}
-
-function text(value: string): Uint8Array {
-  return new TextEncoder().encode(value);
-}
-
-function hex(value: Uint8Array): string {
-  return [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function decodeHex(value: string): Uint8Array {
-  const result = new Uint8Array(value.length / 2);
-  for (let index = 0; index < value.length; index += 2) {
-    result[index / 2] = Number.parseInt(value.slice(index, index + 2), 16);
+function framed(parts: readonly Uint8Array[]): Uint8Array {
+  const result = new Uint8Array(parts.reduce((size, part) => size + 4 + part.length, 0));
+  const view = new DataView(result.buffer);
+  let offset = 0;
+  for (const part of parts) {
+    view.setUint32(offset, part.length, false);
+    offset += 4;
+    result.set(part, offset);
+    offset += part.length;
   }
   return result;
 }
 
-function lengthPrefixed(parts: readonly Uint8Array[]): Uint8Array {
-  const length = parts.reduce((total, part) => total + 4 + part.byteLength, 0);
-  const framed = new Uint8Array(length);
-  const view = new DataView(framed.buffer);
-  let offset = 0;
-  for (const part of parts) {
-    view.setUint32(offset, part.byteLength, false);
-    offset += 4;
-    framed.set(part, offset);
-    offset += part.byteLength;
-  }
-  return framed;
+async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 }
 
-async function hmac(key: Uint8Array, message: Uint8Array): Promise<Uint8Array> {
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    key,
-    { hash: "SHA-256", name: "HMAC" },
-    false,
-    ["sign"],
+async function hmac(key: Uint8Array, bytes: Uint8Array): Promise<Uint8Array> {
+  const imported = await crypto.subtle.importKey(
+    "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
   );
-  return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, message));
+  return new Uint8Array(await crypto.subtle.sign("HMAC", imported, bytes));
 }
 
-async function sha256(value: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", value));
+async function directionalKey(root: Uint8Array, direction: "request" | "response") {
+  return hmac(root, text(`circulusd.state-ingress.key.${direction}.v1\0`));
 }
 
-async function directionalKey(
-  rootKey: Uint8Array,
-  direction: "request" | "response",
-): Promise<Uint8Array> {
-  return hmac(rootKey, text(`circulusd.state-ingress.key.${direction}.v1\0`));
+async function blob(bytes = text("checkpoint payload")) {
+  return { digest: await digestBytes(bytes), encodedBytes: bytes.length, bytes };
 }
 
-async function requestSignature(
-  body: Uint8Array,
-  options: {
-    readonly keyId?: string;
-    readonly rootKey?: Uint8Array;
-    readonly method?: string;
-    readonly path?: string;
-    readonly domain?: string;
-  } = {},
-): Promise<string> {
-  const requestKey = await directionalKey(options.rootKey ?? CURRENT_KEY, "request");
-  return hex(await hmac(requestKey, lengthPrefixed([
-    text(options.domain ?? REQUEST_MAC_DOMAIN),
-    text(options.keyId ?? CURRENT_KEY_ID),
-    text(options.method ?? "POST"),
-    text(options.path ?? INGRESS_PATH),
-    await sha256(body),
-  ])));
-}
-
-async function responseSignature(
-  body: Uint8Array,
-  requestBody: Uint8Array,
-  status: number,
-  requestId: string,
-  keyId = CURRENT_KEY_ID,
-  rootKey = CURRENT_KEY,
-): Promise<string> {
-  const responseKey = await directionalKey(rootKey, "response");
-  return hex(await hmac(responseKey, lengthPrefixed([
-    text(RESPONSE_MAC_DOMAIN),
-    text(keyId),
-    text(requestId),
-    await sha256(requestBody),
-    text(String(status)),
-    text(INGRESS_CONTENT_TYPE),
-    await sha256(body),
-  ])));
-}
-
-async function requestFromBytes(
-  body: Uint8Array,
-  options: {
-    readonly keyId?: string;
-    readonly rootKey?: Uint8Array;
-    readonly path?: string;
-    readonly contentType?: string;
-    readonly signature?: string;
-  } = {},
-): Promise<Request> {
-  const keyId = options.keyId ?? CURRENT_KEY_ID;
-  const path = options.path ?? INGRESS_PATH;
-  const headers = new Headers();
-  headers.set("content-type", options.contentType ?? INGRESS_CONTENT_TYPE);
-  headers.set(KEY_ID_HEADER, keyId);
-  headers.set(
-    SIGNATURE_HEADER,
-    options.signature ??
-      await requestSignature(body, { keyId, rootKey: options.rootKey, path }),
-  );
-  return new Request(`http://127.0.0.1:8787${path}`, { method: "POST", headers, body });
-}
-
-async function signedRequest(
-  payload: IngressPayload,
-  options: Parameters<typeof requestFromBytes>[1] = {},
-): Promise<{ readonly request: Request; readonly body: Uint8Array }> {
-  const body = encodeCanonicalCbor(payload);
-  return { request: await requestFromBytes(body, options), body };
-}
-
-function hostSuccess(requestId: string, result: NormalizedValue) {
+function requestPayload(digest: string) {
   return {
-    protocol: HOST_PROTOCOL,
+    protocol: PROTOCOL,
     major: 1,
     minor: 0,
-    schemaDigest: HOST_SCHEMA_DIGEST,
+    schemaDigest: SCHEMA_DIGEST,
+    requestId: identity("req"),
+    sentAtUnixMs: Date.now(),
+    tenantId: identity("tenant"),
+    actorSubjectId: identity("subject"),
+    sessionId: identity("sess"),
+    expectedAuthorizationGeneration: 7,
+    digest,
+  };
+}
+
+function hostResponse(requestId: string, result: unknown) {
+  return {
+    protocol: "circulus.v1alpha1",
+    major: 1,
+    minor: 0,
+    schemaDigest: HOST_CONTRACT.schemaDigest,
     requestId,
     payload: { ok: true, result },
   };
 }
 
-async function hydratedResult(bytes: Uint8Array = BLOB): Promise<NormalizedValue> {
-  return { digest: await blobDigest(bytes), encodedBytes: bytes.byteLength, bytes };
-}
-
-function environment(
-  stub: SessionStub,
-  names: string[] = [],
-  overrides: Partial<TestEnvironment> = {},
-): TestEnvironment {
-  const guarded: SessionStub = {
-    readSessionEvents: async () => {
-      throw new Error("readSessionEvents must not be reached by a blob read");
-    },
-    initializeSession: async () => {
-      throw new Error("initializeSession must not be reached by a blob read");
-    },
-    executeSessionCommand: async () => {
-      throw new Error("executeSessionCommand must not be reached by a blob read");
-    },
-    readSession: async () => {
-      throw new Error("readSession must not be reached by a blob read");
-    },
-    ...stub,
-  };
+async function signedRequest(
+  payload: unknown,
+  options: {
+    domain?: string;
+    signedPath?: string;
+    path?: string;
+    keyId?: string;
+    rootKey?: Uint8Array;
+    signature?: string;
+    body?: Uint8Array;
+    headers?: Record<string, string>;
+  } = {},
+) {
+  const body = options.body ?? encodeCanonicalCbor(payload);
+  const keyId = options.keyId ?? KEY_ID;
+  const signature = options.signature ?? hex(await hmac(
+    await directionalKey(options.rootKey ?? ROOT_KEY, "request"),
+    framed([
+      text(options.domain ?? "circulusd.state-blob-ingress.request.v1"),
+      text(keyId), text("POST"), text(options.signedPath ?? PATH), await sha256(body),
+    ]),
+  ));
   return {
-    CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID: CURRENT_KEY_ID,
-    CIRCULUSD_STATE_INGRESS_CURRENT_KEY: hex(CURRENT_KEY),
-    SESSION_CELL: {
-      getByName: (name) => {
-        names.push(name);
-        return guarded;
+    body,
+    request: new Request(`http://127.0.0.1:8787${options.path ?? PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": CONTENT_TYPE,
+        "x-circulus-state-key-id": keyId,
+        "x-circulus-state-signature": signature,
+        ...options.headers,
       },
-    },
-    ...overrides,
+      body,
+    }),
   };
 }
 
-async function invoke(request: Request, env: TestEnvironment): Promise<Response> {
-  return worker.fetch(request, env as never);
+function environment(readSessionBlob: (request: unknown) => Promise<unknown>) {
+  const getByName = vi.fn(() => ({ readSessionBlob }));
+  return {
+    CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID: KEY_ID,
+    CIRCULUSD_STATE_INGRESS_CURRENT_KEY: hex(ROOT_KEY),
+    SESSION_CELL: { getByName },
+  };
 }
 
-async function signedResponse(
+async function readSignedResponse(
   response: Response,
   requestBody: Uint8Array,
-  requestId: string,
+  requestId = identity("req"),
+  keyId = KEY_ID,
+  rootKey = ROOT_KEY,
 ): Promise<NormalizedValue> {
   const body = new Uint8Array(await response.arrayBuffer());
-  expect(response.headers.get("content-type")).toBe(INGRESS_CONTENT_TYPE);
-  expect(response.headers.get(KEY_ID_HEADER)).toBe(CURRENT_KEY_ID);
-  expect(response.headers.get(SIGNATURE_HEADER)).toBe(
-    await responseSignature(body, requestBody, response.status, requestId),
-  );
-  return decodeCanonicalCbor(body, {
-    maxBytes: MAX_BLOB_BYTES + ENVELOPE_HEADROOM_BYTES,
-    maxDepth: 72,
-    maxItems: 100_000,
-  });
+  expect(response.headers.get("content-type")).toBe(CONTENT_TYPE);
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("x-circulus-state-key-id")).toBe(keyId);
+  expect(response.headers.get("x-circulus-state-signature")).toBe(hex(await hmac(
+    await directionalKey(rootKey, "response"),
+    framed([
+      text("circulusd.state-blob-ingress.response.v1"), text(keyId), text(requestId),
+      await sha256(requestBody), text(String(response.status)), text(CONTENT_TYPE),
+      await sha256(body),
+    ]),
+  )));
+  return decodeCanonicalCbor(body, { maxBytes: MAX_RESPONSE_BYTES });
 }
 
 function expectUnsigned(response: Response): void {
-  expect(response.headers.has(KEY_ID_HEADER)).toBe(false);
-  expect(response.headers.has(SIGNATURE_HEADER)).toBe(false);
+  expect(response.headers.has("x-circulus-state-key-id")).toBe(false);
+  expect(response.headers.has("x-circulus-state-signature")).toBe(false);
 }
 
-describe("authenticated state-app blob ingress", () => {
-  it("routes one authenticated blob read, derives all trusted fields, and signs the hydrated bytes", async () => {
-    const names: string[] = [];
-    let captured: HostRequest | undefined;
-    const payload = await ingressPayload();
+describe("authenticated session blob ingress", () => {
+  it("pins the request schema to its documented descriptor", async () => {
+    const descriptor = "circulus.state-blob-ingress.v1alpha1|major=1|minor=0|requestId:req|sentAtUnixMs:safe-uint|" +
+      "tenantId:tenant|actorSubjectId:subject|sessionId:sess|expectedAuthorizationGeneration:positive-safe-uint|" +
+      "digest:sha256|fields=protocol,major,minor,schemaDigest,requestId,sentAtUnixMs,tenantId,actorSubjectId,sessionId," +
+      "expectedAuthorizationGeneration,digest|maxBytes=4096|maxDepth=2|maxItems=32";
+    expect(await digestBytes(text(descriptor))).toBe(SCHEMA_DIGEST);
+  });
+
+  it("matches the shared Go/TypeScript request and response golden", async () => {
+    const fixture = JSON.parse(readFileSync(new URL(
+      "../../../packages/protocol-types/fixtures/state-app-blob-ingress-v1alpha1.json",
+      import.meta.url,
+    ), "utf8")) as {
+      request: ReturnType<typeof requestPayload>;
+      keyId: string;
+      rootKeyHex: string;
+      requestCborHex: string;
+      requestMacHex: string;
+      responseStatus: number;
+      response: {
+        payload: { result: { digest: string; encodedBytes: number; bytes: { hex: string } } };
+      };
+      responseCborHex: string;
+      responseMacHex: string;
+    };
+    const rootKey = fromHex(fixture.rootKeyHex);
+    const result = fixture.response.payload.result;
+    expect(fixture).toMatchObject({
+      protocol: PROTOCOL,
+      schemaDigest: SCHEMA_DIGEST,
+      path: PATH,
+      contentType: CONTENT_TYPE,
+      response: { schemaDigest: HOST_CONTRACT.schemaDigest },
+    });
+    expect(await digestBytes(fromHex(result.bytes.hex))).toBe(result.digest);
+    expect(result.digest).toBe(fixture.request.digest);
+    expect(result.encodedBytes).toBe(fromHex(result.bytes.hex).byteLength);
+    const expectedResponse = {
+      ...fixture.response,
+      payload: { ok: true, result: { ...result, bytes: fromHex(result.bytes.hex) } },
+    };
+    const clock = vi.spyOn(Date, "now").mockReturnValue(fixture.request.sentAtUnixMs);
+    try {
+      const { request, body } = await signedRequest(fixture.request, {
+        keyId: fixture.keyId, rootKey,
+      });
+      expect(hex(body)).toBe(fixture.requestCborHex);
+      expect(request.headers.get("x-circulus-state-signature")).toBe(fixture.requestMacHex);
+      const env = {
+        ...environment(async () => expectedResponse),
+        CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID: fixture.keyId,
+        CIRCULUSD_STATE_INGRESS_CURRENT_KEY: fixture.rootKeyHex,
+      };
+      const response = await worker.fetch(request, env as never);
+      expect(response.status).toBe(fixture.responseStatus);
+      expect(response.headers.get("x-circulus-state-signature")).toBe(fixture.responseMacHex);
+      expect(hex(new Uint8Array(await response.clone().arrayBuffer()))).toBe(fixture.responseCborHex);
+      expect(await readSignedResponse(
+        response, body, fixture.request.requestId, fixture.keyId, rootKey,
+      )).toEqual(expectedResponse);
+      expect(fixture.responseMacHex).not.toBe(fixture.requestMacHex);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("routes a blob read with scoped authority and host-observed time", async () => {
+    const value = await blob();
+    const payload = requestPayload(value.digest);
+    const call = vi.fn(async (request: unknown) => {
+      const envelope = request as { requestId: string };
+      return hostResponse(envelope.requestId, value);
+    });
+    const env = environment(call);
     const { request, body } = await signedRequest(payload);
     const before = Date.now();
-    const response = await invoke(request, environment({
-      readSessionBlob: async (unknownRequest) => {
-        captured = structuredClone(unknownRequest) as HostRequest;
-        return hostSuccess(captured.requestId, await hydratedResult());
-      },
-    }, names));
+    const response = await worker.fetch(request, env as never);
     const after = Date.now();
-
     expect(response.status).toBe(200);
-    expect(names).toEqual([
-      JSON.stringify([
-        "circulusd.state-app.cell",
-        1,
-        "session",
-        identity("tenant"),
-        identity("sess"),
-      ]),
-    ]);
+    expect(env.SESSION_CELL.getByName).toHaveBeenCalledExactlyOnceWith(JSON.stringify([
+      "circulusd.state-app.cell", 1, "session", payload.tenantId, payload.sessionId,
+    ]));
+    const captured = call.mock.calls[0]![0] as { payload: { now: number } };
+    expect(captured.payload.now).toBeGreaterThanOrEqual(before);
+    expect(captured.payload.now).toBeLessThanOrEqual(after);
     expect(captured).toEqual({
-      protocol: HOST_PROTOCOL,
-      major: 1,
-      minor: 0,
-      schemaDigest: HOST_SCHEMA_DIGEST,
-      requestId: identity("req"),
+      protocol: "circulus.v1alpha1", major: 1, minor: 0,
+      schemaDigest: HOST_CONTRACT.schemaDigest, requestId: payload.requestId,
       payload: {
         authority: {
-          serviceBinding: "state",
-          tenantId: identity("tenant"),
-          actorUserId: identity("subject"),
-          subjectKind: "session",
-          subjectId: identity("sess"),
-          roles: [],
-          permissions: ["session.read"],
-          authorizationGeneration: 7,
-          currentAuthorizationGeneration: 7,
-          issuedAt: captured?.payload.now,
-          expiresAt: (captured?.payload.now ?? 0) + 1,
+          serviceBinding: "state", tenantId: payload.tenantId,
+          actorUserId: payload.actorSubjectId, subjectKind: "session", subjectId: payload.sessionId,
+          roles: [], permissions: ["session.read"], authorizationGeneration: 7,
+          currentAuthorizationGeneration: 7, issuedAt: captured.payload.now,
+          expiresAt: captured.payload.now + 1,
         },
-        now: captured?.payload.now,
-        digest: await blobDigest(),
+        now: captured.payload.now, digest: value.digest,
       },
     });
-    expect(captured!.payload.now).toBeGreaterThanOrEqual(before);
-    expect(captured!.payload.now).toBeLessThanOrEqual(after);
-    expect(await signedResponse(response, body, identity("req"))).toEqual(
-      hostSuccess(identity("req"), await hydratedResult()),
-    );
+    expect(await readSignedResponse(response, body)).toEqual(hostResponse(payload.requestId, value));
   });
 
-  it("signs a null result when the current state references no such blob", async () => {
-    const payload = await ingressPayload();
+  it("preserves a missing referenced blob as authenticated null", async () => {
+    const payload = requestPayload((await blob()).digest);
     const { request, body } = await signedRequest(payload);
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => hostSuccess(identity("req"), null),
-    }));
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, null)
+    ) as never);
     expect(response.status).toBe(200);
-    expect(await signedResponse(response, body, identity("req"))).toEqual(
-      hostSuccess(identity("req"), null),
-    );
-  });
-
-  it("hydrates a maximum-size blob through the widened response bound", async () => {
-    const bytes = new Uint8Array(MAX_BLOB_BYTES).fill(0x5a);
-    const payload = { ...(await ingressPayload()), digest: await blobDigest(bytes) };
-    const { request, body } = await signedRequest(payload);
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => hostSuccess(identity("req"), await hydratedResult(bytes)),
-    }));
-    expect(response.status).toBe(200);
-    const decoded = await signedResponse(response, body, identity("req")) as {
-      payload: { result: { bytes: Uint8Array; encodedBytes: number } };
-    };
-    expect(decoded.payload.result.encodedBytes).toBe(MAX_BLOB_BYTES);
-    expect(decoded.payload.result.bytes.byteLength).toBe(MAX_BLOB_BYTES);
+    expect(await readSignedResponse(response, body)).toEqual(hostResponse(payload.requestId, null));
   });
 
   it.each([
-    ["missing digest", (payload: IngressPayload) => {
-      const { digest: _digest, ...rest } = payload;
-      return rest;
-    }],
-    ["extra field", (payload: IngressPayload) => ({ ...payload, afterSequence: 0 })],
-    ["read-events field set", (payload: IngressPayload) => {
-      const { digest: _digest, ...rest } = payload;
-      return { ...rest, afterSequence: 0, limit: 16 };
-    }],
-    ["malformed digest", (payload: IngressPayload) => ({ ...payload, digest: "sha256:abc" })],
-    ["uppercase digest", (payload: IngressPayload) => ({
-      ...payload,
-      digest: `sha256:${"A".repeat(64)}`,
-    })],
-    ["zero digest", (payload: IngressPayload) => ({ ...payload, digest: ZERO_DIGEST })],
-    ["non-string digest", (payload: IngressPayload) => ({ ...payload, digest: 7 })],
-    ["zero generation", (payload: IngressPayload) => ({
-      ...payload,
-      expectedAuthorizationGeneration: 0,
-    })],
-    ["wrong protocol", (payload: IngressPayload) => ({
-      ...payload,
-      protocol: "circulus.state-ingress.v1alpha1",
-    })],
-    ["wrong schema digest", (payload: IngressPayload) => ({
-      ...payload,
-      schemaDigest: `sha256:${"6".repeat(64)}`,
-    })],
-    ["stale clock", (payload: IngressPayload) => ({
-      ...payload,
-      sentAtUnixMs: Date.now() - 120_000,
-    })],
-  ])("rejects %s as a signed INVALID_ARGUMENT before routing", async (_name, mutate) => {
-    let calls = 0;
-    const payload = mutate(await ingressPayload());
-    const { request, body } = await signedRequest(payload as IngressPayload);
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => {
-        calls += 1;
-        return hostSuccess(identity("req"), null);
-      },
-    }));
+    ["events MAC domain", { domain: "circulusd.state-ingress.request.v1" }],
+    ["events path", { signedPath: "/circulusd/state/v1/session-events:read" }],
+    ["invalid signature", { signature: "0".repeat(64) }],
+    ["unconfigured key", { keyId: "not-configured" }],
+  ])("rejects %s before any cell lookup", async (_name, options) => {
+    const payload = requestPayload((await blob()).digest);
+    const { request } = await signedRequest(payload, options);
+    const env = environment(async () => { throw new Error("must not call"); });
+    const response = await worker.fetch(request, env as never);
+    expect(response.status).toBe(401);
+    expectUnsigned(response);
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["malformed digest", { digest: "sha256:nope" }],
+    ["uppercase digest", { digest: `sha256:${"A".repeat(64)}` }],
+    ["zero digest", { digest: `sha256:${"0".repeat(64)}` }],
+    ["non-string digest", { digest: 7 }],
+    ["foreign protocol", { protocol: "circulus.state-ingress.v1alpha1" }],
+    ["foreign schema", { schemaDigest: `sha256:${"0".repeat(64)}` }],
+    ["expired timestamp", { sentAtUnixMs: 1 }],
+    ["invalid tenant", { tenantId: "tenant-1" }],
+    ["invalid actor", { actorSubjectId: "subject-1" }],
+    ["invalid session", { sessionId: "session-1" }],
+    ["zero generation", { expectedAuthorizationGeneration: 0 }],
+    ["extra authority", { authority: {} }],
+    ["extra pagination", { limit: 1 }],
+    ["read-events field set", { afterSequence: 0, limit: 16 }],
+  ])("rejects authenticated %s before any cell lookup", async (_name, patch) => {
+    const payload = { ...requestPayload((await blob()).digest), ...patch };
+    const { request, body } = await signedRequest(payload);
+    const env = environment(async () => { throw new Error("must not call"); });
+    const response = await worker.fetch(request, env as never);
     expect(response.status).toBe(400);
-    expect(calls).toBe(0);
-    expect(await signedResponse(response, body, identity("req"))).toMatchObject({
-      schemaDigest: HOST_SCHEMA_DIGEST,
-      requestId: identity("req"),
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
+    expect(await readSignedResponse(response, body)).toMatchObject({
+      payload: { ok: false, error: { code: "INVALID_ARGUMENT" } },
+    });
+  });
+
+  it("rejects a missing digest before any cell lookup", async () => {
+    const { digest: _digest, ...payload } = requestPayload((await blob()).digest);
+    const { request, body } = await signedRequest(payload);
+    const env = environment(async () => { throw new Error("must not call"); });
+    const response = await worker.fetch(request, env as never);
+    expect(response.status).toBe(400);
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
+    expect(await readSignedResponse(response, body)).toMatchObject({
       payload: { ok: false, error: { code: "INVALID_ARGUMENT" } },
     });
   });
 
   it.each([
-    ["echoes another digest", async () => ({
-      ...(await hydratedResult()) as Record<string, NormalizedValue>,
-      digest: `sha256:${"1".repeat(64)}`,
-    }), "INTERNAL_ERROR"],
-    ["declares the wrong length", async () => ({
-      ...(await hydratedResult()) as Record<string, NormalizedValue>,
-      encodedBytes: BLOB.byteLength + 1,
-    }), "INTERNAL_ERROR"],
-    ["returns bytes that do not hash to the digest", async () => ({
-      digest: await blobDigest(),
-      encodedBytes: BLOB.byteLength,
-      bytes: new Uint8Array(BLOB.byteLength).fill(0x00),
-    }), "INTERNAL_ERROR"],
-    ["adds a field", async () => ({
-      ...(await hydratedResult()) as Record<string, NormalizedValue>,
-      encoding: "cbor",
-    }), "INTERNAL_ERROR"],
-    ["drops a field", async () => ({
-      digest: await blobDigest(),
-      bytes: BLOB,
-    }), "INTERNAL_ERROR"],
-    ["returns empty bytes", async () => ({
-      digest: await blobDigest(new Uint8Array(0)),
-      encodedBytes: 0,
-      bytes: new Uint8Array(0),
-    }), "INTERNAL_ERROR"],
-    ["returns bytes as text", async () => ({
-      digest: await blobDigest(),
-      encodedBytes: BLOB.byteLength,
-      bytes: "hydrated checkpoint payload bytes",
-    }), "INTERNAL_ERROR"],
-    ["returns a non-object result", async () => 7, "INTERNAL_ERROR"],
-    ["exceeds the blob bound inside the envelope bound", async () => {
-      const bytes = new Uint8Array(MAX_BLOB_BYTES + 1).fill(0x5a);
-      return hydratedResult(bytes);
-    }, "INTERNAL_ERROR"],
-    ["exceeds the envelope bound", async () => {
-      const bytes = new Uint8Array(MAX_BLOB_BYTES + ENVELOPE_HEADROOM_BYTES).fill(0x5a);
-      return hydratedResult(bytes);
-    }, "RESOURCE_EXHAUSTED"],
-  ])("turns a Host success that %s into a signed 502", async (_name, result, code) => {
-    const hostResult = await result();
-    const digest = typeof hostResult === "object" && hostResult !== null &&
-        !Array.isArray(hostResult) && !(hostResult instanceof Uint8Array) &&
-        typeof (hostResult as { digest?: unknown }).digest === "string" &&
-        /^sha256:[0-9a-f]{64}$/.test((hostResult as { digest: string }).digest) &&
-        (hostResult as { digest: string }).digest !== `sha256:${"1".repeat(64)}`
-      ? (hostResult as { digest: Digest }).digest
-      : await blobDigest();
-    const payload = { ...(await ingressPayload()), digest };
-    const { request, body } = await signedRequest(payload);
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => hostSuccess(identity("req"), hostResult as NormalizedValue),
-    }));
-    expect(response.status).toBe(502);
-    expect(await signedResponse(response, body, identity("req"))).toEqual({
-      protocol: HOST_PROTOCOL,
-      major: 1,
-      minor: 0,
-      schemaDigest: HOST_SCHEMA_DIGEST,
-      requestId: identity("req"),
-      payload: {
-        ok: false,
-        error: {
-          code,
-          message: code === "RESOURCE_EXHAUSTED"
-            ? "The RPC response exceeds its operation limit."
-            : "The operation could not be completed.",
-        },
-      },
-    });
+    ["unknown blob URL", { path: "/circulusd/state/v1/session-blobs:read" }, 404],
+    ["events content type", {
+      headers: { "content-type": "application/vnd.circulusd.state-ingress+cbor" },
+    }, 415],
+  ])("rejects %s before any cell lookup", async (_name, options, status) => {
+    const { request } = await signedRequest(requestPayload((await blob()).digest), options);
+    const env = environment(async () => { throw new Error("must not call"); });
+    const response = await worker.fetch(request, env as never);
+    expect(response.status).toBe(status);
+    expectUnsigned(response);
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
   });
 
-  it("forwards an allowlisted Host failure with its safe message and strips the original text", async () => {
-    const payload = await ingressPayload();
-    const { request, body } = await signedRequest(payload);
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => ({
-        protocol: HOST_PROTOCOL,
-        major: 1,
-        minor: 0,
-        schemaDigest: HOST_SCHEMA_DIGEST,
-        requestId: identity("req"),
-        payload: {
-          ok: false,
-          error: { code: "STALE_GENERATION", message: "internal detail about generation 9" },
-        },
-      }),
-    }));
-    expect(response.status).toBe(200);
-    expect(await signedResponse(response, body, identity("req"))).toEqual({
-      protocol: HOST_PROTOCOL,
-      major: 1,
-      minor: 0,
-      schemaDigest: HOST_SCHEMA_DIGEST,
-      requestId: identity("req"),
-      payload: {
-        ok: false,
-        error: { code: "STALE_GENERATION", message: "The supplied generation is stale." },
-      },
-    });
-  });
-
-  it("binds authorization to the exact path, content type, and blob MAC domain", async () => {
-    let calls = 0;
-    const stub: SessionStub = {
-      readSessionBlob: async () => {
-        calls += 1;
-        return hostSuccess(identity("req"), null);
-      },
+  it("rejects a configured dispatch key for blob reads", async () => {
+    const keyId = "dispatch-start-current-1";
+    const rootKey = new Uint8Array(32).fill(0x51);
+    const { request } = await signedRequest(requestPayload((await blob()).digest), { keyId, rootKey });
+    const env = {
+      ...environment(async () => { throw new Error("must not call"); }),
+      CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID: keyId,
+      CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY: hex(rootKey),
     };
-    const payload = await ingressPayload();
-    const body = encodeCanonicalCbor(payload);
-
-    const wrongPath = await requestFromBytes(body, { path: "/circulusd/state/v1/session-blobs:read" });
-    const wrongPathResponse = await invoke(wrongPath, environment(stub));
-    expect(wrongPathResponse.status).toBe(404);
-    expectUnsigned(wrongPathResponse);
-
-    const wrongContentType = await requestFromBytes(body, { contentType: READ_EVENTS_CONTENT_TYPE });
-    const wrongContentTypeResponse = await invoke(wrongContentType, environment(stub));
-    expect(wrongContentTypeResponse.status).toBe(415);
-    expectUnsigned(wrongContentTypeResponse);
-
-    const readEventsDomain = await requestFromBytes(body, {
-      signature: await requestSignature(body, { domain: READ_EVENTS_REQUEST_MAC_DOMAIN }),
-    });
-    const readEventsDomainResponse = await invoke(readEventsDomain, environment(stub));
-    expect(readEventsDomainResponse.status).toBe(401);
-    expectUnsigned(readEventsDomainResponse);
-
-    const readEventsPath = await requestFromBytes(body, {
-      signature: await requestSignature(body, { path: READ_EVENTS_PATH }),
-    });
-    const readEventsPathResponse = await invoke(readEventsPath, environment(stub));
-    expect(readEventsPathResponse.status).toBe(401);
-    expectUnsigned(readEventsPathResponse);
-
-    expect(calls).toBe(0);
-  });
-
-  it("uses only the read ingress keys and fails closed without them", async () => {
-    let calls = 0;
-    const payload = await ingressPayload();
-    const dispatchKey = new Uint8Array(32).fill(0x51);
-    const { request } = await signedRequest(payload, {
-      keyId: "dispatch-start-current-1",
-      rootKey: dispatchKey,
-    });
-    const response = await invoke(request, environment({
-      readSessionBlob: async () => {
-        calls += 1;
-        return hostSuccess(identity("req"), null);
-      },
-    }, [], {
-      CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY_ID: "dispatch-start-current-1",
-      CIRCULUSD_STATE_DISPATCH_START_CURRENT_KEY: hex(dispatchKey),
-    }));
+    const response = await worker.fetch(request, env as never);
     expect(response.status).toBe(401);
     expectUnsigned(response);
-
-    const { request: unconfigured } = await signedRequest(payload);
-    const unconfiguredResponse = await invoke(unconfigured, environment({
-      readSessionBlob: async () => {
-        calls += 1;
-        return hostSuccess(identity("req"), null);
-      },
-    }, [], {
-      CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID: undefined,
-      CIRCULUSD_STATE_INGRESS_CURRENT_KEY: undefined,
-    }));
-    expect(unconfiguredResponse.status).toBe(503);
-    expectUnsigned(unconfiguredResponse);
-    expect(calls).toBe(0);
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
   });
 
-  it("pins canonical request/response bytes and direction-separated MACs in a shared golden", async () => {
-    const fixture = JSON.parse(readFileSync(new URL(
-      "../../../packages/protocol-types/fixtures/state-app-blob-ingress-v1alpha1.json",
-      import.meta.url,
-    ), "utf8"));
-    expect(fixture.protocol).toBe(INGRESS_PROTOCOL);
-    expect(fixture.schemaDigest).toBe(INGRESS_SCHEMA_DIGEST);
-    expect(fixture.path).toBe(INGRESS_PATH);
-    expect(fixture.contentType).toBe(INGRESS_CONTENT_TYPE);
-    expect(fixture.response.schemaDigest).toBe(HOST_SCHEMA_DIGEST);
+  it("fails closed when the read credentials are absent", async () => {
+    const { request } = await signedRequest(requestPayload((await blob()).digest));
+    const env = {
+      ...environment(async () => { throw new Error("must not call"); }),
+      CIRCULUSD_STATE_INGRESS_CURRENT_KEY_ID: undefined,
+      CIRCULUSD_STATE_INGRESS_CURRENT_KEY: undefined,
+    };
+    const response = await worker.fetch(request, env as never);
+    expect(response.status).toBe(503);
+    expectUnsigned(response);
+    expect(env.SESSION_CELL.getByName).not.toHaveBeenCalled();
+  });
 
-    const blob = decodeHex(fixture.blobHex);
-    expect(await blobDigest(blob)).toBe(fixture.request.digest);
-    expect(fixture.response.payload.result).toEqual({
-      digest: fixture.request.digest,
-      encodedBytes: blob.byteLength,
+  it("accepts the previous read key during rotation", async () => {
+    const value = await blob();
+    const payload = requestPayload(value.digest);
+    const keyId = "state-previous-1";
+    const rootKey = new Uint8Array(48).fill(0x42);
+    const { request, body } = await signedRequest(payload, { keyId, rootKey });
+    const env = {
+      ...environment(async () => hostResponse(payload.requestId, value)),
+      CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY_ID: keyId,
+      CIRCULUSD_STATE_INGRESS_PREVIOUS_KEY: hex(rootKey),
+    };
+    const response = await worker.fetch(request, env as never);
+    expect(response.status).toBe(200);
+    expect(await readSignedResponse(response, body, payload.requestId, keyId, rootKey)).toEqual(
+      hostResponse(payload.requestId, value),
+    );
+  });
+
+  it.each(["STALE_GENERATION", "PERMISSION_DENIED", "CORRUPT_STATE"])(
+    "authenticates and sanitizes host %s errors", async (code) => {
+      const payload = requestPayload((await blob()).digest);
+      const { request, body } = await signedRequest(payload);
+      const response = await worker.fetch(request, environment(async () => ({
+        ...hostResponse(payload.requestId, null),
+        payload: { ok: false, error: { code, message: "private host details" } },
+      })) as never);
+      expect(response.status).toBe(200);
+      const result = await readSignedResponse(response, body);
+      expect(result).toMatchObject({ payload: { ok: false, error: { code } } });
+      expect(JSON.stringify(result)).not.toContain("private host details");
+      if (code === "STALE_GENERATION") {
+        expect(result).toEqual({
+          protocol: "circulus.v1alpha1", major: 1, minor: 0,
+          schemaDigest: HOST_CONTRACT.schemaDigest, requestId: payload.requestId,
+          payload: {
+            ok: false,
+            error: { code, message: "The supplied generation is stale." },
+          },
+        });
+      }
+    },
+  );
+
+  it.each([
+    "wrong digest", "corrupt bytes", "wrong length", "missing bytes", "extra field", "empty blob", "bytes as text",
+  ])("rejects a host success containing %s", async (kind) => {
+    const value = await blob();
+    const invalid: Record<string, unknown> = { ...value };
+    if (kind === "wrong digest") invalid.digest = `sha256:${"0".repeat(64)}`;
+    if (kind === "corrupt bytes") invalid.bytes = new Uint8Array(value.bytes.length).fill(3);
+    if (kind === "wrong length") invalid.encodedBytes = value.encodedBytes + 1;
+    if (kind === "missing bytes") delete invalid.bytes;
+    if (kind === "extra field") invalid.privateData = "must not forward";
+    if (kind === "empty blob") Object.assign(invalid, await blob(new Uint8Array()));
+    if (kind === "bytes as text") invalid.bytes = "hydrated checkpoint payload bytes";
+    const payload = requestPayload(kind === "empty blob" ? invalid.digest as string : value.digest);
+    const { request, body } = await signedRequest(payload);
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, invalid)
+    ) as never);
+    expect(response.status).toBe(502);
+    expect(await readSignedResponse(response, body)).toMatchObject({
+      payload: { ok: false, error: { code: "INTERNAL_ERROR" } },
     });
-    const rootKey = decodeHex(fixture.rootKeyHex);
-    const requestBody = encodeCanonicalCbor(fixture.request);
-    const responseBody = encodeCanonicalCbor({
-      ...fixture.response,
+  });
+
+  it("rejects a non-object host result", async () => {
+    const payload = requestPayload((await blob()).digest);
+    const { request, body } = await signedRequest(payload);
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, 7)
+    ) as never);
+    expect(response.status).toBe(502);
+    expect(await readSignedResponse(response, body)).toMatchObject({
+      payload: { ok: false, error: { code: "INTERNAL_ERROR" } },
+    });
+  });
+
+  it("reports a host response beyond the envelope bound as RESOURCE_EXHAUSTED", async () => {
+    const value = await blob(new Uint8Array(MAX_RESPONSE_BYTES).fill(0x5a));
+    const payload = requestPayload(value.digest);
+    const { request, body } = await signedRequest(payload);
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, value)
+    ) as never);
+    expect(response.status).toBe(502);
+    expect(await readSignedResponse(response, body)).toEqual({
+      protocol: "circulus.v1alpha1", major: 1, minor: 0,
+      schemaDigest: HOST_CONTRACT.schemaDigest, requestId: payload.requestId,
       payload: {
-        ok: true,
-        result: { ...fixture.response.payload.result, bytes: blob },
+        ok: false,
+        error: { code: "RESOURCE_EXHAUSTED", message: "The RPC response exceeds its operation limit." },
       },
     });
-    expect(hex(requestBody)).toBe(fixture.requestCborHex);
-    expect(await requestSignature(requestBody, { keyId: fixture.keyId, rootKey })).toBe(
-      fixture.requestMacHex,
-    );
-    expect(hex(responseBody)).toBe(fixture.responseCborHex);
-    expect(await responseSignature(
-      responseBody,
-      requestBody,
-      fixture.responseStatus,
-      fixture.request.requestId,
-      fixture.keyId,
-      rootKey,
-    )).toBe(fixture.responseMacHex);
-    expect(fixture.responseMacHex).not.toBe(fixture.requestMacHex);
+  });
+
+  it("accepts exactly 4 MiB without increasing other operation limits", async () => {
+    const value = await blob(new Uint8Array(MAX_BLOB_BYTES).fill(19));
+    const payload = requestPayload(value.digest);
+    const { request, body } = await signedRequest(payload);
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, value)
+    ) as never);
+    expect(response.status).toBe(200);
+    const decoded = await readSignedResponse(response, body) as {
+      payload: { result: Awaited<ReturnType<typeof blob>> };
+    };
+    expect(decoded.payload.result.encodedBytes).toBe(MAX_BLOB_BYTES);
+    expect(decoded.payload.result.bytes.length).toBe(MAX_BLOB_BYTES);
+    expect(await digestBytes(decoded.payload.result.bytes)).toBe(value.digest);
+    expect(HOST_RPC_CONTRACTS["session.read-events"].responseMaxEncodedBytes).toBe(1_048_576 + 65_536);
+  });
+
+  it("rejects a blob beyond 4 MiB even when the response envelope fits", async () => {
+    const value = await blob(new Uint8Array(MAX_BLOB_BYTES + 1));
+    const payload = requestPayload(value.digest);
+    const { request, body } = await signedRequest(payload);
+    const response = await worker.fetch(request, environment(async () =>
+      hostResponse(payload.requestId, value)
+    ) as never);
+    expect(response.status).toBe(502);
+    expect(await readSignedResponse(response, body)).toMatchObject({
+      payload: { ok: false, error: { code: "INTERNAL_ERROR" } },
+    });
   });
 });

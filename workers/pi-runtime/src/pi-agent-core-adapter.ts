@@ -378,27 +378,30 @@ export function createPiAgentCoreFactory(
             },
           };
         }
-        const inputRecord = exactRecord(
-          context.input.input,
-          ["prompt", "timestamp"],
-          [],
-          "piAgentCore.turnInput",
-          "CORE_OUTPUT_INVALID",
-        );
-        if (typeof inputRecord.prompt !== "string") {
-          throw new Error("Pi turn prompt must be a string");
+        let timestamp: number;
+        let prompts: UserMessage[];
+        if (context.input.input !== null && typeof context.input.input === "object" &&
+          !Array.isArray(context.input.input) && Object.hasOwn(context.input.input, "messages")) {
+          const inputRecord = exactRecord(context.input.input, ["messages"], [], "piAgentCore.turnInput", "CORE_OUTPUT_INVALID");
+          if (!Array.isArray(inputRecord.messages) || inputRecord.messages.length < 1 || inputRecord.messages.length > 1024) {
+            throw new Error("Pi public turn input requires bounded user messages");
+          }
+          // Public admission carries no timestamp. Zero is the deterministic
+          // public-input codec convention, not an observed admission host time.
+          timestamp = 0;
+          prompts = inputRecord.messages.map((value) => {
+            const message = exactRecord(value, ["role", "content"], [], "piAgentCore.turnInput.message", "CORE_OUTPUT_INVALID");
+            if (message.role !== "user" || typeof message.content !== "string" || message.content.length === 0) {
+              throw new Error("Pi public turn input accepts only nonempty user messages");
+            }
+            return { role: "user", content: message.content, timestamp };
+          });
+        } else {
+          const inputRecord = exactRecord(context.input.input, ["prompt", "timestamp"], [], "piAgentCore.turnInput", "CORE_OUTPUT_INVALID");
+          if (typeof inputRecord.prompt !== "string") throw new Error("Pi turn prompt must be a string");
+          timestamp = boundedSafeInteger(inputRecord.timestamp, 0, "piAgentCore.turnInput.timestamp", "CORE_OUTPUT_INVALID");
+          prompts = [{ role: "user", content: inputRecord.prompt, timestamp }];
         }
-        const timestamp = boundedSafeInteger(
-          inputRecord.timestamp,
-          0,
-          "piAgentCore.turnInput.timestamp",
-          "CORE_OUTPUT_INVALID",
-        );
-        const prompt: UserMessage = {
-          role: "user",
-          content: inputRecord.prompt,
-          timestamp,
-        };
         let capturedContext: PiContext | undefined;
         let modelCalls = 0;
         let modelMismatch = false;
@@ -439,7 +442,7 @@ export function createPiAgentCoreFactory(
           return stream;
         };
         await runAgentLoop(
-          [prompt],
+          prompts,
           { systemPrompt, messages: [], tools: runtimeTools },
           loopConfiguration,
           async () => undefined,

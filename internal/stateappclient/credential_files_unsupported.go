@@ -2,6 +2,4 @@
 
 package stateappclient
 
-func loadRootKeyPair(_, _ string) ([]byte, []byte, error) {
-	return nil, nil, ErrCredentialFilesUnsupported
-}
+func loadRootKeyFiles(_ ...string) ([][]byte, error) { return nil, ErrCredentialFilesUnsupported }

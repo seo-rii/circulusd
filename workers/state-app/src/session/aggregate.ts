@@ -4,6 +4,7 @@ import {
   encodeCanonicalCbor,
   externalizeAgentCheckpoint,
   normalizeProtocolValue,
+  parseAgentCheckpoint,
   parseAgentError,
   parseDigest,
   parseDispatchPermitClaims,
@@ -20,6 +21,7 @@ import {
 } from "@circulusd/protocol-types";
 
 import { sessionError } from "./errors.ts";
+import { sessionPayloadItems, storeSessionPayload, validateSessionPayloadRef } from "./payload.ts";
 import {
   SESSION_CHECKPOINT_DIGEST_DOMAIN,
   SESSION_CHECKPOINT_DIGEST_SCHEMA_VERSION,
@@ -31,21 +33,34 @@ import {
   SESSION_STATE_SCHEMA_VERSION,
   SESSION_STATE_MAX_ENCODED_BYTES,
   SESSION_STATE_MAX_ENCODED_ITEMS,
-  SESSION_TURN_COMPLETION_RESERVE_BYTES,
+  SESSION_CAPACITY_RESERVE_UNIT_BYTES,
+  SESSION_CAPACITY_RESERVE_UNIT_ITEMS,
   SESSION_TURN_INPUT_DIGEST_DOMAIN,
   SESSION_TURN_INPUT_DIGEST_SCHEMA_VERSION,
   SESSION_VALUE_MAX_ENCODED_BYTES,
   type ApplySessionCommandResult,
+  type SessionApplyContext,
+  type SessionArchiveDelta,
+  type CommandReceipt,
+  type SessionTurnIdentity,
+  type SessionInvocationIdentity,
+  SESSION_HISTORY_MAX_RECORDS,
   type CreateSessionStateInput,
   type EffectSettlement,
   type SessionAggregateState,
   type SessionCommand,
-  type SessionCommandOutcome,
+  type StoredSessionCommandOutcome,
+  type StoredEffectSettlement,
+  type StoredSessionCheckpoint,
+  type StoredSessionInput,
   type SessionEffect,
   type SessionPublicEvent,
   type SessionPublicEventReplay,
   type TurnAdmissionReceipt,
 } from "./types.ts";
+import { compactSessionHistory, validatePublicAdmissionAuthority } from "./history.ts";
+import { applySessionBrokerCommand, assertSessionBrokerState, reconcileSessionBrokerState, sessionBrokerBlobReferences } from "./broker.ts";
+import type { SessionBrokerCoreApply } from "./broker.ts";
 import type { SessionAggregateErrorCode } from "./errors.ts";
 
 const textEncoder = new TextEncoder();
@@ -178,14 +193,69 @@ function validatedNormalizedValue(
   }
 }
 
-// sessionStateEncodedSize returns the canonical CBOR byte length of the durable
-// state. It throws the same bounded-value failure as assertSessionInvariants if the
-// state already exceeds the limit; turn admission uses it to reserve headroom for
-// the pending turns' completions.
-function sessionStateEncodedSize(state: SessionAggregateState): number {
-  return encodeCanonicalCbor(normalizeProtocolValue(state), {
-    maxBytes: SESSION_STATE_MAX_ENCODED_BYTES,
-  }).byteLength;
+// Charge the final durable state plus all outstanding completion/recovery work
+// against byte and item limits before accepting any forward growth.
+function sessionCapacity(state: SessionAggregateState) {
+  const normalized = normalizeProtocolValue(state);
+  // Each unit exceeds the bounded identifiers, payload refs, receipt and public
+  // event produced by one terminal/recovery transition. Its reservation is spent
+  // as that transition advances, so abort/claim/settlement can still commit when
+  // ordinary forward growth has reached the admission boundary.
+  let units = 2 * state.queuedTurns.length;
+  if (state.activeTurn !== null) units += state.activeTurn.abortRequested ? 1 : 2;
+  for (const effect of state.effects) {
+    if (effect.phase === "prepared") units += 4;
+    else if (effect.phase === "dispatched") units += effect.lastDispatch?.start === null ? 3 : 2;
+    else if (effect.phase === "externally_committed") units += 1;
+    else if (effect.phase === "blocked") units += 2;
+  }
+  if (state.broker?.engineGrant !== null && state.broker?.engineGrant !== undefined) units += 1;
+  if (state.broker?.preparation?.retry === true) units += 1;
+  return {
+    units,
+    bytes: encodeCanonicalCbor(normalized, { maxBytes: SESSION_STATE_MAX_ENCODED_BYTES }).byteLength +
+      units * SESSION_CAPACITY_RESERVE_UNIT_BYTES,
+    items: sessionPayloadItems(normalized) + units * SESSION_CAPACITY_RESERVE_UNIT_ITEMS,
+  };
+}
+
+export function assertSessionCapacity(previous: SessionAggregateState, next: SessionAggregateState): void {
+  const candidate = sessionCapacity(next);
+  if (candidate.bytes <= SESSION_STATE_MAX_ENCODED_BYTES && candidate.items <= SESSION_STATE_MAX_ENCODED_ITEMS) return;
+  const before = sessionCapacity(previous);
+  // Old deployments did not reserve every pending completion. Permit draining an
+  // already overcommitted legacy state, but never add new work to that deficit.
+  if (candidate.units < before.units && candidate.bytes <= before.bytes && candidate.items <= before.items) return;
+  sessionError(
+    "FAILED_PRECONDITION",
+    `completion/recovery capacity reservation exceeds the durable limit: ${candidate.bytes} bytes, ${candidate.items} items`,
+  );
+}
+
+function assertStoredPayload(
+  value: object,
+  inlineField: string,
+  refField: string,
+  field: string,
+  errorCode: SessionAggregateErrorCode = "FAILED_PRECONDITION",
+): void {
+  const record = value as Record<string, unknown>;
+  const inline = Object.hasOwn(record, inlineField);
+  const reference = Object.hasOwn(record, refField);
+  if (inline === reference) sessionError(errorCode, `${field} requires exactly one of ${inlineField} or ${refField}`);
+  if (reference) validateSessionPayloadRef(record[refField], `${field}.${refField}`);
+  else validatedNormalizedValue(record[inlineField], `${field}.${inlineField}`, SESSION_VALUE_MAX_ENCODED_BYTES, true, errorCode);
+}
+
+function storedInput(turn: StoredSessionInput): StoredSessionInput {
+  return turn.inputRef === undefined
+    ? { input: structuredClone(turn.input) }
+    : { inputRef: structuredClone(turn.inputRef) };
+}
+
+function parseStoredCheckpoint(value: StoredSessionCheckpoint): StoredSessionCheckpoint {
+  return value !== null && typeof value === "object" && "payloadBytes" in value
+    ? parseAgentCheckpoint(value) : parseExternalizedAgentCheckpoint(value);
 }
 
 function validatedIdentifier(value: unknown, field: string): string {
@@ -282,18 +352,12 @@ function assertEffectSettlement(
     case "success": {
       const settlement = validatedExactFields(
         value,
-        ["kind", "result"],
-        [],
+        ["kind"],
+        ["result", "resultPayloadRef"],
         field,
         errorCode,
       );
-      validatedNormalizedValue(
-        settlement.result,
-        `${field}.result`,
-        SESSION_VALUE_MAX_ENCODED_BYTES,
-        true,
-        errorCode,
-      );
+      assertStoredPayload(settlement, "result", "resultPayloadRef", field, errorCode);
       break;
     }
     case "error": {
@@ -305,7 +369,7 @@ function assertEffectSettlement(
         errorCode,
       );
       validatedIdentifier(settlement.code, `${field}.code`);
-      validatedIdentifier(settlement.message, `${field}.message`);
+      parseAgentError({ code: settlement.code, message: settlement.message, retryable: settlement.retryable });
       if (typeof settlement.retryable !== "boolean") {
         sessionError(errorCode, `${field}.retryable must be a boolean`);
       }
@@ -338,6 +402,12 @@ function assertSessionCommandOutcome(
   }
   const kind = (value as { readonly kind?: unknown }).kind;
   switch (kind) {
+    case "broker_boundary": {
+      const outcome = validatedExactFields(value, ["kind", "operation", "effectId"], [], field, errorCode);
+      validatedIdentifier(outcome.effectId, `${field}.effectId`);
+      if (!["retry", "block", "recovery_settlement"].includes(outcome.operation as string)) sessionError(errorCode, "unknown broker boundary");
+      break;
+    }
     case "turn_enqueued": {
       const outcome = validatedExactFields(
         value,
@@ -750,20 +820,36 @@ function validatedCheckpointDigest(validated: AgentCheckpoint) {
 }
 
 // Every externalized payload the state references, as blob digests (deduplicated,
-// in durable order): queued-turn checkpoints, the active checkpoint, and each
-// terminal turn final checkpoint. The host derives blob creation/deletion from
+// in durable order), including payload references duplicated in receipts. The host
+// derives blob creation/deletion from
 // the difference between successive states' sets.
 export function sessionReferencedBlobDigests(state: SessionAggregateState): Digest[] {
   const digests = new Set<Digest>();
-  for (const turn of state.queuedTurns) {
-    digests.add(turn.checkpoint.payloadDigest);
-  }
-  if (state.activeTurn !== null) {
-    digests.add(state.activeTurn.checkpoint.payloadDigest);
+  const addCheckpoint = (checkpoint: StoredSessionCheckpoint) => {
+    if (!("payloadBytes" in checkpoint)) digests.add(checkpoint.payloadDigest);
+  };
+  for (const turn of [...state.queuedTurns, ...(state.activeTurn === null ? [] : [state.activeTurn])]) {
+    addCheckpoint(turn.checkpoint);
+    if (turn.inputRef !== undefined) digests.add(turn.inputRef.digest);
   }
   for (const turn of state.terminalTurns) {
-    digests.add(turn.finalCheckpoint.payloadDigest);
+    addCheckpoint(turn.finalCheckpoint);
+    if (turn.inputRef !== undefined) digests.add(turn.inputRef.digest);
+    if (turn.status === "completed" && turn.resultPayloadRef !== undefined) digests.add(turn.resultPayloadRef.digest);
+    if (turn.status === "failed" && turn.error.detailsRef !== undefined) digests.add(turn.error.detailsRef.digest);
   }
+  for (const effect of state.effects) {
+    if (effect.requestPayloadRef !== undefined) digests.add(effect.requestPayloadRef.digest);
+    if (effect.settlement?.kind === "success" && effect.settlement.resultPayloadRef !== undefined) {
+      digests.add(effect.settlement.resultPayloadRef.digest);
+    }
+  }
+  for (const { outcome } of state.commandReceipts) {
+    if (outcome.kind === "effect_settled" && outcome.settlement.kind === "success" && outcome.settlement.resultPayloadRef !== undefined) {
+      digests.add(outcome.settlement.resultPayloadRef.digest);
+    }
+  }
+  for (const reference of sessionBrokerBlobReferences(state)) digests.add(reference.digest);
   return [...digests];
 }
 
@@ -875,23 +961,18 @@ export function createSessionState(input: CreateSessionStateInput): SessionAggre
 export interface MigrateSessionStateResult {
   readonly state: SessionAggregateState;
   readonly migrated: boolean;
-  // Payloads lifted out of a legacy inline state (storage redesign stage B); the
-  // host persists them with the migrating write.
+  // Reserved for bounded migration rewrites. Current migrations retain legacy
+  // inline payloads and never generate an unbounded set of blob writes.
   readonly blobs?: ReadonlyMap<Digest, Uint8Array>;
   readonly referencedBlobs?: readonly Digest[];
 }
 
-// Externalize one legacy inline checkpoint: verify its payload digest, split off
-// the bytes as a blob, and compute the chain digest over the wire form (needed by
-// turns that can still receive engine steps).
+// Retain validated legacy bytes inline. A version migration must not write an
+// unbounded number of blob keys; later engine updates replace one checkpoint.
 async function migrateInlineCheckpoint(
   value: unknown,
   field: string,
-  blobs: Map<Digest, Uint8Array>,
-): Promise<{
-  readonly checkpoint: ExternalizedAgentCheckpoint;
-  readonly checkpointChainDigest: Digest;
-}> {
+): Promise<AgentCheckpoint> {
   let full: AgentCheckpoint;
   try {
     full = await validateAgentCheckpoint(value);
@@ -904,12 +985,7 @@ async function migrateInlineCheckpoint(
     }
     throw error;
   }
-  const externalized = externalizeAgentCheckpoint(full);
-  blobs.set(externalized.checkpoint.payloadDigest, externalized.payloadBytes);
-  return {
-    checkpoint: externalized.checkpoint,
-    checkpointChainDigest: await validatedCheckpointDigest(full),
-  };
+  return full;
 }
 
 export async function migrateSessionState(
@@ -926,7 +1002,9 @@ export async function migrateSessionState(
     (schemaVersion !== 1 &&
       schemaVersion !== 2 &&
       schemaVersion !== 3 &&
-      schemaVersion !== 4)
+      schemaVersion !== 4 &&
+      schemaVersion !== 5 &&
+      schemaVersion !== 6)
   ) {
     return {
       state: state as SessionAggregateState,
@@ -938,7 +1016,7 @@ export async function migrateSessionState(
     schemaVersion === 1
       ? LEGACY_SESSION_STATE_V1_FIELDS
       : LEGACY_SESSION_STATE_V2_FIELDS,
-    [],
+    schemaVersion === 6 ? ["history"] : [],
     `legacy schema-v${schemaVersion} session state`,
     "FAILED_PRECONDITION",
   );
@@ -953,6 +1031,7 @@ export async function migrateSessionState(
         }
       : {}),
   } as unknown as SessionAggregateState;
+  if (schemaVersion === 5 || schemaVersion === 6) return { state: migrated, migrated: true };
   if (
     schemaVersion <= 3 &&
     (!Array.isArray(migrated.effects) ||
@@ -968,9 +1047,8 @@ export async function migrateSessionState(
       `schema-v${schemaVersion} Session dispatch history lacks a provable provider route`,
     );
   }
-  // Schema v5: every inline checkpoint (pre-v5 states kept payload bytes in the
-  // record) becomes an externalized checkpoint plus a blob, and each turn that can
-  // still take engine steps records its checkpoint chain digest.
+  // Pre-v5 checkpoints retain their inline form with no added chain metadata.
+  // Their next engine step derives the predecessor from the existing wire form.
   if (
     !Array.isArray(migrated.queuedTurns) ||
     !Array.isArray(migrated.terminalTurns) ||
@@ -981,7 +1059,6 @@ export async function migrateSessionState(
       `schema-v${schemaVersion} Session turn history is malformed`,
     );
   }
-  const blobs = new Map<Digest, Uint8Array>();
   const legacyTurn = (turn: unknown, field: string) => {
     if (typeof turn !== "object" || turn === null || Array.isArray(turn)) {
       sessionError("FAILED_PRECONDITION", `${field} is not a turn record`);
@@ -991,44 +1068,40 @@ export async function migrateSessionState(
   const queuedTurns = [];
   for (const [index, entry] of migrated.queuedTurns.entries()) {
     const turn = legacyTurn(entry, `queuedTurns[${index}]`);
-    const { checkpoint, checkpointChainDigest } = await migrateInlineCheckpoint(
+    const checkpoint = await migrateInlineCheckpoint(
       turn.checkpoint,
       `queuedTurns[${index}].checkpoint`,
-      blobs,
     );
-    queuedTurns.push({ ...turn, checkpoint, checkpointChainDigest });
+    queuedTurns.push({ ...turn, checkpoint });
   }
   let activeTurn = null;
   if (migrated.activeTurn !== null) {
     const turn = legacyTurn(migrated.activeTurn, "activeTurn");
-    const { checkpoint, checkpointChainDigest } = await migrateInlineCheckpoint(
+    const checkpoint = await migrateInlineCheckpoint(
       turn.checkpoint,
       "activeTurn.checkpoint",
-      blobs,
     );
-    activeTurn = { ...turn, checkpoint, checkpointChainDigest };
+    activeTurn = { ...turn, checkpoint };
   }
   const terminalTurns = [];
   for (const [index, entry] of migrated.terminalTurns.entries()) {
     const turn = legacyTurn(entry, `terminalTurns[${index}]`);
-    const { checkpoint } = await migrateInlineCheckpoint(
+    const checkpoint = await migrateInlineCheckpoint(
       turn.finalCheckpoint,
       `terminalTurns[${index}].finalCheckpoint`,
-      blobs,
     );
     terminalTurns.push({ ...turn, finalCheckpoint: checkpoint });
   }
-  const externalized = {
+  const retained = {
     ...migrated,
     queuedTurns,
     activeTurn,
     terminalTurns,
   } as unknown as SessionAggregateState;
   return {
-    state: externalized,
+    state: retained,
     migrated: true,
-    blobs,
-    referencedBlobs: sessionReferencedBlobDigests(externalized),
+    referencedBlobs: sessionReferencedBlobDigests(retained),
   };
 }
 
@@ -1044,7 +1117,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   validatedExactFields(
     state,
     SESSION_STATE_FIELDS,
-    [],
+    ["history", "broker"],
     "session state",
     "FAILED_PRECONDITION",
   );
@@ -1062,6 +1135,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   if (state.schemaVersion !== SESSION_STATE_SCHEMA_VERSION) {
     sessionError("FAILED_PRECONDITION", "unsupported session state schemaVersion");
   }
+  assertSessionBrokerState(state);
   validatedIdentifier(state.sessionId, "state.sessionId");
   validatedIdentifier(state.tenantId, "state.tenantId");
   validatedIdentifier(state.userId, "state.userId");
@@ -1140,6 +1214,57 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     sessionError("FAILED_PRECONDITION", "unknown session status");
   }
 
+  const commandThrough = state.history?.commandThrough ?? 0;
+  const publicEventThrough = state.history?.publicEventThrough ?? 0;
+  const turnThrough = state.history?.turnThrough ?? 0;
+  if (state.history !== undefined) {
+    const history = state.history;
+    validatedExactFields(history, ["commandThrough", "publicEventThrough", "turnThrough",
+      "runtimePointerAtCommandThrough", "latestSettledTurnAtTurnThrough", "publicEventAnchors",
+      "dispatchStartReceipts", "runtimeRevisionDigests"], [], "state.history", "FAILED_PRECONDITION");
+    for (const [name, value, maximum] of [
+      ["commandThrough", commandThrough, state.eventSequence],
+      ["publicEventThrough", publicEventThrough, state.publicEventSequence],
+      ["turnThrough", turnThrough, state.nextTurnSequence],
+    ] as const) {
+      validatedInteger(value, `history.${name}`, 0);
+      if (value > maximum) sessionError("FAILED_PRECONDITION", "history watermark exceeds its cursor");
+    }
+    const pointer = validatedExactFields(history.runtimePointerAtCommandThrough,
+      ["activeRevision", "candidateRevision", "previousRevision", "switchGeneration"], [],
+      "history.runtimePointerAtCommandThrough", "FAILED_PRECONDITION");
+    parseDigest(pointer.activeRevision, "history activeRevision");
+    if (pointer.candidateRevision !== null) parseDigest(pointer.candidateRevision, "history candidateRevision");
+    if (pointer.previousRevision !== null) parseDigest(pointer.previousRevision, "history previousRevision");
+    validatedInteger(pointer.switchGeneration, "history switchGeneration", 1);
+    if ((turnThrough === 0) !== (history.latestSettledTurnAtTurnThrough === null)) {
+      sessionError("FAILED_PRECONDITION", "archived terminal cursor lacks its last identity");
+    }
+    if (history.latestSettledTurnAtTurnThrough !== null) validatedIdentifier(history.latestSettledTurnAtTurnThrough, "history latestSettledTurn");
+    if (!Array.isArray(history.publicEventAnchors) || !Array.isArray(history.dispatchStartReceipts) ||
+      !Array.isArray(history.runtimeRevisionDigests)) sessionError("FAILED_PRECONDITION", "history anchors must be arrays");
+    const anchorKeys = new Set<string>();
+    for (const event of history.publicEventAnchors) {
+      const key = JSON.stringify([event.type, "effectId" in event ? event.effectId : event.turnId]);
+      if (event.sequence > publicEventThrough || anchorKeys.has(key)) sessionError("FAILED_PRECONDITION", "invalid or duplicate public event prefix anchor");
+      anchorKeys.add(key);
+    }
+    for (const receipt of history.dispatchStartReceipts) {
+      if (receipt.outcome.kind !== "dispatch_start_claimed" || receipt.committedEventSequence > commandThrough) {
+        sessionError("FAILED_PRECONDITION", "invalid dispatch receipt prefix anchor");
+      }
+    }
+    const revisions = new Set<Digest>();
+    for (const digest of history.runtimeRevisionDigests) {
+      parseDigest(digest, "history runtimeRevisionDigest");
+      if (revisions.has(digest) || !state.terminalTurns.some((turn) => turn.finalCheckpoint.runtimeRevisionDigest === digest)) {
+        sessionError("FAILED_PRECONDITION", "runtime prefix contains unused or duplicate revision evidence");
+      }
+      revisions.add(digest);
+    }
+  }
+  const publicEventsWithAnchors = [...(state.history?.publicEventAnchors ?? []), ...state.publicEvents];
+  const receiptsWithAnchors = [...(state.history?.dispatchStartReceipts ?? []), ...state.commandReceipts];
   const knownTurns = new Set<string>();
   for (const [index, turnId] of state.knownTurnIds.entries()) {
     const validated = validatedIdentifier(turnId, `state.knownTurnIds[${index}]`);
@@ -1148,7 +1273,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
     knownTurns.add(validated);
   }
-  if (state.nextTurnSequence !== state.knownTurnIds.length) {
+  if (state.nextTurnSequence !== turnThrough + state.knownTurnIds.length) {
     sessionError("FAILED_PRECONDITION", "nextTurnSequence does not match admitted turn count");
   }
   const representedTurnIds = new Set<string>();
@@ -1158,7 +1283,6 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       [
         "turnId",
         "sequence",
-        "input",
         "inputDigest",
         "finalCheckpoint",
         "turnLeaseGeneration",
@@ -1166,17 +1290,16 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "abortRequested",
         "abortReason",
         "status",
-        "result",
         "error",
       ],
-      [],
+      ["input", "inputRef", "result", "resultPayloadRef"],
       `state.terminalTurns[${index}]`,
       "FAILED_PRECONDITION",
     );
     if (
       !knownTurns.has(turn.turnId) ||
-      state.knownTurnIds[turn.sequence] !== turn.turnId ||
-      turn.sequence !== index
+      state.knownTurnIds[turn.sequence - turnThrough] !== turn.turnId ||
+      turn.sequence !== index + turnThrough
     ) {
       sessionError("FAILED_PRECONDITION", "terminal turn history is not FIFO admission order");
     }
@@ -1186,15 +1309,9 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     representedTurnIds.add(turn.turnId);
     validatedIdentifier(turn.turnId, `state.terminalTurns[${index}].turnId`);
     validatedInteger(turn.sequence, `state.terminalTurns[${index}].sequence`, 0);
-    validatedNormalizedValue(
-      turn.input,
-      `state.terminalTurns[${index}].input`,
-      SESSION_VALUE_MAX_ENCODED_BYTES,
-      true,
-      "FAILED_PRECONDITION",
-    );
+    assertStoredPayload(turn, "input", "inputRef", `state.terminalTurns[${index}]`);
     parseDigest(turn.inputDigest, `terminal turn ${turn.turnId} inputDigest`);
-    const finalCheckpoint = parseExternalizedAgentCheckpoint(turn.finalCheckpoint);
+    const finalCheckpoint = parseStoredCheckpoint(turn.finalCheckpoint);
     checkpointMatchesSession(state, finalCheckpoint, turn.turnId, false);
     validatedInteger(turn.turnLeaseGeneration, "terminal turn lease generation", 1);
     validatedInteger(turn.leaseExpiresAt, "terminal turn lease expiry", 1);
@@ -1214,19 +1331,21 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "terminal engine checkpoint must be engine kind");
     }
     if (turn.status === "completed") {
-      validatedNormalizedValue(
-        turn.result,
-        `state.terminalTurns[${index}].result`,
-        SESSION_VALUE_MAX_ENCODED_BYTES,
-        true,
-        "FAILED_PRECONDITION",
-      );
+      assertStoredPayload(turn, "result", "resultPayloadRef", `state.terminalTurns[${index}]`);
       if (turn.error !== null) {
         sessionError("FAILED_PRECONDITION", "completed turn retained a terminal error");
       }
     } else if (turn.status === "failed") {
-      parseAgentError(turn.error, `state.terminalTurns[${index}].error`);
-      if (turn.error.details !== undefined) {
+      const errorRecord = validatedExactFields(
+        turn.error, ["code", "message", "retryable"], ["details", "detailsRef"],
+        `state.terminalTurns[${index}].error`, "FAILED_PRECONDITION",
+      );
+      const { detailsRef, ...inlineError } = errorRecord;
+      parseAgentError(inlineError, `state.terminalTurns[${index}].error`);
+      if (Object.hasOwn(errorRecord, "detailsRef")) {
+        if (Object.hasOwn(errorRecord, "details")) sessionError("FAILED_PRECONDITION", "error details and detailsRef are exclusive");
+        validateSessionPayloadRef(detailsRef, `state.terminalTurns[${index}].error.detailsRef`);
+      } else if (turn.error.details !== undefined) {
         validatedNormalizedValue(
           turn.error.details,
           `state.terminalTurns[${index}].error.details`,
@@ -1235,7 +1354,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
           "FAILED_PRECONDITION",
         );
       }
-      if (turn.result !== null) {
+      if (turn.result !== null || Object.hasOwn(turn, "resultPayloadRef")) {
         sessionError("FAILED_PRECONDITION", "failed turn retained a terminal result");
       }
     } else if (turn.status === "aborted") {
@@ -1243,6 +1362,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         !turn.abortRequested ||
         turn.abortReason === null ||
         turn.result !== null ||
+        Object.hasOwn(turn, "resultPayloadRef") ||
         turn.error !== null
       ) {
         sessionError("FAILED_PRECONDITION", "aborted turn terminal fields disagree");
@@ -1251,7 +1371,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "unknown terminal turn status");
     }
   }
-  const latestTerminal = state.terminalTurns.at(-1)?.turnId ?? null;
+  const latestTerminal = state.terminalTurns.at(-1)?.turnId ?? state.history?.latestSettledTurnAtTurnThrough ?? null;
   if (state.latestSettledTurn !== latestTerminal) {
     sessionError("FAILED_PRECONDITION", "latestSettledTurn does not match terminal history");
   }
@@ -1267,14 +1387,12 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "turnId",
         "sequence",
         "status",
-        "input",
         "inputDigest",
         "checkpoint",
-        "checkpointChainDigest",
         "turnLeaseGeneration",
         "leaseExpiresAt",
       ],
-      [],
+      ["input", "inputRef", "checkpointChainDigest"],
       `state.queuedTurns[${index}]`,
       "FAILED_PRECONDITION",
     );
@@ -1293,23 +1411,19 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     if (turn.sequence <= previousSequence) {
       sessionError("FAILED_PRECONDITION", "queued turn sequence is not strict FIFO");
     }
-    if (state.knownTurnIds[turn.sequence] !== turn.turnId) {
+    if (state.knownTurnIds[turn.sequence - turnThrough] !== turn.turnId) {
       sessionError("FAILED_PRECONDITION", "queued turn sequence does not match admission order");
     }
     previousSequence = turn.sequence;
-    const checkpoint = parseExternalizedAgentCheckpoint(turn.checkpoint);
-    parseDigest(turn.checkpointChainDigest, `queued turn ${turn.turnId} checkpointChainDigest`);
+    const checkpoint = parseStoredCheckpoint(turn.checkpoint);
+    if (!("payloadBytes" in checkpoint) || turn.checkpointChainDigest !== undefined) {
+      parseDigest(turn.checkpointChainDigest, `queued turn ${turn.turnId} checkpointChainDigest`);
+    }
     checkpointMatchesSession(state, checkpoint, turn.turnId);
     if (checkpoint.kind !== "genesis" || checkpoint.checkpointSequence !== 0) {
       sessionError("FAILED_PRECONDITION", "a queued turn must retain its genesis checkpoint");
     }
-    validatedNormalizedValue(
-      turn.input,
-      `state.queuedTurns[${index}].input`,
-      SESSION_VALUE_MAX_ENCODED_BYTES,
-      true,
-      "FAILED_PRECONDITION",
-    );
+    assertStoredPayload(turn, "input", "inputRef", `state.queuedTurns[${index}]`);
     parseDigest(turn.inputDigest, `queued turn ${turn.turnId} inputDigest`);
     validatedInteger(turn.turnLeaseGeneration, "queued turn lease generation", 1);
     validatedInteger(turn.leaseExpiresAt, "queued turn lease expiry", 1);
@@ -1330,17 +1444,15 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "turnId",
         "sequence",
         "status",
-        "input",
         "inputDigest",
         "checkpoint",
-        "checkpointChainDigest",
         "turnLeaseGeneration",
         "leaseExpiresAt",
         "abortRequested",
         "abortReason",
         "activeEffectId",
       ],
-      [],
+      ["input", "inputRef", "checkpointChainDigest"],
       "state.activeTurn",
       "FAILED_PRECONDITION",
     );
@@ -1359,10 +1471,10 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     representedTurnIds.add(active.turnId);
     validatedIdentifier(active.turnId, "state.activeTurn.turnId");
     validatedInteger(active.sequence, "state.activeTurn.sequence", 0);
-    if (state.knownTurnIds[active.sequence] !== active.turnId) {
+    if (state.knownTurnIds[active.sequence - turnThrough] !== active.turnId) {
       sessionError("FAILED_PRECONDITION", "active turn sequence does not match admission order");
     }
-    if (active.sequence !== state.terminalTurns.length) {
+    if (active.sequence !== turnThrough + state.terminalTurns.length) {
       sessionError("FAILED_PRECONDITION", "active turn does not follow terminal history");
     }
     if (
@@ -1371,16 +1483,12 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     ) {
       sessionError("FAILED_PRECONDITION", "active turn is not the FIFO head");
     }
-    const checkpoint = parseExternalizedAgentCheckpoint(active.checkpoint);
-    parseDigest(active.checkpointChainDigest, `active turn ${active.turnId} checkpointChainDigest`);
+    const checkpoint = parseStoredCheckpoint(active.checkpoint);
+    if (!("payloadBytes" in checkpoint) || active.checkpointChainDigest !== undefined) {
+      parseDigest(active.checkpointChainDigest, `active turn ${active.turnId} checkpointChainDigest`);
+    }
     checkpointMatchesSession(state, checkpoint, active.turnId);
-    validatedNormalizedValue(
-      active.input,
-      "state.activeTurn.input",
-      SESSION_VALUE_MAX_ENCODED_BYTES,
-      true,
-      "FAILED_PRECONDITION",
-    );
+    assertStoredPayload(active, "input", "inputRef", "state.activeTurn");
     parseDigest(active.inputDigest, `active turn ${active.turnId} inputDigest`);
     if (state.status !== "running") {
       sessionError("FAILED_PRECONDITION", "an active turn requires running session status");
@@ -1437,14 +1545,13 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
         "phase",
         "dispatchAttempt",
         "lastDispatch",
-        "requestPayload",
         "externalCommitId",
         "resultRef",
         "settlement",
         "consumedAtCheckpointSequence",
         "consumedByAbort",
       ],
-      ["parentOperationId", "ordinal"],
+      ["parentOperationId", "ordinal", "requestPayload", "requestPayloadRef"],
       `state.effects[${index}]`,
       "FAILED_PRECONDITION",
     );
@@ -1487,13 +1594,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     ) {
       sessionError("FAILED_PRECONDITION", "effect authority identity does not match the session");
     }
-    validatedNormalizedValue(
-      effect.requestPayload,
-      `state.effects[${index}].requestPayload`,
-      SESSION_VALUE_MAX_ENCODED_BYTES,
-      true,
-      "FAILED_PRECONDITION",
-    );
+    assertStoredPayload(effect, "requestPayload", "requestPayloadRef", `state.effects[${index}]`);
     validatedInteger(effect.dispatchAttempt, `effect ${effect.effectId} dispatchAttempt`, 0);
     if ((effect.dispatchAttempt === 0) !== (effect.lastDispatch === null)) {
       sessionError("FAILED_PRECONDITION", "dispatch attempt and durable dispatch metadata disagree");
@@ -1626,13 +1727,9 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
     const hasExternalCommitId = effect.externalCommitId !== null;
     const hasResultRef = effect.resultRef !== null;
-    if (hasExternalCommitId !== hasResultRef) {
-      sessionError("FAILED_PRECONDITION", "external commit proof fields must appear together");
-    }
-    if (hasExternalCommitId && hasResultRef) {
-      validatedIdentifier(effect.externalCommitId, "effect externalCommitId");
-      validatedIdentifier(effect.resultRef, "effect resultRef");
-    }
+    if (hasResultRef && !hasExternalCommitId) sessionError("FAILED_PRECONDITION", "result reference lacks an external commit identity");
+    if (hasExternalCommitId) validatedIdentifier(effect.externalCommitId, "effect externalCommitId");
+    if (hasResultRef) validatedIdentifier(effect.resultRef, "effect resultRef");
     if (effect.phase === "externally_committed" && !hasExternalCommitId) {
       sessionError("FAILED_PRECONDITION", "externally committed effect lacks external commit proof");
     }
@@ -1715,7 +1812,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
   }
 
-  if (state.publicEvents.length !== state.publicEventSequence) {
+  if (state.publicEvents.length !== state.publicEventSequence - publicEventThrough) {
     sessionError(
       "FAILED_PRECONDITION",
       "publicEventSequence does not match the public event journal",
@@ -1739,20 +1836,22 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   const settledEffectIds = new Set<string>();
   const terminalEventTurnIds = new Set<string>();
   const turnsWithEarlierEvents = new Set<string>();
-  for (let index = 0; index < state.publicEventSequence; index += 1) {
-    const event = state.publicEvents[index];
+  let previousPublicSequence = 0;
+  for (const [index, event] of publicEventsWithAnchors.entries()) {
     if (event === undefined) {
       sessionError("FAILED_PRECONDITION", "public event journal has a gap");
     }
     const eventField = `state.publicEvents[${index}]`;
     validatedInteger(event.sequence, `${eventField}.sequence`, 1);
-    if (event.sequence !== index + 1) {
+    if (event.sequence <= previousPublicSequence || (event.sequence > publicEventThrough &&
+      event.sequence !== publicEventThrough + index - (state.history?.publicEventAnchors.length ?? 0) + 1)) {
       sessionError("FAILED_PRECONDITION", "public event journal is not gap-free");
     }
+    previousPublicSequence = event.sequence;
     validatedIdentifier(event.turnId, `${eventField}.turnId`);
     validatedInteger(event.turnSequence, `${eventField}.turnSequence`, 0);
     if (
-      state.knownTurnIds[event.turnSequence] !== event.turnId ||
+      state.knownTurnIds[event.turnSequence - turnThrough] !== event.turnId ||
       terminalEventTurnIds.has(event.turnId)
     ) {
       sessionError("FAILED_PRECONDITION", "public event turn identity or order is inconsistent");
@@ -1835,7 +1934,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
           preparedEffectIds.add(effect.effectId);
         } else if (event.type === "tool.externally_committed") {
           validatedIdentifier(event.externalCommitId, `${eventField}.externalCommitId`);
-          validatedIdentifier(event.resultRef, `${eventField}.resultRef`);
+          if (event.resultRef !== null) validatedIdentifier(event.resultRef, `${eventField}.resultRef`);
           if (
             effect.service === "model" ||
             effect.externalCommitId !== event.externalCommitId ||
@@ -1957,7 +2056,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
       sessionError("FAILED_PRECONDITION", "duplicate public idempotency key receipt");
     }
     idempotencyKeyDigests.add(idempotencyKeyDigest);
-    const event = state.publicEvents[receipt.publicEventSequence - 1];
+    const event = publicEventsWithAnchors.find((candidate) => candidate.sequence === receipt.publicEventSequence);
     if (
       event === undefined ||
       event.type !== "turn.accepted" ||
@@ -1975,7 +2074,7 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
   }
   if (
     admissionEventSequences.size !== publicTurnIds.size ||
-    state.publicEvents.some(
+    publicEventsWithAnchors.some(
       (event) =>
         event.type === "turn.accepted" && !admissionEventSequences.has(event.sequence),
     )
@@ -1985,10 +2084,10 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
 
   const commandIds = new Set<string>();
   const dispatchStartReceiptEffectIds = new Set<string>();
-  if (state.commandReceipts.length !== state.eventSequence) {
+  if (state.commandReceipts.length !== state.eventSequence - commandThrough) {
     sessionError("FAILED_PRECONDITION", "eventSequence does not match command receipt count");
   }
-  for (const [index, receipt] of state.commandReceipts.entries()) {
+  for (const [index, receipt] of receiptsWithAnchors.entries()) {
     validatedExactFields(
       receipt,
       ["commandId", "commandDigest", "committedEventSequence", "outcome"],
@@ -2003,7 +2102,8 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     validatedIdentifier(receipt.commandId, "receipt.commandId");
     parseDigest(receipt.commandDigest, "receipt.commandDigest");
     validatedInteger(receipt.committedEventSequence, "receipt event sequence", 1);
-    if (receipt.committedEventSequence !== index + 1) {
+    if (receipt.committedEventSequence > commandThrough &&
+      receipt.committedEventSequence !== commandThrough + index - (state.history?.dispatchStartReceipts.length ?? 0) + 1) {
       sessionError("FAILED_PRECONDITION", "command receipts are not in eventSequence order");
     }
     assertSessionCommandOutcome(
@@ -2073,11 +2173,13 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
     }
   }
 
-  let receiptActiveRevision: typeof activeRevision | null = null;
-  let receiptCandidateRevision: typeof activeRevision | null = null;
-  let receiptPreviousRevision: typeof activeRevision | null = null;
-  let receiptSwitchGeneration = 1;
-  const activatedRuntimeRevisions = new Set<typeof activeRevision>();
+  const runtimeAnchor = state.history?.runtimePointerAtCommandThrough;
+  let receiptActiveRevision: typeof activeRevision | null = runtimeAnchor?.activeRevision ?? null;
+  let receiptCandidateRevision: typeof activeRevision | null = runtimeAnchor?.candidateRevision ?? null;
+  let receiptPreviousRevision: typeof activeRevision | null = runtimeAnchor?.previousRevision ?? null;
+  let receiptSwitchGeneration = runtimeAnchor?.switchGeneration ?? 1;
+  const activatedRuntimeRevisions = new Set<typeof activeRevision>(state.history?.runtimeRevisionDigests ?? []);
+  if (runtimeAnchor !== undefined) activatedRuntimeRevisions.add(runtimeAnchor.activeRevision);
   for (const receipt of state.commandReceipts) {
     const receiptOutcome = receipt.outcome;
     switch (receiptOutcome.kind) {
@@ -2182,24 +2284,24 @@ export function assertSessionInvariants(state: SessionAggregateState): void {
 
 export async function validateSessionState(state: SessionAggregateState): Promise<void> {
   assertSessionInvariants(state);
-  // Stored checkpoints are externalized (parsed structurally above); their payload
-  // bytes live in the host blob store, so no payload digest re-check happens here.
-  if (state.activeTurn !== null) {
-    if ((await turnInputDigest(state.activeTurn.input)) !== state.activeTurn.inputDigest) {
-      sessionError("DIGEST_MISMATCH", "active turn inputDigest does not bind its input");
+  // Inline legacy values still bind their original semantic digests. Externalized
+  // values were checked at ingestion; the host verifies their content-addressed
+  // bytes on writes/reads without hydrating every historical payload here.
+  const turns = [...state.queuedTurns, ...state.terminalTurns, ...(state.activeTurn === null ? [] : [state.activeTurn])];
+  for (const turn of turns) {
+    if (turn.inputRef === undefined && await turnInputDigest(turn.input) !== turn.inputDigest) {
+      sessionError("DIGEST_MISMATCH", `turn ${turn.turnId} inputDigest is invalid`);
     }
-  }
-  for (const turn of state.queuedTurns) {
-    if ((await turnInputDigest(turn.input)) !== turn.inputDigest) {
-      sessionError("DIGEST_MISMATCH", `queued turn ${turn.turnId} inputDigest is invalid`);
-    }
-  }
-  for (const turn of state.terminalTurns) {
-    if ((await turnInputDigest(turn.input)) !== turn.inputDigest) {
-      sessionError("DIGEST_MISMATCH", `terminal turn ${turn.turnId} inputDigest is invalid`);
+    const checkpoint = "checkpoint" in turn ? turn.checkpoint : turn.finalCheckpoint;
+    if ("payloadBytes" in checkpoint) {
+      await validateAgentCheckpoint(checkpoint);
+      if ("checkpointChainDigest" in turn && turn.checkpointChainDigest !== undefined && await validatedCheckpointDigest(checkpoint) !== turn.checkpointChainDigest) {
+        sessionError("DIGEST_MISMATCH", `turn ${turn.turnId} checkpoint chain digest is invalid`);
+      }
     }
   }
   for (const effect of state.effects) {
+    if (effect.requestPayloadRef !== undefined) continue;
     const requestDigest = await effectRequestDigest({
       service: effect.service,
       operation: effect.operation,
@@ -2219,6 +2321,7 @@ export function replaySessionPublicEvents(
   state: SessionAggregateState,
   afterSequenceInput: unknown,
   limitInput: unknown,
+  archivedEvents: readonly SessionPublicEvent[] = [],
 ): SessionPublicEventReplay {
   assertSessionInvariants(state);
   const afterSequence = validatedInteger(afterSequenceInput, "afterSequence", 0);
@@ -2239,6 +2342,13 @@ export function replaySessionPublicEvents(
     )
       ? state.activeTurn
       : null;
+  const through = state.history?.publicEventThrough ?? 0;
+  const archivedCount = Math.min(limit, Math.max(0, through - afterSequence));
+  if (archivedEvents.length !== archivedCount || archivedEvents.some((event, index) =>
+    event.sequence !== afterSequence + index + 1 || event.sequence > through)) {
+    sessionError("FAILED_PRECONDITION", "public replay requires its authenticated contiguous archive page");
+  }
+  const hotStart = Math.max(0, afterSequence - through);
   return {
     snapshot: {
       sessionId: state.sessionId,
@@ -2247,17 +2357,55 @@ export function replaySessionPublicEvents(
       lastEventSequence: state.publicEventSequence,
     },
     events: structuredClone(
-      state.publicEvents.slice(afterSequence, afterSequence + limit),
+      [...archivedEvents, ...state.publicEvents.slice(hotStart, hotStart + limit - archivedCount)],
     ),
   };
 }
 
-export async function applySessionCommand(
+// A null authenticated lookup proves absence. Missing evidence must never be
+// treated as a reusable identifier once any history has left the hot state.
+function historyWitness<T>(
   state: SessionAggregateState,
-  command: SessionCommand,
-  context?: { readonly transactionTime: number },
+  entry: object | undefined,
+  keyField: string,
+  expectedKey: string | number,
+  valueField: string,
+): T | undefined {
+  if (entry === undefined) {
+    if (state.history !== undefined) {
+      sessionError("FAILED_PRECONDITION", `missing authenticated history lookup for ${keyField}`);
+    }
+    return undefined;
+  }
+  const record = entry as Record<string, unknown>;
+  if (record[keyField] !== expectedKey || !Object.hasOwn(record, valueField)) {
+    sessionError("FAILED_PRECONDITION", `history lookup is not bound to ${keyField}`);
+  }
+  const value = record[valueField];
+  return value === null ? undefined : value as T;
+}
+
+export async function applySessionCommand(
+  state: SessionAggregateState, command: SessionCommand, context?: SessionApplyContext,
+): Promise<ApplySessionCommandResult> {
+  if (command?.kind === "broker_operation") {
+    return applySessionBrokerCommand(state, command, context,
+      (inner, finalize) => applySessionCoreCommand(state, inner, context, finalize));
+  }
+  return applySessionCoreCommand(state, command, context);
+}
+
+async function applySessionCoreCommand(
+  state: SessionAggregateState,
+  command: Exclude<SessionCommand, { kind: "broker_operation" }>,
+  context?: SessionApplyContext,
+  brokerFinalize?: Parameters<SessionBrokerCoreApply>[1],
 ): Promise<ApplySessionCommandResult> {
   await validateSessionState(state);
+  if (brokerFinalize === undefined && state.broker !== undefined &&
+    (command.kind === "commit_engine_step" || "effectId" in command)) {
+    sessionError("FAILED_PRECONDITION", "broker-owned Session boundaries require a persisted broker proof");
+  }
   validatedIdentifier(command.commandId, "commandId");
   validatedInteger(command.expectedEventSequence, "expectedEventSequence", 0);
 
@@ -2515,18 +2663,11 @@ export async function applySessionCommand(
     const admission = validatedExactFields(
       command.publicAdmission,
       ["authorizationGeneration", "idempotencyKeyDigest", "requestDigest"],
-      [],
+      ["tenantId", "actorSubjectId"],
       "publicAdmission",
       "INVALID_ARGUMENT",
     );
-    const authorizationGeneration = validatedInteger(
-      admission.authorizationGeneration,
-      "publicAdmission.authorizationGeneration",
-      0,
-    );
-    if (authorizationGeneration !== state.authorizationGeneration) {
-      sessionError("STALE_GENERATION", "public turn admission authority is stale");
-    }
+    validatePublicAdmissionAuthority(state, command);
     const input = validatedNormalizedValue(
       command.input,
       "input",
@@ -2553,7 +2694,11 @@ export async function applySessionCommand(
     const idempotencyKeyDigest = validatedPublicAdmission.idempotencyKeyDigest;
     const admissionReceipt = state.turnAdmissionReceipts.find(
       (receipt) => receipt.idempotencyKeyDigest === idempotencyKeyDigest,
-    );
+    ) ?? historyWitness<TurnAdmissionReceipt>(state, context?.history?.admission,
+      "idempotencyKeyDigest", idempotencyKeyDigest, "receipt");
+    if (admissionReceipt !== undefined && admissionReceipt.idempotencyKeyDigest !== idempotencyKeyDigest) {
+      sessionError("FAILED_PRECONDITION", "archived admission receipt has a different key");
+    }
     if (admissionReceipt !== undefined) {
       if (
         admissionReceipt.requestDigest !== validatedPublicAdmission.requestDigest ||
@@ -2580,8 +2725,11 @@ export async function applySessionCommand(
 
   const existingReceipt = state.commandReceipts.find(
     (receipt) => receipt.commandId === command.commandId,
-  );
+  ) ?? historyWitness<CommandReceipt>(state, context?.history?.command,
+    "commandId", command.commandId, "receipt");
   if (existingReceipt !== undefined) {
+    if (existingReceipt.commandId !== command.commandId) sessionError("FAILED_PRECONDITION", "archived command receipt has a different identity");
+    assertSessionCommandOutcome(existingReceipt.outcome, "archived command outcome", "FAILED_PRECONDITION");
     if (existingReceipt.commandDigest !== commandDigest) {
       sessionError(
         "IDEMPOTENCY_CONFLICT",
@@ -2590,7 +2738,8 @@ export async function applySessionCommand(
     }
     const receiptOutcome = existingReceipt.outcome;
     if (receiptOutcome.kind === "dispatch_start_claimed") {
-      const effect = effectById(state, receiptOutcome.effectId);
+      const effect = effectById(state, receiptOutcome.effectId) ?? historyWitness<SessionEffect>(
+        state, context?.history?.effect, "effectId", receiptOutcome.effectId, "record");
       const start = effect?.lastDispatch?.start;
       const dispatch = parseDispatchPermitClaims(
         receiptOutcome.startPermit.dispatchPermitClaims,
@@ -2894,8 +3043,8 @@ export async function applySessionCommand(
     }
   }
 
-  const next = structuredClone(state);
-  let outcome: SessionCommandOutcome;
+  let next = structuredClone(state);
+  let outcome: StoredSessionCommandOutcome;
   let turnPromotionTime: number | null = null;
   // Payload bytes this command externalized, keyed by blob digest; the tail hands
   // the newly referenced ones to the host as blobs.
@@ -2923,7 +3072,10 @@ export async function applySessionCommand(
         );
       }
       const turnId = validatedIdentifier(command.turnId, "turnId");
-      if (next.knownTurnIds.includes(turnId)) {
+      const archivedTurn = next.knownTurnIds.includes(turnId) ? undefined
+        : historyWitness<SessionTurnIdentity>(state, context?.history?.turn, "turnId", turnId, "record");
+      if (archivedTurn !== undefined && archivedTurn.turnId !== turnId) sessionError("FAILED_PRECONDITION", "archived turn lookup has a different identity");
+      if (next.knownTurnIds.includes(turnId) || archivedTurn !== undefined) {
         sessionError("ALREADY_EXISTS", `turn ${turnId} already exists`);
       }
       const transactionTime = validatedInteger(
@@ -2985,7 +3137,7 @@ export async function applySessionCommand(
         turnId,
         sequence: next.nextTurnSequence,
         status: "queued" as const,
-        input,
+        inputRef: await storeSessionPayload(input, ingestedPayloads),
         inputDigest,
         checkpoint: genesis.checkpoint,
         checkpointChainDigest: await validatedCheckpointDigest(checkpoint),
@@ -3031,28 +3183,7 @@ export async function applySessionCommand(
         };
         next.turnAdmissionReceipts.push(admissionReceipt);
       }
-      // Reject before acceptance if admitting this turn would leave no durable room
-      // to persist its completion. Terminal records (result/error, final checkpoint,
-      // receipt, public event) accumulate in the bounded state, so without a
-      // reservation a turn could be accepted and then fail to store its result once
-      // enough prior results have accumulated (review F01, the observed defect).
-      // Reserve headroom for one worst-case completion beyond the projected state and
-      // convert the failure into a contractual pre-admission rejection that reports
-      // the durable size and reserved budget. This is the interim admission guard;
-      // paged history and externalized payloads remain the long-term layout, so a
-      // long-lived session can still legitimately exhaust its bounded history here.
-      const projectedStateBytes = sessionStateEncodedSize(next);
-      if (
-        projectedStateBytes + SESSION_TURN_COMPLETION_RESERVE_BYTES >
-        SESSION_STATE_MAX_ENCODED_BYTES
-      ) {
-        sessionError(
-          "FAILED_PRECONDITION",
-          `turn admission would leave no room to persist its completion: ` +
-            `${projectedStateBytes} durable bytes plus a ${SESSION_TURN_COMPLETION_RESERVE_BYTES}-byte ` +
-            `completion reservation exceeds the ${SESSION_STATE_MAX_ENCODED_BYTES}-byte limit`,
-        );
-      }
+      // Capacity is checked on the final candidate, after all events and receipts.
       break;
     }
 
@@ -3126,7 +3257,8 @@ export async function applySessionCommand(
       }
       // The predecessor chain digest was computed over its wire form at ingestion
       // and stored; the externalized checkpoint cannot be re-digested.
-      if (step.checkpoint.predecessorDigest !== active.checkpointChainDigest) {
+      const predecessorDigest = active.checkpointChainDigest ?? await validatedCheckpointDigest(active.checkpoint as AgentCheckpoint);
+      if (step.checkpoint.predecessorDigest !== predecessorDigest) {
         sessionError(
           "DIGEST_MISMATCH",
           "checkpoint predecessorDigest does not match durable state",
@@ -3196,11 +3328,17 @@ export async function applySessionCommand(
             "requestDigest does not bind the normalized effect intent",
           );
         }
-        if (
-          next.effects.some(
-            (effect) => effect.effectId === effectId || effect.invocationId === invocationId,
-          )
-        ) {
+        const hotEffect = next.effects.some((effect) => effect.effectId === effectId);
+        const hotInvocation = next.effects.some((effect) => effect.invocationId === invocationId);
+        const archivedEffect = hotEffect ? undefined : historyWitness<SessionEffect>(
+          state, context?.history?.effect, "effectId", effectId, "record");
+        const archivedInvocation = hotInvocation ? undefined : historyWitness<SessionInvocationIdentity>(
+          state, context?.history?.invocation, "invocationId", invocationId, "record");
+        if ((archivedEffect !== undefined && archivedEffect.effectId !== effectId) ||
+          (archivedInvocation !== undefined && archivedInvocation.invocationId !== invocationId)) {
+          sessionError("FAILED_PRECONDITION", "archived effect lookup has a different identity");
+        }
+        if (hotEffect || hotInvocation || archivedEffect !== undefined || archivedInvocation !== undefined) {
           sessionError("ALREADY_EXISTS", "effectId or invocationId was already used");
         }
         const claimSource = {
@@ -3227,7 +3365,7 @@ export async function applySessionCommand(
           phase: "prepared",
           dispatchAttempt: 0,
           lastDispatch: null,
-          requestPayload: structuredClone(step.request.payload),
+          requestPayloadRef: await storeSessionPayload(step.request.payload, ingestedPayloads),
           externalCommitId: null,
           resultRef: null,
           settlement: null,
@@ -3257,7 +3395,7 @@ export async function applySessionCommand(
         const terminalTurnBase = {
           turnId: active.turnId,
           sequence: active.sequence,
-          input: structuredClone(active.input),
+          ...storedInput(active),
           inputDigest: active.inputDigest,
           finalCheckpoint: committed.checkpoint,
           turnLeaseGeneration: active.turnLeaseGeneration,
@@ -3269,7 +3407,7 @@ export async function applySessionCommand(
           next.terminalTurns.push({
             ...terminalTurnBase,
             status: "completed",
-            result: structuredClone(step.result),
+            resultPayloadRef: await storeSessionPayload(step.result, ingestedPayloads),
             error: null,
           });
         } else {
@@ -3277,7 +3415,12 @@ export async function applySessionCommand(
             ...terminalTurnBase,
             status: "failed",
             result: null,
-            error: structuredClone(step.error),
+            error: step.error.details === undefined
+              ? structuredClone(step.error)
+              : {
+                code: step.error.code, message: step.error.message, retryable: step.error.retryable,
+                detailsRef: await storeSessionPayload(step.error.details, ingestedPayloads),
+              },
           });
         }
         next.latestSettledTurn = active.turnId;
@@ -3455,7 +3598,12 @@ export async function applySessionCommand(
         }
         throw error;
       }
-      const issuingReceipt = next.commandReceipts[command.expectedEventSequence - 1];
+      const issuingReceipt = next.commandReceipts.find((receipt) => receipt.committedEventSequence === command.expectedEventSequence)
+        ?? historyWitness<CommandReceipt>(state, context?.history?.issuingReceipt,
+          "eventSequence", command.expectedEventSequence, "receipt");
+      if (issuingReceipt !== undefined && issuingReceipt.committedEventSequence !== command.expectedEventSequence) {
+        sessionError("FAILED_PRECONDITION", "archived issuing receipt has a different sequence");
+      }
       const issuedDispatchPermitClaims =
         issuingReceipt?.outcome.kind === "effect_dispatched"
           ? issuingReceipt.outcome.dispatchPermitClaims
@@ -3583,7 +3731,7 @@ export async function applySessionCommand(
         command.externalCommitId,
         "externalCommitId",
       );
-      effect.resultRef = validatedIdentifier(command.resultRef, "resultRef");
+      effect.resultRef = command.resultRef === null ? null : validatedIdentifier(command.resultRef, "resultRef");
       effect.phase = "externally_committed";
       if (active.status === "needs_confirmation") {
         active.status = "active";
@@ -3685,7 +3833,7 @@ export async function applySessionCommand(
           settlement = {
             kind: "error",
             code: validatedIdentifier(command.settlement.code, "settlement.code"),
-            message: validatedIdentifier(command.settlement.message, "settlement.message"),
+            message: parseAgentError({ code: command.settlement.code, message: command.settlement.message, retryable: command.settlement.retryable }).message,
             retryable: command.settlement.retryable,
           };
           if (typeof settlement.retryable !== "boolean") {
@@ -3703,12 +3851,15 @@ export async function applySessionCommand(
       }
       assertEffectSettlement(settlement, "settlement", "INVALID_ARGUMENT");
       effect.phase = "settled";
-      effect.settlement = settlement;
+      const storedSettlement: StoredEffectSettlement = settlement.kind === "success"
+        ? { kind: "success", resultPayloadRef: await storeSessionPayload(settlement.result, ingestedPayloads) }
+        : settlement;
+      effect.settlement = storedSettlement;
       if (!active.abortRequested) {
         active.status = "active";
         next.status = "running";
       }
-      outcome = { kind: "effect_settled", effectId: effect.effectId, settlement };
+      outcome = { kind: "effect_settled", effectId: effect.effectId, settlement: storedSettlement };
       break;
     }
 
@@ -3970,7 +4121,7 @@ export async function applySessionCommand(
         next.terminalTurns.push({
           turnId: active.turnId,
           sequence: active.sequence,
-          input: structuredClone(active.input),
+          ...storedInput(active),
           inputDigest: active.inputDigest,
           finalCheckpoint: active.checkpoint,
           turnLeaseGeneration: active.turnLeaseGeneration,
@@ -4024,7 +4175,7 @@ export async function applySessionCommand(
       next.terminalTurns.push({
         turnId: active.turnId,
         sequence: active.sequence,
-        input: structuredClone(active.input),
+        ...storedInput(active),
         inputDigest: active.inputDigest,
         finalCheckpoint: active.checkpoint,
         turnLeaseGeneration: active.turnLeaseGeneration,
@@ -4309,7 +4460,7 @@ export async function applySessionCommand(
         next.terminalTurns.push({
           turnId: queued.turnId,
           sequence: queued.sequence,
-          input: structuredClone(queued.input),
+          ...storedInput(queued),
           inputDigest: queued.inputDigest,
           finalCheckpoint: queued.checkpoint,
           turnLeaseGeneration: queued.turnLeaseGeneration,
@@ -4342,8 +4493,9 @@ export async function applySessionCommand(
     if (!publiclyAdmittedTurnIds.has(effect.turnId)) {
       continue;
     }
-    const turnSequence = next.knownTurnIds.indexOf(effect.turnId);
-    if (turnSequence < 0) {
+    const turnIndex = next.knownTurnIds.indexOf(effect.turnId);
+    const turnSequence = turnIndex + (next.history?.turnThrough ?? 0);
+    if (turnIndex < 0) {
       sessionError("FAILED_PRECONDITION", "prepared effect turn is not known");
     }
     appendPublicEvent({
@@ -4367,12 +4519,13 @@ export async function applySessionCommand(
     if (previousEffect === undefined || previousEffect.phase === effect.phase) {
       continue;
     }
-    const turnSequence = next.knownTurnIds.indexOf(effect.turnId);
-    if (turnSequence < 0) {
+    const turnIndex = next.knownTurnIds.indexOf(effect.turnId);
+    const turnSequence = turnIndex + (next.history?.turnThrough ?? 0);
+    if (turnIndex < 0) {
       sessionError("FAILED_PRECONDITION", "transitioned effect turn is not known");
     }
     if (effect.phase === "externally_committed" && effect.service !== "model") {
-      if (effect.externalCommitId === null || effect.resultRef === null) {
+      if (effect.externalCommitId === null) {
         sessionError("FAILED_PRECONDITION", "external commit transition lacks proof");
       }
       appendPublicEvent({
@@ -4449,14 +4602,25 @@ export async function applySessionCommand(
     committedEventSequence: next.eventSequence,
     outcome: structuredClone(outcome),
   });
+  reconcileSessionBrokerState(next);
+  if (brokerFinalize !== undefined) await brokerFinalize(next, outcome, ingestedPayloads);
+  const beforeCompactionReferences = sessionReferencedBlobDigests(next);
+  let archiveDelta: SessionArchiveDelta | undefined;
+  if (context?.history !== undefined) {
+    const compacted = compactSessionHistory(next, context.historyMaxRecords ?? SESSION_HISTORY_MAX_RECORDS);
+    if (Object.values(compacted.archive).some((records) => records.length > 0)) {
+      next = compacted.state;
+      archiveDelta = compacted.archive;
+    }
+  }
   await validateSessionState(next);
-  // Blob side channel: the complete referenced set plus bytes for every digest the
-  // prior state did not already reference (those must have been ingested here;
-  // content-addressing means an already-stored digest needs no bytes).
+  assertSessionCapacity(state, next);
+  // Archive ownership is persisted by the host before hot references are pruned.
+  // Include new payloads even if this same transition moves them into history.
   const referencedBlobs = sessionReferencedBlobDigests(next);
   const previouslyReferenced = new Set(sessionReferencedBlobDigests(state));
   const blobs = new Map<Digest, Uint8Array>();
-  for (const digest of referencedBlobs) {
+  for (const digest of beforeCompactionReferences) {
     if (previouslyReferenced.has(digest)) {
       continue;
     }
@@ -4469,5 +4633,5 @@ export async function applySessionCommand(
     }
     blobs.set(digest, bytes);
   }
-  return { state: next, outcome, commandDigest, replayed: false, blobs, referencedBlobs };
+  return { state: next, outcome, commandDigest, replayed: false, blobs, referencedBlobs, ...(archiveDelta === undefined ? {} : { archiveDelta }) };
 }
