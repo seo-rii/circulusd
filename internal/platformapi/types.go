@@ -6,9 +6,9 @@ package platformapi
 
 import (
 	"context"
-	"errors"
 
 	"github.com/hancomac/circulusd/internal/authority"
+	"github.com/hancomac/circulusd/internal/sessionadmission"
 	"github.com/hancomac/circulusd/internal/sessionevent"
 )
 
@@ -17,14 +17,14 @@ var (
 	ErrInvalidRequest       = sessionevent.ErrInvalidRequest
 	ErrAccessDenied         = sessionevent.ErrAccessDenied
 	ErrSessionNotFound      = sessionevent.ErrSessionNotFound
-	ErrTurnNotFound         = errors.New("platform api: turn not found")
-	ErrIdempotencyConflict  = errors.New("platform api: idempotency conflict")
-	ErrSequenceConflict     = errors.New("platform api: durable event sequence conflict")
+	ErrTurnNotFound         = sessionadmission.ErrTurnNotFound
+	ErrIdempotencyConflict  = sessionadmission.ErrIdempotencyConflict
+	ErrSequenceConflict     = sessionadmission.ErrSequenceConflict
 	ErrInvalidCursor        = sessionevent.ErrInvalidCursor
 	ErrStaleAuthority       = sessionevent.ErrStaleAuthority
-	ErrInvalidTransition    = errors.New("platform api: invalid turn transition")
+	ErrInvalidTransition    = sessionadmission.ErrInvalidTransition
 	ErrRepositoryFailure    = sessionevent.ErrRepositoryFailure
-	ErrRepositoryNotDurable = errors.New("platform api: repository is not crash durable")
+	ErrRepositoryNotDurable = sessionadmission.ErrRepositoryNotDurable
 )
 
 type Operation = sessionevent.Operation
@@ -46,10 +46,7 @@ type EventAuthorizer interface {
 	AuthorizeEvent(context.Context, EventAuthority) error
 }
 
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+type Message = sessionadmission.Message
 
 type TurnStatus = sessionevent.TurnStatus
 
@@ -62,26 +59,9 @@ const (
 	TurnAborted           = sessionevent.TurnAborted
 )
 
-type Turn struct {
-	ID            string
-	TenantID      string
-	SubjectID     string
-	SessionID     string
-	RequestDigest string
-	Status        TurnStatus
-}
-
-type CreateTurnRequest struct {
-	Principal      Principal
-	SessionID      string
-	IdempotencyKey string
-	Messages       []Message
-}
-
-type CreateTurnResult struct {
-	Turn         Turn
-	Deduplicated bool
-}
+type Turn = sessionadmission.Turn
+type CreateTurnRequest = sessionadmission.CreateTurnRequest
+type CreateTurnResult = sessionadmission.CreateTurnResult
 
 type EventType = sessionevent.EventType
 

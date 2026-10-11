@@ -2,7 +2,6 @@ package platformapi
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"unicode/utf8"
@@ -10,6 +9,7 @@ import (
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/idempotency"
 	"github.com/hancomac/circulusd/internal/identity"
+	"github.com/hancomac/circulusd/internal/publicsession"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -323,12 +323,7 @@ func (service *Service) authorizeReplay(ctx context.Context, request ReplayEvent
 }
 
 func validateAuthorizationPermit(permit AuthorizationPermit, request AuthorizationRequest) error {
-	if permit.Operation != request.Operation || permit.Principal != request.Principal ||
-		permit.SessionID != request.SessionID || permit.AuthorizationGeneration == 0 ||
-		permit.AuthorizationGeneration > maximumSharedInteger || permit.Proof == (OpaqueAuthorizationProof{}) {
-		return ErrAccessDenied
-	}
-	return nil
+	return publicsession.ValidateAuthorizationPermit(permit, request)
 }
 
 func (service *Service) validateReplay(replay EventReplay, request ReplayEventsRequest, limit int) error {
@@ -347,28 +342,11 @@ func (service *Service) validateReplay(replay EventReplay, request ReplayEventsR
 }
 
 func repositoryError(ctx context.Context, err error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	for _, known := range []error{
-		ErrAccessDenied, ErrSessionNotFound, ErrTurnNotFound, ErrIdempotencyConflict,
-		ErrSequenceConflict, ErrInvalidCursor, ErrStaleAuthority, ErrInvalidTransition,
-	} {
-		if errors.Is(err, known) {
-			return known
-		}
-	}
-	return ErrRepositoryFailure
+	return publicsession.RepositoryError(ctx, err)
 }
 
 func validatePrincipal(principal Principal) error {
-	if _, err := identity.Parse(identity.Tenant, principal.TenantID); err != nil {
-		return ErrInvalidRequest
-	}
-	if _, err := identity.Parse(identity.Subject, principal.SubjectID); err != nil {
-		return ErrInvalidRequest
-	}
-	return nil
+	return publicsession.ValidatePrincipal(principal)
 }
 
 func validateEventAuthority(authority EventAuthority) error {
