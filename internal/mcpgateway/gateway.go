@@ -51,18 +51,19 @@ type toolKey struct {
 // Gateway is immutable after construction. Its dependencies must be safe for
 // concurrent use; Apply is pure and EffectRepository owns durable CAS.
 type Gateway struct {
-	bounds      Bounds
-	servers     map[serverKey]ServerRegistration
-	tools       map[toolKey]ToolRegistration
-	authority   AuthorityValidator
-	authorizer  ToolAuthorizer
-	credentials CredentialBroker
-	repository  EffectRepository
-	audit       AuditSink
-	providers   map[string]Provider
-	sampling    SamplingBroker
-	elicitation ElicitationBroker
-	roots       RootsProvider
+	bounds        Bounds
+	servers       map[serverKey]ServerRegistration
+	tools         map[toolKey]ToolRegistration
+	authority     AuthorityValidator
+	authorizer    ToolAuthorizer
+	credentials   CredentialBroker
+	repository    EffectRepository
+	audit         AuditSink
+	providers     map[string]Provider
+	sampling      SamplingBroker
+	elicitation   ElicitationBroker
+	roots         RootsProvider
+	nativeFactory *NativeFactory
 }
 
 func NewCredentialHandle(value string) (CredentialHandle, error) {
@@ -83,16 +84,24 @@ func NewGateway(configuration Configuration, dependencies Dependencies) (*Gatewa
 }
 
 func NewProductionGateway(configuration Configuration, production ProductionDependencies) (*Gateway, error) {
-	_ = production
 	if configuration.AllowReferenceMemory {
 		return nil, fmt.Errorf("%w: production gateway cannot enable reference memory", ErrInvalidConfiguration)
 	}
-	// Verified probe wrappers cannot bind their operational methods to the
-	// probed runtime: a wrapper can delegate calls to process-local or split
-	// backends while forwarding ProbeProduction to a genuine endpoint. Until a
-	// sealed factory constructs the actual operational graph, accepting any
-	// graph here would be a confused-deputy durability claim.
-	return nil, fmt.Errorf("%w: sealed MCP production adapter factory is unavailable", ErrStoreUnavailable)
+	factory := production.factory
+	if factory == nil || !equalNativeConfiguration(configuration, factory.configuration) || factory.validateDependencies(production) != nil {
+		return nil, fmt.Errorf("%w: MCP operations require an exact sealed native factory", ErrStoreUnavailable)
+	}
+	providers := make(map[string]Provider, len(factory.providers))
+	for id, provider := range factory.providers {
+		providers[id] = provider
+	}
+	gateway, err := newGateway(configuration, Dependencies{Authority: factory.authority, Authorizer: factory.authorizer,
+		Repository: factory.repository, Audit: factory.audit, Providers: providers}, true)
+	if err != nil {
+		return nil, err
+	}
+	gateway.nativeFactory = factory
+	return gateway, nil
 }
 
 func newGateway(configuration Configuration, dependencies Dependencies, verifiedProduction bool) (*Gateway, error) {

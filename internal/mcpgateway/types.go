@@ -349,6 +349,7 @@ type ProductionDependencies struct {
 	Sampling    dependency.Verified[ProductionSamplingBroker]
 	Elicitation dependency.Verified[ProductionElicitationBroker]
 	Roots       dependency.Verified[ProductionRootsProvider]
+	factory     *NativeFactory
 }
 
 type CallRequest struct {
@@ -594,6 +595,7 @@ type SessionProviderPermit struct {
 	DispatchAttempt uint64
 	start           broker.DispatchStartPermit
 	seal            *struct{}
+	source          *nativeSessionSource
 }
 
 func (permit SessionProviderPermit) Open() (broker.DispatchStartPermit, bool) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +32,7 @@ func TestSessionDispatchPrepareIsPureAndConcurrentStartCallsProviderOnce(t *test
 	starter := mustSessionStarter(t, &gateway, observedLedger, route)
 	call := sessionCall(fixture)
 	dispatch := sessionDispatch(t, fixture, call, route)
+	dispatch.ParentOperation = "sha256:" + strings.Repeat("a", 64)
 
 	commandDigest, err := starter.Prepare(context.Background(), dispatch, fixture.scope.RuntimeRevision, call)
 	if err != nil {
@@ -67,6 +69,12 @@ func TestSessionDispatchPrepareIsPureAndConcurrentStartCallsProviderOnce(t *test
 		if _, opened := forged.Open(); opened {
 			t.Error("mutated Session provider permit opened")
 			return ProviderStartResult{}, errors.New("mutated Session provider permit opened")
+		}
+		changedParent := command.Session
+		changedParent.start.Dispatch.ParentOperation = "sha256:" + strings.Repeat("b", 64)
+		if _, opened := changedParent.Open(); opened {
+			t.Error("Session provider permit opened after its raw Pi parent changed")
+			return ProviderStartResult{}, errors.New("changed Pi parent retained provider authority")
 		}
 		if digest, digestErr := digestCanonicalCall(command.Server.ServerID, command.ToolName, command.InputCanonical); digestErr != nil || broker.Digest(digest) != dispatch.RequestDigest {
 			t.Errorf("prepared command payload was not copied exactly: %x, %v", digest, digestErr)
@@ -272,6 +280,9 @@ func TestSessionProviderProofBindsEveryNonSecretDispatchField(t *testing.T) {
 		{name: "operation", mutate: func(value *broker.DispatchStartPermit) { value.Dispatch.Operation += ".other" }},
 		{name: "parent operation", mutate: func(value *broker.DispatchStartPermit) {
 			value.Dispatch.ParentOperationID = mustID(t, identity.Operation)
+		}},
+		{name: "raw Pi parent operation", mutate: func(value *broker.DispatchStartPermit) {
+			value.Dispatch.ParentOperation = "sha256:" + strings.Repeat("a", 64)
 		}},
 		{name: "ordinal", mutate: func(value *broker.DispatchStartPermit) { value.Dispatch.Ordinal++ }},
 		{name: "replay policy", mutate: func(value *broker.DispatchStartPermit) { value.Dispatch.ReplayPolicy = broker.ReplaySafe }},
@@ -569,7 +580,7 @@ func sessionDispatch(t *testing.T, fixture gatewayFixture, call CallRequest, rou
 		},
 		Opaque: broker.OpaquePermit("dispatch"), TenantID: fixture.scope.TenantID,
 		WorkspaceID: mustID(t, identity.Workspace), UserID: fixture.scope.UserID,
-		Service: broker.ServiceMCP, Operation: call.ToolName, Ordinal: 1,
+		Service: broker.ServiceMCP, Operation: call.ToolName, Ordinal: 0,
 		ReplayPolicy: broker.ReplayPolicy(fixture.tool.ReplayPolicy),
 		Generations: broker.Generations{
 			TurnLease: fixture.scope.Generations.TurnLease, Placement: fixture.scope.Generations.Placement,

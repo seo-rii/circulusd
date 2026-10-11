@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/effectledger"
 	"github.com/hancomac/circulusd/internal/identity"
 )
@@ -27,8 +29,16 @@ const (
 // MCP provider attempt. The subordinate ledger stores immutable command bytes
 // and observations, never the Session bearer or a second retry authority.
 type SessionDispatchStarter struct {
-	gateway     *Gateway
-	ledger      effectledger.Ledger
+	gateway      *Gateway
+	ledger       effectledger.Ledger
+	routeDigest  broker.Digest
+	nativeSource *nativeSessionSource
+}
+
+type nativeSessionSource struct {
+	factory     *NativeFactory
+	ledger      *effectledger.NativeLedger
+	verified    dependency.Verified[*effectledger.NativeLedger]
 	routeDigest broker.Digest
 }
 
@@ -39,6 +49,56 @@ func NewReferenceSessionDispatchStarter(
 	ledger effectledger.Ledger,
 	routeDigest broker.Digest,
 ) (*SessionDispatchStarter, error) {
+	return newSessionDispatchStarter(gateway, ledger, routeDigest)
+}
+
+// NewProductionSessionDispatchStarter requires the exact sealed native MCP
+// graph and a separately qualified concrete native observation ledger. An
+// unavailable provider candidate cannot enable actual Session dispatch.
+func NewProductionSessionDispatchStarter(gateway *Gateway, verified dependency.Verified[*effectledger.NativeLedger], routeDigest broker.Digest) (*SessionDispatchStarter, error) {
+	if gateway == nil || routeDigest == (broker.Digest{}) {
+		return nil, ErrInvalidConfiguration
+	}
+	ledger, descriptor, err := verified.Open()
+	if err != nil || ledger == nil {
+		return nil, ErrStoreUnavailable
+	}
+	if ledger.Service() != broker.ServiceMCP || ledger.RouteDigest() != routeDigest {
+		return nil, ErrAuthorityMismatch
+	}
+	factory := gateway.nativeFactory
+	if factory == nil || gateway.repository != factory.repository || gateway.authority != factory.authority || gateway.authorizer != factory.authorizer || gateway.audit != factory.audit ||
+		!reflect.DeepEqual(descriptor, factory.repository.descriptor) {
+		return nil, ErrStoreUnavailable
+	}
+	groups := append(nativeRepositoryGroups(), dependency.AtomicEffectLifecycle, effectledger.AtomicProviderObservationLedger)
+	if _, err := dependency.RequireAtomicDomain(groups, factory.repository.binding, verified); err != nil {
+		return nil, ErrStoreUnavailable
+	}
+	starter, err := newSessionDispatchStarter(gateway, ledger, routeDigest)
+	if err != nil {
+		return nil, err
+	}
+	if len(gateway.providers) != len(factory.providers) {
+		return nil, ErrStoreUnavailable
+	}
+	available := false
+	for id, provider := range gateway.providers {
+		if provider != factory.providers[id] {
+			return nil, ErrStoreUnavailable
+		}
+		if real, ok := provider.(*nativeHTTPProvider); ok && real.factory == factory && real.transport != nil {
+			available = true
+		}
+	}
+	if !available {
+		return nil, ErrProviderUnavailable
+	}
+	starter.nativeSource = &nativeSessionSource{factory: factory, ledger: ledger, verified: verified, routeDigest: routeDigest}
+	return starter, nil
+}
+
+func newSessionDispatchStarter(gateway *Gateway, ledger effectledger.Ledger, routeDigest broker.Digest) (*SessionDispatchStarter, error) {
 	if gateway == nil || isNilInterface(ledger) || routeDigest == (broker.Digest{}) {
 		return nil, ErrInvalidConfiguration
 	}
@@ -125,6 +185,9 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	sessionPermit, sessionOpened := deriveSessionProviderPermit(claim)
 	if !sessionOpened {
 		return ErrDispatchNotDurable
+	}
+	if starter.nativeSource != nil {
+		sessionPermit.source = starter.nativeSource
 	}
 	claim = broker.ClaimedDispatchStart{}
 	start.Opaque = ""
@@ -268,11 +331,17 @@ func (starter *SessionDispatchStarter) validateClaimedCommand(
 	dispatch := start.Dispatch
 	dispatchBinding := dispatch
 	dispatchBinding.Opaque = ""
+	// Durable NativeLedger snapshots preserve the exact deadline instant in
+	// UTC, without process-local monotonic clock bits. Compare canonical copies
+	// of both complete permits, retaining every other immutable dispatch fact.
+	dispatchBinding.Deadline = dispatchBinding.Deadline.UTC().Round(0)
+	commandDispatch := command.Dispatch
+	commandDispatch.Deadline = commandDispatch.Deadline.UTC().Round(0)
 	reencoded, digest, err := encodeSessionDispatchPayload(
 		payload.runtimeRevision, payload.serverID, payload.toolName, payload.inputCanonical, starter.gateway.bounds,
 	)
 	if err != nil || !bytes.Equal(reencoded, command.Payload) || digest != command.CommandDigest ||
-		start.CommandDigest != digest || command.Dispatch != dispatchBinding {
+		start.CommandDigest != digest || commandDispatch != dispatchBinding {
 		return ErrAuthorityMismatch
 	}
 	if dispatch.Service != broker.ServiceMCP || dispatch.Operation != payload.toolName ||
@@ -531,6 +600,10 @@ func deriveSessionProviderPermit(claim broker.ClaimedDispatchStart) (SessionProv
 
 func sessionProviderProof(start broker.DispatchStartPermit) (Digest, error) {
 	dispatch := start.Dispatch
+	parentText := dispatch.ParentOperation
+	if dispatch.ParentOperationID != (identity.ID{}) {
+		parentText = dispatch.ParentOperationID.String()
+	}
 	proofInput := canonical.Array{
 		"circulusd.hash", int64(1), "mcp.session.provider-start", int64(1),
 		canonical.Map{
@@ -543,7 +616,7 @@ func sessionProviderProof(start broker.DispatchStartPermit) (Digest, error) {
 				"invocation":    dispatch.InvocationID.String(),
 				"requestDigest": canonical.Bytes(dispatch.RequestDigest[:]),
 				"service":       string(dispatch.Service), "operation": dispatch.Operation,
-				"parentOperation": dispatch.ParentOperationID.String(), "ordinal": dispatch.Ordinal,
+				"parentOperation": parentText, "ordinal": dispatch.Ordinal,
 				"replayPolicy": string(dispatch.ReplayPolicy),
 				"generations": canonical.Map{
 					"turnLease": dispatch.Generations.TurnLease, "placement": dispatch.Generations.Placement,
