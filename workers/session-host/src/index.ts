@@ -1,4 +1,13 @@
-import { digestStructuredValue, normalizeStringSet } from "@circulusd/protocol-types";
+import {
+  digestStructuredValue,
+  normalizeStringSet,
+  parseDigest,
+  parseExternalizedAgentCheckpoint,
+  rehydrateAgentCheckpoint,
+  validateAgentCheckpoint,
+  type Digest,
+  type ExternalizedAgentCheckpoint,
+} from "@circulusd/protocol-types";
 
 export type SessionHostErrorCode =
   | "INVALID_RUNTIME"
@@ -6,6 +15,7 @@ export type SessionHostErrorCode =
   | "RUNTIME_TOO_LARGE"
   | "MODULE_DIGEST_MISMATCH"
   | "INVALID_TURN"
+  | "CHECKPOINT_UNAVAILABLE"
   | "INVALID_AGENT_EVENT"
   | "DURABLE_COMMIT_FAILED"
   | "EVENT_BUDGET_EXCEEDED"
@@ -83,6 +93,9 @@ export interface SessionHostLimits {
   // Bounds a conservative canonical binary-size estimate for both turn input
   // and AgentEvent snapshots before any structured clone is allocated.
   readonly maximumEventBytes: number;
+  // Externalized payloads have their own protocol-bounded budget. Hydrating a
+  // large input must not implicitly enlarge the outbound AgentEvent budget.
+  readonly maximumCheckpointPayloadBytes: number;
 }
 
 export type EphemeralAgentEvent = {
@@ -140,10 +153,28 @@ export interface EphemeralEventSink {
   emit(event: EphemeralAgentEvent): Promise<void>;
 }
 
+/** Host-only STATE adapter. It must authorize the read against current Session
+ * state and reject stale authority; absent or superseded blobs return null.
+ * Credentials stay in this port's implementation, never in a Worker definition.
+ */
+export interface CheckpointBlobReader {
+  readBlob(input: {
+    readonly turnId: string;
+    readonly authority: Uint8Array;
+    readonly checkpoint: ExternalizedAgentCheckpoint;
+  }): Promise<{
+    readonly digest: Digest;
+    readonly encodedBytes: number;
+    readonly bytes: Uint8Array;
+  } | null>;
+}
+
 export interface DriveTurnOptions {
   readonly turnId: string;
   readonly authority: Uint8Array;
   readonly checkpoint: unknown;
+  /** Full wire-checkpoint digest retained by the durable Session snapshot. */
+  readonly checkpointChainDigest?: Digest;
   readonly committer: DurableEventCommitter;
   readonly ephemeralSink: EphemeralEventSink;
   readonly maximumEvents: number;
@@ -165,6 +196,7 @@ interface ValidatedDriveTurnOptions {
   readonly turnId: string;
   readonly executionId: string;
   readonly authority: Uint8Array;
+  readonly checkpointChainDigest?: Digest;
   readonly maximumEvents: number;
   readonly commit: (event: DurableAgentEvent) => Promise<void>;
   readonly emit: (event: EphemeralAgentEvent) => Promise<void>;
@@ -176,6 +208,7 @@ const DEFAULT_LIMITS: SessionHostLimits = {
   maximumBundleBytes: 32 << 20,
   maximumAuthorityBytes: 64 << 10,
   maximumEventBytes: 1 << 20,
+  maximumCheckpointPayloadBytes: 4 << 20,
 };
 
 const MAXIMUM_COMPATIBILITY_FLAGS = 256;
@@ -198,13 +231,14 @@ function validatedExactKeys(
   fields: readonly string[],
   field: string,
   code: SessionHostErrorCode,
+  optionalFields: readonly string[] = [],
 ): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new SessionHostError(code, `${field} must be an object`);
   }
   const record = value as Record<string, unknown>;
   for (const key of Reflect.ownKeys(record)) {
-    if (typeof key !== "string" || !fields.includes(key)) {
+    if (typeof key !== "string" || (!fields.includes(key) && !optionalFields.includes(key))) {
       throw new SessionHostError(code, `${field} has unknown field ${String(key)}`);
     }
     const descriptor = Object.getOwnPropertyDescriptor(record, key);
@@ -452,6 +486,7 @@ export class SessionHost {
   readonly #verifier: RuntimeVerifier;
   readonly #bindings: BrokerBindings;
   readonly #limits: SessionHostLimits;
+  readonly #checkpointBlobs: CheckpointBlobReader | undefined;
   readonly #activeTurns = new WeakMap<AgentEngine, Set<string>>();
 
   constructor(config: {
@@ -459,6 +494,7 @@ export class SessionHost {
     readonly verifier: RuntimeVerifier;
     readonly bindings: BrokerBindings;
     readonly limits?: Partial<SessionHostLimits>;
+    readonly checkpointBlobs?: CheckpointBlobReader;
   }) {
     if (config.loader === undefined || config.verifier === undefined || config.bindings === undefined) {
       throw new SessionHostError("INVALID_RUNTIME", "loader, verifier, and bindings are required");
@@ -474,7 +510,10 @@ export class SessionHost {
       !Number.isSafeInteger(limits.maximumAuthorityBytes) ||
       limits.maximumAuthorityBytes <= 0 ||
       !Number.isSafeInteger(limits.maximumEventBytes) ||
-      limits.maximumEventBytes <= 0
+      limits.maximumEventBytes <= 0 ||
+      !Number.isSafeInteger(limits.maximumCheckpointPayloadBytes) ||
+      limits.maximumCheckpointPayloadBytes <= 0 ||
+      limits.maximumCheckpointPayloadBytes > (4 << 20)
     ) {
       throw new SessionHostError("INVALID_RUNTIME", "all SessionHost limits must be positive");
     }
@@ -493,6 +532,10 @@ export class SessionHost {
     }
     this.#bindings = config.bindings;
     this.#limits = limits;
+    if (config.checkpointBlobs !== undefined && typeof config.checkpointBlobs.readBlob !== "function") {
+      throw new SessionHostError("INVALID_RUNTIME", "checkpoint blob reader is invalid");
+    }
+    this.#checkpointBlobs = config.checkpointBlobs;
   }
 
   async load(runtime: RuntimeRevision): Promise<{ readonly workerId: string; readonly worker: object }> {
@@ -821,6 +864,7 @@ export class SessionHost {
       ["turnId", "authority", "checkpoint", "committer", "ephemeralSink", "maximumEvents"],
       "start turn options",
       "INVALID_TURN",
+      ["checkpointChainDigest"],
     );
     const validated = this.#validatedTurnOptions(options);
     const checkpoint = this.#cloneTurnValue(options.checkpoint, "checkpoint");
@@ -830,12 +874,14 @@ export class SessionHost {
     return this.#beginDriving(
       engine,
       validated,
-      () =>
+      async () =>
         engine.startTurn({
           turnId: validated.turnId,
           executionId: validated.executionId,
           authority: validated.authority,
-          checkpoint,
+          checkpoint: Object.hasOwn(checkpoint, "payloadSize") || validated.checkpointChainDigest !== undefined
+            ? await this.#hydrateCheckpoint(checkpoint, validated)
+            : checkpoint,
         }),
     );
   }
@@ -854,6 +900,7 @@ export class SessionHost {
       ],
       "resume turn options",
       "INVALID_TURN",
+      ["checkpointChainDigest"],
     );
     const validated = this.#validatedTurnOptions(options);
     const checkpoint = this.#cloneTurnValue(options.checkpoint, "checkpoint");
@@ -864,12 +911,14 @@ export class SessionHost {
     return this.#beginDriving(
       engine,
       validated,
-      () =>
+      async () =>
         engine.resumeTurn({
           turnId: validated.turnId,
           executionId: validated.executionId,
           authority: validated.authority,
-          checkpoint,
+          checkpoint: Object.hasOwn(checkpoint, "payloadSize") || validated.checkpointChainDigest !== undefined
+            ? await this.#hydrateCheckpoint(checkpoint, validated)
+            : checkpoint,
           settlement,
         }),
     );
@@ -878,7 +927,7 @@ export class SessionHost {
   async #beginDriving(
     engine: AgentEngine,
     options: ValidatedDriveTurnOptions,
-    begin: () => AsyncIterable<AgentEvent>,
+    begin: () => AsyncIterable<AgentEvent> | Promise<AsyncIterable<AgentEvent>>,
   ): Promise<DriveTurnResult> {
     const abortTurn = engine.abortTurn.bind(engine);
     let engineTurns = this.#activeTurns.get(engine);
@@ -892,7 +941,7 @@ export class SessionHost {
     engineTurns.add(options.turnId);
     try {
       try {
-        const events = begin();
+        const events = await begin();
         return await this.#driveEvents(abortTurn, events, options);
       } catch (error) {
         if (error instanceof SessionHostError) throw error;
@@ -914,14 +963,7 @@ export class SessionHost {
     }
   }
 
-  #validatedTurnOptions(options: DriveTurnOptions): {
-    readonly turnId: string;
-    readonly executionId: string;
-    readonly authority: Uint8Array;
-    readonly maximumEvents: number;
-    readonly commit: (event: DurableAgentEvent) => Promise<void>;
-    readonly emit: (event: EphemeralAgentEvent) => Promise<void>;
-  } {
+  #validatedTurnOptions(options: DriveTurnOptions): ValidatedDriveTurnOptions {
     const turnId = validatedIdentifier(options.turnId, "turnId", "INVALID_TURN");
     const committer = options.committer;
     const commit = committer?.commit;
@@ -976,6 +1018,14 @@ export class SessionHost {
       throw new SessionHostError("INVALID_TURN", "turn authority, ports, or event budget is invalid");
     }
     const maximumEvents = options.maximumEvents;
+    let checkpointChainDigest: Digest | undefined;
+    if (Object.hasOwn(options, "checkpointChainDigest")) {
+      try {
+        checkpointChainDigest = parseDigest(options.checkpointChainDigest);
+      } catch (error) {
+        throw new SessionHostError("INVALID_TURN", "checkpoint chain digest is invalid", { cause: error });
+      }
+    }
     const executionEntropy = new Uint8Array(16);
     crypto.getRandomValues(executionEntropy);
     const executionId = `exec_${Array.from(executionEntropy, (value) =>
@@ -985,6 +1035,7 @@ export class SessionHost {
       turnId,
       executionId,
       authority,
+      ...(checkpointChainDigest === undefined ? {} : { checkpointChainDigest }),
       maximumEvents,
       commit: (event) => commit.call(committer, event),
       emit: (event) => emit.call(ephemeralSink, event),
@@ -998,6 +1049,73 @@ export class SessionHost {
       "INVALID_TURN",
       this.#limits.maximumEventBytes,
     );
+  }
+
+  async #hydrateCheckpoint(
+    value: unknown,
+    options: ValidatedDriveTurnOptions,
+  ): Promise<unknown> {
+    try {
+      if (!Object.hasOwn(value as object, "payloadSize")) {
+        const checkpoint = await validateAgentCheckpoint(value);
+        if (
+          await digestStructuredValue("circulusd.session.agent-checkpoint", 1, checkpoint) !==
+            options.checkpointChainDigest
+        ) {
+          throw new Error("checkpoint does not match its durable chain digest");
+        }
+        return checkpoint;
+      }
+      const checkpoint = parseExternalizedAgentCheckpoint(value);
+      if (
+        checkpoint.turnId !== options.turnId ||
+        checkpoint.payloadSize > this.#limits.maximumCheckpointPayloadBytes ||
+        this.#checkpointBlobs === undefined
+      ) {
+        throw new Error("checkpoint identity, payload budget, or blob reader is unavailable");
+      }
+      const result = await this.#checkpointBlobs.readBlob({
+        turnId: options.turnId,
+        authority: new Uint8Array(options.authority),
+        checkpoint: structuredClone(checkpoint),
+      });
+      const blob = validatedExactKeys(
+        result,
+        ["digest", "encodedBytes", "bytes"],
+        "checkpoint blob",
+        "CHECKPOINT_UNAVAILABLE",
+      );
+      if (
+        blob.digest !== checkpoint.payloadDigest ||
+        blob.encodedBytes !== checkpoint.payloadSize ||
+        !(blob.bytes instanceof Uint8Array)
+      ) {
+        throw new Error("checkpoint blob metadata does not match its durable reference");
+      }
+      // The clone helper charges nine framing bytes for a typed array. Account
+      // for that separately so a payload exactly at the configured cap fits.
+      const bytes = validatedStructuredClone(
+        blob.bytes,
+        "checkpoint payload bytes",
+        "CHECKPOINT_UNAVAILABLE",
+        this.#limits.maximumCheckpointPayloadBytes + 9,
+      ) as Uint8Array;
+      const hydrated = await rehydrateAgentCheckpoint(checkpoint, bytes);
+      if (
+        options.checkpointChainDigest !== undefined &&
+        await digestStructuredValue("circulusd.session.agent-checkpoint", 1, hydrated) !==
+          options.checkpointChainDigest
+      ) {
+        throw new Error("checkpoint does not match its durable chain digest");
+      }
+      return hydrated;
+    } catch (error) {
+      throw new SessionHostError(
+        "CHECKPOINT_UNAVAILABLE",
+        "checkpoint payload could not be authorized and verified",
+        { cause: error },
+      );
+    }
   }
 
   async #driveEvents(
