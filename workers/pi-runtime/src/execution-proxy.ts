@@ -58,7 +58,7 @@ async function checkedEvent(input: AgentEvent, predecessor: AgentCheckpoint): Pr
 }
 
 interface IteratorDriver {
-  claim(iterator: ProxyIterator): void;
+  claim(iterator: ProxyIterator): Promise<void>;
   release(iterator: ProxyIterator): void;
   exchange(request: PiExecutionRequest): Promise<PiExecutionReply>;
   validate<T>(work: () => Promise<T>): Promise<T>;
@@ -86,6 +86,8 @@ class ProxyIterator implements AsyncIterableIterator<AgentEvent> {
 
   [Symbol.asyncIterator](): AsyncIterableIterator<AgentEvent> { return this; }
   get executionId(): string { return this.#initial.executionId; }
+  get closing(): Promise<void> | null { return this.#closing; }
+  get closed(): boolean { return this.#closed; }
 
   fail(): void { this.#failed = true; this.#closed = true; }
 
@@ -101,8 +103,9 @@ class ProxyIterator implements AsyncIterableIterator<AgentEvent> {
     this.#pulling = true;
     try {
       if (!this.#claimed) {
-        this.#driver.claim(this);
+        await this.#driver.claim(this);
         this.#claimed = true;
+        if (this.#closed) { this.#driver.release(this); return done(); }
       }
       if (!this.#opened) {
         this.#checkpoint = await this.#driver.validate(() => validateAgentCheckpoint(this.#checkpoint));
@@ -197,9 +200,19 @@ export class PiExecutionProxy implements AgentEngine {
         turnId: value.turnId, executionId: value.executionId, sequence: 0, operation: resume ? "resume" : "start",
         authority: value.authority, checkpoint: value.checkpoint, ...(resume ? { settlement: value.settlement } : {}) }) as OpeningRequest;
       return new ProxyIterator(initial, {
-        claim: (iterator) => {
+        claim: async (iterator) => {
           if (this.#poisoned) throw unavailable();
-          if (this.#active.has(initial.turnId)) throw new PiRuntimeError("STEP_IN_PROGRESS", "turn already has an active Pi execution");
+          const owner = this.#active.get(initial.turnId);
+          if (owner !== undefined) {
+            if (owner.closing === null) throw new PiRuntimeError("STEP_IN_PROGRESS", "turn already has an active Pi execution");
+            // A committed host boundary can finish before its bounded close
+            // exchange. Keep the old owner/capacity fence until that exchange
+            // verifies cleanup, then admit at most one waiting continuation.
+            await owner.closing;
+            if (this.#poisoned) throw unavailable();
+            if (iterator.closed) return;
+            if (this.#active.has(initial.turnId)) throw new PiRuntimeError("STEP_IN_PROGRESS", "turn already has an active Pi execution");
+          }
           if (this.#active.size >= maximumActiveExecutions) throw new PiRuntimeError("STEP_IN_PROGRESS", "Pi execution proxy capacity is exhausted");
           this.#active.set(initial.turnId, iterator);
         },

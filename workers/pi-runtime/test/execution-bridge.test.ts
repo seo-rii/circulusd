@@ -63,13 +63,14 @@ const binding: PiExecutionBinding = { scope: { ...SCOPE }, runtimeRevisionDigest
   // Test-only endpoint identity. This is not the existing genesis entrypoint's
   // signed artifact mapping and must not authorize an execution deployment.
   artifactDigest: `sha256:${"c".repeat(64)}` };
-function bridge(core: "pi" | "delta" | "checkpoint" = "pi") {
+function bridge(core: "pi" | "delta" | "checkpoint" = "pi", beforeClose?: () => Promise<void>) {
   const checkpointFixture = core === "checkpoint" ? remote.createCheckpointFixture(structuredClone(binding)) : null;
   const endpoint = checkpointFixture?.endpoint ?? (core === "delta" ? remote.createDeltaFixtureEndpoint(structuredClone(binding)) :
     remote.createEndpoint(structuredClone(binding), structuredClone(CONFIGURATION)));
   const requests: PiExecutionRequest[] = [];
   const proxy = new PiExecutionProxy({ binding, transport: { async exchange(value) {
     requests.push(structuredClone(value));
+    if (value.operation === "close") await beforeClose?.();
     return structuredClone(await endpoint.exchange(structuredClone(value)));
   } } });
   return { endpoint, requests, proxy, advances: checkpointFixture?.advances };
@@ -112,6 +113,39 @@ function modelMessage(tool: boolean) {
 }
 
 describe("actual bundled Pi execution through primitive pull RPC", () => {
+  it("resumes immediately on one composition while its committed boundary close is pending", async () => {
+    const closeEntered = deferred(), releaseClose = deferred();
+    const fixture = bridge("pi", async () => { closeEntered.resolve(); await releaseClose.promise; });
+    const local = host();
+    try {
+      const first = effect((await local.startTurn(fixture.proxy, options(await genesis()))).boundary);
+      await closeEntered.promise;
+      let resumed = false;
+      const continuation = local.resumeTurn(fixture.proxy, { ...options(first.checkpoint),
+        settlement: settlement(first.request.requestDigest, { version: 1, message: modelMessage(true) }) });
+      void continuation.then(() => { resumed = true; }, () => { resumed = true; });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(resumed).toBe(false);
+      expect(fixture.requests.map((value) => value.operation)).toEqual(["start", "pull", "close"]);
+
+      releaseClose.resolve();
+      const tool = effect((await continuation).boundary);
+      expect(tool.request.service).toBe("external-tool");
+      const nextModel = effect((await local.resumeTurn(fixture.proxy, { ...options(tool.checkpoint),
+        settlement: settlement(tool.request.requestDigest, { version: 1, toolCallId: "execution-echo-call",
+          toolName: "echo", content: [{ type: "text", text: "1.25" }], isError: false,
+          timestamp: 1_700_000_000_002 }) })).boundary);
+      const result = await local.resumeTurn(fixture.proxy, { ...options(nextModel.checkpoint),
+        settlement: settlement(nextModel.request.requestDigest, { version: 1, message: modelMessage(false) }) });
+      expect(result.boundary.type).toBe("turn_complete");
+      expect(parseAgentCheckpoint(result.boundary.checkpoint).checkpointSequence).toBe(4);
+      expect(fixture.requests.filter((value) => value.operation === "resume")).toHaveLength(3);
+    } finally {
+      releaseClose.resolve();
+      await fixture.endpoint.dispose();
+    }
+  });
+
   it("cold-reconstructs model → fractional tool → model → complete using committed checkpoints", async () => {
     const checkpoint = await genesis(), first = bridge(), firstHost = host();
     const firstBoundary = effect((await firstHost.startTurn(first.proxy, options(checkpoint))).boundary);

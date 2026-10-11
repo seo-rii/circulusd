@@ -125,6 +125,114 @@ describe("Pi execution host proxy", () => {
     await first.return?.();
   });
 
+  it("waits for the previous close acknowledgment before opening one same-turn resume", async () => {
+    const source = await fixture();
+    const close = Promise.withResolvers<PiExecutionReply>();
+    const requests: PiExecutionRequest[] = [];
+    const proxy = new PiExecutionProxy({ binding: binding(), transport: { exchange: async (request) => {
+      requests.push(request);
+      return request.operation === "close" && request.executionId === source.context.executionId ? close.promise :
+        reply(request, { type: "assistant_delta", delta: request.executionId });
+    } } });
+    const previous = iterator(proxy, source.context);
+    await previous.next();
+    const closed = previous.return?.();
+    await vi.waitFor(() => expect(requests.at(-1)?.operation).toBe("close"));
+    const current = proxy.resumeTurn({ ...source.context, executionId: "exec_resume",
+      settlement: { requestDigest: "test-raw", outcome: { kind: "success", result: {} } } })[Symbol.asyncIterator]();
+    const pending = current.next();
+    const duplicate = iterator(proxy, { ...source.context, executionId: "exec_duplicate" });
+    const rejected = expect(duplicate.next()).rejects.toMatchObject({ code: "STEP_IN_PROGRESS" });
+    await Promise.resolve();
+    expect(requests.map((request) => request.operation)).toEqual(["start", "pull", "close"]);
+    close.resolve(reply(requests.at(-1)!));
+    await closed;
+    expect((await pending).value).toMatchObject({ delta: "exec_resume" });
+    await rejected;
+    expect(requests.filter((request) => request.operation === "resume")).toHaveLength(1);
+    expect(requests.some((request) => request.executionId === "exec_duplicate")).toBe(false);
+    await current.return?.();
+  });
+
+  it("does not admit a canceled waiter or let it prevent a live continuation", async () => {
+    const source = await fixture();
+    const close = Promise.withResolvers<PiExecutionReply>();
+    const requests: PiExecutionRequest[] = [];
+    const proxy = new PiExecutionProxy({ binding: binding(), transport: { exchange: async (request) => {
+      requests.push(request);
+      return request.operation === "close" && request.executionId === source.context.executionId ? close.promise :
+        reply(request, { type: "assistant_delta", delta: request.executionId });
+    } } });
+    const previous = iterator(proxy, source.context);
+    await previous.next();
+    const closed = previous.return?.();
+    await vi.waitFor(() => expect(requests.at(-1)?.operation).toBe("close"));
+    const canceled = iterator(proxy, { ...source.context, executionId: "exec_canceled" });
+    const discarded = canceled.next();
+    const current = iterator(proxy, { ...source.context, executionId: "exec_continuation" });
+    const pending = current.next();
+    await canceled.return?.();
+    close.resolve(reply(requests.at(-1)!));
+    await closed;
+    expect(await discarded).toEqual({ done: true, value: undefined });
+    expect((await pending).value).toMatchObject({ delta: "exec_continuation" });
+    expect(requests.some((request) => request.executionId === "exec_canceled")).toBe(false);
+    await current.return?.();
+  });
+
+  for (const failure of ["rejection", "mismatched-reply", "timeout"] as const) {
+    it(`forbids queued continuation after an ambiguous close ${failure}`, async () => {
+      const source = await fixture();
+      const close = Promise.withResolvers<PiExecutionReply>();
+      const requests: PiExecutionRequest[] = [];
+      const proxy = new PiExecutionProxy({ binding: binding(), timeoutMs: 1_000, transport: { exchange: async (request) => {
+        requests.push(request);
+        return request.operation === "close" ? close.promise : reply(request, { type: "assistant_delta", delta: "one" });
+      } } });
+      const previous = iterator(proxy, source.context);
+      await previous.next();
+      vi.useFakeTimers();
+      try {
+        const closed = previous.return?.();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(requests.at(-1)?.operation).toBe("close");
+        const current = iterator(proxy, { ...source.context, executionId: "exec_resume" });
+        const failed = expect(current.next()).rejects.toMatchObject({ code: "ENGINE_POISONED" });
+        if (failure === "rejection") close.reject(new Error("private transport failure"));
+        if (failure === "mismatched-reply") close.resolve({ ...reply(requests.at(-1)!), executionId: "exec_other" });
+        await vi.advanceTimersByTimeAsync(failure === "timeout" ? 1_000 : 0);
+        await failed;
+        expect(await closed).toEqual({ done: true, value: undefined });
+        expect(requests.some((request) => request.executionId === "exec_resume")).toBe(false);
+        expect(() => proxy.startTurn(source.context)).toThrow("invalid or unavailable");
+        await vi.advanceTimersByTimeAsync(1_000);
+      } finally { vi.useRealTimers(); }
+    });
+  }
+
+  it("retains resident capacity until the previous close acknowledges cleanup", async () => {
+    const source = await fixture();
+    const close = Promise.withResolvers<PiExecutionReply>();
+    const requests: PiExecutionRequest[] = [];
+    const proxy = new PiExecutionProxy({ binding: binding(), transport: { exchange: async (request) => {
+      requests.push(request);
+      return request.operation === "close" && request.executionId === "exec_capacity_0" ? close.promise :
+        reply(request, { type: "assistant_delta", delta: "one" });
+    } } });
+    const streams = Array.from({ length: 65 }, (_, index) => iterator(proxy, { ...source.context,
+      turnId: `turn_capacity_${index}`, executionId: `exec_capacity_${index}`,
+      checkpoint: { ...source.checkpoint, turnId: `turn_capacity_${index}` } }));
+    await Promise.all(streams.slice(0, 64).map((stream) => stream.next()));
+    const closed = streams[0]!.return?.();
+    await vi.waitFor(() => expect(requests.at(-1)?.operation).toBe("close"));
+    await expect(streams[64]!.next()).rejects.toMatchObject({ code: "STEP_IN_PROGRESS" });
+    expect(requests.filter((request) => request.operation === "start")).toHaveLength(64);
+    close.resolve(reply(requests.at(-1)!));
+    await closed;
+    expect((await streams[64]!.next()).value).toMatchObject({ delta: "one" });
+    await Promise.all(streams.slice(1).map((stream) => stream.return?.()));
+  });
+
   it("closes only the owned execution and ignores stale abort and repeated return after replacement", async () => {
     const source = await fixture();
     const wire = transport([{ type: "assistant_delta", delta: "old" }, { type: "assistant_delta", delta: "new" }]);
