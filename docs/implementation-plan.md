@@ -1,19 +1,27 @@
 # Implementation plan
 
-Status: Unit 10 external resource gate executes green on a provisioned host. The
-cpuMs/isolate-enforcement blocker is resolved by re-scope (2026-09-02): the
-certified resource safety boundary is the kernel-enforced one (cgroup
-`cpu.max`/`memory.max` + pidfd whole-shard kill). The live probe runner is built
-and `TestStockWorkerdResourceQualification` reaches its achievable bar on a
-provisioned WSL2 cgroup-v2 host against the pinned workerd — four required PASS
-(cpu-limit kernel throttle, rss-cold-start, shard-pressure-recycle OOM,
-shard-kill-reconstruction) plus a recorded honest FAIL
-(dynamic-worker-reconstruction) from one bound envelope. `AdmissionReady` stays
-false; the acceptance ledger and `docs/unit10-operator.md` record it without
-promoting §53. Remaining: a production install-profile run (this is a
-development host) and the final acceptance close.
+Status: local checkpoint, numeric wire, Session storage, admission and reference
+composition work has advanced; the complete production graph remains closed.
+The current host passed the pinned stock workerd semantic fixture and now has
+an isolated celld/object-store environment. The measured native fork built and
+served an acknowledged seed. Repeated lease self-fencing was traced to the
+dedicated object store's exhausted metadata volume slots; after a private
+capacity adjustment, native stability and actual crash/owner observations
+passed. Independent issuance, immutable publication and signed live probes
+also passed, completing stage 1 for this machine's measured storage-only source.
+The full Session application remains unqualified. The NsJail
+qualification environment remains unavailable. Production
+provider storage sources, executable-genesis qualification and the served graph
+remain incomplete, as detailed below. The complete signed Session broker,
+admission planner, concrete provider-result persistence, credential/audit stores
+and qualified public composition are implemented locally; native qualification
+still requires actual source services, dedicated signed artifacts and hosts.
+`AdmissionReady` stays false. The historical 2026-09-02 provisioned WSL2 resource
+run recorded four required PASS results plus the honest dynamic-worker FAIL;
+that result is retained in the acceptance ledger and is not a fresh production
+install qualification for this host.
 
-Updated: 2026-09-02
+Updated: 2026-10-11
 
 This document turns the normative phase roadmap in `SPEC.md` §51 into small,
 reviewable repository work units. `SPEC.md` remains the product contract;
@@ -21,10 +29,486 @@ reviewable repository work units. `SPEC.md` remains the product contract;
 unit is not a conformance `PASS` unless the acceptance ledger records the exact
 required external evidence.
 
-The machine-transfer resume checkpoint for the current unit is
+The historical Unit 10 machine-transfer checkpoint is
 [`docs/unit10-handoff.md`](unit10-handoff.md).
 
 ## Current sequence
+
+### 2026-10-07 remaining-work execution
+
+The ordered implementation below starts from `95a1604`. Code/test completion
+and external qualification are separate: none of these entries grants production
+readiness without the required fresh runtime evidence.
+
+1. **Checkpoint hydration — implemented and locally verified.** The signed
+   Session blob ingress and Go client now share a golden wire fixture, separate
+   operation MAC domains, scoped read authority, and a 4 MiB payload ceiling.
+   SessionHost verifies the durable reference before invoking an engine,
+   including cold-engine reconstruction and missing/stale blob failures. The
+   ingress suites passed 94 tests; SessionHost passed 55 and the Pi host adapter
+   passed 13; Go stateappclient passed under `-race`; focused type/lint checks
+   passed. These are local contract tests, not real celld qualification.
+2. **Fractional tool arguments (R3) — implemented and locally verified.** Go
+   producer encoding, TypeScript execution/provider decoding, durable
+   re-encoding, and shared binary64 vectors are connected. The Pi suite passed
+   183 tests and the harness passed 21. A Go/TypeScript differential check of
+   4,132 bit patterns found no mismatches. The generated workerd fixture and its
+   content-addressed identities were refreshed. Root type/tests/lint passed;
+   Go package tests passed after updating the fixture identities.
+3. **Session storage — implemented and locally verified.** Schema
+   6 uses exclusive inline/ref fields for inputs, requests, terminal results,
+   error details, and settlements. Successful `effect_settled` outcomes hydrate
+   their new and replayed result bodies inside the committing transaction;
+   ordinary state reads retain references. Per-turn/effect byte/item reservations are checked
+   after receipts and public events; migration retains legacy inline values
+   without a bulk blob rewrite. Type/lint/Go checks passed, along with focused
+   Session 70, Phase 0B 14, capacity/host 54, and transaction 7 tests. The full
+   test run exposed old schema/inline expectations, which were corrected and
+   rechecked. History now uses bounded rows/event pages and a digest-verified
+   B-tree index so a missing page cannot masquerade as an unused command ID.
+   Receipt/identity retention is indefinite; archive blob pins survive hot-state
+   GC. After updating the generated schema identities and admission path, the
+   final state-app run passed all 396 tests. The full Worker/protocol gate passed
+   690 tests across 50 files, including SessionHost 55, Pi 183 and protocol 56.
+   These are reference-storage results; the live qualification below is still
+   required.
+4. **Live qualification — stock workerd fixture passed; external gates open.**
+   On 2026-10-08 the installed npm workerd binary matched the release manifest's
+   extracted x86_64 digest and `TestStockWorkerdFixture` passed against that real
+   process. The fixture does not run the five resource/recovery qualification
+   components, and stable-broker-binding remains mock evidence. No dedicated
+   qualification cgroup/configuration, celld endpoint/credentials, object-store
+   target, or native signed evidence was supplied or found in the configured
+   locations. Celld/state probe interfaces also still lack concrete external
+   drivers. These gates remain incomplete; existing user cgroups were not
+   repurposed and shared infrastructure was not provisioned.
+5. **Workload/public adapters — local slices verified; production incomplete.**
+   An explicitly reference-only UDS workload service preserves the original
+   sealed claim across one outbound start and validates the returned identity
+   before external-commit confirmation and settlement. It never retries an
+   ambiguous start; bounded process-local guards are not crash durability.
+   Typed signed turn admission now carries actual inputs into the Session and
+   rechecks actor/tenant/generation before archived replay. The HTTP admission
+   service and its actual SSE reader require one verified atomic domain. PAT
+   HTTP authentication maps each operation to a separate configured scope.
+   Related Go race tests, 113 host wire/preflight tests, root type/lint checks,
+   and the proto contract suite passed. A qualified admission planner, complete
+   broker grant/retry/result-body adapters, durable credentials/audit/ACL and
+   the live production gates are still missing; the public-listener rejection
+   and false `AdmissionReady` remain. U14.3 below lists the concrete contracts.
+6. **NsJail reference composition verified; live slice incomplete.** A planner
+   using the signed registry now binds the Session, immutable runtime,
+   SandboxSpec and cache identity to the exact NsJail environment and passes
+   the real declarative launch-plan checks. Six actual Session/Workspace Cell
+   cases prove checkpoint reconstruction and one workspace operation across
+   commit-response loss; a lost start claim with no invocation evidence refuses
+   execution. These use a reference core/operation, not a native sandbox. The
+   native provider/bootstrap/qualification runner, complete signed install
+   artifacts and provisioned host remain missing.
+7. **Harness integration — implemented and locally verified.** A live test is
+   opt-in; an explicitly selected backend's startup failure now fails the test
+   with bounded, sanitized diagnostics. A subprocess with missing binaries
+   proves the failure exit without launching a sandbox. The harness delegates
+   nonce, peer/socket, response and event-stream validation to the shared Go
+   sandbox RPC client, closes it on every sandbox lifecycle exit, and retains
+   the wire vectors in the standard harness test command. Build instructions
+   are current. Node tests passed 27 cases with one unrequested live test
+   skipped; the real UDS adapter tests passed under `-race`. This is development
+   evidence; no NsJail/Docker/unshare live run is claimed.
+
+Final local validation on 2026-10-08 passed: the complete Go package suite under
+`go test -race -p=1 ./...`, `go vet -p=1 ./...`, root `pnpm check`/`pnpm lint`,
+and `git diff --check`. The final Go log is
+`/home/seorii/logs/circulusd-final-go-green-5w7inb_t.log` (exit 0); the type/lint
+log is `/home/seorii/logs/circulusd-final-types-lint-3rffapt7.log` (exit 0).
+The Go gate includes the unchanged diagnostic dependency guards: broker-aware
+workload logic lives in `internal/referenceworkload`, separate from the narrow
+`internal/controlrpc` transport. This local validation does not complete the
+open production implementation or external qualification requirements above.
+
+The additional Pro migration review could not run: the consultation failed
+before producing advice (model picker unavailable). Implementation must rely on
+verified repository contracts and tests, without attributing a verdict to Pro.
+
+### 2026-10-08 continued implementation
+
+The full Session broker contract is now implemented in schema 7 and
+`internal/stateappbroker`: durable grant acquisition without event advancement,
+atomic grant consumption, separate retry preparation, dispatch/start exclusion,
+confirmation, settlement, blocking, recovery and original typed operation
+lookup. Original host-minted opaque bytes survive replay and archival; the
+receipt archive pins its transitive checkpoint/result blobs. Raw command
+entrypoints cannot inject host policy/entropy or bypass an outstanding grant.
+
+The signed Go client uses a fourth independently snapshotted credential role.
+The Pi codec reconstructs actual checkpoint bytes and the actual canonical
+settlement body, preserving fractional arguments/cost wrappers and raw parent
+operation IDs. Scoped hydration rejects a wrong turn, consumed settlement or
+mismatched result before blob I/O. Bootstrap can construct a scoped Store only
+with a verified result resolver, then independently challenges that actual
+Store/client and checks its existing atomic state domain.
+
+Actual SessionCell fixtures contain 39 broker responses and four payload blobs.
+The Go Coordinator uses those exact request/response bytes through acquire,
+commit, dispatch, fresh/replayed start, ledger confirmation, settlement/replay
+and resume. The full state-app suite, root type/lint and focused Go race/vet
+checks passed after rotating all 20 source-derived host contracts and signed
+ingress fixtures. These are local contracts, not celld crash-durability proof.
+
+The model/MCP gateways and invocation ledger accept the actual Pi first-child
+`ordinal: 0`, preserve its raw parent identifier in the provider proof and
+reject a changed parent. Top-level occurrences require ordinal zero; typed
+legacy child identities retain their binding. The final complete Go race gate
+passed 74 tested packages, followed by vet and whitespace validation (PID
+314115, exit 0):
+`/home/seorii/logs/circulusd-continued-full-go-qtxm6upt.log`.
+
+The remaining production dependencies are a qualified native provider result
+reader and admission planner, durable credentials/audit/ACL, the served engine/
+provider graph, and real celld/object-store/workerd/NsJail evidence. Native
+NsJail qualification driver progress is recorded under U13.4/U13.5 below.
+No infrastructure was provisioned and no live jail was run by this continuation.
+
+### Admission and committed-result read continuation
+
+The signed admission-role planning endpoint reads authoritative Session scope,
+authorization, runtime, CAS and host-time lease in one transaction. It checks
+the full public input and both semantic digests before hot/archived idempotency
+lookup. Replay returns the original admission and performs neither genesis
+creation nor a second admit. New planning requires an immutable bounded host
+lease policy and an independently qualified executable genesis provider; the
+planner rejects empty/oversized/wrong-input/wrong-runtime checkpoints. The
+engine's signed `engine-genesis` capability is independent of the Session
+transaction domain. Bootstrap challenges all four operational admission
+boundaries separately and joins them to the actual event reader.
+The production graph imports only the pure `internal/sessionadmission`
+contracts; the public API preserves its existing types and error identities
+through aliases. Its dependency guard still excludes reference memory stores.
+
+The actual Pi core now accepts the public ordered user-message input unchanged,
+in addition to its existing prompt input. A cold-engine test verifies the first
+model effect against the complete original messages. Timestamp zero is the
+deterministic public-input codec convention, not observed admission time.
+
+The provider-result read protocol authenticates the exact tenant/workspace/
+Session/effect/invocation/request/commit/artifact identity, immutable canonical
+body and SHA256. Its server and broker resolver wrap only independently verified
+operational sources/readers and their actual native challenge. The record
+resolver requires committed original ledger facts and matches retained Pi
+metadata, tool arguments/order and costs without synthesizing missing provider
+fields. MCP result decoding needs explicit immutable bounds and an already
+retained Pi tool envelope. Body/time limits apply before provider reads or
+oversized cloning, and implementation diagnostics stay out of returned errors.
+
+These are implementation and local contract results. A crash-durable native
+provider record/body writer, a native executable-genesis transport/provider,
+durable credential/audit/ACL stores and the served execution graph remain open,
+along with fresh celld/object-store/workerd/NsJail qualification. The detailed
+configuration and source qualifications are in `docs/unit11-operator.md`.
+
+Final local validation passed all 75 tested Go packages under
+`go test -race -p=1 ./...`, then vet and whitespace checks (PID 1135635,
+exit 0, `/home/seorii/logs/circulusd-admission-result-final-go-uwpk03a1.log`).
+The standard root unit command passed 765 tests across 56 files, including all
+422 state-app and 185 Pi tests, followed by root type/lint checks (PID 1135559,
+exit 0, `/home/seorii/logs/circulusd-admission-result-final-workers-mlt6v2jq.log`).
+The refreshed bundle and stable-broker identities also passed the actual pinned
+stock workerd semantic fixture (PID 1135587, exit 0,
+`/home/seorii/logs/circulusd-admission-result-final-stock-workerd-tz8dtbi1.log`).
+This run provides no new resource/recovery or native durability evidence.
+
+### Ordered native composition continuation
+
+1. The concrete `providerresult.PersistentRecords` adapter now stores original
+   committed ledger facts, normalized Pi bytes, their digest and the immutable
+   publication receipt in one qualified native transaction source. Exact
+   replay, cold adapter reconstruction, concurrent publication and lost
+   commit/barrier responses are covered locally. Every successful read/write
+   confirms the same source's durability barrier. A real native transaction
+   source qualification and authenticated first-terminal producer are still
+   required; the concrete native Storage bridge is described below.
+2. `internal/enginegenesis` now connects an independently verified native
+   executable-genesis source across separate bounded authenticated loopback
+   transport. Actual Pi fixture bytes and native challenge proofs are retained.
+   Whole-request deadlines cover stalled reads and native calls. The actual
+   native WorkerLoader proof/transport bridge and its release qualification
+   remain prerequisites.
+3. `internal/authstate` now implements the PAT store and atomic chained audit
+   outbox over a separately qualified native transaction source. Current CAS,
+   scope, expiry and revocation are checked inside the credential transaction.
+   The current ACL adapter preserves the native authority's exact scoped proof
+   and requires its own capability in the Session domain. Native credential
+   storage and the current membership/quota authority still need wiring.
+4. `internal/publicbootstrap` now composes verified PAT/audit, current ACL,
+   admission and event-page dependencies into the public HTTP handler. Concrete
+   credential/ACL adapters pass the HTTP flow, durable-barrier denial, cold
+   reconstruction and revocation tests. Closing the graph cancels active
+   requests and stalled body reads are bounded. `internal/publicsession` owns
+   the production HTTP/admission/SSE implementation; legacy API facades retain
+   their types and errors without pulling memory repositories into this graph.
+
+5. The local-account store now persists its immutable password/lockout policy,
+   recomputes login transitions against current account state and commits each
+   credential transition with its chained audit row and native barrier. Unknown,
+   disabled and locked accounts preserve generic audited denial. Reopening with
+   changed policy requires an explicit migration.
+6. `internal/auditcheckpoint` now publishes independently signed PAT/account
+   audit snapshots. Exact state SHA, head and native source identities are
+   checked in the publishing transaction; stale snapshots fail, and exact replay
+   returns the original verified signature. Receipt durability is confirmed
+   before returning. Native signing, periodic execution, immutable external
+   anchoring and live audit conformance remain required.
+7. The actual Pi genesis generator and pinned celld Loader adapter now validate
+   the full ordered public input and scoped ABI/state-v2 runtime. A trusted
+   runtime verifier must attest the exact module/config artifact before Loader
+   access. The fixed WorkerEntrypoint wrapper uses an ESM source map, JSON-only
+   environment and one genesis RPC with outbound access denied. No native proof
+   is fabricated; the full SessionHost execution path remains separate.
+8. `internal/celldbridge` now implements qualified Go callback transactions over
+   a bounded authenticated loopback snapshot/receipt/CAS/barrier transport.
+   `workers/state-app/src/native-storage` implements the corresponding native
+   DO kernel and gated `stub.fetch` router. State chunks, immutable receipts and
+   logical revision commit in one actual native storage transaction; a fresh
+   marker write supplies the barrier. Nine shared canonical-CBOR fixtures bind
+   the Go and TypeScript codecs. A transport MAC grants no production authority:
+   both the client and Storage adapter need independently verified native proof.
+9. Audit-checkpoint and provider-result consumers now check completion of the
+   final callback attempt. A definite conflict during a lazy receipt read can
+   abort an earlier attempt without rejecting a later successful retry. A
+   skipped or incomplete final callback still fails before exposing a result
+   or confirming its consumer barrier. The actual native adapter PAT-to-signed-
+   checkpoint flow exercises this compatibility contract.
+10. `workers/pi-runtime/src/genesis-worker.ts` now exposes the existing Go
+    native-genesis HTTP protocol around a retained actual Pi Loader source.
+    Its dedicated operational keys, exact canonical-CBOR replies and native
+    challenge forwarding match `internal/enginegenesis`; shared fixtures cover
+    actual Pi success and authenticated `UNAVAILABLE`/`BAD_SOURCE` responses.
+    Source identity/input/checkpoint data are bounded and snapshotted before
+    asynchronous validation. Body, Loader, proof and signing waits share one
+    deadline; expired calls expose no signed result. The wrapper creates no
+    native qualification or remote-isolate termination guarantee.
+11. `SignedPiGenesisRuntimeVerifier` now implements the previously abstract
+    immutable revision-to-artifact mapping verifier. It requires both an
+    independently pinned signing digest and an independently provisioned
+    Ed25519 root. A valid signature cannot repoint the selected runtime mapping.
+    The pure `piGenesisRuntimeArtifactDigest` helper shares the source's exact
+    module/configuration snapshot and artifact computation with offline signing
+    preparation. Go prepares/verifies the same bounded canonical-CBOR document;
+    a shared public fixture also binds signature bytes and weak-key rejection.
+    These claims authorize a revision/artifact pair only, not native readiness.
+12. The transport-neutral Pi execution pull bridge now separates host-owned
+    brokers from loaded engine state. `PiExecutionProxy` implements the existing
+    SessionHost engine interface, while `PiExecutionEndpoint` owns fresh engines
+    behind bounded structured-clone start/resume/pull/close/abort messages. Exact
+    Session scope, revision/artifact and execution identities are checked before
+    advancement; host sink/commit completion controls the next pull. Raw finite
+    fractional settlements survive transport before the existing Pi codecs
+    normalize them. Cold actual-Pi reconstruction and explicit bounded-core delta
+    fixtures cover this local composition. This supplies the execution protocol,
+    but actual Loader entrypoint/artifact verification, qualified broker service
+    composition and native termination/resource evidence remain required.
+13. The concrete execution Loader composition now supplies a separate fixed
+    WorkerEntrypoint wrapper, configuration/artifact hash domains and
+    `SignedPiExecutionRuntimeVerifier`. Go's `internal/engineexecution` prepares
+    and verifies the same bounded mapping document; a public fixture rejects
+    genesis signatures even for identical claims and roots. The
+    `CelldPiExecutionEngine` adapter verifies the execution mapping before
+    acquiring a fresh UUID-named Loader composition, then uses the pinned
+    single-hop callable RPC ABI. Runtime inputs are owned before the first
+    wait, and timed-out or canceled acquisition discards late stubs. Native
+    get/entrypoint acquisition does not await compilation: first exchange
+    remains bounded. Disposal abandons local waits and schedules release;
+    neither factory success nor disposal is native eligibility/termination
+    proof. Actual bundled Pi cold continuation passes through this ABI fixture.
+
+The preceding native Storage validation passed all 81 tested Go packages under race,
+followed by vet; all 809 Worker/protocol tests across 60 files, root type/lint
+and diff checks also passed. This includes the unchanged `cmd/platformd`
+dependency guard, 12 actual-Pi genesis/Loader tests from the preceding gate and
+32 new native Storage tests. Exact PIDs/log paths and the distinction
+between local ABI fixtures and native runtime evidence are recorded in
+`docs/acceptance.md`.
+
+The final genesis HTTP continuation passed all 81 Go packages under race/vet
+and all 843 Worker/protocol tests across 62 files, followed by root type/lint
+and whitespace checks. Its 34 new TypeScript tests cover the shared Go wire,
+actual retained Loader-source/bundled Pi generation, full input cold
+reconstruction, definite source rejection, deadline/cancellation and unchanged
+native proof forwarding. The existing production dependency guard and generated
+stock-workerd bundle identity remain unchanged. Exact final logs/PIDs are in
+`docs/acceptance.md`; these are local contract/ABI checks only.
+
+The signed runtime mapping continuation passed all 81 Go packages under
+race/vet and 870 Worker/protocol tests across 64 files using serial package/file
+collection with one Vitest worker, followed by root type/lint and whitespace
+checks. Its 27 new TypeScript tests cover shared signed bytes, independent
+digest/root pins, root policy, runtime constructor sealing and actual
+source/Loader/HTTP integration. A concurrent run's existing 50 ms Storage test
+failure and its focused/serial passing results are retained with exact
+PIDs/logs in `docs/acceptance.md`.
+
+The execution pull continuation passed all 962 Worker/protocol tests across
+68 files with the same serial collection, followed by root type/lint and
+whitespace checks. Its 92 new tests cover the bounded primitive wire, endpoint
+ownership/cleanup, proxy semantic validation and six bundled bridge cases.
+Actual pinned Pi performs the cold model/tool chain; explicit bounded core
+fixtures verify deltas and intermediate commit success/failure. Independent
+code review passed after cleanup/cancellation fixes; the attempted Pro review
+failed before producing a response. Exact PIDs/logs and qualification limits
+are recorded in `docs/acceptance.md`. No Go source or generated stock-workerd
+bundle was changed by this continuation.
+
+The concrete Loader execution continuation passed all 1,019 Worker/protocol
+tests across 71 files with serial collection, root type/lint checks and all
+82 Go packages under race/vet, followed by whitespace checks: PID 955259,
+exit 0, `/home/seorii/logs/circulusd-loader-execution-final-j8w4br2i.log`.
+Its 57 new TypeScript tests cover the execution entrypoint, independent signed
+mapping and concrete Loader adapter; the new Go mapping package consumes the
+same public cross-purpose fixture. Actual bundled Pi performs the cold
+model/tool chain over a local native-shaped Loader fixture. Independent review
+passed after snapshot/cancellation fixes. The generated stock-workerd bundle
+identity is unchanged; actual native runtime qualification remains open.
+
+The requested next sequence is actual storage qualification, the served
+execution graph, then operational authority/resource enforcement. Storage
+preparation now includes an explicit S3 conditional-write client/qualification
+command and a private native Storage deployment bundle builder. Verified stock
+celld and SeaweedFS archives/executables are retained locally with extraction
+provenance. The user selected this machine; an isolated loopback store and
+dedicated bucket now hold the actual stock native deployment. Real S3 CAS,
+same-directory and empty-directory state/receipt/barrier recovery, application
+stale-CAS rejection and a dropped successful response have been observed. The
+store was moved to a new private `/data` directory after root-disk exhaustion;
+its file digests and successful recovery after the machine reboot were checked.
+The stock live-owner trial also passed: actual LTX/proof-read interception,
+SIGSTOP/lease expiry, a new native CELL owner/epoch, prior-process SELF-FENCE 3
+without acknowledgement, and unchanged new-owner state. Its measurements remain
+stock-only. A bounded capacity pilot admitted 20 additional CELLs but did not
+release the seed CELL. The later measured native run, with two resident slots
+and A absent, released the seed after exactly two committed disposable objects.
+Actual final-fork raw crash/owner observations, independent issuance, native
+proof publication and fresh signed live-probe verification have completed.
+Stage 1 is complete for the measured storage-only source on this machine;
+stage 2 served-graph implementation and isolated native preparation are in
+progress. Stage 3 operational enforcement has not begun.
+
+The stage 2 continuation now includes separate private builders for the full
+seven-namespace Session state app and purpose-bound Pi genesis/execution
+artifacts. The native subordinate effect ledger, factory-owned MCP repository
+and model authority/quota primitives passed focused race/vet gates. They require
+their own exact native atomic groups; the storage-only B23 proof cannot enable
+them. The anonymous pinned MCP HTTP/SSE transport and durable provider/Session
+adapter have passed focused race/vet gates. The authenticated Session quota
+projection also passed its focused gate and independent review: committed
+successful settlement consumes the original reservation, pre-dispatch failed
+recovery releases it, and uncertain/dispatched failures hold it. It preserves
+immutable final replay and reports `AtomicReservationSettlement: false`.
+The native model starter/provider/counter and cross-object atomic quota
+settlement remain unavailable. Raw MCP response JSON still requires the actual
+Pi result-normalization bridge before the served tool chain can complete.
+The final frozen quota and MCP provider sources passed independent review and
+a complete Go integration gate: 97 packages (88 with tests), race/vet/diff
+checks, runner PID 86125, exit 0,
+`/home/seorii/logs/circulusd-platform-go-gate-j9rrfq_y.log`. All 526 Go source
+and module files stayed unchanged throughout this gate. This does not certify
+the served graph or grant any missing native atomic group.
+
+The native owned-CELL RPC path now waits for serialized writes and the ownership
+gate before replying; seven focused harness cases and four patch-verifier cases
+passed. A separately built executable and separately provisioned bucket host
+the prepared full Session app in unsigned measurement mode. The original B23
+build, app, process and signed storage evidence remain unchanged. Actual Session
+initialization and authenticated reads now passed, followed by actual pidfd
+SIGKILL and the same reads through a fresh local directory/process. Six read
+results have the same canonical digest. This proves only the initialized
+Session's recovery: admission, effects, checkpoints and public events have not
+completed their native fault matrix. Loader hosting, provider execution and
+independent full-source issuance remain required. Preparation, unsigned
+measurement and local adapter tests grant no admission authority.
+
+Storage preparation validation passed all 83 Go packages with the race detector,
+then Go vet and diff checks (PID 2161461, exit 0,
+`/home/seorii/logs/circulusd-native-storage-preparation-final-03lczlro.log`).
+The native deployment bundle builder's eight tests, syntax and focused lint
+checks also passed (PID 989822, exit 0,
+`/home/seorii/logs/circulusd-native-storage-builder-reviewed-uk5kwo6h.log`).
+These results cover preparation tools; the separate actual storage-only
+qualification completion is recorded below.
+The earlier stage 1 Go regression gate passed all 88 tested packages with
+`go test -race -p=1 ./...`, `go vet -p=1 ./...` and diff checks (PID 469764,
+exit 0, `/home/seorii/logs/circulusd-local-go-gate-2psuxwlx.log`). The actual
+native generation-16 seed retained acknowledged revision 1, its receipt and a
+fresh barrier. Native generations 9, 16 and 17 subsequently SELF-FENCE exited 3
+after roughly 2,501 ms ambiguous lease-renewal attempts with 10/15-second TTLs.
+Those earlier attempts supplied no native SIGKILL/recovery chain or
+owner-fencing qualification. Generation 18's unsigned
+state/native-storage probes both returned the required 404 before another
+self-fencing exit. Independent SDK GET timeouts persisted after native celld
+exited, and the completed provider dump/source inspection confirmed the cause:
+two bucket volumes exhausted the private store's two volume slots, blocking
+default-collection metadata flushes, filling the queue and retaining per-key
+transaction locks. See the exact provider source and retained observations in
+`docs/unit11-operator.md`.
+The private store limit alone was raised from two to four slots, preserving
+existing files and the 1 GiB free-space floor. The native build, application
+graph and lease checks are unchanged. Replacement native generation 19
+(PID 988299, resident limit 2, TTL 15 seconds, Tokio threads 2) completed
+a 204.11-second diagnostic and exited 0 after owned SIGTERM: 41 lease attempts
+applied, none ambiguous, maximum 12 ms, and root-isolate retirement without
+self-fencing. Default-collection volume growth confirmed metadata flushes.
+Fresh actual provider CAS also passed with 32 contenders, one winner,
+31 precondition failures and three stale-operation 412 results. The new native
+fault chain completed with exit 0: actual generations/PIDs 20/2291966 and
+21/2581521 were SIGKILLed, same-watch recovery used watch 20, then fresh-watch
+B23/2835395 recovered. All five raw phase reports have no errors; response-loss
+advanced seed revision 1→2 before the owner trial. The native owner trial also
+completed: A22/1601344 claimed the released seed without changing logical state,
+then its actual LTX/held proof GET, STOP, B23 epoch 4→5 takeover, release while
+stopped and CONT produced SELF-FENCE exit 3 without acknowledgement. B revision
+4/state stayed unchanged after barrier 8→9. Raw manifests and exact observations
+are in `docs/acceptance.md`. Independent assembly/signing/issuance/publication
+and final verification all exited 0. Verifier PID 3946724 confirmed fresh nonce
+signatures and HTTP 200 for both native reserved probe routes on unchanged
+B23/PID 2835395, start tick 454970, runtime epoch 23. Its report is
+`reports/native-probe-verify-575896e0b8.json`, status
+`jobs/native-probe-verify-fdc84599e6.json`, and completed log
+`/home/seorii/logs/circulusd-local-native-probe-verify-ehbm_j7_.log`.
+The descriptor qualifies exactly `command-receipt` and `native-storage`, with
+issued evidence digest
+`sha256:6c2a870e21759f4407e2061de1f988fa716edf5ebd488e909c615eb5895795e3`.
+This completes the selected machine's stage 1 storage-only qualification.
+The full Session app, served graph and operational stages remain unqualified;
+`platformAdmissionReady` and `productionDependencyMinted` remain false.
+
+The complete `cmd/platformd` execution graph still
+needs qualified native state/storage/engine/provider sources, TLS, secret and
+scheduler/reconciler composition and fresh profile evidence. The dedicated
+workerd/NsJail qualification configurations remain unset; NsJail is not installed.
+A verified stock celld binary is now available in the private preparation cache,
+and the selected isolated service is running. A separate native producer,
+strict independent issuer and actual raw fault drivers are implemented; the
+full native build passed after a memory-budget stop and a disk-cache retry.
+Its separate raw executable and loaded main module have a signed storage-only
+selection; actual final-fork crash/owner observations, independent issuance and
+signed native probes have passed for that storage-only source. The issuer's response-loss phase must precede
+the pending-owner trial because it requires the original seed revision/state.
+Shared infrastructure remains outside this run.
+The measured isolated Storage source now has actual native proof, active
+replication, conditional-write object storage and output-gate/crash evidence.
+A different application or configuration needs its own measurements and fresh
+proof; this does not establish the full platform release or §53 profile.
+Pinned celld's JSON-only Loader environment cannot carry broker stubs;
+the new execution protocol uses structured-clone RPC while retaining brokers
+on the host. The concrete execution Loader adapter is now implemented locally;
+actual native Loader qualification and qualified broker service composition
+are still required;
+see `docs/unit11-operator.md` and ARCH-004 in the local risk register.
+The genesis HTTP wrapper supplies local wire/source integration, but actual
+Loader bindings, operator-provisioned signed runtime artifact mappings, same-source native probes
+and isolate resource/termination evidence are still required. The full
+SessionHost/broker Loader composition remains separate from genesis generation;
+its execution-only artifact/mapping contract is implemented, but real operator
+documents/roots, native runtime proof and served broker composition are missing.
 
 | Unit | State | Scope |
 |---|---|---|
@@ -32,10 +516,10 @@ The machine-transfer resume checkpoint for the current unit is
 | 8 | complete | Fail-closed production bootstrap boundary and separate diagnostic-only development daemon |
 | 9 | complete | Credentialed daemon UDS roles, complete sandbox launch binding, diagnostic shells, and identity-bound doctor evidence |
 | 10 | in progress | Phase 0A workerd resource enforcement, observation, recycle, and reconstruction qualification |
-| 11 | in progress | Phase 0B durable turn/effect state machine and celld authority: reference-first slices U11.1-U11.5 landed and the U11.6 celld conformance probe scaffold; the real-process celld durability PASS remains external-gated |
-| 12 | in progress | Durable public idempotency and API/SSE disconnect/replay recovery: reference-first §53.16 slices U12.1-U12.3 and the celld-backed Repository composition U12.4a/b landed (idempotency concurrency, SSE reconnect/ephemeral-loss, durable Repository conformance gate, celld public-session aggregate + Repository adapter); the crash-durable celld substrate and served listener (U12.5) are external-gated |
-| 13 | planned | Phase 1A NsJail single-node vertical slice: reference-first launch-plan §53.10 static verifier, single-environment resolution, and end-to-end orchestration over the reference provider land host-independently; the real NsJail isolation PASS, offline install, and live end-to-end durable turn are external-gated on a provisioned NsJail host |
-| 14 | planned | Private `platformd`↔`agentd` workload composition: the reference workload graph wiring platformd dispatch to agentd/workerd execution and back, proven host-independently against reference providers; the served production graph is external-gated |
+| 11 | in progress | Reference turn/effect state, complete signed Session broker, immutable provider-result persistence/read adapters, the authenticated native Storage bridge, measured fork producer, raw fault drivers and independent issuer are implemented. Actual native crash/owner observations, independent issuance/publication and signed live probes passed for this machine's storage-only source; stage 1 is complete. Full Session/provider source qualification remains open. |
+| 12 | in progress | Public idempotency/API/SSE recovery, signed admission, concrete PAT/account/audit adapters and qualified public composition are verified locally. Actual native genesis/full-Session/ACL/signing services, served listener and live served durability evidence remain missing. |
+| 13 | in progress | Static plans, signed environment planning, reference Cell recovery and the native isolation/resource qualification driver are implemented. Native provider composition, signed offline installation and real dedicated-host qualification remain open. |
+| 14 | in progress | Signed admission, complete broker Store, concrete result/credential/audit adapters, pure public HTTP composition and reference UDS transport are implemented. Full Session/provider/engine source qualification and the served execution graph remain incomplete. |
 
 After Unit 12, the Phase 1A NsJail single-node vertical slice (Unit 13) receives
 the work-unit plan below; the private `platformd`↔`agentd` workload composition
@@ -1078,17 +1562,20 @@ durability gate; §53.4 and §53.9 stay `NOT_RUN`; `state.celld` stays `NOT_WIRE
 - `internal/broker` `Coordinator` orchestrates a `DurableStore` (the turn/effect
   program counter: `AcquireEngineStep`, `CommitEngineStep`, `MarkDispatched`,
   `ClaimDispatchStart`, `MarkExternallyCommitted`, `SettleEffect`, `BlockEffect`,
-  `PrepareRetry`, `SettleRecovery`). No non-test `DurableStore` implementation
-  exists.
+  `PrepareRetry`, `SettleRecovery`). `internal/stateappbroker.Store` now implements
+  this surface against the single authoritative Session transaction. Bootstrap
+  independently seals each scoped operational Store; native substrate and
+  provider result-reader qualification remain open.
 - `internal/effectledger` is the subordinate invocation ledger (reference,
-  in-process only). `internal/stateappclient` wires only `ReadSessionEvents`,
-  `ClaimDispatchStart`, and `ReadSessionBlob` (hydrating one externalized
-  payload by content digest; storage redesign stage B2.2) to the authenticated
-  state-app; the full turn/effect surface is not wired.
+  in-process only). `internal/stateappclient` wires `ReadSessionEvents` and
+  `ClaimDispatchStart` to the authenticated state-app. The full turn/effect
+  surface is now wired through `internal/stateappbroker` and the separate signed
+  broker ingress. `internal/stateappcodec` owns checkpoint/result hydration.
 
 ### Reference-first vs external-evidence split
 
-Reference-first (lands now, host-independent):
+Planned reference work (host-independent; current status is recorded in the
+work packages below):
 - a concrete Session-DO `celld.Aggregate` (the turn/effect state machine) and a
   reusable fault-injecting reference `celld.Storage`, driven through the existing
   `celld.Host`;
@@ -1371,7 +1858,46 @@ Unit 12 is complete only when all of the following are true:
 
 ## Unit 13: Phase 1A NsJail single-node vertical slice
 
-Status: planned (2026-09-06). This is the `SPEC.md` §51.3 vertical slice: the
+Current host boundary (2026-10-08): no provisioned NsJail executable, curated
+rootfs, sandboxd install, seccomp policy or dedicated cgroup root was found in
+the configured/default locations. The tracked release manifest remains an
+unsigned development manifest and contains no NsJail binary artifacts. There
+is no repository `install.sh`, and executord is a diagnostic control shell,
+not a bootstrapped isolation runner. These are unresolved prerequisites for
+U13.5, not conditions that reference tests may mark successful.
+`IsolationProbe` now has the concrete native isolation/resource qualification
+driver described below; the full install qualification `Probe` still lacks its
+external composition. The default doctor
+probes inspect host, release and diagnostic UDS state; they do not launch an
+NsJail isolation test. Provider construction, a trusted environment resolver,
+the real capability probe and the isolation runner must be composed before an
+operator-supplied environment alone can close this gate.
+
+A provisioned run needs a pinned NsJail binary, immutable environment/rootfs,
+seccomp and sandboxd digests, the rootfs command allowlist, unique sandbox
+UID/GID policy, private socket roots and an exclusively delegated cgroup-v2
+subtree with cpu/memory/pids/kill access. The planner's existing layout is
+`<EnvironmentRoot>/<RootfsDigest>/nsjail/rootfs` with the seccomp policy under
+`<EnvironmentRoot>/<RootfsDigest>/nsjail/seccomp/<SeccompDigest>.policy`. A clean
+network-denied install target, complete signed release/trust roots and the
+celld/object-store credentials and evidence from Units 10–12 are also required.
+
+The implemented doctor command selects an install profile, not a `--backend`
+flag. On an already provisioned lightweight installation its invocation is:
+
+```sh
+platformctl doctor --profile lightweight \
+  --config /etc/pi-platform/config.yaml \
+  --release-manifest /usr/lib/pi-platform/release-manifest.json \
+  --release-trust-roots /etc/pi-platform/release-trust-roots.json
+```
+
+The configuration must select NsJail and the referenced files and daemon
+sockets must already exist. This diagnostic command does not install, launch,
+or qualify the missing runtime components and its report is not startup
+authority.
+
+Status: in progress (2026-10-08). This is the `SPEC.md` §51.3 vertical slice: the
 first lightweight provider (NsJail), one execution environment, and the whole
 single-node graph from offline install to a recovered durable turn. It is
 sequenced after Units 10–12 and consumes their evidence and the §53 conformance
@@ -1382,17 +1908,15 @@ false until the full single-node graph closes on real hardware.
 
 ### Outcome
 
-Deliver the `SPEC.md` §51.3 completion set on a single node:
+The required `SPEC.md` §51.3 completion set on a single node remains open:
 
-```text
-✓ offline install (lightweight profile)
-✓ per-session Pi isolate
-✓ native command through NsJail
-✓ workspace commit/recovery
-✓ seccomp/network/resource enforcement
-✓ end-to-end durable turn/effect recovery
-✓ platformctl doctor --backend nsjail
-```
+- offline install (lightweight profile);
+- per-session Pi isolate;
+- native command through NsJail;
+- workspace commit/recovery;
+- seccomp/network/resource enforcement;
+- end-to-end durable turn/effect recovery;
+- `platformctl doctor --profile lightweight`.
 
 Scope (per §51.3): platformd, state-app/celld, object store, agentd/workerd,
 executord, sandboxd, NsJailProvider, one `minimal-v1`/`standard-v1`
@@ -1427,6 +1951,15 @@ promoted by the reference-first slices.
 - `internal/workspace` (manifest, blob, materialized) and the state-app Workspace
   aggregate provide the materialized-manifest workspace and content-addressed
   blob store the slice writes through.
+- `internal/sessionplan` resolves signed extension requirements to one curated
+  environment, binds the immutable runtime/Session/SandboxSpec/cache identity,
+  and passes the existing NsJail launch-plan verifier. Its sealed plan validates
+  configuration; it grants neither admission authority nor host qualification.
+- `session.reference-orchestration.test.ts` runs the actual Session and Workspace
+  Cells with a reference Pi core and workspace operation. Six cases prove
+  recovery through lost commit/settlement responses and fail-closed behavior
+  after a lost claim without invocation evidence. It does not run a native
+  command, a sandbox provider, or a live kernel.
 
 ### Reference-first vs external-evidence split
 
@@ -1448,7 +1981,7 @@ Reference-first (lands now, host-independent):
   native-command dispatch → workspace `prepare`/commit → effect settle →
   kill/restart recovery — proven host-independently, reusing the Unit 11 durable
   turn/effect machine and the Unit 12 idempotency boundary;
-- U13.4 the NsJail `IsolationProbe` harness and the `doctor --backend nsjail`
+- U13.4 the NsJail `IsolationProbe` harness and the `doctor --profile lightweight`
   report shape: the seam a provisioned host plugs a real launcher into, plus the
   backend-capability probe descriptor the doctor emits, validated at the
   reference level.
@@ -1458,8 +1991,7 @@ External-evidence (gated on a provisioned NsJail host; deferred):
   external `§53.10` PASS against a live kernel (namespaces/seccomp/cgroup/network/
   cleanup); offline lightweight-profile install on a clean network-denied Linux
   host; per-session Pi isolate; a native command executed through NsJail; real
-  workspace commit and post-kill recovery; and `platformctl doctor --backend
-  nsjail` against the live sandbox.
+  workspace commit and post-kill recovery; and `platformctl doctor --profile lightweight` against the live sandbox.
 
 ### Work packages and strict TDD order
 
@@ -1469,18 +2001,94 @@ External-evidence (gated on a provisioned NsJail host; deferred):
   namespace, exposed docker socket, unbounded cgroup, non-ONCE jail) fails the
   matching check; GREEN: the real `Planner.Build` output passes every one of the
   thirteen §53.10 checks. No kernel. Green under `go test -race`.
-- U13.2 — single-environment resolution (reference). Requirement-union → one
-  curated environment; version-conflict → session-creation failure; missing
-  artifact → backend unselectable; raw-path attempt → rejected.
+- U13.2 — single-environment resolution (reference). Locally implemented and
+  verified in `internal/sessionplan`: requirement-union → one curated
+  environment; version-conflict → planning failure; missing artifact → backend
+  unselectable; raw-path attempt → rejected. The real declarative NsJail plan,
+  defensive copies and concurrent planning passed race tests.
 - U13.3 — end-to-end orchestration over the reference provider (reference).
-  Dispatch → sandbox → native command → workspace commit → settle → kill/restart
-  recovery, all green under `-race`; reuses Units 11–12.
-- U13.4 — NsJail `IsolationProbe` harness + `doctor --backend nsjail` shape
-  (reference harness; the real probe is U13.5).
+  Partially implemented: actual Cell admission/claim → reference workspace
+  operation → commit → settlement → checkpoint reconstruction passed six
+  TypeScript tests. The wider environment → provider → native-command loop is
+  still missing; the passing Cell tests do not satisfy that completion set.
+- U13.4 — NsJail `IsolationProbe` harness + `doctor --profile lightweight` shape
+  (reference harness; the real probe is U13.5). Existing contract/evaluator and
+  doctor-profile shape tests cover this boundary. The explicit native driver in
+  `internal/conformance/nsjail/qualification` now invokes the production pinned
+  launcher and authenticated sandbox RPC; automatic doctor integration and live
+  execution evidence remain open.
 - U13.5 — external vertical slice (gated): live NsJail §53.10 PASS, offline
   install, per-session isolate, native command, commit/recovery, resource
-  enforcement, e2e durable turn, `doctor --backend nsjail`. Promotes §53.10 and
+  enforcement, e2e durable turn, `doctor --profile lightweight`. Promotes §53.10 and
   contributes §53.7/§53.8/§53.13/§53.18 only here.
+
+### Native NsJail qualification driver
+
+This driver runs only against dedicated, preprovisioned signed artifacts. It
+does not install/delegate resources or enable production admission. Its explicit
+operator command is:
+
+```sh
+CIRCULUSD_NSJAIL_QUALIFICATION_CONFIG=/absolute/config.json \
+  go test -count=1 -run '^TestProvisionedNsJailQualification$' -v \
+  ./internal/conformance/nsjail/qualification
+```
+
+Run that long command in the background with a private log and retain its PID
+and final exit status. The strict JSON config has `schemaVersion:1` and these
+fields: `releaseManifestPath`, `trustRootsPath`, `installedNsJailPath`,
+`environmentInventoryPath`, `environmentRoot`, `sandboxRoot`, `cgroupRoot`,
+`evidenceOutputDirectory`, `hostUid`, `hostGid`, `sandboxdClientUid`,
+`commandManifestOwnerUid`, `totalMillis`, `stepMillis`, `cleanupMillis`. Paths
+must be absolute and canonical. The three mutable roots must be distinct,
+current-owner mode 0700, non-overlapping with inputs and exclusively available.
+The sandbox root must be empty; the cgroup-v2 root must have enabled cpu/memory/
+pids controllers, no processes and no existing child cgroups. Allocated sandbox
+UID/GID cannot be root, the controller's UID/GID or the sentinel value. Use
+`stepMillis >= 10000`, `totalMillis > stepMillis` (120000 recommended, maximum
+600000), and `cleanupMillis` between 100 and 60000. Socket paths must fit the
+launcher's 107-byte sockaddr limit.
+
+The existing candidate/production release signature rules apply. Select exactly
+one architecture-matched direct ELF `nsjail` artifact and one direct
+`nsjail-qualification-environment` inventory; both signed SHA-256 and size must
+match their installed bytes. The exact inventory hash names
+`<environmentRoot>/<hash>/nsjail/rootfs`. Inventory schema 1 records architecture,
+sandboxd/helper paths and digests, seccomp digest, every rootfs directory/file
+entry and its mode/hash. No symlinks, special files or unlisted entries are
+allowed (10000 entries, 256 MiB/file and 1 GiB total). The signed command manifest
+contains only `circulusd-nsjail-qualification` at the helper path. Build the
+helper without executing it on the host:
+
+```sh
+CGO_ENABLED=0 go build -o <staging>/qualification-helper \
+  ./internal/conformance/nsjail/cmd/qualification-helper
+```
+
+The signed inventory also requires the exact `experiments` descriptor:
+
+```json
+{"version":1,"seccompSyscall":"getppid","seccompErrno":1,"cpuMillis":3000,"memoryBytes":805306368,"pidsAttempts":128,"addressSpaceBytes":4294967296,"maximumUserProcesses":512}
+```
+
+Its dedicated seccomp policy must return EPERM for harmless `getppid` while
+permitting the fixture/sandboxd runtime. A successful host control call is
+compared with the jailed syscall. CPU, memory and PID pressure each use a fresh
+owned sandbox with an authenticated ready/GO handshake. The host pins cgroup
+file descriptors before GO and compares exact limits, inode identity and raw
+counter changes: throttled CPU periods, OOM/oom_kill and pids.max enforcement.
+Actual cgroup limits remain 512 MiB, 64 tasks and 500 ms CPU/second. Separate
+qualification RLIMIT_AS=4 GiB/RLIMIT_NPROC=512 prevent rlimits from masking those
+experiments; zero-valued optional planner fields preserve existing defaults.
+Applied controls or Seccomp mode alone cannot produce PASS.
+
+All sandboxes must pass owned cleanup. The driver atomically retains a unique
+mode-0600 `nsjail-<run-id>.json` with release/config/runner/environment/host/boot
+identity and raw observations. Injected runners always produce reference-only
+evidence. The executable runs from a sealed immutable snapshot; rootfs/helper
+paths retain the existing trusted-host assumption that their owner does not
+replace or modify them during qualification. No live jail ran in this chat, so
+§53.10 remains UNAVAILABLE and the wider durable vertical slice remains open.
 
 ### Required evidence and exit criteria
 
@@ -1491,8 +2099,7 @@ Unit 13 is complete only when all of the following hold:
   provisioned host (else §53.10 stays `UNAVAILABLE`);
 - offline lightweight install, per-session Pi isolate, native command through
   NsJail, workspace commit/recovery, seccomp/network/resource enforcement,
-  end-to-end durable turn/effect recovery, and `platformctl doctor --backend
-  nsjail` all pass on that host;
+  end-to-end durable turn/effect recovery, and `platformctl doctor --profile lightweight` all pass on that host;
 - §53.10 is promoted only from the live host, and §53.7/§53.8/§53.13/§53.18 gain
   real evidence only from it — never from the reference slices;
 - `AdmissionReady` becomes true only when the whole single-node production graph
@@ -1505,18 +2112,20 @@ Unit 13 is complete only when all of the following hold:
 1. launch-plan §53.10 static verifier (U13.1);
 2. single-environment resolution suite (U13.2);
 3. end-to-end orchestration over the reference provider (U13.3);
-4. NsJail `IsolationProbe` harness + `doctor --backend nsjail` shape (U13.4);
+4. NsJail `IsolationProbe` harness + `doctor --profile lightweight` shape (U13.4);
 5. external vertical slice and acceptance docs (U13.5, gated).
 
 ## Unit 14: Private platformd↔agentd workload composition
 
-Status: planned (2026-09-06). This unit closes the private workload loop between
+Status: in progress (2026-10-08). This unit closes the private workload loop between
 `platformd` (dispatch admission + settlement over the durable state plane) and
 `agentd`/`executord` (out-of-process execution in workerd/NsJail), replacing the
-`errProductionGraphIncomplete` stub in `cmd/platformd`. Unlike Units 10–13 it
-introduces almost no new logic: its constituent reference pieces already exist
-and are tested (see the baseline). Unit 14 is the composition and served-graph
-wiring. It promotes a §53 status only from the served graph on real celld +
+`errProductionGraphIncomplete` stub in `cmd/platformd`. Its reference pieces
+already exist and are tested. The signed broker implements durable grants,
+retry reservations and original receipt retention; qualified native provider/
+engine sources and the served composition remain open as listed below.
+Unit 14 includes those contracts and the served-graph wiring. It promotes a
+§53 status only from the served graph on real celld +
 agentd/workerd; every reference slice promotes nothing and `AdmissionReady`
 stays false until the whole single-node graph closes.
 
@@ -1549,10 +2158,18 @@ The composition's parts already exist and are reference-tested:
   fence/route-mismatch-rejected, deadline/abort-blocked, and
   recovery-safe over the reference `fakeStore` (`dispatch_consumer_test.go`,
   including a 64-way concurrent race and a claim-response-loss + restart matrix).
-- `internal/broker.DurableStore` is the celld-backed atomic effect ladder;
-  `internal/stateappadapter` provides the production celld-backed implementation.
-- `internal/controlrpc` (linux) is the credentialed `platformd`↔`agentd`/
-  `executord` RPC with a concurrent-clients integration test.
+- `internal/broker.DurableStore` specifies the atomic effect ladder.
+  `internal/stateappadapter` currently implements event reads and the narrow
+  dispatch-start claim; `internal/stateappbroker` implements the complete signed
+  Session contract with actual checkpoint/result hydration and bootstrap
+  verification. Native state durability and provider source qualification
+  remain external requirements.
+- `internal/controlrpc` (linux) supplies credentialed diagnostic RPC and the
+  explicit reference workload wire transport, without broker dependencies.
+  `internal/referenceworkload` binds one immutable command/route to the original
+  sealed claim and returns observed results for confirmation and settlement.
+  Its process-local guards do not authorize production execution or durable
+  restart replay. The diagnostic executable's dependency guard remains intact.
 - `internal/agent.Manager` is the agentd-side workerd/isolate execution manager.
 - `cmd/platformd` builds the production graph but returns
   `errProductionGraphIncomplete` for the workload/public portions by design.
@@ -1565,7 +2182,8 @@ Reference-first (already landed; Unit 14 verifies/consolidates, does not re-prov
 - the `controlrpc` platformd↔agentd/executord boundary
   (`internal/controlrpc` integration).
 
-Reference-first (lands in Unit 14, host-independent):
+Planned reference work (host-independent; current status is recorded in the
+work packages below):
 - U14.1 a named `WorkloadDispatcher` composition object that wires
   `broker.DispatchConsumer` to an `agentExecutor` seam (the interface the
   controlrpc-transported agentd start satisfies), with a reference `agentExecutor`
@@ -1592,11 +2210,46 @@ External-evidence (gated on Units 10/11/13; deferred):
   fresh claim, never on replay, and returns the settlement path. Green under
   `-race`.
 - U14.2 — `controlrpc`-transported `DispatchStarter` (reference, linux). The
-  starter forwards the claimed start to a reference agentd over `controlrpc`;
-  exactly-once and claim-identity preservation across the wire; verified in the
-  native WSL2 gate.
+  reference starter/handler and return sink are implemented and verified over
+  real local UDS under `-race`. The original sealed claim reaches confirmation
+  and settlement; concurrent starts, lost responses, changed identities and
+  authentication failures cannot trigger a second execution. Guards are bounded
+  and process-local, so this is not durable restart or native execution evidence.
 - U14.3 — served production graph (external, gated): the real composition wired
   into `cmd/platformd`, gated on Units 10/11/13; promotes §53.2/§53.5 only here.
+
+The 2026-10-08 implementation comparison identified these prerequisites for
+U14.3. They are implementation gaps in addition to the external evidence gate:
+
+1. **Implemented locally:** bind the Go store to one tenant/workspace/Session and read its current
+   checkpoint, settlement, effects and fences in one transaction. Hydrate and
+   verify referenced checkpoint bytes; derive engine limits from trusted runtime
+   policy rather than caller values.
+2. **Implemented locally:** persist bounded engine grants without advancing the Session event sequence.
+   Consume a grant, commit its engine boundary, mint effect identities and
+   preparation permits, and retain the operation receipt in one transaction.
+3. **Implemented locally:** add a distinct retry reservation mutually exclusive with the prior attempt's
+   start claim, blocking, and interrupted settlement. Broker-owned recovery
+   cannot bypass that reservation through legacy raw Session commands.
+4. **Implemented locally:** retain original broker operation kind/key/digest and typed receipt through
+   archive lookup. Preserve exact opaque proofs; never reconstruct a historical
+   receipt from the current mutable effect snapshot.
+5. **Read/normalization adapters implemented; native record source still open:** resolve authenticated result references into actual normalized settlement
+   bodies for Pi resume, and reconcile error commits with no result reference.
+   Keep all broker metadata in the same Session transaction; it must not become
+   a second turn/effect state machine.
+
+The narrow public admission path is implemented separately from those broker
+operations. Its planner now reads current CAS/runtime/lease fields from the
+authoritative Session and requires an independent qualified genesis provider;
+the API supplies the complete canonical input, authorization and idempotency
+digests. Both planner and transport require independent signed verification in
+the same Session atomic domain; the engine genesis capability is separately
+qualified. There is no default local checkpoint constructor. HTTP admission and
+the actual SSE reader must also share that verified domain. The HTTP PAT adapter
+connects route-specific scopes to the existing PAT service; it does not provide
+the missing durable credential/audit store. These pieces do not make the
+state-only bootstrap a complete production graph.
 
 ### Required evidence and exit criteria
 

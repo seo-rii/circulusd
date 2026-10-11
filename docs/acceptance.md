@@ -9,6 +9,618 @@ This ledger maps `SPEC.md` section 53 to its required evidence. Status is intent
 
 Only `PASS` satisfies a required release profile. Development fakes and unit launch-plan tests do not upgrade a real conformance status.
 
+The 2026-10-08 continuation completed the local Session broker contract: schema 7
+durable grants, retry reservations, original opaque receipt archival, the full
+signed Go `DurableStore`, Pi checkpoint/result hydration, and independently
+challenged bootstrap composition. The actual SessionCell fixture contains 39
+responses/four blobs; Go Coordinator tests compare the exact outgoing CBOR and
+exercise fresh/replayed start, confirmation, settlement/replay and resume. The
+state-app suite passed 417 tests; focused Go race/vet and root type/lint passed.
+Logs: `/home/seorii/logs/circulusd-broker-worker-full-bgq56fex.log`,
+`/home/seorii/logs/circulusd-broker-composition-final-7aljyo3q.log` and
+`/home/seorii/logs/circulusd-broker-types-lint-9xnk8u4f.log` (each exit 0).
+The final complete Go gate passed all 74 tested packages with
+`go test -race -p=1 ./...`, followed by `go vet -p=1 ./...` and
+`git diff --check`: PID 314115, exit 0, log
+`/home/seorii/logs/circulusd-continued-full-go-qtxm6upt.log`.
+The result reader uses signed test fixtures in these checks; native provider
+retrieval, real celld/object-store durability and the served production graph
+remain open. No §53 status or `AdmissionReady` is promoted by this evidence.
+
+The admission/result-read continuation implements authoritative signed turn
+planning, exact ordered public Pi input, independently qualified admission
+bootstrap, and immutable committed provider-result transport/normalization.
+Actual SessionCell planning fixtures include archived replay, cold Pi genesis
+and stale-CAS rejection. Model/MCP record-to-server-to-reader tests retain the
+original ledger identity and canonical Pi body without fabricated metadata.
+Final local validation passed on 2026-10-08:
+
+- All 75 tested Go packages passed `go test -race -p=1 ./...`, followed by
+  `go vet -p=1 ./...` and `git diff --check`: PID 1135635, exit 0,
+  `/home/seorii/logs/circulusd-admission-result-final-go-uwpk03a1.log`.
+- Standard root `pnpm test:unit` passed all 765 tests across 56 files
+  (protocol 56, extension manifest 47, Pi 185, SessionHost 55, state-app 422),
+  followed by root `pnpm check` and `pnpm lint`: PID 1135559, exit 0,
+  `/home/seorii/logs/circulusd-admission-result-final-workers-mlt6v2jq.log`.
+  The existing large-blob regression still compares every byte; native byte
+  comparison replaces the deep array assertion that exceeded its timeout.
+- The rebuilt Pi fixture passed `TestStockWorkerdFixture` against the same
+  manifest-pinned installed executable: PID 1135587, exit 0,
+  `/home/seorii/logs/circulusd-admission-result-final-stock-workerd-tz8dtbi1.log`.
+  Stable-broker bindings remain mock and resource/recovery components remain
+  `NOT_RUN`.
+
+The unchanged production dependency guard passes after separating pure
+admission contracts from the reference-memory public API package. Native
+committed-record backends, executable-genesis providers, durable credentials/
+audit/ACL and the served graph remain incomplete. These local checks do not
+qualify celld/object-store/NsJail or promote any §53 status or `AdmissionReady`.
+
+The ordered native-composition continuation adds concrete immutable provider
+result persistence, bounded authenticated native-genesis transport, durable
+PAT/account and chained audit adapters, current ACL proof forwarding, qualified
+public HTTP composition, and an independently signed audit-checkpoint
+publisher. Actual Pi genesis generation and the pinned celld Loader adapter
+also execute the real entrypoint bundle in local tests, then reconstruct its
+checkpoint in a cold Pi engine to the first model boundary with the complete
+ordered Korean/English input. Pending Loader and RPC waits reject cancellation;
+remote isolate termination remains a native host responsibility. These
+adapters require sealed operational sources and exact native
+barriers; their local tests never create production authority. The pure public
+HTTP/Session implementation is separated from legacy memory repositories,
+preserving the unchanged production dependency guard.
+
+Focused race/vet gates passed for persistence, genesis transport and complete
+HTTP deadlines, credentials/accounts, signed checkpoints and public-package
+compatibility. Tests cover concurrent/reopened adapters, ambiguous responses,
+stale or corrupted snapshots, expiry/revocation and barrier failure before
+public Session I/O. Native storage, ACL and signing services, real celld
+transaction/output-gate and execution bridges, terminal producer authentication,
+TLS and the complete served runtime still remain prerequisites. The operator
+contracts are in `docs/unit11-operator.md`; none of this evidence changes §53
+status or `AdmissionReady`.
+
+The final native-composition Go gate passed all 80 tested packages under
+`go test -race -p=1 ./...`, then `go vet -p=1 ./...` and `git diff --check`:
+PID 1384074, exit 0,
+`/home/seorii/logs/circulusd-native-composition-full-go-w0ptsvv_.log`.
+The final root Worker/protocol gate passed all 777 tests across 58 files
+(protocol 56, extension manifest 47, Pi 197, SessionHost 55, state-app 422),
+followed by `pnpm check`, `pnpm lint` and `git diff --check`: PID 315037,
+exit 0, `/home/seorii/logs/circulusd-native-composition-full-workers-1h_af8p0.log`.
+The genesis-only source uses new direct-import modules; existing SessionHost
+bindings, resource defaults, RPC fixtures and generated stock-workerd Pi bundle
+are unchanged. The bundle SHA remains
+`fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549`.
+The new Loader test executes the actual bundle through a local ABI fixture;
+it does not claim a native celld run or a new stock-workerd qualification.
+
+The native Storage continuation adds `internal/celldbridge` and the separate
+state-app native DO kernel/router. Nine shared byte-exact canonical-CBOR fixtures
+cover absent/stored snapshots, immutable and missing receipts, CAS publication,
+read-only revision advancement, historical/fresh barriers and definite stale
+CAS. Go tests separately verify transport MACs, immutable native proof, source
+qualification, bounded retries, cold historical tokens, oversized state and
+owned client cancellation. Actual PAT-to-signed-checkpoint integration exercises
+a receipt conflict during an earlier callback attempt. Result/checkpoint guards
+accept a later completed attempt and reject a skipped or incomplete final one.
+
+The TypeScript tests simulate actual native transaction and fetch contracts:
+chunked state/receipt rollback and corruption, physical route/metadata anchors,
+orphan receipts, lost replies/reopened kernels, fresh barrier writes, and pending
+output gates. The external reply is signed only after gated fetch resolution.
+Stalled body/native/probe/signature waits are bounded; an expired request exposes
+no signed success or conflict response. These checks use local contract fixtures,
+not a real native celld process, active replicator, object store or crash test.
+An independently signed native probe and measured code/configuration/output gate
+remain necessary. No production status or `AdmissionReady` is promoted.
+
+The final native Storage Go gate passed all 81 tested packages under
+`go test -race -p=1 ./...`, then `go vet -p=1 ./...` and `git diff --check`:
+PID 4016950, exit 0,
+`/home/seorii/logs/circulusd-native-storage-full-go-tqorm_no.log`.
+After the final orphan-receipt guard, the root Worker/protocol gate passed all
+809 tests across 60 files (protocol 56, extension manifest 47, Pi 197,
+SessionHost 55, state-app 454), followed by `pnpm check`, `pnpm lint` and
+`git diff --check`: PID 1353956, exit 0,
+`/home/seorii/logs/circulusd-native-storage-final-workers-rrbx00dh.log`.
+Existing SessionHost/state-app source contracts, RPC identities, deployment
+configuration and generated stock-workerd Pi bundle were not changed by this
+Storage unit. The normal state-app typecheck now includes the new direct-import
+native Storage source modules; no stock-workerd/native-runtime run is claimed.
+
+The genesis HTTP continuation now connects the retained Pi source to the
+existing Go native-genesis contract. Shared public-test-key fixtures bind exact
+request/response CBOR, directional keys/MACs, semantic request digest, actual
+Pi checkpoint and authenticated source-error replies. Go tests verify actual
+server equality and loopback Client consumption. TypeScript verifies the same
+vectors and checks immutable original scope/input/checkpoint validation before
+hashing, fresh timestamps, MAC separation and exact native probe framing.
+The HTTP wrapper captures source methods/configuration and pins the full native
+descriptor; neither operation creates source authority. Actual native probes,
+signed Loader artifact mapping, remote termination/resource limits and the full
+SessionHost execution graph remain external prerequisites. `AdmissionReady`
+remains false.
+
+The final genesis HTTP Go gate passed all 81 tested packages under
+`go test -race -p=1 ./...`, then `go vet -p=1 ./...` and `git diff --check`:
+PID 2784983, exit 0,
+`/home/seorii/logs/circulusd-genesis-http-full-go-tt482_et.log`.
+The final root Worker/protocol gate passed 843 tests across 62 files (protocol
+56, extension manifest 47, Pi 231, SessionHost 55, state-app 454), followed by
+`pnpm check`, `pnpm lint` and `git diff --check`: PID 2179936, exit 0,
+`/home/seorii/logs/circulusd-genesis-http-full-workers-_4hzbex6.log`.
+All 34 added TypeScript tests use new direct-import modules. The HTTP integration
+invokes the actual `CelldPiGenesisSource` and esbuild Pi entrypoint with a local
+Loader/base/verifier fixture, matches exact Go golden response bytes/MAC, and
+cold-reconstructs the first model boundary with the complete original messages.
+Source runtime mismatch performs no extra Loader access. Existing RPC/source
+identities, deployment configuration and the generated stock-workerd Pi bundle
+SHA `fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549`
+remain unchanged by this continuation. No actual native celld/proof qualification
+or fresh stock-workerd resource/recovery run is claimed.
+
+The signed runtime mapping continuation implements independent digest/root
+pinning for the exact Pi revision/artifact pair. Go and TypeScript agree on the
+bounded canonical claim document and ASCII signing digest, exact public fixture
+signature, and rejection of weak/noncanonical Ed25519 roots. Tests cover valid
+signatures under wrong pins/roots, changed claims/artifacts, malformed documents,
+caller mutation during asynchronous crypto, unsupported crypto and fabricated
+verifiers, including direct JavaScript construction and missing private-field
+brands. A module-private constructor seal is checked at runtime after signature
+verification. The pure artifact helper and actual Loader source share one snapshot
+and digest implementation. Signed test mappings exercise the real Pi source and
+HTTP/cold reconstruction path; local test signers and Loader fixtures supply no
+production roots, native proof or resource evidence. `AdmissionReady` stays false.
+
+The signed mapping Go gate passed all 81 tested packages under
+`go test -race -p=1 ./...`, followed by `go vet -p=1 ./...`: PID 1282896,
+exit 0, `/home/seorii/logs/circulusd-signed-genesis-mapping-full-go-tx4s0p16.log`.
+
+The concurrent post-seal root Worker run passed all 258 Pi tests but exited 1
+because the existing native Storage response-signing test did not reach its
+expected signing checkpoint within its 50 ms request limit: PID 1503971,
+`/home/seorii/logs/circulusd-signed-genesis-mapping-final-workers-cfkpoq08.log`.
+The unchanged Storage test file passed all 17 tests with one Vitest worker:
+PID 1654556, exit 0,
+`/home/seorii/logs/circulusd-signed-genesis-storage-deadline-focused-bccbeb2u.log`.
+This timing-sensitive check must not be reported as a clean concurrent gate.
+
+Complete validation then passed 870 Worker/protocol tests across 64 files
+(protocol 56, extension manifest 47, Pi 258, SessionHost 55, state-app 454)
+using `pnpm -r --workspace-concurrency=1 --if-present test:unit --maxWorkers=1
+--no-file-parallelism`, followed by `pnpm check`, `pnpm lint` and
+`git diff --check`: PID 1654569, exit 0,
+`/home/seorii/logs/circulusd-signed-genesis-mapping-serial-workers-_4ii3i19.log`.
+The mapping continuation adds 21 mapping tests and six signed-artifact/actual
+Loader integration tests. The runtime constructor seal was also independently
+checked against six JavaScript fabrication routes, all rejected. No existing
+Storage code or tests were changed to obtain this result. The generated
+stock-workerd Pi bundle SHA remains unchanged.
+
+The execution continuation implements a transport-neutral primitive pull RPC
+around the existing SessionHost engine interface. Owned request/reply snapshots
+bind all four Session scope fields, revision/artifact, turn/execution and ordered
+pull sequence. They preserve finite fractional Pi settlements and reject
+capabilities, object/array accessor fields, unsupported values and oversized
+payloads. Typed-array copies use intrinsics without invoking caller accessors.
+The host proxy validates complete checkpoint successors and effect digests before
+exposing durable events; it retains host broker capabilities. Ambiguous
+transport/validation failures poison the proxy without retries. Endpoint
+execution identities remain bounded tombstones, resident capacity includes
+pending cleanup, and failed cleanup retires peers while retaining its fence.
+Both sides use cancellation signals for current work only, avoiding retained
+reaction histories on lifetime unresolved promises.
+
+Six bundled bridge tests cover actual pinned Pi model → fractional tool → model
+→ complete reconstruction across fresh endpoints, terminal commit waits and
+owned abort on commit failure. Explicit bounded core fixtures cover delta
+backpressure and nonterminal checkpoint commit success/failure; advance count
+stays one while a commit is blocked and cannot reach two after failure. The
+pinned actual Pi adapter does not emit deltas from completed model settlements.
+An initial integration gate exposed two incorrect test expectations (that delta
+emission and `close` after commit failure, where SessionHost actually aborts):
+PID 2093653, exit 1,
+`/home/seorii/logs/circulusd-native-execution-integration-vja1fbik.log`.
+The corrected bridge/checkpoint gate passed all six tests and normal Pi type
+checking: PID 2805217, exit 0,
+`/home/seorii/logs/circulusd-native-execution-bridge-checkpoint-h32r4018.log`.
+
+Independent code review found and resolved cleanup of failed/closing peers,
+resident capacity release and long-lived Promise reaction retention. Endpoint
+27 tests, focused lint and diff checks passed: PID 1687041, exit 0,
+`/home/seorii/logs/circulusd-execution-endpoint-peer-cleanup-ved7hxae.log`.
+Proxy 46 tests, normal Pi type checking, focused lint and diff checks passed:
+PID 2198605, exit 0,
+`/home/seorii/logs/circulusd-native-execution-proxy-reviewed-yvvhg_19.log`.
+The shared wire's 13 tests and preceding four bridge tests passed with normal
+Pi type/lint checks: PID 1464153, exit 0,
+`/home/seorii/logs/circulusd-native-execution-integration-reviewed-tdsrv0nm.log`.
+
+Final validation passed 962 Worker/protocol tests across 68 files
+(protocol 56, extension manifest 47, Pi 350, SessionHost 55, state-app 454)
+using `pnpm -r --workspace-concurrency=1 --if-present test:unit --maxWorkers=1
+--no-file-parallelism`, then `pnpm check`, `pnpm lint` and `git diff --check`:
+PID 3302922, exit 0,
+`/home/seorii/logs/circulusd-native-execution-final-workers-lomvvzkr.log`.
+This adds 92 tests in four files: wire 13, endpoint 27, proxy 46 and bundled
+bridge six. Go sources are unchanged; their preceding 81-package race/vet gate
+remains the latest complete Go result. The stock-workerd Pi bundle SHA remains
+`fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549`.
+
+The additional `gpt-pro-consult` design review produced no validated response:
+its shared authenticated browser startup navigation timed out, and fallback CDP
+connection also timed out. Network access was enabled and DNS resolved; browser
+authentication could not be established through the failed connection. PID
+4053424, exit 1,
+`/home/seorii/logs/circulusd-native-execution-pro-design-0y_sl55x.log`.
+Implementation was reviewed independently against pinned source/repository
+contracts without attributing any verdict to Pro.
+
+The preceding pull-only bridge uses a local structured-clone transport fixture
+and supplies no native Loader binding, signed execution deployment artifact,
+runtime proof or remote termination/resource evidence. The existing genesis-only
+mapping cannot authorize a distinct execution artifact. Actual native Loader
+qualification and qualified host broker composition remain open;
+`AdmissionReady` stays false.
+
+The Loader execution continuation now adds the fixed
+`createPiExecutionEntrypointClass` wrapper and `CelldPiExecutionEngine` adapter.
+The actual bundled Pi core reconstructs model → fractional tool → model →
+complete across fresh Loader compositions, using the concrete signed execution
+mapping verifier and a local native-shaped Loader/base fixture. Its callable
+RPC node rejects deeper `.bind`/`.call`/`.apply` paths, so the test validates
+the pinned one-hop `Reflect.apply` invocation. Binary authority/checkpoints
+remain structured-clone RPC values; scoped environment/configuration remain
+JSON, and `globalOutbound` is explicitly null. Brokers stay on SessionHost.
+
+Execution configuration/artifact/mapping use separate hash domains. The
+sealed verifier requires independent document-digest and public-root pins;
+its exact three-field binding includes the execution mapping domain. A valid
+genesis verifier for identical execution claims/root/artifact is rejected
+before Loader access. `internal/engineexecution` prepares/verifies the same
+canonical document, and the public fixture includes both independently valid
+purpose signatures to prove cross-purpose rejection. Production APIs accept
+no private signing key or native evidence. The new Go package passed its
+focused race/vet gate: PID 2643383, exit 0,
+`/home/seorii/logs/circulusd-native-execution-mapping-go-5sy3_wo9.log`.
+Its 23 TypeScript tests, normal Pi type checking and focused lint passed:
+PID 3927324, exit 0,
+`/home/seorii/logs/circulusd-native-execution-mapping-ts-final-j5_7xysy.log`.
+
+The entrypoint's 15 tests cover actual Pi cold continuation, complete scope
+checks before shared initialization, owned environment/request snapshots,
+overlapping calls, tombstones/stale controls and no cross-pull `waitUntil`:
+PID 3305320, exit 0,
+`/home/seorii/logs/circulusd-execution-entrypoint-final-ozxhtj93.log`.
+The adapter's 19 tests, normal Pi type/lint and diff checks passed:
+PID 591486, exit 0,
+`/home/seorii/logs/circulusd-loader-execution-adapter-reviewed-jjecui4w.log`.
+Independent review resolved deferred same-turn artifact copying and an
+unobserved late load rejection when Loader synchronously cancels factory
+acquisition. Regression tests exercise both failure paths.
+
+Final validation passed all 1,019 Worker/protocol tests across 71 files
+(protocol 56, extension manifest 47, Pi 407, SessionHost 55, state-app 454)
+using serial package/file collection, followed by `pnpm check`, `pnpm lint`,
+`go test -race -p=1 ./...`, `go vet -p=1 ./...` and `git diff --check`.
+All 82 tested Go packages passed. The 57 added TypeScript tests are in three
+new files, and the new Go mapping package adds one tested package.
+PID 955259, exit 0,
+`/home/seorii/logs/circulusd-loader-execution-final-j8w4br2i.log`.
+The generated stock-workerd Pi bundle is unchanged at
+`sha256:fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549`.
+
+Every composition uses a fresh UUID after its scoped artifact identity, since
+native Loader names remain cached after stub disposal. Factory success means
+verified artifact and owned native stubs, not completed compilation or native
+readiness; compilation/entrypoint initialization occurs on the bounded first
+exchange. Factory cancellation ends at publication. Separate lifetime disposal
+rejects local waits and schedules native registry release once, without
+claiming cooperative engine cleanup or native-stop acknowledgement. Native
+in-flight work may still finish. Real cross-RPC continuation/timer behavior,
+measured code/runtime proof, configured object storage, resource/termination
+enforcement and the qualified served broker graph remain unverified. Read-only
+host checks still find neither celld nor NsJail on PATH. `AdmissionReady` stays
+false, and no infrastructure was provisioned.
+
+The requested storage → served execution → operational authority/resource
+sequence initially started with storage preparation only. Its later storage-only
+completion on this machine is recorded below. The new actual S3 client
+uses the official AWS SDK v2, an explicit existing bucket and credential source,
+native opaque ETags, bounded HTTP requests and no SDK mutation retries. Its
+qualification command writes a private exclusive report with endpoint/bucket
+digests and stage observations. Generic CAS cleanup now verifies run-owned
+payloads, handles nonce collisions without deleting foreign objects and checks
+logical absence after conditional deletion. Regression tests reject no-op
+deletion, ambiguous persisted writes followed by HTTP 500, unsafe report parents,
+JSON case-fold aliases and incorrect SigV4/header/path behavior. The 22 new Go
+tests passed focused race/vet/diff: PID 1897092, exit 0,
+`/home/seorii/logs/circulusd-s3-native-cas-reviewed-owxfqzvn.log`.
+These HTTP fixtures do not qualify an actual endpoint or celld durability.
+
+The final Go regression passed all 83 tested packages under
+`go test -race -p=1 ./...`, followed by `go vet -p=1 ./...` and
+`git diff --check`: PID 2161461, exit 0,
+`/home/seorii/logs/circulusd-native-storage-preparation-final-03lczlro.log`.
+The new qualification command adds one tested Go package. Worker source and
+the generated stock-workerd bundle were unchanged in this preparation unit;
+the preceding 1,019-test Worker result was not rerun or relabeled as live proof.
+
+The native Storage project builder emits an actual bundled Worker/DO pair with
+the existing transaction kernel, dedicated namespace and private operational
+HMAC configuration. Its eight tests cover malformed/private inputs, exclusive
+outputs, digest-only public metadata, actual snapshot/commit/barrier/read and
+unsigned 404 for both reserved native probe paths. Syntax, focused lint and
+diff checks passed: PID 989822, exit 0,
+`/home/seorii/logs/circulusd-native-storage-builder-reviewed-uk5kwo6h.log`.
+The prepared bundle SHA is not the subsequently re-bundled/loaded deployment
+SHA, and its manifest explicitly remains `PREPARATION_ONLY`/not admission-ready.
+
+Pinned x86_64 celld 0.3.0 and SeaweedFS 4.44 release archives were downloaded,
+verified against the existing manifest and extracted without starting services:
+PID 2889969, exit 0,
+`/home/seorii/logs/circulusd-native-storage-artifacts-6pjiust2.log`.
+Private archive/executable provenance is retained under
+`.codex/native-storage-qualification/artifacts/provenance.json`.
+Read-only Docker discovery found a responding 29.1.2 server. At that preparation
+checkpoint, no bucket, container, native node, deployment or trust root had been
+provisioned; the actual mutation/fault-test target awaited selection and native
+signer/issuer/durability qualification remained incomplete. The later selected-
+machine observations and storage-only completion are retained below. Served
+graph and operational authority/resource work have not started.
+
+The new native signer design consultation failed before producing a response:
+PID 586058, exit 1, model picker not found,
+`/home/seorii/logs/circulusd-storage-native-design-525j_4kh.log`.
+Independent source-boundary reviewers confirmed that the current SPEC requires
+a minimal measured celld fork, separate signed artifact selection, raw fault
+observations before conformance issuance and full graph/credential generation
+fencing on restart. No verdict is attributed to Pro. Exact completion and
+prepared-tool contracts are in `docs/unit11-operator.md`; `AdmissionReady`
+remains false.
+
+The selected-machine storage continuation (2026-10-11) has provisioned only
+its dedicated loopback SeaweedFS service, private bucket and stock celld
+application. The actual loaded main module is 59,617 bytes with SHA
+`sha256:1719d6592159027b446b5434af31f59879199662b63217108e43b3efb0b2a7ef`;
+the prepared file has a different digest. The raw reports are retained under
+`.codex/native-storage-qualification/local/run-v37k2up7/reports`.
+
+Actual provider CAS passed with its opaque ETags. The later raw CAS observer
+also recorded exactly 32 contenders, one winner and 31 native HTTP 412
+responses; stale update, duplicate create and stale delete each returned 412.
+The winner, ordinary read and fresh-client read have the same full SHA. This
+run exited 0 (PID 173860,
+`/home/seorii/logs/circulusd-native-storage-cas-actual-k7jvbffr.log`), with
+`reports/native-cas-raw.json` retaining the exact statuses, ETags and digests.
+Its eight focused regression tests, race detector, vet and diff checks exited
+0 (PID 140117,
+`/home/seorii/logs/circulusd-native-storage-cas-observer-sqyn9pc5.log`).
+
+Stock state/receipt/barrier observations include these actual fault runs:
+
+| Observation | Process/result | Retained log |
+|---|---|---|
+| Initial acknowledged commit and readback | PID 2671962, exit 0 | `/home/seorii/logs/circulusd-local-observe-seed-06efhxhh.log` |
+| SIGKILL followed by same-directory recovery | Native PID 2362464, exit -9; observer PID 3352238, exit 0 | `/home/seorii/logs/circulusd-local-observe-verify-ltdaxt3a.log` |
+| Empty-directory recovery | Observer PID 3961172, exit 0 | `/home/seorii/logs/circulusd-local-observe-verify-3fkrrimb.log` |
+| Empty-directory read after the machine reboot | Observer PID 85379, exit 0 | `/home/seorii/logs/circulusd-local-observe-verify-_wfpk2y2.log` |
+| Second actual SIGKILL followed by empty-directory recovery | Native PID 79665, exit -9; observer PID 101276, exit 0 | `/home/seorii/logs/circulusd-local-observe-verify-ws8mqm4q.log` |
+| Stale application revision rejection and unchanged readback | Observer PID 99366, exit 0 | `/home/seorii/logs/circulusd-local-observe-stale-cas-ykaapq0e.log` |
+| One dropped successful response, then committed state/receipt/barrier readback | Observer PID 106619, exit 0 | `/home/seorii/logs/circulusd-local-observe-loss-tb4hvosa.log` |
+
+An immediate post-startup recovery request failed (`snapshot-after:UNAVAILABLE`,
+PID 93196, exit 1,
+`/home/seorii/logs/circulusd-local-observe-verify-tfyybamg.log`); its raw failure
+is retained and the later successful read is a separate report. Real root-disk
+exhaustion also made the store read-only and caused native self-fencing, which
+was not counted as a second injected SIGKILL. Only this run's 63 store files
+were copied to a new private `/data` directory with matching SHA values; the
+store and the original acknowledged state survived the later host reboot.
+These stock observations have host-claimed bindings and are rejected by the
+final native issuer. Neither stale application CAS nor provider CAS proves a
+still-live prior native owner's late-write rejection.
+
+The separate stock live-owner experiment completed in 12.37 seconds. Prior
+native PID 249415 owned CELL epoch 6, uploaded an actual LTX with HTTP 200 and
+had exactly one subsequent ownership GET held by the local relay. After SIGSTOP
+and lease expiry, native PID 264409 claimed epoch 7 and committed revision 3→4.
+The held GET was released while the prior process remained stopped and returned
+the new owner's actual body/ETag. The resumed prior process exited 3 with a
+retained `SELF-FENCE` line; its one request received no acknowledgement
+(`UNAVAILABLE`, HTTP status 0). The new owner's revision 4 and state SHA
+`sha256:8c464922542235390a36c9862f18e5049d657232eb5a0fe3064d96c49431a2a9`
+remained unchanged, with fresh barrier serial 9→10. The raw protocol and process
+facts are in `owner-experiment/experiment-with-termination.json`; the completed
+prior-process log is `/home/seorii/logs/circulusd-local-node-j2_voevu.log`.
+This is stock-only evidence and cannot qualify the separately selected fork.
+
+The real native CELL `%3A` escaped-path relay regression, seven focused tests,
+race detector, vet and diff checks passed (PID 229723, exit 0,
+`/home/seorii/logs/circulusd-native-owner-escaped-path-72kfmaxv.log`). A later
+bounded capacity pilot admitted exactly 20 additional native CELLs; B held 16
+CELLs and A five, with the seed still owned by B. B remained live, but seed
+release/takeover was not observed. `owner-experiment/capacity-result.json`
+retains that negative result; no capacity-handoff PASS is claimed.
+
+The reviewed minimal native fork and independent storage-only issuer are now
+implemented. Focused proof-crate tests/clippy/formatting exited 0 (PID 3314501,
+`/home/seorii/logs/circulusd-native-celld-proof-final-8_oco05a.log`); the
+issuer's 17 focused cases/race/vet exited 0 (PID 3587980,
+`/home/seorii/logs/circulusd-native-storage-issuer-owner-transcript-jbgld73m.log`).
+The first full native build was terminated by its memory budget, exit -15,
+`/home/seorii/logs/circulusd-native-celld-build-9op7w_sp.log`. The post-reboot
+private disk-cache retry passed in 15 minutes 32 seconds, supervisor PID 64435,
+Cargo PID 64652, exit 0,
+`/home/seorii/logs/circulusd-native-celld-build-2v_mocim.log`; its authoritative
+result is in the adjacent `.log.status.json` file. The separately selected
+63,319,056-byte raw executable has SHA
+`sha256:292c6753b45bf0a1bc42c5928c49be0ed048fb32fb43c00e697ccc10ece64adc`.
+Pinned source, patch, proof and lockfile hashes were rechecked after compilation.
+This successful full build does not establish signed native live probes.
+
+The actual fork generation-16 seed observed an acknowledged state/receipt and
+fresh barrier with native PID 747699, revision 1 and state SHA
+`sha256:d1a480f031438ddc8d676ec875ebf94ac8e41e5fded274fb247e61b03e0ae5c4`.
+Its report is `reports/native-seed-0e0efd9ab5211616.json`. Native generations 9,
+16 and 17 all subsequently SELF-FENCE exited 3 after lease renewal became
+ambiguous at about 2,501 ms, including the 10-second and 15-second TTL attempts.
+Generation 16's completed log is
+`/home/seorii/logs/circulusd-local-native-node-rpkh683q.log`; generation 17,
+PID 1223355, exited 3 in
+`/home/seorii/logs/circulusd-local-native-node-u_rmmpg_.log`.
+An acknowledged seed is not a crash test, and these self-fencing exits are not
+injected SIGKILLs. Those early attempts supplied no actual fork recovery or
+native owner qualification; the later fresh run is recorded below.
+
+Generation 18's actual unsigned state and native-storage probes both returned
+404 (observer PID 3611053, exit 0,
+`/home/seorii/logs/circulusd-local-native-probe-unsigned-tm1eh0qv.log`, report
+`reports/native-probe-unsigned-5fd0dd7123.json`); the native process later
+self-fenced with exit 3. These are negative controls, not signed probe PASS.
+An independent 90-GET SDK trace recorded 30 initial successes in 1–4 ms, then
+two-second timeouts persisting after native exit (supervised diagnostic
+PID 3242347, exit 0,
+`/home/seorii/logs/circulusd-local-lease-diagnosis-aq2w846w.log`). The diagnostic
+exit 0 means observations were retained, not that all GETs succeeded.
+
+The actual SeaweedFS binary identifies commit
+`3563738699f29fd1c9efde6fcbf4ba253439cac8`, `vcs.modified=false`.
+Its completed dump and exact source confirmed volume-slot exhaustion: the two
+bucket volumes consumed `-volume.max=2`, leaving no default-collection system
+metadata volume. Repeated metadata-flush failures filled the 16-window queue;
+transaction writers retained exclusive per-key locks and blocked subsequent
+GETs. The seven blocked writers and flush retry are retained in
+`/home/seorii/logs/circulusd-local-store-qe25i6by.log`. This confirms provider
+capacity as the cause of the repeated lease failures; the source links and
+lock/flush chain are in `docs/unit11-operator.md`.
+
+The owned store PID 69518 blocked on SIGTERM and exited 2 after the intentional
+diagnostic SIGQUIT. Only its private controller limit was changed to
+`-volume.max=4`; existing volume files and the 1 GiB free-space floor were
+preserved. Replacement PID 775008, job `jobs/store-eb87bb8045.json`, created
+default-collection volumes 27/28 with `readOnly:false`. Its log is
+`/home/seorii/logs/circulusd-local-store-q2xydw3q.log`.
+Native generation 19, actual PID 988299, used resident limit 2, TTL 15 seconds
+and two Tokio threads, completed a 204.109891-second diagnostic and exited 0
+after owned SIGTERM. All 41 lease attempts applied; none became ambiguous, and
+the maximum measured duration was 12 ms. The root isolate was freed and no
+SELF-FENCE occurred. Default volumes 27/28 grew to 9,851/26,967 bytes, proving
+system metadata flushes. The completed report is
+`reports/native-19-post-capacity-diagnostic.json`; its completed log is
+`/home/seorii/logs/circulusd-local-native-node-krdjxuti.log`.
+The native build SHA, application graph and lease checks were not changed.
+
+The fresh post-capacity provider CAS run passed with 32 contenders, one winner
+and 31 actual precondition failures. Three stale operations each returned 412;
+fresh-client bytes/digest matched and bounded cleanup completed. Supervisor
+PID 1584549, child PID 1585016, exited 0; report
+`reports/native-cas-post-capacity-1791648016150627376.json`, log
+`/home/seorii/logs/circulusd-native-storage-cas-post-capacity-hp0wkepm.log`.
+This proves the new provider observations; it does not supply the native owner
+fence or crash-recovery evidence.
+
+A fresh native fault chain completed with exit 0: generation 20,
+actual PID 2291966, and generation 21, PID 2581521, were each SIGKILLed
+(exit -9); generation 21 used watch 20, then B23/PID 2835395 recovered with a
+fresh watch. All five phase reports retained `errors: []`: seed, same-watch
+verify, fresh-watch verify, stale-CAS and response-loss. Native20's unsigned
+state/native-storage probes both returned 404. Supervisor PID 2287697,
+child PID 2288666, status `jobs/native-fault-chain-f79a054a6e.json`, log
+`/home/seorii/logs/circulusd-local-native-fault-chain-jit1k4rm.log`.
+The manifest is `reports/native-fault-chain-d76e45d4ce58.json`; the actual seed
+is `reports/native-seed-78546e676d4c81d8.json`, revision 1/state SHA
+`sha256:0782b3ff928081078e3f12c34a8772cb5990f17d107a89b690397bc166a21068`.
+Final B's response-loss report is `reports/native-response-loss-682dd276e2.json`:
+one backend 200, explicit receivedBytes 0, committed revision 2/state SHA
+`sha256:8ace22902b047db5e835952e3a3bc6625481cbd2be434ab136d07ebd1c65163b`,
+receipt and a fresh barrier. It precedes the owner fault and retains the
+original revision-1 baseline.
+
+The actual native capacity phase committed exactly two nonce-scoped disposable
+objects through B23, with A absent. Actual seed CELL
+`NativeStorageQualificationCell:a832a93d22b818c04437f06c6743c7111204f8c0b16ce80303ec502d49d8bdc8`
+changed from B/epoch 3 to an empty-node/epoch-3 own.json with changed ETag;
+the seed was absent from B's two residents. B remained live.
+`owner-native/capacity-native-result.json` retains these facts; supervised
+PID 985226 exited 0, log
+`/home/seorii/logs/circulusd-native-owner-capacity-iaqc7220.log`.
+New A22/PID 1601344 reclaimed the seed at CELL epoch 4 by read + fresh barrier,
+keeping revision 2/state unchanged. B explicitly evicted a replicated disposable,
+reducing occupied slots 2→1 while retaining its exact own.json body/ETag.
+
+The actual native owner trial completed in 12.150896465 seconds, supervised
+PID 4123245, exit 0, log
+`/home/seorii/logs/circulusd-native-owner-trial-cdp0x4i2.log`.
+A's actual LTX PUT returned 200 and exactly one following proof GET was held.
+Pinned SIGSTOP observed process state T; the retained post-STOP lease determined
+the 10.699-second expiry wait. B23 claimed CELL epoch 5, saw the unacknowledged
+uploaded revision 3, and committed revision 4. The proof GET was released while
+A remained stopped and returned B's exact owner body/ETag. CONT produced actual
+SELF-FENCE exit 3 and one HTTP 0/UNAVAILABLE request without acknowledgement;
+pending driver PID 4125071 exited 0 after retaining the failure facts.
+B revision 4/state SHA
+`sha256:1e6f24fcccb23c81b28e4376b3f734f05b535d23e260920156b83d2a9edf318a`
+remained unchanged after fresh barrier 8→9. Actual protocol/process sequences,
+responses and raw termination bytes are retained in
+`owner-native/owner-trial-result.json` and `owner-native/prior-termination-log.json`.
+A's completed log is `/home/seorii/logs/circulusd-local-native-node-r2ociwog.log`;
+its STOP/CONT transcripts are `reports/process-fault-589bd605665a.json` and
+`reports/process-fault-798174b7d732.json`. Runtime probe epochs 22→23 are
+separate from CELL epochs 4→5; actual proxy/direct configuration digests remain
+distinct. Only the owned relay PID 1448343 was terminated after the trial,
+exit 0; A had already exited 3. B23 remains live and the store was untouched.
+Independent raw assembly, observation signing, conformance issuance and native
+immutable publication then completed with exit 0. The exact canonical native
+owner record is `owner-native/owner-observation.json`, digest
+`sha256:d137481a2e96f1f777f14fa29aad6b878103bb6888ba8042569dcbb0bd4107dd`.
+Final live verification also exited 0: actual verifier PID 3946724, supervisor
+3945880, status `jobs/native-probe-verify-fdc84599e6.json`, completed log
+`/home/seorii/logs/circulusd-local-native-probe-verify-ehbm_j7_.log`.
+`reports/native-probe-verify-575896e0b8.json` records HTTP 200 and independently
+verified fresh nonce signatures from both `/circulusd/state/v1/production:probe`
+and `/circulusd/native-storage/v1/production:probe`, describing unchanged
+B23/PID 2835395, start tick 454970 and runtime probe epoch 23.
+The raw report digest is
+`sha256:6a316ce7137620a368b069a1bf4bea1333165f0bea9590cac0a18217270b5ae4`;
+the issued evidence digest is
+`sha256:6c2a870e21759f4407e2061de1f988fa716edf5ebd488e909c615eb5895795e3`.
+`native-23/issued-evidence.json` records issue time 1791649636 and expiry
+1791734416 (Unix seconds). Exact atomic groups are `command-receipt` and
+`native-storage`. The source's `productionEligible: true` qualifies only this
+measured storage source; the verifier records `platformAdmissionReady: false`
+and `productionDependencyMinted: false`. This completes stage 1 on the selected
+machine, without qualifying the full Session app, served execution graph,
+operational enforcement or production release, and without promoting any full
+§53 profile below. Earlier failures and stock-only results remain retained.
+
+Raw response-loss facts now retain the explicit `receivedBytes: 0` value after
+completed publication under the observation mutex. The two publication
+regressions passed 20 repetitions with race detection, followed by focused
+Storage observer/issuer race/vet/diff checks (PID 394531, exit 0,
+`/home/seorii/logs/circulusd-native-storage-byte-publication-wkp46q5u.log`).
+The latest complete Go gate passed all 88 packages with race detection and
+serial package execution, followed by vet and diff checks (PID 469764, exit 0,
+`/home/seorii/logs/circulusd-local-go-gate-2psuxwlx.log`). These local checks
+do not supply runtime qualification. The independent actual native observations,
+issuance and signed live probes above complete stage 1 storage-only
+qualification on this machine. Stage 2 served execution and stage 3 operational
+enforcement have not begun. Admission remains closed.
+
+The native NsJail qualification driver now measures all 13 isolation checks,
+including a curated syscall denial and separate CPU/memory/PID pressure runs.
+Signed inventory bounds, sealed executable bytes, authenticated READY/GO,
+pinned cgroup descriptors/counters and owned cleanup are exercised by local
+fault tests. Focused race/vet, diagnostic dependency checks, native helper and
+arm64 helper/executor test-binary builds passed in
+`/home/seorii/logs/circulusd-nsjail-enforcement-gate-gt8r6n40.log` and
+`/home/seorii/logs/circulusd-nsjail-enforcement-final-tbqxxwnj.log` (exit 0).
+The actual jail/helper was not run on this host; injected observations are
+reference-only, and the live gate still needs provisioned signed artifacts and
+dedicated roots. §53.10 remains UNAVAILABLE. The operator contract is in the
+Unit 13 native-driver section of `docs/implementation-plan.md`.
+
 | SPEC | Area | Required evidence | Current status |
 |---|---|---|---|
 | §53.1 | Session/Pi/extension isolation | stock workerd, two sessions, eviction and stale generation suite | NOT_RUN |
@@ -47,6 +659,141 @@ reference-only, so even the executed gate does not by itself satisfy §53.1,
 §53.3, or §53.4, and it does not change any status in the table above.
 
 ## External qualification notes
+
+- 2026-10-11 stage 2 integration gate: all 97 Go packages (88 with tests, nine
+  without tests) passed `go test -race -p=1 ./...`, followed by
+  `go vet -p=1 ./...` and `git diff --check`. Runner PID 86125 exited 0;
+  completed log `/home/seorii/logs/circulusd-platform-go-gate-j9rrfq_y.log`,
+  private status
+  `.codex/native-platform-qualification/run-ktvkxeee/jobs/go-gate-5dede8d860.json`.
+  The gate checked the exact same 526 Go source/module-file hashes before and
+  after execution. Final independent reviews passed for the frozen native
+  quota projection and MCP provider units. This is regression evidence;
+  the actual model endpoint, Pi terminal bridge, trusted SessionHost/broker
+  composition, engine/full-Session source issuance and operational stage
+  remain open. No production acceptance status is promoted.
+
+- 2026-10-11 stage 2 progress: the private full Session app builder passed six
+  tests and focused static checks (PID 1850312, exit 0,
+  `/home/seorii/logs/circulusd-native-state-app-builder-jhq2l36j.log`). The
+  independent Pi preparation builder passed three tests, including bundled
+  genesis-to-first-model execution; its initial combined gate stopped on a lint
+  warning, and the corrected focused lint/diff checks passed separately. The
+  native effect ledger, MCP repository/factory and model authority/quota state
+  passed package race/vet checks with completed logs
+  `/home/seorii/logs/circulusd-native-effect-ledger-gate-3rrwlg18.log`,
+  `/home/seorii/logs/circulusd-native-mcp-final-1jozw3oi.log`, and
+  `/home/seorii/logs/circulusd-native-model-primitives-gate-9t0xxfql.log`.
+  These are source and local contract checks; their required atomic groups
+  exceed the two groups qualified by the retained B23 storage source.
+- 2026-10-11 native RPC preparation: seven harness tests verify owned-CELL
+  response gating after serialization, rejection on gate failure and the
+  unchanged routed path (PID 123956, exit 0,
+  `/home/seorii/logs/circulusd-native-rpc-output-gate-ujflxinb.log`). Four
+  isolated Git fixtures verify the exact build patch, including staged and
+  unstaged tampering. The new native build exited 0 (Cargo PID 817762,
+  `/home/seorii/logs/circulusd-native-celld-build-s6sbi1n7.log`) with executable
+  digest `sha256:c13566938e206b3aecd72bc38c1a804416d498d35c1fbf86c52d181eec0bb61c`.
+  A separate loopback bucket passed actual object-store CAS and now hosts the
+  full Session app, loaded digest
+  `sha256:27012482008ea862c1a93b26917f4b270cd2fa32c8f3e4a80290e8a99684579c`,
+  in unsigned measurement mode (PID 2616751, start tick 799737). Its private
+  root is `.codex/native-platform-qualification/run-ktvkxeee`. The retained
+  storage-only B23 source is unchanged. The new graph has no independently
+  issued conformance proof, served Loader/provider chain or fault qualification;
+  no acceptance-table status or production capability is promoted.
+- 2026-10-11 actual Session bootstrap recovery: the separately built private
+  operator driver passed six tests, vet and build (PID 897776, exit 0,
+  `/home/seorii/logs/circulusd-native-session-driver-final-pins-x_2mcqbv.log`).
+  Its actual authenticated internal initialization returned HTTP 200 with a
+  fresh version-0 result; that peer transport has no response MAC, which the
+  report explicitly records. Three served read requests returned HTTP 200 with
+  verified response MACs. The exact new native PID 2616751 was then killed via
+  pidfd (exit -9), and a fresh local directory/process, PID 2872193/start tick
+  930557/runtime epoch 2, recovered the initialized Session. Three further
+  authenticated reads retained the same canonical result digest, with exact
+  before/after process, boot, build, prepared/deployed artifact and measurement
+  checks. The private combined report is
+  `.codex/native-platform-qualification/run-ktvkxeee/reports/session-bootstrap-recovery.json`,
+  digest `sha256:354096b0b4cf133f85b20e9f8b728cc73104300ed2db1224e50ad697cbfaef14`.
+  Initialization/read/recovery driver PIDs 1645217, 1846332 and 3452676 all
+  exited 0; their completed logs are
+  `/home/seorii/logs/circulusd-platform-session-init-xz10ayu4.log`,
+  `/home/seorii/logs/circulusd-platform-session-read-7z621p2k.log`, and
+  `/home/seorii/logs/circulusd-platform-session-read-cold-32ipiq92.log`.
+  This partial observation contains no admitted turn, provider dispatch or
+  committed engine checkpoint/public-event lifecycle and does not qualify the
+  full Session source, owned-RPC write fault semantics or served graph.
+- 2026-10-11 provider/accounting continuation: the concrete anonymous MCP
+  `2025-06-18` HTTP/SSE transport and native provider adapter passed their
+  focused race/vet gates. The final provider gate exited 0 (supervisor 1277557,
+  `/home/seorii/logs/circulusd-native-mcp-http-frozen-vkgtqrgv.log`). Owned
+  HTTP fixtures verify single-winner calls, response loss without replay,
+  cancellation/RPC-error uncertainty, cold lookup/tombstones, reference-permit
+  rejection and shared concrete Storage/NativeLedger Session dispatch. The
+  native Storage fixture is local contract evidence, not a qualified live
+  native source. Generic MCP JSON cannot satisfy the existing Pi result
+  normalizer; the authenticated Pi terminal publication remains unwired.
+  The native Session quota projection passed model/bootstrap race/vet checks
+  and independent frozen-source review (supervisor 773324, exit 0,
+  `/home/seorii/logs/circulusd-native-session-quota-gate-pjvy2t8d.log`). It
+  reads authenticated concrete Session/ledger facts, preserves original
+  reservation replay after takeover, releases only pre-dispatch failure, and
+  retains ambiguous charge. Commit/barrier loss and canonical v1-to-v2
+  conversion pass locally. Cross-object atomic settlement remains false;
+  no live provider execution, atomic quota or §53 status is promoted.
+
+- 2026-10-08 final Go and static gate: `go test -race -p=1 ./...`,
+  `go vet -p=1 ./...` and `git diff --check` all exited 0 in
+  `/home/seorii/logs/circulusd-final-go-green-5w7inb_t.log`. Root `pnpm check`
+  and `pnpm lint` also exited 0 in
+  `/home/seorii/logs/circulusd-final-types-lint-3rffapt7.log`. An initial full
+  Go run caught a diagnostic dependency regression; separating broker-aware
+  workload adapters into `internal/referenceworkload` fixed it while retaining
+  the existing executable dependency guards and the UDS recovery regressions.
+  These commands are local regression gates, not production qualification.
+
+- 2026-10-08 final Worker regression: all 690 tests across 50 files passed
+  (state-app 396, SessionHost 55, Pi 183, protocol 56). The state-app log is
+  `/home/seorii/logs/circulusd-final-worker-state-app-wu6ky85f.log` (exit 0).
+  This includes six reference orchestration cases using the actual Session and
+  Workspace Cells, cold Pi reconstruction, and commit-response-loss recovery.
+  The operation and Pi core are reference implementations; no sandbox provider
+  or native command ran in those cases. The signed-registry configuration
+  planner also passed the real declarative NsJail launch-plan checks under Go
+  race testing. It grants no admission or live-isolation authority.
+
+- 2026-10-08 harness regression: 27 Node tests passed and the one unrequested
+  live sandbox test skipped. Explicit startup selection now fails on missing
+  binaries or backend failure; a separate process using an empty temporary
+  sandbox directory proved exit 1 before any launch. The Go harness now uses
+  the shared sandbox RPC client and passed real private-UDS race tests, the
+  standard build/test commands, Windows test compilation and Linux ARM64
+  compilation. No NsJail, Docker or unshare launcher ran during these checks.
+  These results do not qualify an isolation backend or upgrade a §53 status.
+
+- 2026-10-08 local composition evidence: separate signed public admission,
+  canonical message preservation, same-domain HTTP/SSE composition and scoped
+  PAT authentication passed their focused tests. The source-derived host wire
+  regression passed 113 tests; Go state client/admission/bootstrap/public API
+  race tests and root type/lint checks passed. The explicitly reference UDS
+  workload transport passed controlrpc/broker race tests and the proto contract
+  suite, including concurrent starts, response loss, malformed identities,
+  role/boot rejection and no authentication retry. Its callback executor and
+  process-local guards are reference evidence only. Production still lacks the
+  complete grant/retry/result-body store adapter, qualified native admission
+  planner, durable credential/audit/ACL composition and served runtime gates.
+  No public production listener was enabled and no §53 status was promoted.
+
+- 2026-10-08: `TestStockWorkerdFixture` passed against the locally installed
+  workerd `2026-08-25` executable with SHA-256
+  `b805ed481caa643953357d38146b82c118addcb525eb87e3d190b5617c82bc75`, matching the
+  release manifest's extracted x86_64 pin. The live fixture exited 0; its log is
+  `/home/seorii/logs/circulusd-stock-workerd-live-LZhMrehR.log`. The five
+  resource/recovery components remained `NOT_RUN`, and stable-broker-binding
+  remains mock. No current dedicated resource qualification configuration or
+  real celld/object-store environment and signed evidence was available. This
+  semantic fixture does not upgrade a §53 status or `AdmissionReady`.
 
 - Pi Agent Core `0.84.3` and workerd `v1.20260825.1` remain short of the complete bounded-step Phase 0A gate. The digest-pinned stock workerd binary ran the actual ABI/state-v2 Pi adapter across four fresh engine/core instances over the checkpoint sequence `model -> external-tool -> model -> complete` and observed the complete extension hook sequence without Node compatibility flags. A separate probe rendezvoused the first model settlements and ran that trace concurrently for two distinct content-addressed Dynamic Workers through real Workerd service bindings backed by a deterministic mock MODEL/MCP worker; effect digests, identities, stages, bounded retry, and missing bindings were checked, and its evidence remains `mock: true`. This proves the binding and correlation shape, not production broker authorization, durable delivery, or recovery. The separately-run Unit 10 resource gate now covers the Dynamic Worker kill/recreation, shard recycle, cgroup pressure, and CPU/RSS boundaries on a provisioned host (recorded in the Unit 10 bullet below); it does not promote this §53.3 status.
 - Unit 10 external resource qualification (`TestStockWorkerdResourceQualification`) reached its achievable bar on a provisioned WSL2 cgroup-v2 host against the digest-pinned stock workerd `1.20260825.1`. Four required results are non-mock external `PASS` and the fifth is a recorded honest `FAIL`, all from one release-, config-, host-, boot-, cgroup-, runner-, and run-bound canonical-CBOR envelope (`workerd-resource-observation-v1.cbor`): `workerd.cpu-limit` (kernel `cpu.max` 50000/100000 enforced — ~20 throttled periods / ~0.97 s under a runaway worker — plus supervisor SIGKILL + recycle; the in-isolate `cpuMs` limit was confirmed not to fire and is recorded as non-enforced), `workerd.rss-cold-start` (five cold starts, each ~48 MiB pidfd-verified process RSS with a distinct nonzero cgroup memory charge at the exact shard identity), `workerd.shard-pressure-recycle` (memory.current driven to ~245 MiB of a 256 MiB `memory.max` cap, OOM-killed, then reconstructed into a new isolate replaying the acknowledged checkpoint), and `workerd.shard-kill-reconstruction` (explicit whole-shard SIGKILL, then reconstruction into a new isolate replaying the acknowledged checkpoint). The recorded `FAIL` is `workerd.dynamic-worker-reconstruction`: the designated in-isolate cpuMs runaway is never aborted, so stock workerd performs no per-isolate reconstruction on this pin — a documented residual gap, never a skip or a PASS. This certifies only the kernel-enforced resource safety boundary observed on this development host; it is not a production install-profile run. The Session, checkpoint, and placement fixtures remain reference-only, `AdmissionReady` stays false while the recorded gap and every production dependency are open, `cmd/agentd` stays diagnostic-only, and §53.1, §53.3, and §53.4 remain `NOT_RUN`. Closing the per-isolate gap requires a re-pinned/rebuilt workerd that enforces isolate limits in serve mode. See `docs/unit10-operator.md`.
