@@ -105,10 +105,10 @@ export const extensionOrder = {
 
 export const stableBrokerBinding = {
   async test(_controller, env) {
-    const left = env.LOADER.get("stable-broker/sha256-fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549/identity-a", () =>
+    const left = env.LOADER.get("stable-broker/sha256-b2dbe9f525690a98ae24251abec662564de84901e1a5fb5067c3dbc94536fe61/identity-a", () =>
       definition("identity-a", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
     );
-    const right = env.LOADER.get("stable-broker/sha256-fc666a4fc75c7dd3e873e31e78b7b7124e00770b901ff0a12f4b0f2eafd7d549/identity-b", () =>
+    const right = env.LOADER.get("stable-broker/sha256-b2dbe9f525690a98ae24251abec662564de84901e1a5fb5067c3dbc94536fe61/identity-b", () =>
       definition("identity-b", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
     );
     const [leftResult, rightResult] = await Promise.all([

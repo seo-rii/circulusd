@@ -54,6 +54,9 @@ const EFFECT_REQUEST_DIGEST_DOMAIN = "circulusd.session.effect-request";
 const TOOL_BATCH_DIGEST_DOMAIN = "circulusd.session.tool-batch";
 const DIGEST_SCHEMA_VERSION = 1;
 const MAX_PENDING_ABORT_TURNS = 64;
+// The longest engine-owned BoundaryFault code. Nonterminal checkpoints must
+// leave room to record a fault while retaining their committed core state.
+const TERMINAL_HEADROOM_CODE = "EXTENSION_OUTPUT_INVALID";
 
 export const DEFAULT_ENGINE_BUDGETS: EngineBudgets = Object.freeze({
   maxStepInputBytes: 5 * 1_048_576,
@@ -528,6 +531,12 @@ export class LowLevelPiAgentEngine {
   ) {
     this.#identity = parseIdentity(identity);
     this.#budgets = parseBudgets(options.budgets);
+    boundedProtocolValue(
+      this.#terminalState(null, TERMINAL_HEADROOM_CODE),
+      this.#budgets.maxCheckpointBytes,
+      "options.budgets.maxCheckpointBytes",
+      "INVALID_CONFIGURATION",
+    );
     this.#clock = options.clock ?? new SystemEngineClock();
     if (
       typeof this.#clock.now !== "function" ||
@@ -606,6 +615,7 @@ export class LowLevelPiAgentEngine {
       },
       this.#budgets,
     );
+    this.#requireTerminalHeadroom(state);
     const payloadBytes = encodeCanonicalCbor(state, {
       maxBytes: this.#budgets.maxCheckpointBytes,
     });
@@ -811,18 +821,26 @@ export class LowLevelPiAgentEngine {
         void this.#interruptActiveStep(activeStep);
       }
       controller.abort(fault);
-      const terminalState: AdapterState = {
-        version: CHECKPOINT_STATE_VERSION,
-        status: "terminal",
-        coreState: state.coreState,
-        turnInput: null,
-        beforeTurnCompleted: true,
-        awaiting: null,
-        pendingTools: [],
-        completedTools: [],
-        terminalCode: fault.code,
-      };
-      const nextCheckpoint = await this.#createSuccessorCheckpoint(checkpoint, terminalState);
+      let nextCheckpoint: AgentCheckpoint;
+      try {
+        nextCheckpoint = await this.#createSuccessorCheckpoint(
+          checkpoint,
+          this.#terminalState(state.coreState, fault.code),
+        );
+      } catch (terminalError) {
+        if (!(terminalError instanceof PiRuntimeError) || terminalError.code !== "INVALID_CHECKPOINT") {
+          throw terminalError;
+        }
+        // Checkpoints written before terminal headroom was reserved remain
+        // readable. If their retained core state prevents even an error from
+        // fitting, persist a bounded terminal error instead of throwing again.
+        // Normal completion never uses this lossy fallback; the predecessor
+        // digest continues to bind the original committed state.
+        nextCheckpoint = await this.#createSuccessorCheckpoint(
+          checkpoint,
+          this.#terminalState(null, fault.code),
+        );
+      }
       return this.#attachCheckpoint(nextCheckpoint, {
         kind: "turn_error",
         error: { code: fault.code, message: fault.message, retryable: false },
@@ -1202,6 +1220,15 @@ export class LowLevelPiAgentEngine {
     };
   }
 
+  #requireTerminalHeadroom(state: AdapterState): void {
+    boundedProtocolValue(
+      this.#terminalState(state.coreState, TERMINAL_HEADROOM_CODE),
+      this.#budgets.maxCheckpointBytes,
+      "checkpoint.terminalHeadroom",
+      "INVALID_CHECKPOINT",
+    );
+  }
+
   #throwIfAborted(signal: AbortSignal): void {
     if (signal.aborted) {
       throw signal.reason instanceof BoundaryFault
@@ -1215,6 +1242,7 @@ export class LowLevelPiAgentEngine {
     state: AdapterState,
   ): Promise<AgentCheckpoint> {
     parseAdapterState(state, this.#budgets);
+    if (state.status !== "terminal") this.#requireTerminalHeadroom(state);
     const payloadBytes = encodeCanonicalCbor(state, {
       maxBytes: this.#budgets.maxCheckpointBytes,
     });
