@@ -570,10 +570,19 @@ export async function applySessionBrokerCommand(state: SessionAggregateState, co
     }
     case "settle-recovery": {
       const effect = assertKey(next, request.body.key);
-      assertNoStart(effect);
-      if (effect.phase !== "prepared" && effect.phase !== "dispatched") sessionError("FAILED_PRECONDITION", "effect cannot be settled by recovery");
-      if (request.body.kind === "failed" && effect.phase !== "prepared") sessionError("FAILED_PRECONDITION", "failed recovery settlement is only valid before dispatch");
-      if (request.body.kind === "interrupted_unknown" && effect.phase !== "dispatched") sessionError("FAILED_PRECONDITION", "interrupted recovery settlement requires an uncertain dispatch");
+      if (effect.phase !== "prepared" && effect.phase !== "dispatched" && effect.phase !== "blocked") sessionError("FAILED_PRECONDITION", "effect cannot be settled by recovery");
+      if (request.body.kind === "failed") {
+        // A matching terminal invocation-ledger failure may settle a dispatched
+        // attempt even after its start claim. No external retry is authorized.
+        if (effect.phase === "blocked") sessionError("FAILED_PRECONDITION", "blocked recovery requires cancellation or confirmation");
+      } else {
+        assertNoStart(effect);
+        if (effect.phase !== "dispatched" && !next.activeTurn!.abortRequested) sessionError("FAILED_PRECONDITION", "prepared or blocked interruption requires a turn abort");
+      }
+      if (effect.phase === "blocked") {
+        next.activeTurn!.status = "active";
+        next.status = "running";
+      }
       effect.phase = "settled";
       effect.settlement = request.body.kind === "failed" ? { kind: "error", code: request.body.error.reason || `BROKER_ERROR_${request.body.error.code}`,
         message: request.body.error.message, retryable: request.body.error.retryable } :

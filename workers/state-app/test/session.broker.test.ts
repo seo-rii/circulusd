@@ -225,6 +225,80 @@ describe("Session broker authoritative transaction", () => {
     expect((await g.read()).unconsumedSettlement!.settlement.kind).toBe("interrupted_unknown");
   });
 
+
+  it.each([
+    { phase: "prepared", started: false, abort: true, kind: "interrupted_unknown" },
+    { phase: "blocked", started: false, abort: true, kind: "interrupted_unknown" },
+    { phase: "dispatched", started: false, abort: false, kind: "failed" },
+    { phase: "dispatched", started: true, abort: false, kind: "failed" },
+  ] as const)("settles $phase recovery ($kind, start=$started) and retains its original receipt", async ({ phase, started, abort, kind }) => {
+    const f = await fixture();
+    const prepared = await f.prepare(phase === "blocked" ? "confirm" : "safe");
+    const effect = (await f.read()).activeEffect!;
+    const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
+    if (phase !== "prepared") {
+      const dispatched = await f.dispatch(prepared.preparation!);
+      if (started) await f.call({ operation: "claim-start", body: { snapshot: f.snapshot(await f.read()), key,
+        dispatchOpaque: dispatched.permit.opaque, commandDigest: d("a"), nowUnixMs: 1_000 } });
+    }
+    const error: SessionBrokerPublicError = { code: 7, reason: "RECOVERED", message: "original failure", retryable: false,
+      retryAfterMs: 500, metadata: { original: "retained" }, requestId: "original-request" };
+    if (phase === "blocked") await f.call({ operation: "block", body: { snapshot: f.snapshot(await f.read()), key,
+      operationKey: "block", operationDigest: d("b"), reason: error } });
+    if (abort) {
+      const turn = await f.read();
+      await f.executeRaw({ kind: "request_abort", commandId: "abort", expectedEventSequence: turn.eventSequence,
+        turnId: turn.turnId, fence: turn.fence, transactionTime: 1_000, reason: "cancel" });
+    }
+    const body = { snapshot: f.snapshot(await f.read()), key, operationKey: "recovery", operationDigest: d("c"), kind, error };
+    const settled = await f.call<SessionBrokerSettlementReceipt>({ operation: "settle-recovery", body });
+    expect(settled.error).toEqual(error);
+    expect(settled.recoveryKind).toBe(kind);
+    expect(settled.dispatchAttempt).toBe(phase === "prepared" ? 0 : 1);
+    f.restart();
+    const revision = f.storage.backing.durableRevision;
+    expect(await f.call({ operation: "settle-recovery", body })).toEqual(settled);
+    expect(f.storage.backing.durableRevision).toBe(revision);
+    if (abort) {
+      const turn = await f.read();
+      await f.executeRaw({ kind: "finalize_abort", commandId: "finalize", expectedEventSequence: turn.eventSequence,
+        turnId: turn.turnId, fence: turn.fence, transactionTime: 1_000 });
+      expect((await f.state()).terminalTurns[0]!.status).toBe("aborted");
+    } else {
+      const resumed = await f.acquire("resume");
+      expect(resumed.grant.unconsumedSettlement!.settlement.kind).toBe("error");
+      await f.commit(resumed.grant, { kind: "turn_complete", checkpoint: await f.checkpoint(await f.read()), result: { recovered: true } }, "complete");
+      expect((await f.read()).active).toBe(false);
+    }
+  });
+
+  it("rejects interruption without abort, failed blocked recovery, and interruption of a started attempt", async () => {
+    const f = await fixture();
+    const prepared = await f.prepare("confirm");
+    const effect = (await f.read()).activeEffect!;
+    const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
+    const error: SessionBrokerPublicError = { code: 7, reason: "CANCELLED", message: "cancelled", retryable: false, retryAfterMs: 0, metadata: {}, requestId: null };
+    await expect(f.call({ operation: "settle-recovery", body: { snapshot: f.snapshot(await f.read()), key,
+      operationKey: "illegal-prepared", operationDigest: d("a"), kind: "interrupted_unknown", error } })).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    await f.dispatch(prepared.preparation!);
+    await f.call({ operation: "block", body: { snapshot: f.snapshot(await f.read()), key, operationKey: "block", operationDigest: d("a"), reason: error } });
+    for (const kind of ["failed", "interrupted_unknown"] as const) {
+      await expect(f.call({ operation: "settle-recovery", body: { snapshot: f.snapshot(await f.read()), key,
+        operationKey: `illegal-blocked-${kind}`, operationDigest: d("b"), kind, error } })).rejects.toMatchObject({ code: "FAILED_PRECONDITION" });
+    }
+    const g = await fixture();
+    const next = await g.prepare();
+    const sent = await g.dispatch(next.preparation!);
+    await g.call({ operation: "claim-start", body: { snapshot: g.snapshot(await g.read()), key: sent.body.key,
+      dispatchOpaque: sent.permit.opaque, commandDigest: d("c"), nowUnixMs: 1_000 } });
+    const turn = await g.read();
+    await g.executeRaw({ kind: "request_abort", commandId: "abort", expectedEventSequence: turn.eventSequence,
+      turnId: turn.turnId, fence: turn.fence, transactionTime: 1_000, reason: "cancel" });
+    await expect(g.call({ operation: "settle-recovery", body: { snapshot: g.snapshot(await g.read()), key: sent.body.key,
+      operationKey: "illegal-started", operationDigest: d("d"), kind: "interrupted_unknown", error } })).rejects.toMatchObject({ code: "DISPATCH_ALREADY_STARTED" });
+    expect((await g.read()).activeEffect!.phase).toBe("dispatched");
+  });
+
   it("archives original grant receipts and payload pins without a second program counter", async () => {
     const f = await fixture();
     const first = await f.acquire("acquire-0");

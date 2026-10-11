@@ -26,7 +26,7 @@ const hex = (value: unknown) => Buffer.from(encodeCanonicalCbor(value as Normali
 async function vectors() {
   const responses: Array<{ name: string; operation: string; requestCborHex: string; responseCborHex: string }> = [];
   const blobs = new Map<Digest, { digest: Digest; encodedBytes: number; bytes: { hex: string } }>();
-  async function scenario(label: string, replayPolicy?: "safe" | "confirm" | "never") {
+  async function scenario(label: string, replayPolicy?: "safe" | "confirm" | "never", dispatchNow = true) {
     const storage = new RestartableDurableStorage();
     const physical = (name: string) => ({ toString: () => name, equals: (other: unknown) => String(other) === name });
     const cell = new SessionCell({ storage, id: physical(sessionCellName(authority.tenantId, authority.sessionId)) } as never,
@@ -83,11 +83,16 @@ async function vectors() {
     const prepared = await read("prepared");
     const effect = prepared.activeEffect!;
     const key = { turnId: effect.turnId, effectId: effect.effectId, invocationId: effect.invocationId, requestDigest: effect.requestDigest };
-    const dispatch = await call<Record<string, NormalizedValue>>("dispatch", { operation: "dispatch", body: { snapshot: snapshot(prepared), key,
+    async function abort() {
+      const turn = await read("before-abort");
+      await rpc("session.execute", { kind: "request_abort", commandId: `${label}-abort`, expectedEventSequence: turn.eventSequence,
+        turnId: turn.turnId, fence: turn.fence, transactionTime: NOW, reason: "cancel" }, (request) => cell.executeSessionCommand(request));
+    }
+    const dispatch = dispatchNow ? await call<Record<string, NormalizedValue>>("dispatch", { operation: "dispatch", body: { snapshot: snapshot(prepared), key,
       operationKey: `${label}-dispatch`, operationDigest: digest("e"), preparationOpaque: committed.preparation!.opaque, providerRequestId: id("req"),
-      providerRouteDigest: digest("f"), nowUnixMs: NOW, deadlineUnixMs: committed.preparation!.deadline } });
-    const current = await read("dispatched");
-    return { call, read, snapshot, key, dispatch, current };
+      providerRouteDigest: digest("f"), nowUnixMs: NOW, deadlineUnixMs: committed.preparation!.deadline } }) : null;
+    const current = dispatchNow ? await read("dispatched") : prepared;
+    return { call, read, snapshot, key, dispatch: dispatch!, current, abort };
   }
   const main = await scenario("success");
   const claimBody = { snapshot: main.snapshot(main.current), key: main.key, dispatchOpaque: main.dispatch.opaque as Uint8Array, commandDigest: digest("7"), nowUnixMs: NOW };
@@ -137,6 +142,22 @@ async function vectors() {
   const recovery = await scenario("recovery", "never");
   await recovery.call("settlement", { operation: "settle-recovery", body: { snapshot: recovery.snapshot(recovery.current), key: recovery.key,
     operationKey: "recovery-settle", operationDigest: digest("4"), kind: "interrupted_unknown", error } });
+  for (const [label, phase, started] of [
+    ["abort-prepared", "prepared", false], ["abort-blocked", "blocked", false],
+    ["ledger-failed", "dispatched", false], ["ledger-failed-started", "dispatched", true],
+  ] as const) {
+    const source = await scenario(label, phase === "blocked" ? "confirm" : "safe", phase !== "prepared");
+    if (started) await source.call("start", { operation: "claim-start", body: { snapshot: source.snapshot(source.current),
+      key: source.key, dispatchOpaque: source.dispatch.opaque as Uint8Array, commandDigest: digest("7"), nowUnixMs: NOW } });
+    if (phase === "blocked") await source.call("block", { operation: "block", body: { snapshot: source.snapshot(source.current),
+      key: source.key, operationKey: `${label}-block`, operationDigest: digest("3"), reason: error } });
+    const abort = phase !== "dispatched";
+    if (abort) await source.abort();
+    const before = await source.read("before-recovery");
+    await source.call("settlement", { operation: "settle-recovery", body: { snapshot: source.snapshot(before), key: source.key,
+      operationKey: `${label}-recover`, operationDigest: digest("4"), kind: abort ? "interrupted_unknown" : "failed", error } });
+    await source.read("settled");
+  }
   return { version: 1, authority, policy, responses, blobs: [...blobs.values()].sort((a, b) => a.digest.localeCompare(b.digest)) };
 }
 

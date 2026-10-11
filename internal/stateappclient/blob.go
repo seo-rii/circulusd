@@ -15,7 +15,7 @@ const (
 	blobIngressContentType   = "application/vnd.circulusd.state-blob-ingress+cbor"
 	blobIngressProtocol      = "circulus.state-blob-ingress.v1alpha1"
 	blobIngressSchemaDigest  = "sha256:d9402c455a2d37e51885684aa26ade9d26ff444cc5a15fb89c2ce2af372e40e5"
-	blobHostSchemaDigest     = "sha256:40be7ec7d4352285f697f042acf8bf38f8f30def0c0569ec8ff08535df0737a2"
+	blobHostSchemaDigest     = "sha256:43f0bcb396d577f73e741c00ae9c759bb716b8d71ecc00827e8285d0c4e276b6"
 	blobRequestMACDomain     = "circulusd.state-blob-ingress.request.v1"
 	blobResponseMACDomain    = "circulusd.state-blob-ingress.response.v1"
 	maximumSessionBlobBytes  = 4 << 20

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/broker"
@@ -64,7 +65,7 @@ func (c *coordinatorGoldenClient) ExecuteSessionBroker(ctx context.Context, requ
 	}
 	if request.Operation == "lookup-operation" {
 		key := request.Body["operationKey"].(string)
-		receipt, found := c.receipts[key]
+		receipt, found := c.receipts[request.Body["kind"].(string)+":"+key]
 		return canonical.Map{"found": found, "kind": request.Body["kind"], "operationDigest": request.Body["operationDigest"], "receipt": receipt}, nil
 	}
 	var name, next string
@@ -87,7 +88,7 @@ func (c *coordinatorGoldenClient) ExecuteSessionBroker(ctx context.Context, requ
 		c.claims++
 	case "confirm":
 		name, next = scenario+".confirmation", scenario+".confirmed"
-	case "settle":
+	case "settle", "settle-recovery":
 		name, next = scenario+".settlement", scenario+".settled"
 	default:
 		c.t.Fatalf("unexpected operation %q", request.Operation)
@@ -109,7 +110,8 @@ func (c *coordinatorGoldenClient) ExecuteSessionBroker(ctx context.Context, requ
 		c.current = next
 	}
 	if key, ok := request.Body["operationKey"].(string); ok {
-		c.receipts[key] = response
+		kind := map[string]string{"dispatch": "dispatch", "confirm": "confirmation", "settle": "settlement", "settle-recovery": "recovery_settlement", "block": "block"}[request.Operation]
+		c.receipts[kind+":"+key] = response
 	}
 	return response, nil
 }
@@ -317,6 +319,74 @@ func TestNestedDispatchStartRouteTypesFailWithoutPanic(t *testing.T) {
 			d.effect(effect, broker.Generations{})
 			if d.err == nil {
 				t.Fatal("malformed nested route accepted")
+			}
+		})
+	}
+}
+
+// The actual Coordinator emits each recovery request checked byte-for-byte
+// against real SessionCell state transitions, including a claimed failed start.
+func TestCoordinatorActualSessionRecoveryMatrix(t *testing.T) {
+	fixture := loadCoordinatorGolden(t)
+	for _, scenario := range []string{"abort-prepared", "abort-blocked", "ledger-failed", "ledger-failed-started"} {
+		t.Run(scenario, func(t *testing.T) {
+			groups := []dependency.AtomicGroup{dependency.AtomicEffectLifecycle}
+			qualified := proof.NewProductionProofs(t, groups)
+			client := &coordinatorGoldenClient{ProductionProofs: qualified, t: t, scope: fixture.Authority,
+				rows: map[string]struct{ RequestCborHex, ResponseCborHex string }{}, blobs: map[string][]byte{}, current: scenario + ".before-recovery", receipts: map[string]canonical.Value{}}
+			for _, row := range fixture.Responses {
+				client.rows[row.Name] = struct{ RequestCborHex, ResponseCborHex string }{row.RequestCborHex, row.ResponseCborHex}
+			}
+			for _, blob := range fixture.Blobs {
+				client.blobs[blob.Digest], _ = hex.DecodeString(blob.Bytes.Hex)
+			}
+			d := decoder{}
+			active := client.response(client.current)
+			store, err := newStore(client, Config{Scope: fixture.Authority, UserID: d.id(identity.Subject, active["userId"], false),
+				EngineStepLimits: d.budget(active["engineStepLimits"]), Results: proof.Verify[ResultResolver](t, qualified, &testResults{ProductionProofs: qualified}, groups)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			turn, err := store.ReadTurn(context.Background(), d.id(identity.Session, active["sessionId"], false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			authority := broker.ValidatedTurnFence{TenantID: turn.TenantID, WorkspaceID: turn.WorkspaceID, SessionID: turn.SessionID, TurnID: turn.TurnID,
+				Generations: turn.Generations, ExpiresAt: turn.LeaseExpiresAt}
+			body := client.request(scenario + ".settlement")
+			request := broker.RecoveryRequest{Authority: authority, Now: time.UnixMilli(4_102_444_800_000), EffectID: turn.ActiveEffect.EffectID,
+				InvocationID: turn.ActiveEffect.InvocationID, RequestDigest: turn.ActiveEffect.RequestDigest,
+				OperationKey: body["operationKey"].(string), OperationDigest: d.digest(body["operationDigest"]), Reason: d.publicError(body["error"])}
+			ledger := &coordinatorGoldenLedger{t: t}
+			if strings.HasPrefix(scenario, "ledger-failed") {
+				effect := turn.ActiveEffect
+				ledger.record = broker.LedgerRecord{Status: broker.LedgerFailed, TenantID: turn.TenantID, WorkspaceID: turn.WorkspaceID,
+					EffectID: effect.EffectID, InvocationID: effect.InvocationID, RequestDigest: effect.RequestDigest,
+					Service: effect.Service, Operation: effect.Operation, DispatchAttempt: effect.DispatchAttempt,
+					ProviderRequestID: effect.LastDispatch.ProviderRequestID, ProviderRouteDigest: effect.LastDispatch.ProviderRouteDigest}
+			}
+			coordinator, err := broker.NewCoordinator(store, ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision, err := coordinator.RecoverEffect(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := broker.RecoverySettleInterrupted
+			if strings.HasPrefix(scenario, "ledger-failed") {
+				want = broker.RecoverySettleFailed
+			}
+			if decision.Action != want || decision.SettlementReceipt == nil || !proto.Equal(decision.SettlementReceipt.Error, request.Reason) {
+				t.Fatalf("recovery = %+v, want %s retaining original error", decision, want)
+			}
+			replayed, err := coordinator.RecoverEffect(context.Background(), request)
+			if err != nil || replayed.Action != want || !proto.Equal(replayed.SettlementReceipt.Effect, decision.SettlementReceipt.Effect) ||
+				replayed.SettlementReceipt.EventSequence != decision.SettlementReceipt.EventSequence {
+				t.Fatalf("recovery replay: %+v, %v", replayed, err)
+			}
+			if d.err != nil {
+				t.Fatal(d.err)
 			}
 		})
 	}
