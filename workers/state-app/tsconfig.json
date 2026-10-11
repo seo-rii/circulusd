@@ -13,6 +13,7 @@
     "src/workspace/**/*.ts",
     "src/control/**/*.ts",
     "src/host/**/*.ts",
+    "src/native-storage/**/*.ts",
     "worker-configuration.d.ts"
   ]
 }
