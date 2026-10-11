@@ -24,9 +24,10 @@ import {
 } from "@circulusd/protocol-types";
 
 import { BoundaryFault, PiRuntimeError } from "./errors.ts";
-import { decodePiJson, encodePiJson } from "./pi-json-codec.ts";
+import { decodePiJson, encodePiJson, validatePiJson } from "./pi-json-codec.ts";
 import {
   PI_AGENT_CORE_MODEL_PROTOCOL_VERSION,
+  PiToolArgumentsEncodingError,
   decodePiAgentCoreModelContext,
   decodePiAgentCoreModelSettlement,
   encodePiAgentCoreAssistantMessage,
@@ -95,8 +96,8 @@ export function createPiAgentCoreInitialState(): NormalizedValue {
 // configuration survives the integer-only canonical bound below (tool schemas
 // legitimately carry constraints such as "minimum": 0.1). A malformed tool is left
 // untouched so the bound and per-tool validation still reject it with their own
-// error. Tool-call argument numbers are wrapped at the (Go) producer boundary, not
-// here.
+// error. Invalid schema JSON must not fall back to accepting a pre-encoded wrapper.
+// Tool-call numbers are wrapped at the model producer boundary, not here.
 function wrapToolSchemaNumbers(
   configuration: PiAgentCoreAdapterConfiguration,
 ): PiAgentCoreAdapterConfiguration {
@@ -117,8 +118,10 @@ function wrapToolSchemaNumbers(
       }
       try {
         return { ...toolRecord, parameters: encodePiJson(toolRecord.parameters) };
-      } catch {
-        return tool;
+      } catch (error) {
+        throw new PiRuntimeError(
+          "INVALID_CONFIGURATION", "Pi tool schema must be raw JSON without reserved wrapper keys", { cause: error },
+        );
       }
     }),
   } as PiAgentCoreAdapterConfiguration;
@@ -411,10 +414,7 @@ export function createPiAgentCoreFactory(
           capturedContext = {
             ...(piContext.systemPrompt === undefined ? {} : { systemPrompt: piContext.systemPrompt }),
             messages: structuredClone(piContext.messages),
-            tools: advertisedTools.map((tool) => ({
-              ...tool,
-              parameters: encodePiJson(tool.parameters),
-            })) as unknown as NonNullable<PiContext["tools"]>,
+            tools: structuredClone(advertisedTools) as unknown as NonNullable<PiContext["tools"]>,
           };
           const stream = createAssistantMessageEventStream();
           const aborted: AssistantMessage = {
@@ -526,6 +526,17 @@ export function createPiAgentCoreFactory(
         try {
           decodedMessage = decodePiAgentCoreModelSettlement(settlementRecord);
         } catch (error) {
+          if (error instanceof PiToolArgumentsEncodingError) {
+            return {
+              kind: "turn_error",
+              state: { ...state, phase: "failed" },
+              error: {
+                code: "PI_TOOL_CALL_INVALID",
+                message: "Pi tool call arguments are not valid encoded JSON",
+                retryable: false,
+              },
+            };
+          }
           throw new BoundaryFault("CORE_OUTPUT_INVALID", "Pi model settlement encoding is invalid", { cause: error });
         }
         const messageRecord = exactRecord(
@@ -797,32 +808,15 @@ export function createPiAgentCoreFactory(
                 },
               };
             }
-            const argumentNodes: NormalizedValue[] = [
-              normalizeProtocolValue(toolCallRecord.arguments),
-            ];
-            let containsNonJsonArgument = false;
-            while (argumentNodes.length > 0) {
-              const node = argumentNodes.pop();
-              if (node instanceof Uint8Array) {
-                containsNonJsonArgument = true;
-                break;
-              }
-              if (Array.isArray(node)) {
-                argumentNodes.push(...node);
-              } else if (node !== null && typeof node === "object") {
-                argumentNodes.push(...Object.values(node));
-              }
-            }
             let validatedArguments: NormalizedValue;
             try {
-              if (containsNonJsonArgument) throw new Error("tool arguments are not JSON");
               const runtimeTool = runtimeTools.find((tool) => tool.name === toolCallRecord.name);
               if (runtimeTool === undefined) throw new Error("registered runtime tool is missing");
-              validatedArguments = normalizeProtocolValue(validateToolArguments(
+              validatedArguments = encodePiJson(validateToolArguments(
                 runtimeTool,
                 {
                   ...toolCallRecord,
-                  arguments: structuredClone(toolCallRecord.arguments),
+                  arguments: validatePiJson(toolCallRecord.arguments),
                 } as ToolCall,
               ));
               if (
@@ -849,13 +843,16 @@ export function createPiAgentCoreFactory(
               arguments: validatedArguments,
             });
             toolCallIds.add(toolCallRecord.id);
-            toolCalls.push(normalizeProtocolValue(toolCallRecord));
+            toolCalls.push(normalizeProtocolValue({
+              ...toolCallRecord,
+              arguments: encodePiJson(toolCallRecord.arguments),
+            }));
             validatedToolCalls.set(toolCallRecord.id, validatedToolCall);
             continue;
           }
           throw new Error("Pi model-only settlement contains unsupported content");
         }
-        // The codec narrows costs only; the Pi schema checks above validate the
+        // The codec restores costs and tool JSON; the Pi schema checks validate the
         // remaining response fields before this existing typed Pi boundary.
         const assistant = decodedMessage as AssistantMessage;
         if ((toolCalls.length > 0) !== (stopReason === "toolUse")) {
@@ -1094,10 +1091,7 @@ export function createPiAgentCoreFactory(
           capturedContext = {
             ...(piContext.systemPrompt === undefined ? {} : { systemPrompt: piContext.systemPrompt }),
             messages: structuredClone(piContext.messages),
-            tools: advertisedTools.map((tool) => ({
-              ...tool,
-              parameters: encodePiJson(tool.parameters),
-            })) as unknown as NonNullable<PiContext["tools"]>,
+            tools: structuredClone(advertisedTools) as unknown as NonNullable<PiContext["tools"]>,
           };
           const stream = createAssistantMessageEventStream();
           const aborted: AssistantMessage = {

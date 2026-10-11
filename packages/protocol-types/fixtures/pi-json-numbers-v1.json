@@ -1,0 +1,468 @@
+{
+  "version": 1,
+  "wrapperKey": "$pi.number.v1",
+  "numbers": [
+    {
+      "name": "zero",
+      "bitsHex": "0000000000000000",
+      "decimal": "0",
+      "encoded": 0,
+      "cborHex": "00"
+    },
+    {
+      "name": "one",
+      "bitsHex": "3ff0000000000000",
+      "decimal": "1",
+      "encoded": 1,
+      "cborHex": "01"
+    },
+    {
+      "name": "negative one",
+      "bitsHex": "bff0000000000000",
+      "decimal": "-1",
+      "encoded": -1,
+      "cborHex": "20"
+    },
+    {
+      "name": "safe maximum",
+      "bitsHex": "433fffffffffffff",
+      "decimal": "9007199254740991",
+      "encoded": 9007199254740991,
+      "cborHex": "1b001fffffffffffff"
+    },
+    {
+      "name": "safe minimum",
+      "bitsHex": "c33fffffffffffff",
+      "decimal": "-9007199254740991",
+      "encoded": -9007199254740991,
+      "cborHex": "3b001ffffffffffffe"
+    },
+    {
+      "name": "one tenth",
+      "bitsHex": "3fb999999999999a",
+      "decimal": "0.1",
+      "encoded": {
+        "$pi.number.v1": "0.1"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763163302e31"
+    },
+    {
+      "name": "negative one tenth",
+      "bitsHex": "bfb999999999999a",
+      "decimal": "-0.1",
+      "encoded": {
+        "$pi.number.v1": "-0.1"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e7631642d302e31"
+    },
+    {
+      "name": "three tenths",
+      "bitsHex": "3fd3333333333333",
+      "decimal": "0.3",
+      "encoded": {
+        "$pi.number.v1": "0.3"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763163302e33"
+    },
+    {
+      "name": "one and quarter",
+      "bitsHex": "3ff4000000000000",
+      "decimal": "1.25",
+      "encoded": {
+        "$pi.number.v1": "1.25"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763164312e3235"
+    },
+    {
+      "name": "pi",
+      "bitsHex": "400921fb54442d18",
+      "decimal": "3.141592653589793",
+      "encoded": {
+        "$pi.number.v1": "3.141592653589793"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763171332e313431353932363533353839373933"
+    },
+    {
+      "name": "small fixed cutoff",
+      "bitsHex": "3eb0c6f7a0b5ed8d",
+      "decimal": "0.000001",
+      "encoded": {
+        "$pi.number.v1": "0.000001"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763168302e303030303031"
+    },
+    {
+      "name": "below small fixed cutoff",
+      "bitsHex": "3eb0c6f7a0b5ed8c",
+      "decimal": "9.999999999999997e-7",
+      "encoded": {
+        "$pi.number.v1": "9.999999999999997e-7"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763174392e393939393939393939393939393937652d37"
+    },
+    {
+      "name": "above small fixed cutoff",
+      "bitsHex": "3eb0c6f7a0b5ed8e",
+      "decimal": "0.0000010000000000000002",
+      "encoded": {
+        "$pi.number.v1": "0.0000010000000000000002"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76317818302e30303030303130303030303030303030303030303032"
+    },
+    {
+      "name": "small exponent",
+      "bitsHex": "3e7ad7f29abcaf48",
+      "decimal": "1e-7",
+      "encoded": {
+        "$pi.number.v1": "1e-7"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76316431652d37"
+    },
+    {
+      "name": "small Go cutoff",
+      "bitsHex": "3ee4f8b588e368f1",
+      "decimal": "0.00001",
+      "encoded": {
+        "$pi.number.v1": "0.00001"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763167302e3030303031"
+    },
+    {
+      "name": "large fixed",
+      "bitsHex": "4415af1d78b58c40",
+      "decimal": "100000000000000000000",
+      "encoded": {
+        "$pi.number.v1": "100000000000000000000"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763175313030303030303030303030303030303030303030"
+    },
+    {
+      "name": "below large exponent cutoff",
+      "bitsHex": "444b1ae4d6e2ef4f",
+      "decimal": "999999999999999900000",
+      "encoded": {
+        "$pi.number.v1": "999999999999999900000"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763175393939393939393939393939393939393030303030"
+    },
+    {
+      "name": "large exponent cutoff",
+      "bitsHex": "444b1ae4d6e2ef50",
+      "decimal": "1e+21",
+      "encoded": {
+        "$pi.number.v1": "1e+21"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76316531652b3231"
+    },
+    {
+      "name": "above large exponent cutoff",
+      "bitsHex": "444b1ae4d6e2ef51",
+      "decimal": "1.0000000000000001e+21",
+      "encoded": {
+        "$pi.number.v1": "1.0000000000000001e+21"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763176312e30303030303030303030303030303031652b3231"
+    },
+    {
+      "name": "unsafe integer",
+      "bitsHex": "4340000000000000",
+      "decimal": "9007199254740992",
+      "encoded": {
+        "$pi.number.v1": "9007199254740992"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76317039303037313939323534373430393932"
+    },
+    {
+      "name": "next unsafe integer",
+      "bitsHex": "4340000000000001",
+      "decimal": "9007199254740994",
+      "encoded": {
+        "$pi.number.v1": "9007199254740994"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76317039303037313939323534373430393934"
+    },
+    {
+      "name": "rounded large integer",
+      "bitsHex": "43abc16d674ec801",
+      "decimal": "1000000000000000100",
+      "encoded": {
+        "$pi.number.v1": "1000000000000000100"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76317331303030303030303030303030303030313030"
+    },
+    {
+      "name": "smallest subnormal",
+      "bitsHex": "0000000000000001",
+      "decimal": "5e-324",
+      "encoded": {
+        "$pi.number.v1": "5e-324"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76316635652d333234"
+    },
+    {
+      "name": "negative smallest subnormal",
+      "bitsHex": "8000000000000001",
+      "decimal": "-5e-324",
+      "encoded": {
+        "$pi.number.v1": "-5e-324"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e7631672d35652d333234"
+    },
+    {
+      "name": "second subnormal",
+      "bitsHex": "0000000000000002",
+      "decimal": "1e-323",
+      "encoded": {
+        "$pi.number.v1": "1e-323"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e76316631652d333233"
+    },
+    {
+      "name": "largest subnormal",
+      "bitsHex": "000fffffffffffff",
+      "decimal": "2.225073858507201e-308",
+      "encoded": {
+        "$pi.number.v1": "2.225073858507201e-308"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763176322e323235303733383538353037323031652d333038"
+    },
+    {
+      "name": "smallest normal",
+      "bitsHex": "0010000000000000",
+      "decimal": "2.2250738585072014e-308",
+      "encoded": {
+        "$pi.number.v1": "2.2250738585072014e-308"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763177322e32323530373338353835303732303134652d333038"
+    },
+    {
+      "name": "largest finite",
+      "bitsHex": "7fefffffffffffff",
+      "decimal": "1.7976931348623157e+308",
+      "encoded": {
+        "$pi.number.v1": "1.7976931348623157e+308"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763177312e37393736393331333438363233313537652b333038"
+    },
+    {
+      "name": "smallest finite",
+      "bitsHex": "ffefffffffffffff",
+      "decimal": "-1.7976931348623157e+308",
+      "encoded": {
+        "$pi.number.v1": "-1.7976931348623157e+308"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763178182d312e37393736393331333438363233313537652b333038"
+    },
+    {
+      "name": "above one",
+      "bitsHex": "3ff0000000000001",
+      "decimal": "1.0000000000000002",
+      "encoded": {
+        "$pi.number.v1": "1.0000000000000002"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763172312e30303030303030303030303030303032"
+    },
+    {
+      "name": "below one",
+      "bitsHex": "3fefffffffffffff",
+      "decimal": "0.9999999999999999",
+      "encoded": {
+        "$pi.number.v1": "0.9999999999999999"
+      },
+      "cborHex": "a16d2470692e6e756d6265722e763172302e39393939393939393939393939393939"
+    }
+  ],
+  "invalidWrappers": [
+    {
+      "name": "invalid decimal \"\"",
+      "value": {
+        "$pi.number.v1": ""
+      }
+    },
+    {
+      "name": "invalid decimal \"NaN\"",
+      "value": {
+        "$pi.number.v1": "NaN"
+      }
+    },
+    {
+      "name": "invalid decimal \"Infinity\"",
+      "value": {
+        "$pi.number.v1": "Infinity"
+      }
+    },
+    {
+      "name": "invalid decimal \"-Infinity\"",
+      "value": {
+        "$pi.number.v1": "-Infinity"
+      }
+    },
+    {
+      "name": "invalid decimal \"-0\"",
+      "value": {
+        "$pi.number.v1": "-0"
+      }
+    },
+    {
+      "name": "invalid decimal \"0\"",
+      "value": {
+        "$pi.number.v1": "0"
+      }
+    },
+    {
+      "name": "invalid decimal \"1\"",
+      "value": {
+        "$pi.number.v1": "1"
+      }
+    },
+    {
+      "name": "invalid decimal \"9007199254740991\"",
+      "value": {
+        "$pi.number.v1": "9007199254740991"
+      }
+    },
+    {
+      "name": "invalid decimal \"01\"",
+      "value": {
+        "$pi.number.v1": "01"
+      }
+    },
+    {
+      "name": "invalid decimal \"+0.1\"",
+      "value": {
+        "$pi.number.v1": "+0.1"
+      }
+    },
+    {
+      "name": "invalid decimal \" 0.1\"",
+      "value": {
+        "$pi.number.v1": " 0.1"
+      }
+    },
+    {
+      "name": "invalid decimal \"0.10\"",
+      "value": {
+        "$pi.number.v1": "0.10"
+      }
+    },
+    {
+      "name": "invalid decimal \"1e-06\"",
+      "value": {
+        "$pi.number.v1": "1e-06"
+      }
+    },
+    {
+      "name": "invalid decimal \"1e21\"",
+      "value": {
+        "$pi.number.v1": "1e21"
+      }
+    },
+    {
+      "name": "invalid decimal \"1e309\"",
+      "value": {
+        "$pi.number.v1": "1e309"
+      }
+    },
+    {
+      "name": "invalid decimal \"1e-324\"",
+      "value": {
+        "$pi.number.v1": "1e-324"
+      }
+    },
+    {
+      "name": "invalid decimal \"0x1\"",
+      "value": {
+        "$pi.number.v1": "0x1"
+      }
+    },
+    {
+      "name": "invalid decimal \"1.0000000000000000000000000000000000000000\"",
+      "value": {
+        "$pi.number.v1": "1.0000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "nonstring number",
+      "value": {
+        "$pi.number.v1": 1
+      }
+    },
+    {
+      "name": "nonstring null",
+      "value": {
+        "$pi.number.v1": null
+      }
+    },
+    {
+      "name": "extra wrapper member",
+      "value": {
+        "$pi.number.v1": "0.1",
+        "extra": true
+      }
+    },
+    {
+      "name": "nested malformed wrapper",
+      "value": {
+        "nested": {
+          "$pi.number.v1": "0.10"
+        }
+      }
+    }
+  ],
+  "invalidRaw": [
+    {
+      "name": "prewrapped fraction",
+      "value": {
+        "$pi.number.v1": "0.1"
+      }
+    },
+    {
+      "name": "prewrapped integer",
+      "value": {
+        "$pi.number.v1": "1"
+      }
+    },
+    {
+      "name": "nested reserved collision",
+      "value": {
+        "nested": [
+          {
+            "$pi.number.v1": "data"
+          }
+        ]
+      }
+    },
+    {
+      "name": "reserved with other field",
+      "value": {
+        "$pi.number.v1": "data",
+        "other": 1
+      }
+    },
+    {
+      "name": "normalized key collision",
+      "value": {
+        "é": 1,
+        "é": 2
+      }
+    }
+  ],
+  "invalidNumbers": [
+    {
+      "name": "negative zero",
+      "bitsHex": "8000000000000000"
+    },
+    {
+      "name": "positive infinity",
+      "bitsHex": "7ff0000000000000"
+    },
+    {
+      "name": "negative infinity",
+      "bitsHex": "fff0000000000000"
+    },
+    {
+      "name": "quiet NaN",
+      "bitsHex": "7ff8000000000001"
+    }
+  ]
+}

@@ -7,6 +7,7 @@ import {
   createPiAgentCoreInitialState,
   decodePiAgentCoreModelContext,
   decodePiAgentCoreModelSettlement,
+  decodePiJson,
   encodePiAgentCoreModelSettlement,
   type AgentCoreFactory,
   type EngineIdentity,
@@ -249,10 +250,17 @@ async function dispatchEffect(
     const toolCall = payload.toolCall ?? {};
     const toolCallId = typeof toolCall.id === "string" ? toolCall.id : "";
     const name = typeof toolCall.name === "string" ? toolCall.name : "";
-    const args =
+    const encodedArguments =
       toolCall.arguments !== null && typeof toolCall.arguments === "object" && !Array.isArray(toolCall.arguments)
-        ? (toolCall.arguments as Record<string, unknown>)
+        ? (toolCall.arguments as NormalizedValue)
         : {};
+    // Effects and checkpoints retain canonical numeric wrappers. Only the tool
+    // execution boundary receives real JSON numbers; never mutate the request.
+    const decodedArguments = decodePiJson(encodedArguments);
+    if (decodedArguments === null || typeof decodedArguments !== "object" || Array.isArray(decodedArguments)) {
+      throw new Error("decoded tool-call arguments must be an object");
+    }
+    const args = decodedArguments as Record<string, unknown>;
     budget.toolCalls += 1;
     if (budget.toolCalls > MAX_TOOL_CALLS_PER_TURN) {
       const outcome: EngineSettlement["outcome"] = {

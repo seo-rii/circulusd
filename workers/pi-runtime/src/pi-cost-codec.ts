@@ -2,12 +2,62 @@ import type { Context } from "@earendil-works/pi-ai";
 import type { EffectIntent, NormalizedValue } from "@circulusd/protocol-types";
 
 import { PiRuntimeError } from "./errors.ts";
+import { decodePiJson, encodePiJson, validatePiJson } from "./pi-json-codec.ts";
 import { boundedProtocolValue, exactRecord } from "./validation.ts";
 
 export const PI_AGENT_CORE_MODEL_PROTOCOL_VERSION = 2 as const;
 export const PI_AGENT_CORE_COST_ENCODING = "pi-cost-decimal-v1" as const;
 const maximumValueBytes = 4 << 20;
 const costFields = ["input", "output", "cacheRead", "cacheWrite", "total"] as const;
+
+// Keep malformed tool JSON distinguishable from the assistant/cost envelope so
+// the adapter preserves its existing PI_TOOL_CALL_INVALID terminal error.
+export class PiToolArgumentsEncodingError extends PiRuntimeError {
+  constructor(cause: unknown) {
+    super("INVALID_CONTEXT", "Pi tool call arguments are not valid encoded JSON", { cause });
+    this.name = "PiToolArgumentsEncodingError";
+  }
+}
+
+function assistantContent(content: unknown, encode: boolean): unknown {
+  let source: unknown;
+  try {
+    source = encode ? validatePiJson(content) : content;
+  } catch (error) {
+    throw new PiToolArgumentsEncodingError(error);
+  }
+  if (!Array.isArray(source)) return source;
+  return source.map((block: unknown) => {
+    if (
+      block === null || typeof block !== "object" || Array.isArray(block) ||
+      block instanceof Uint8Array || !("type" in block) || block.type !== "toolCall" ||
+      !("arguments" in block)
+    ) return block;
+    try {
+      return {
+        ...block,
+        arguments: encode ? encodePiJson(block.arguments) : decodePiJson(block.arguments as NormalizedValue),
+      };
+    } catch (error) {
+      throw new PiToolArgumentsEncodingError(error);
+    }
+  });
+}
+
+function contextTools(tools: unknown, encode: boolean): unknown {
+  const source = encode ? validatePiJson(tools) : tools;
+  if (!Array.isArray(source)) return source;
+  return source.map((tool: unknown) => {
+    if (
+      tool === null || typeof tool !== "object" || Array.isArray(tool) ||
+      tool instanceof Uint8Array || !("parameters" in tool)
+    ) return tool;
+    return {
+      ...tool,
+      parameters: encode ? encodePiJson(tool.parameters) : decodePiJson(tool.parameters as NormalizedValue),
+    };
+  });
+}
 
 export interface DecodedPiAssistantRecord {
   readonly [field: string]: unknown;
@@ -88,11 +138,12 @@ export function encodePiAgentCoreAssistantMessage(value: unknown): NormalizedVal
   const encodedCost = Object.fromEntries(costFields.map((field) => [field, checkedCost(cost[field]).toString()]));
   return boundedProtocolValue({
     ...message,
+    content: assistantContent(message.content, true),
     usage: { ...usage, cost: { encoding: PI_AGENT_CORE_COST_ENCODING, ...encodedCost } },
   }, maximumValueBytes, "piModel.encodedMessage", "INVALID_CONTEXT");
 }
 
-/** Converts costs only; callers must still validate the remaining Pi fields. */
+/** Converts costs and tool JSON; callers must still validate the remaining Pi fields. */
 export function decodePiAgentCoreAssistantMessage(value: unknown): DecodedPiAssistantRecord {
   const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.message", "INVALID_CONTEXT");
   const { message, usage, cost } = assistantRecords(normalized);
@@ -114,7 +165,7 @@ export function decodePiAgentCoreAssistantMessage(value: unknown): DecodedPiAssi
   return {
     ...message,
     role: "assistant",
-    content: message.content,
+    content: assistantContent(message.content, false),
     api: message.api,
     provider: message.provider,
     model: message.model,
@@ -156,10 +207,11 @@ export function encodePiAgentCoreModelContext(value: Context): NormalizedValue {
     messages: value.messages.map((message) => message.role === "assistant"
       ? encodePiAgentCoreAssistantMessage(message)
       : message),
+    ...(value.tools === undefined ? {} : { tools: contextTools(value.tools, true) }),
   }, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
 }
 
-/** Decode v2 costs without asserting that the transcript is a valid Pi Context. */
+/** Restore costs and tool JSON without asserting that the transcript is a valid Pi Context. */
 export function decodePiAgentCoreModelContext(value: unknown): DecodedPiContextRecord {
   const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
   const context = exactRecord(normalized, ["messages"], ["systemPrompt", "tools"], "piModel.context", "INVALID_CONTEXT");
@@ -172,7 +224,38 @@ export function decodePiAgentCoreModelContext(value: unknown): DecodedPiContextR
       message !== null && typeof message === "object" && message.role === "assistant"
         ? decodePiAgentCoreAssistantMessage(message)
         : message),
+    ...(context.tools === undefined ? {} : { tools: contextTools(context.tools, false) }),
   };
+}
+
+function ownDataField(value: unknown, field: string): unknown {
+  if (value === null || typeof value !== "object") return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, field);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function hasRawToolArgumentNumber(message: unknown): boolean {
+  // Inspect a bounded clone, never provider-supplied getters or array methods.
+  // Already encoded wrappers are left to the normal durable validation path.
+  let content: unknown;
+  try {
+    content = validatePiJson(ownDataField(message, "content"));
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(content)) return false;
+  for (const block of content) {
+    if (ownDataField(block, "type") !== "toolCall") continue;
+    const pending = [ownDataField(block, "arguments")];
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (typeof value === "number" && !Number.isSafeInteger(value)) return true;
+      if (value !== null && typeof value === "object") {
+        for (const entry of Object.values(value)) pending.push(entry);
+      }
+    }
+  }
+  return false;
 }
 
 /** Adapt raw Pi v1 responses only for an exact pending Pi model request. */
@@ -185,23 +268,18 @@ export function normalizePiAgentCoreSettlement(value: unknown, request: EffectIn
   ) return value;
   // Preserve the existing validation/terminal-error path for canonical legacy
   // inputs. Inspect only own data fields while locating an actual raw fraction.
-  let candidate: unknown = value;
-  for (const field of ["outcome", "result", "message", "usage", "cost"]) {
-    if (candidate === null || typeof candidate !== "object") return value;
-    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
-    if (descriptor === undefined || !("value" in descriptor)) return value;
-    candidate = descriptor.value;
-  }
-  if (candidate === null || typeof candidate !== "object" || !costFields.some((field) => {
-    const descriptor = Object.getOwnPropertyDescriptor(candidate, field);
-    return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "number" && !Number.isSafeInteger(descriptor.value);
-  })) return value;
+  const message = ownDataField(ownDataField(ownDataField(value, "outcome"), "result"), "message");
+  const cost = ownDataField(ownDataField(message, "usage"), "cost");
+  const rawCost = costFields.some((field) => {
+    const number = ownDataField(cost, field);
+    return typeof number === "number" && !Number.isSafeInteger(number);
+  });
+  if (!rawCost && !hasRawToolArgumentNumber(message)) return value;
   const settlement = exactRecord(value, ["requestDigest", "outcome"], [], "piModel.engineSettlement", "INVALID_CONTEXT");
   const outcome = exactRecord(settlement.outcome, ["kind"], ["result", "code", "message", "retryable", "reason"], "piModel.outcome", "INVALID_CONTEXT");
   if (outcome.kind !== "success") return value;
   const result = exactRecord(outcome.result, ["version", "message"], [], "piModel.settlement", "INVALID_CONTEXT");
-  const { cost } = assistantRecords(result.message);
-  if (result.version !== 1 || costFields.every((field) => Number.isSafeInteger(cost[field]))) return value;
+  if (result.version !== 1) return value;
   return {
     ...settlement,
     outcome: { ...outcome, result: encodePiAgentCoreModelSettlement(result.message) },

@@ -5,6 +5,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
 import { test } from "node:test";
+import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 
 import { buildAdapterConfiguration, engineIdentity, runtimeRevisionDigest } from "../src/agent-config.ts";
 import {
@@ -208,6 +209,123 @@ test("mock provider drives the circulusd engine through model -> tool -> model -
   assert.equal(second.status, "completed");
   const secondModelStart = session.events.filter((event) => event.type === "model.started").at(-1) as DurableEvent;
   assert.equal((secondModelStart.data as { historyInjected: number }).historyInjected, 2);
+});
+
+test("fractional tool arguments reach execution and subsequent provider context as numbers", async () => {
+  const received: Readonly<Record<string, unknown>>[] = [];
+  const contexts: Context[] = [];
+  const tools = createToolDefinitions([{
+    name: "numeric_echo",
+    description: "Echo nested numeric JSON without running an external process",
+    parameters: {
+      type: "object",
+      properties: {
+        value: { type: "number", minimum: 0.1, maximum: 1.5, multipleOf: 0.25, default: 0.75 },
+        nested: { type: "array", items: { type: "number" } },
+      },
+      required: ["value", "nested"],
+      additionalProperties: false,
+    },
+    replayPolicy: "safe",
+    run: (args) => {
+      received.push(structuredClone(args));
+      return JSON.stringify(args);
+    },
+  }]);
+  const mock = new MockModelProvider({ deltaDelayMs: 0 });
+  const provider: ModelProvider = {
+    configuration: mock.configuration,
+    describe: () => mock.describe(),
+    complete: async (input) => {
+      contexts.push(structuredClone(input.context));
+      if (contexts.length > 1) return mock.complete(input);
+      const content: AssistantMessage["content"] = [{
+        type: "toolCall", id: "call_fraction", name: "numeric_echo",
+        arguments: { value: 1.25, nested: [0.125, -0.75, 2] },
+      }, {
+        type: "toolCall", id: "call_calculator", name: "calculator",
+        arguments: { expression: "1.25+0.125" },
+      }];
+      return {
+        role: "assistant", content, stopReason: "toolUse", timestamp: 123,
+        api: MOCK_MODEL.api, provider: MOCK_MODEL.provider, model: MOCK_MODEL.id,
+        usage: {
+          input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3,
+          cost: { input: 0.00001, output: 0.00002, cacheRead: 0, cacheWrite: 0, total: 0.00003 },
+        },
+      };
+    },
+  };
+  const configuration = buildAdapterConfiguration(provider.configuration, tools);
+  const digest = runtimeRevisionDigest(configuration);
+  const runtime = createTurnRuntime({
+    provider, tools, configuration,
+    identity: (sessionId) => engineIdentity(sessionId, digest),
+    historyInjection: false,
+  });
+  const session = new Session(digest);
+  const turn = session.beginTurn("Echo fractional JSON and calculate 1.25+0.125");
+  await runTurn(session, turn, runtime);
+
+  assert.equal(turn.status, "completed", JSON.stringify(turn.error));
+  assert.deepEqual(received, [{ value: 1.25, nested: [0.125, -0.75, 2] }]);
+  assert.match(turn.result ?? "", /1\.375/);
+  assert.equal(contexts.length, 2);
+  for (const context of contexts) {
+    assert.deepEqual(context.tools?.find((tool) => tool.name === "numeric_echo")?.parameters, tools.at(-1)?.parameters);
+  }
+  const priorAssistant = contexts[1]?.messages.find((message) => message.role === "assistant");
+  assert.ok(priorAssistant?.role === "assistant");
+  assert.deepEqual(priorAssistant.content.find((block) => block.type === "toolCall" && block.id === "call_fraction"), {
+    type: "toolCall", id: "call_fraction", name: "numeric_echo",
+    arguments: { value: 1.25, nested: [0.125, -0.75, 2] },
+  });
+  assert.equal(priorAssistant.usage.cost.total, 0.00003);
+  const results = contexts[1]?.messages.filter((message) => message.role === "toolResult");
+  assert.equal(results?.length, 2);
+  assert.equal(textOfContent(results?.[0]?.content), '{"value":1.25,"nested":[0.125,-0.75,2]}');
+  assert.equal(textOfContent(results?.[1]?.content), "1.375");
+});
+
+test("malformed durable number wrappers fail before a harness tool executes", async () => {
+  let executions = 0;
+  const tools = createToolDefinitions([{
+    name: "numeric_echo", description: "Echo one number",
+    parameters: { type: "object", properties: { value: { type: "number" } } },
+    replayPolicy: "safe",
+    run: () => { executions += 1; return "unexpected"; },
+  }]);
+  const provider = new MockModelProvider({ deltaDelayMs: 0 });
+  const configuration = buildAdapterConfiguration(provider.configuration, tools);
+  const digest = runtimeRevisionDigest(configuration);
+  const runtime = createTurnRuntime({
+    provider, tools, configuration,
+    identity: (sessionId) => engineIdentity(sessionId, digest),
+    historyInjection: false,
+  });
+  const session = new Session(digest);
+  const turn = session.beginTurn("invalid wrapped argument");
+  await runTurn(session, turn, {
+    ...runtime,
+    factory: () => ({
+      advance: async () => ({
+        kind: "tool_requests", state: null,
+        requests: [{
+          service: "external-tool", operation: "external-tool.call", replayPolicy: "safe",
+          payload: {
+            toolCall: {
+              id: "call_bad", name: "numeric_echo",
+              arguments: { value: { "$pi.number.v1": "NaN" } },
+            },
+          },
+        }],
+      }),
+    }),
+  });
+  assert.equal(turn.status, "failed");
+  assert.match(turn.error?.message ?? "", /number wrapper/);
+  assert.equal(executions, 0);
+  assert.equal(session.events.some((event) => event.type === "tool.started"), false);
 });
 
 test("aborting a running turn settles it as turn.aborted", async () => {

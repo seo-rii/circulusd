@@ -12,6 +12,7 @@ import {
   decodePiAgentCoreModelContext,
   decodePiAgentCoreModelSettlement,
   encodePiAgentCoreModelSettlement,
+  normalizePiAgentCoreSettlement,
 } from "../src/index.ts";
 import { identity, successSettlement } from "./helpers.ts";
 
@@ -65,6 +66,29 @@ async function firstModel() {
 }
 
 describe("Pi decimal cost boundary", () => {
+  it("preserves canonical legacy integer tool settlements without changing their bytes", async () => {
+    const first = await firstModel();
+    const message = providerMessage(true);
+    message.usage.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+    const settlement = successSettlement(first.request.requestDigest, {
+      version: 1, message,
+    } as unknown as NormalizedValue);
+    const normalized = normalizePiAgentCoreSettlement(settlement, first.request);
+    expect(normalized).toBe(settlement);
+    expect(encodeCanonicalCbor(normalized)).toEqual(encodeCanonicalCbor(settlement));
+  });
+
+  it("does not adapt fractional tool responses for a non-Pi pending request", async () => {
+    const first = await firstModel();
+    const message = providerMessage(true);
+    message.content = [{ type: "toolCall", id: "raw_fraction", name: "echo", arguments: { value: 1.25 } }];
+    const settlement = successSettlement(first.request.requestDigest, {
+      version: 1, message,
+    } as unknown as NormalizedValue);
+    const other = { ...first.request, service: "external-tool" as const, operation: "call" };
+    expect(normalizePiAgentCoreSettlement(settlement, other)).toBe(settlement);
+  });
+
   it("round-trips actual pinned Pi calculateCost values through canonical durable bytes", () => {
     const message = providerMessage();
     expect(message.usage.cost.input).toBeGreaterThan(0);
