@@ -25,6 +25,7 @@ import (
 )
 
 const (
+	launchNonceBytes     = 32
 	controlSocketInside  = "/run/circulusd/control/control.sock"
 	manifestInside       = "/etc/circulusd/commands.json"
 	sandboxdInside       = "/sandbox/sandboxd"
@@ -312,7 +313,7 @@ func preparePlan(options launchOptions) (*launcherPlan, error) {
 		return nil, errors.New("refusing to launch as root; run as an unprivileged user")
 	}
 	if _, err := os.Stat(options.sandboxd); err != nil {
-		return nil, fmt.Errorf("sandboxd binary not found at %s; build it with `pnpm sandbox:build`", options.sandboxd)
+		return nil, fmt.Errorf("sandboxd binary not found at %s; build it with `corepack pnpm harness:sandbox:build`", options.sandboxd)
 	}
 	digest, err := sha256File(options.sandboxd)
 	if err != nil {
@@ -563,7 +564,7 @@ func (plan *launcherPlan) launch(id string, generation uint64) (*instance, error
 		ID:         id,
 		Generation: generation,
 		Launcher:   plan.Launcher,
-		Nonce:      make([]byte, handshakeNonceBytes),
+		Nonce:      make([]byte, launchNonceBytes),
 		ServerUID:  uint32(os.Getuid()),
 		done:       make(chan struct{}),
 	}

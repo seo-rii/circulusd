@@ -3,7 +3,7 @@
 //   bin/sandboxd       circulusd's cmd/sandboxd (unmodified)
 //   bin/sandbox-agent  harness/sandbox/agent, the harness' executord stand-in
 //   node harness/sandbox/build.mjs [--circulusd <path>]   build both binaries (default: this repository)
-//   node harness/sandbox/build.mjs --test                  run the agent's host-OS Go tests with the same toolchain
+//   node harness/sandbox/build.mjs --test                  run shared-protocol and agent host-OS Go tests
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -43,8 +43,9 @@ if (go === null) {
   process.exit(2);
 }
 if (argv.includes("--test")) {
-  // Host-OS tests (protocol vectors, text helpers); the Linux-only files are vetted at build time.
-  const result = spawnSync(go.command, ["test", "./harness/sandbox/agent/..."], { cwd: circulusd, stdio: "inherit", windowsHide: true });
+  // Keep the shared wire vectors in this gate on every host. Linux also runs
+  // the real private-UDS tests; other hosts compile only portable tests.
+  const result = spawnSync(go.command, ["test", "./internal/sandboxrpc", "./harness/sandbox/agent/..."], { cwd: circulusd, stdio: "inherit", windowsHide: true });
   process.exit(result.status ?? 1);
 }
 mkdirSync(binDirectory, { recursive: true });

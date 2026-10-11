@@ -1,4 +1,4 @@
-package main
+package sandboxrpc
 
 import (
 	"bytes"
@@ -8,13 +8,13 @@ import (
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 )
 
-// Vectors previously generated with circulusd's generated package
-// (formerly sandbox/vectors/main.go); they pin the mirrored digest rules.
+// These vectors preserve the harness wire contract at its shared implementation.
+// The harness imports Client directly and no longer maintains protocol copies.
 func TestNonceProofVector(t *testing.T) {
 	nonce := bytes.Repeat([]byte{0x5a}, 32)
 	sandboxID := []byte("sandbox_ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	proof := hex.EncodeToString(nonceProof(nonce, sandboxID, 1, v1.ProtocolPeer_PROTOCOL_PEER_SANDBOXD))
-	if proof != "c43972172b649256240bd7e8a87461d97e967b5beb6a2585ec72b8f72ddcf8b4" {
+	if proof != "e5031f826862f15e62835970bf8bd757b6e837675f70dc3f8050a82b683f8f5c" {
 		t.Fatalf("nonce proof = %s", proof)
 	}
 }

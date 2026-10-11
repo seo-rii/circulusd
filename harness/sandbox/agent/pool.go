@@ -162,6 +162,7 @@ func (p *pool) ensure(sb *sessionSandbox, note *string) (*executor, error) {
 	if sb.exec != nil {
 		if sb.exec.inst.exited() {
 			logf("session %s: sandboxd %s gen %d exited (%v)", sb.sessionID, sb.sandboxID, sb.generation, sb.exec.inst.err)
+			_ = sb.exec.client.close()
 			sb.exec.inst.cleanup()
 			sb.exec = nil
 			*note = fmt.Sprintf("the sandbox for this session had exited and was relaunched (generation %d); /workspace was reset", sb.generation+1)
@@ -180,6 +181,7 @@ func (p *pool) ensure(sb *sessionSandbox, note *string) (*executor, error) {
 
 func (p *pool) relaunch(sb *sessionSandbox, reason string, note *string) (*executor, error) {
 	logf("session %s: rotating sandboxd %s gen %d -> %d: %s", sb.sessionID, sb.sandboxID, sb.generation, sb.generation+1, reason)
+	_ = sb.exec.client.close()
 	sb.exec.inst.stop()
 	sb.exec = nil
 	*note = fmt.Sprintf("the sandbox for this session was relaunched (generation %d; %s); /workspace was reset", sb.generation+1, reason)
@@ -192,14 +194,19 @@ func (p *pool) launch(sb *sessionSandbox) (*executor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("launch sandboxd for session %s: %w", sb.sessionID, err)
 	}
-	client := newSandboxClient(inst.SocketPath, inst.ServerUID, inst.ID, inst.Generation, inst.Nonce)
+	client, err := newSandboxClient(inst.SocketPath, inst.ServerUID, inst.ID, inst.Generation, inst.Nonce)
 	for index := range inst.Nonce {
 		inst.Nonce[index] = 0
+	}
+	if err != nil {
+		inst.stop()
+		return nil, fmt.Errorf("sandboxd transport for session %s: %w", sb.sessionID, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err = client.handshake(ctx)
 	cancel()
 	if err != nil {
+		_ = client.close()
 		inst.stop()
 		return nil, fmt.Errorf("sandboxd handshake for session %s: %w", sb.sessionID, err)
 	}
@@ -217,6 +224,7 @@ func (sb *sessionSandbox) stop(reason string) {
 		return
 	}
 	logf("session %s: stopping sandboxd %s gen %d (%s)", sb.sessionID, sb.sandboxID, sb.generation, reason)
+	_ = sb.exec.client.close()
 	sb.exec.inst.stop()
 	sb.exec = nil
 }

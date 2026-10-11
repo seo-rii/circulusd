@@ -19,6 +19,7 @@ import (
 )
 
 const (
+	stdinChunkBytes       = 64 << 10
 	tenantID              = "tenant_circulusd-test"
 	userID                = "subject_local"
 	pythonCommand         = "python3"
@@ -346,9 +347,9 @@ func (e *executor) afterSpawn(ctx context.Context, handle *v1.ProcessHandle, pla
 // feedStdin streams the data in protocol-sized chunks and closes stdin.
 func (e *executor) feedStdin(ctx context.Context, handle *v1.ProcessHandle, data []byte) error {
 	var sequence uint64
-	for offset := 0; offset < len(data); offset += maximumStdinChunkBytes {
+	for offset := 0; offset < len(data); offset += stdinChunkBytes {
 		sequence++
-		end := min(offset+maximumStdinChunkBytes, len(data))
+		end := min(offset+stdinChunkBytes, len(data))
 		e.keyed++
 		if err := e.client.writeStdin(ctx, handle, sequence, data[offset:end]); err != nil {
 			return err
@@ -403,12 +404,6 @@ func (e *executor) collect(ctx context.Context, handle *v1.ProcessHandle, timeou
 		var exit *v1.ProcessResult
 		for stream.Receive() {
 			event := stream.Msg()
-			if event == nil || hasUnknownFields(event) || !proto.Equal(event.GetProcess(), handle) || event.GetSequence() != after+1 {
-				_ = stream.Close()
-				cancel()
-				e.cancel(handle, "protocol violation")
-				return nil, errors.New("process event failed protocol validation")
-			}
 			after = event.GetSequence()
 			switch payload := event.GetEvent().(type) {
 			case *v1.ProcessEvent_Stdout:
@@ -458,7 +453,7 @@ func (e *executor) collect(ctx context.Context, handle *v1.ProcessHandle, timeou
 			e.cancel(handle, "client gone")
 			return nil, ctx.Err()
 		}
-		if time.Since(started) > timeout+maximumRPCDeadline {
+		if time.Since(started) > timeout+maximumAttachmentDuration {
 			e.cancel(handle, "no exit within deadline")
 			return nil, fmt.Errorf("sandbox process did not report an exit within its deadline (%v)", streamErr)
 		}

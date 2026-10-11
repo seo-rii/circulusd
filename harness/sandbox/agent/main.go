@@ -3,10 +3,9 @@
 // unshare), performs the one-time-nonce handshake, and exposes a small local
 // JSON API that the Node backend calls to run python inside the sandbox.
 //
-// The wire protocol is circulusd's own: the generated protobuf types and
-// connect-go clients from api/generated/circulus/v1alpha are used unchanged.
-// Only the request-digest / nonce-proof rules of internal/sandboxrpc (which
-// Go's internal-package rule keeps private) are mirrored in protocol.go.
+// The wire protocol, launch authentication, and response validation use the
+// shared internal/sandboxrpc client from this Go module. The harness supplies
+// its reference permits, operation keys, and process collection policy.
 //
 //	sandbox-agent serve --sandboxd <path> [--launcher auto|nsjail|docker|unshare] ...
 //	sandbox-agent jail-init ...      (internal: runs inside the unshare user namespace)
