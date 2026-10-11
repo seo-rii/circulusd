@@ -4,13 +4,14 @@ import { test } from "node:test";
 
 import { createPythonTool } from "../src/python-tool.ts";
 import { CirculusdSandboxExecutor } from "../src/sandbox/executor.ts";
-import { toWslPath, type SandboxLauncherKind } from "../src/sandbox/launcher.ts";
+import { toWslPath } from "../src/sandbox/launcher.ts";
 import { executeTool, type ToolContext } from "../src/tools.ts";
+import { createLiveDiagnostics, runSelectedLiveSandbox, selectLiveSandbox } from "./support/live-sandbox.ts";
 
 // Starts the real sandbox agent inside WSL2 (or on a Linux host), which runs
 // one sandboxd per session through nsjail/docker/unshare, and drives it over
-// SandboxProcessService. Skipped when the sandbox cannot start (no WSL, no
-// built binaries, ...) with the reason.
+// SandboxProcessService. An unrequested gate skips without starting anything.
+// Once selected, missing binaries and every startup/probe failure fail the test.
 
 function toolContext(sessionId: string, toolCallId: string, signal = new AbortController().signal): ToolContext {
   return {
@@ -29,27 +30,26 @@ test("wsl path conversion", () => {
 });
 
 test("circulusd sandbox: python runs inside a per-session sandboxd with kernel isolation", { timeout: 240_000 }, async (t) => {
-  const logs: string[] = [];
-  let sandbox: CirculusdSandboxExecutor;
-  try {
-    sandbox = await CirculusdSandboxExecutor.start({
-      distro: process.env.CIRCULUSD_TEST_SANDBOX_DISTRO ?? null,
+  const selection = selectLiveSandbox(process.env);
+  const diagnostics = createLiveDiagnostics();
+  const sandbox = await runSelectedLiveSandbox(selection, (reason) => t.skip(reason), async () => {
+    assert.ok(selection.enabled);
+    return CirculusdSandboxExecutor.start({
+      distro: selection.distro,
       sandboxDirectory: resolve(import.meta.dirname, "../../sandbox"),
       // CIRCULUSD_TEST_SANDBOX_LAUNCHER=docker runs the same checks against the docker launcher.
-      launcher: (process.env.CIRCULUSD_TEST_SANDBOX_LAUNCHER as SandboxLauncherKind | undefined) ?? "auto",
+      launcher: selection.launcher,
       python: "/usr/bin/python3",
       workspaceSize: "64m",
       // Tiny idempotency budget so the generation rotation is exercised below
       // (each run costs one keyed RPC, plus two more when it has stdin).
       ledgerBudget: 9,
       maxSessions: 4,
-      log: (line) => logs.push(line),
+      log: diagnostics.log,
       startupTimeoutMs: 120_000,
     });
-  } catch (error) {
-    t.skip(`sandbox unavailable: ${error instanceof Error ? error.message : String(error)}`);
-    return;
-  }
+  }, diagnostics);
+  if (sandbox === null) return;
   try {
     const ready = sandbox.ready;
     assert.match(ready.environmentDigest, /^sha256:[0-9a-f]{64}$/);
@@ -147,7 +147,7 @@ test("circulusd sandbox: python runs inside a per-session sandboxd with kernel i
     assert.equal(rotated.isError, false, rotated.text);
     assert.match(rotated.text, /^note: .*relaunched \(generation 2; idempotency budget of 9 keyed RPCs used\)/);
     assert.match(rotated.text, /\nFalse$/);
-    assert.ok(logs.some((line) => /rotating sandboxd sandbox_[A-Z2-7]{26} gen 1 -> 2/.test(line)), logs.join("\n"));
+    assert.ok(diagnostics.lines().some((line) => /rotating sandboxd sandbox_[A-Z2-7]{26} gen 1 -> 2/.test(line)), diagnostics.lines().join("\n"));
 
     // Aborting the turn cancels the run instead of waiting for the timeout.
     const controller = new AbortController();

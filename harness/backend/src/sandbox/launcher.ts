@@ -78,7 +78,7 @@ export async function launchSandbox(options: SandboxLaunchOptions): Promise<Sand
   const sandboxd = resolve(sandboxDirectory, "bin", "sandboxd");
   for (const binary of [agent, sandboxd]) {
     if (!existsSync(binary)) {
-      throw new Error(`${binary} is missing; run \`corepack pnpm sandbox:build\` first`);
+      throw new Error(`${binary} is missing; run \`corepack pnpm harness:sandbox:build\` first`);
     }
   }
   const agentArguments = [

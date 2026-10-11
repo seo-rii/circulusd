@@ -83,11 +83,13 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
 
 **launcher (`CIRCULUSD_TEST_SANDBOX_LAUNCHER`, 기본 `auto` = nsjail → docker → unshare 순으로 가능한 것):**
 
-| launcher | sandboxd `--backend` | 격리 | 이 호스트에서 검증 |
+| launcher | sandboxd `--backend` | 격리 | 이전 개발 환경 기록¹ |
 |---|---|---|---|
 | `nsjail` | `nsjail` | NsJail 이 tmpfs 루트에 `/usr` 읽기 전용 bind, user/mount/pid/net/ipc/uts 네임스페이스, uid 매핑은 newuidmap, rlimit, no_new_privs. sandboxd 는 내부 root 로 CAP_SETUID/SETGID/KILL 만 가지고, 파이썬은 `setpriv` 로 subuid 에 매핑된 uid 1000 으로 실행 | O |
 | `docker` | `docker` | 세션당 컨테이너: `--network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 512m --user <uid>`, tmpfs `/workspace`, 이미지 기본 `python:3.14-slim`(`CIRCULUSD_TEST_SANDBOX_IMAGE`). nonce 는 컨테이너 stdin → fd 3. 제어 소켓은 `/mnt/wsl` 공유 tmpfs. **주의**: 비root `--user` 는 setuid 능력이 없어 sandboxd 와 파이썬이 같은 uid 로 돌며, 파이썬이 자기 세션의 sandboxd 를 죽이거나 제어 소켓을 건드릴 수는 있습니다(다른 세션·호스트에는 닿지 않음). 격리가 중요하면 nsjail 을 쓰세요 | O (WSL 안 docker.io 29.1.3) |
 | `unshare` | `nsjail` (라벨) | util-linux `unshare` 네임스페이스 + 에이전트의 `jail-init`(mount(2)/pivot_root). 파이썬은 `prlimit`(nproc 256, as 2 GiB, fsize 512 MiB, nofile 512, core 0) 아래 `setpriv` 로 uid 1000 으로 실행, `/tmp` 는 64 MiB. nsjail 이 없을 때의 대역이며 seccomp 등은 없음 | O |
+
+¹ 가져온 하네스의 개발 환경 기록입니다. 현재 호스트의 실행 증거나 production qualification을 뜻하지 않습니다.
 
 어떤 launcher 인지는 기동 로그와 `/v1/capabilities` 의 `execution.python.launcher`, UI 헤더에 항상 드러납니다. 샌드박스를 못 띄우면
 `python` 도구는 **빠집니다**(호스트 실행으로 조용히 대체하지 않음). 격리 없이 호스트 파이썬으로 돌리려면 `CIRCULUSD_TEST_SANDBOX=host` 를
@@ -100,11 +102,19 @@ circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circul
 ```bash
 corepack pnpm harness:sandbox:build      # sandboxd + sandbox-agent 를 GOOS=linux 로 빌드 → harness/sandbox/bin/
 corepack pnpm harness:sandbox:test       # 에이전트의 프로토콜 규칙 테스트 (Go; 루트의 go test ./... 에도 포함됨)
-CIRCULUSD_TEST_SANDBOX_LAUNCHER=nsjail node --test harness/backend/test/sandbox-live.test.ts   # 실제 sandboxd 로 라이브 테스트
+CIRCULUSD_TEST_SANDBOX_LIVE=1 CIRCULUSD_TEST_SANDBOX_LAUNCHER=nsjail node --test harness/backend/test/sandbox-live.test.ts
+# Windows/WSL2에서는 CIRCULUSD_TEST_SANDBOX_DISTRO=Ubuntu-24.04 로 준비된 배포판을 선택할 수 있습니다.
 ```
 
 라이브 테스트는 격리(uid, cwd `/workspace`, 호스트 파일·네트워크·환경 없음), 세션 간 workspace 분리, 제한 시간, 원장 예산에 따른
-세대 재기동, abort 취소를 세 launcher 모두에서 확인합니다.
+세대 재기동, abort 취소를 선택한 launcher에서 검사합니다. 실행하려면 바이너리와 해당 launcher가 준비된 호스트가 필요합니다.
+테스트 전용 `CIRCULUSD_TEST_SANDBOX_LIVE=1` 또는 명시적인 `CIRCULUSD_TEST_SANDBOX_LAUNCHER`/`DISTRO` 설정이 실행을 선택합니다.
+이 설정이 모두 없으면 sandbox를 시작하거나 가용성을 probe하지 않고 이유와 함께 skip합니다. 명시적으로 선택한 경우 바이너리 누락,
+기동 실패, probe 실패는 **테스트 실패와 nonzero 종료 코드**를 반환합니다. 진단은 최대 8개의 분류된 로그와 종료 코드만 포함하고,
+원문 ready token·credential·오류 cause는 출력하지 않습니다.
+
+`CIRCULUSD_TEST_SANDBOX_LIVE=0`은 명시적 비활성화입니다. launcher/distro 선택과 함께 쓰면 설정 오류이며, 알 수 없는 launcher나
+빈 distro도 실패합니다. 이 테스트 설정은 앱의 `CIRCULUSD_TEST_SANDBOX=circulusd|host|off`와 별개입니다.
 
 도구 자체의 동작: stdout/stderr 만 돌아오고, 기본 30 초 제한(`CIRCULUSD_TEST_PYTHON_TIMEOUT_MS`), 스트림당 16 KiB 로 잘립니다.
 코드는 64 KiB, stdin 은 256 KiB 까지 받습니다(에이전트는 각각 100 KiB·1 MiB 에서 한 번 더 거절하고, 스크립트가 stdin 을 다 읽지 않고
@@ -117,7 +127,8 @@ UI 는 코드와 전체 출력을 접이식 블록으로 보여 줍니다.
 
 ```bash
 corepack pnpm -r --if-present check                      # 워크스페이스 전체 tsc (하네스 포함)
-corepack pnpm --filter @circulusd/harness-backend test   # node --test: 도구, mock 라우팅, 엔진 end-to-end, abort, HTTP/SSE 재전송, 세션 상한/삭제 정리, 히스토리 예산 (루트 pnpm test 에도 포함)
+corepack pnpm --filter @circulusd/harness-backend test   # 도구·엔진·HTTP/SSE·live gate 단위 테스트; 라이브는 명시 선택 시에만 실행
+node --test harness/backend/test/sandbox-gate.test.ts   # 실제 sandbox 없이 skip/실패/진단 및 missing-binary nonzero 종료 검증
 ```
 
 ## API 요약
