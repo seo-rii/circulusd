@@ -66,6 +66,9 @@ const (
 	AtomicEffectLifecycle AtomicGroup = "effect-lifecycle"
 	AtomicQuotaSettlement AtomicGroup = "quota-settlement"
 	AtomicPublicEvent     AtomicGroup = "public-idempotency-event"
+	// AtomicEngineGenesis attests executable checkpoint initialization with its
+	// exact runtime and input. It belongs to the engine's independent domain.
+	AtomicEngineGenesis AtomicGroup = "engine-genesis"
 )
 
 // Descriptor is the immutable identity measured by both an offline
