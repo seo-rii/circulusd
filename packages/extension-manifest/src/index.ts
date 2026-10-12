@@ -200,10 +200,10 @@ function boundedString(
   value: unknown,
   path: string,
   maxBytes: number,
-  options: { readonly allowControls?: boolean; readonly requireNfc?: boolean } = {},
+  options: { readonly allowEmpty?: boolean; readonly allowControls?: boolean; readonly requireNfc?: boolean } = {},
 ): string {
-  if (typeof value !== "string" || value.length === 0) {
-    fail(path, "must be a non-empty string");
+  if (typeof value !== "string" || (value.length === 0 && options.allowEmpty !== true)) {
+    fail(path, options.allowEmpty === true ? "must be a string" : "must be a non-empty string");
   }
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -663,6 +663,7 @@ function snapshotFiles(value: ExtensionBundleFiles): readonly SnapshotFile[] {
     let bytes: Uint8Array;
     if (typeof raw === "string") {
       boundedString(raw, `$files[${JSON.stringify(rawPath)}]`, MAX_FILE_BYTES, {
+        allowEmpty: true,
         allowControls: true,
         requireNfc: false,
       });
