@@ -13,6 +13,34 @@ const schemaMaps = new Set(["$defs", "definitions", "properties", "patternProper
 const schemaArrays = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
 const schemaValues = new Set(["additionalProperties", "unevaluatedProperties", "items", "unevaluatedItems", "contains", "propertyNames", "not", "if", "then", "else"]);
 
+function decimalNumber(value: number): { coefficient: bigint; exponent: number } {
+  const text = value.toString();
+  const exponentPosition = text.indexOf("e");
+  const significand = exponentPosition === -1 ? text : text.slice(0, exponentPosition);
+  const decimalPosition = significand.indexOf(".");
+  return {
+    coefficient: BigInt(significand.replace(".", "")),
+    exponent: (exponentPosition === -1 ? 0 : Number(text.slice(exponentPosition + 1)))
+      - (decimalPosition === -1 ? 0 : significand.length - decimalPosition - 1),
+  };
+}
+
+function compileDecimalMultipleOf(divisor: number): (value: number) => boolean {
+  if (!Number.isFinite(divisor) || divisor <= 0) throw new Error("multipleOf must be a positive finite number");
+  const multiple = decimalNumber(divisor);
+  return (value) => {
+    if (!Number.isFinite(value)) return false;
+    const number = decimalNumber(value);
+    const exponent = number.exponent - multiple.exponent;
+    // Go's validator parses shortest decimal number strings as exact rationals.
+    // Integer arithmetic preserves those semantics without division rounding,
+    // tolerance, or overflow/underflow, including subnormal finite JSON numbers.
+    return exponent >= 0
+      ? (number.coefficient * 10n ** BigInt(exponent)) % multiple.coefficient === 0n
+      : number.coefficient % (multiple.coefficient * 10n ** BigInt(-exponent)) === 0n;
+  };
+}
+
 // Traverse schema positions, never enum/const/example instance data.
 function checkOfflineSchema(value: JsonValue): void {
   if (typeof value === "boolean") return;
@@ -38,6 +66,16 @@ function checkOfflineSchema(value: JsonValue): void {
 export function validateExtensionSchema(schema: JsonValue, defaults?: JsonValue): void {
   checkOfflineSchema(schema);
   const ajv = new Ajv2020({ strict: false, validateFormats: false, allErrors: false, ownProperties: true, addUsedSchema: false });
+  ajv.removeKeyword("multipleOf");
+  ajv.addKeyword({
+    keyword: "multipleOf",
+    type: "number",
+    schemaType: "number",
+    metaSchema: { type: "number", exclusiveMinimum: 0 },
+    compile: compileDecimalMultipleOf,
+    errors: false,
+    error: { message: ({ schema: divisor }) => `must be multiple of ${divisor}` },
+  });
   if (!ajv.validateSchema(schema as object)) throw new Error(`invalid draft 2020-12 schema: ${ajv.errorsText()}`);
   // Compile even without defaults so unresolved refs and invalid regexes cannot
   // hide behind configuration fields that have not been supplied yet.
