@@ -80,13 +80,19 @@ func (resolver *Resolver) Resolve(request Request) (Revision, error) {
 		}
 		constraint := requirement.Constraint
 		if wildcard := wildcardPattern.FindStringSubmatch(constraint); wildcard != nil {
-			major, _ := strconv.ParseUint(wildcard[1], 10, 64)
+			major, err := strconv.ParseUint(wildcard[1], 10, 64)
+			if err != nil {
+				return Revision{}, fmt.Errorf("%w: invalid version constraint %q", ErrInvalidRequest, constraint)
+			}
 			if wildcard[2] == "" {
 				parsed = append(parsed, parsedRequirement{packageID: requirement.PackageID, matches: func(candidate semanticVersion) bool {
 					return candidate.major == major
 				}})
 			} else {
-				minor, _ := strconv.ParseUint(wildcard[2], 10, 64)
+				minor, err := strconv.ParseUint(wildcard[2], 10, 64)
+				if err != nil {
+					return Revision{}, fmt.Errorf("%w: invalid version constraint %q", ErrInvalidRequest, constraint)
+				}
 				parsed = append(parsed, parsedRequirement{packageID: requirement.PackageID, matches: func(candidate semanticVersion) bool {
 					return candidate.major == major && candidate.minor == minor
 				}})
