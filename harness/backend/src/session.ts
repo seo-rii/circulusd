@@ -27,6 +27,13 @@ export interface EphemeralEvent {
 export type SessionEvent = DurableEvent | EphemeralEvent;
 export type SessionEventListener = (event: SessionEvent) => void;
 
+export interface ReplaySubscription {
+  /** References to the retained events at subscription time, never a growing live log. */
+  readonly replay: readonly DurableEvent[];
+  readonly cutoff: number;
+  readonly unsubscribe: () => void;
+}
+
 export type TurnStatus = "running" | "completed" | "failed" | "aborted";
 
 export interface TurnError {
@@ -149,6 +156,25 @@ export class Session {
     this.#listeners.add(listener);
     return () => {
       this.#listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Capture a fixed replay window and attach live delivery in one synchronous
+   * operation. The caller can then await replay backpressure without losing
+   * events committed after the cutoff. At most MAX_EVENTS_PER_SESSION shared
+   * event references are retained; payloads are not copied or serialized here.
+   */
+  captureReplaySubscription(listener: SessionEventListener, afterEventId = 0): ReplaySubscription {
+    const cutoff = this.lastEventId;
+    const replay = Object.freeze(this.events.filter((event) => event.id > afterEventId && event.id <= cutoff));
+    this.#listeners.add(listener);
+    return {
+      replay,
+      cutoff,
+      unsubscribe: () => {
+        this.#listeners.delete(listener);
+      },
     };
   }
 

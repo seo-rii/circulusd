@@ -16,7 +16,7 @@ import {
   runtimeRevisionDigest,
 } from "./agent-config.ts";
 import type { ModelProvider } from "./providers/index.ts";
-import { SessionStore, type Session, type SessionEvent } from "./session.ts";
+import { SessionStore, type DurableEvent, type Session, type SessionEvent } from "./session.ts";
 import type { ToolDefinition } from "./tools.ts";
 import { createTurnRuntime, runTurn, type TurnRuntime } from "./turn-runner.ts";
 
@@ -335,13 +335,16 @@ export function createApp(options: AppOptions): App {
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    response.write("retry: 1000\n\n");
     // Writing to a response after it ended (or to one the socket has already
     // torn down) raises ERR_STREAM_WRITE_AFTER_END as an 'error' event, which
     // without a listener takes the whole process down.
-    response.on("error", (error) => log(`sse ${session.id}: ${error.message}`));
     let closed = false;
     let unsubscribe = (): void => undefined;
+    let replay: readonly DurableEvent[] = [];
+    const pending: { readonly frame: string; readonly bytes: number }[] = [];
+    let pendingBytes = 0;
+    let wakePump: (() => void) | null = null;
+    let cancelDrain: (() => void) | null = null;
     const writable = (): boolean => !closed && !response.writableEnded && !response.destroyed;
     // Detaches from the session and ends the response. Idempotent, and safe
     // to call before the socket has actually closed.
@@ -350,6 +353,11 @@ export function createApp(options: AppOptions): App {
       closed = true;
       clearInterval(heartbeat);
       unsubscribe();
+      replay = [];
+      pending.length = 0;
+      pendingBytes = 0;
+      cancelDrain?.();
+      wakePump?.();
       const remaining = sseClients.get(session.id);
       if (remaining !== undefined) {
         remaining.delete(close);
@@ -357,23 +365,56 @@ export function createApp(options: AppOptions): App {
       }
       if (!response.writableEnded && !response.destroyed) response.end();
     };
-    const write = (event: SessionEvent): void => {
-      if (!writable()) return;
-      if (response.writableLength > SSE_MAX_BUFFERED_BYTES) {
-        log(`sse ${session.id}: client is not reading (${response.writableLength} bytes pending); dropping it`);
+    response.on("error", (error) => {
+      log(`sse ${session.id}: ${error.message}`);
+      close();
+    });
+    const withinBudget = (additionalBytes: number): boolean => {
+      const buffered = response.writableLength + pendingBytes + additionalBytes;
+      if (buffered > SSE_MAX_BUFFERED_BYTES) {
+        log(`sse ${session.id}: client is not reading (${buffered} bytes pending); dropping it`);
         close();
         response.destroy();
-        return;
+        return false;
       }
+      return true;
+    };
+    const frameOf = (event: SessionEvent): string => {
       const lines = [
         ...(event.id === null ? [] : [`id: ${event.id}`]),
         `event: ${event.type}`,
         `data: ${JSON.stringify(event)}`,
       ];
-      response.write(`${lines.join("\n")}\n\n`);
+      return `${lines.join("\n")}\n\n`;
+    };
+    const enqueue = (frame: string): void => {
+      if (!writable()) return;
+      const bytes = Buffer.byteLength(frame);
+      if (!withinBudget(bytes)) return;
+      pending.push({ frame, bytes });
+      pendingBytes += bytes;
+      wakePump?.();
+    };
+    const writeFrame = async (frame: string): Promise<boolean> => {
+      if (!writable() || !withinBudget(Buffer.byteLength(frame))) return false;
+      if (response.write(frame)) return true;
+      // write(false) accepted the frame. Do not write it again after drain.
+      // Only this pump writes, so a single drain waiter controls both replay
+      // and live events, and close() can release it even without a drain.
+      await new Promise<void>((resolveDrain) => {
+        const finish = (): void => {
+          response.off("drain", finish);
+          cancelDrain = null;
+          resolveDrain();
+        };
+        cancelDrain = finish;
+        response.once("drain", finish);
+        if (!writable()) finish();
+      });
+      return writable();
     };
     const heartbeat = setInterval(() => {
-      if (writable()) response.write(": ping\n\n");
+      enqueue(": ping\n\n");
     }, SSE_HEARTBEAT_MS);
     let clients = sseClients.get(session.id);
     if (clients === undefined) {
@@ -383,18 +424,46 @@ export function createApp(options: AppOptions): App {
     clients.add(close);
     request.on("close", close);
     response.on("close", close);
-    write({
+    const subscription = session.captureReplaySubscription((event) => enqueue(frameOf(event)), lastEventId);
+    replay = subscription.replay;
+    unsubscribe = subscription.unsubscribe;
+    const opened = frameOf({
       id: null,
       type: "stream.open",
       sessionId: session.id,
       turnId: session.activeTurn?.turnId ?? null,
       at: Date.now(),
       // firstEventId > resumeFrom + 1 means older events were dropped and cannot be replayed.
-      data: { resumeFrom: lastEventId, firstEventId: session.firstEventId, lastEventId: session.lastEventId },
+      data: { resumeFrom: lastEventId, firstEventId: session.firstEventId, lastEventId: subscription.cutoff },
     });
-    // Replays the retained log first; a client that cannot take it all is closed by write().
-    unsubscribe = session.subscribe(write, lastEventId);
-    if (closed) unsubscribe();
+    const pump = async (): Promise<void> => {
+      if (!(await writeFrame("retry: 1000\n\n")) || !(await writeFrame(opened))) return;
+      let replayIndex = 0;
+      while (writable() && replayIndex < replay.length) {
+        const event = replay[replayIndex];
+        replayIndex += 1;
+        if (event !== undefined && !(await writeFrame(frameOf(event)))) return;
+      }
+      replay = [];
+      while (writable()) {
+        const next = pending.shift();
+        if (next !== undefined) {
+          pendingBytes -= next.bytes;
+          if (!(await writeFrame(next.frame))) return;
+        } else {
+          await new Promise<void>((resolveWake) => {
+            wakePump = resolveWake;
+            if (!writable() || pending.length > 0) resolveWake();
+          });
+          wakePump = null;
+        }
+      }
+    };
+    void pump().catch((error: unknown) => {
+      log(`sse ${session.id}: ${error instanceof Error ? error.message : String(error)}`);
+      close();
+      response.destroy();
+    });
   };
 
   const server = createServer((request, response) => {
