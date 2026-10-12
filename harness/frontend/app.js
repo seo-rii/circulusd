@@ -43,6 +43,7 @@ const state = {
   viewEpoch: 0,
   source: null,
   activeTurnId: null,
+  pendingSubmission: null, // owner of the in-flight turn POST for this view
   bubbles: new Map(), // turnId -> assistant bubble record
   userBubbles: new Map(), // turnId -> user bubble element
   pendingUserBubble: null, // optimistic user bubble waiting for its turn.accepted
@@ -206,7 +207,7 @@ function ensureAssistantBubble(turnId) {
 function setActiveTurn(turnId) {
   state.activeTurnId = turnId;
   ui.abort.disabled = turnId === null;
-  ui.send.disabled = turnId !== null;
+  ui.send.disabled = turnId !== null || state.pendingSubmission !== null;
 }
 
 function logEvent(event, id) {
@@ -461,6 +462,7 @@ function isCurrentView(sessionId, viewEpoch) {
 function resetView() {
   state.bubbles.clear();
   state.userBubbles.clear();
+  state.pendingSubmission = null;
   state.pendingUserBubble = null;
   state.finishedTurns.clear();
   pendingPaint.clear();
@@ -498,13 +500,16 @@ async function newSession() {
 
 async function submitPrompt() {
   const prompt = ui.prompt.value.trim();
-  if (prompt === "" || state.sessionId === null || state.activeTurnId !== null) return;
+  if (prompt === "" || state.sessionId === null || state.activeTurnId !== null || state.pendingSubmission !== null) return;
   const sessionId = state.sessionId;
   const viewEpoch = state.viewEpoch;
+  const submission = {};
+  state.pendingSubmission = submission;
   ui.prompt.value = "";
   ui.send.disabled = true;
   // Drawn once here; turn.accepted adopts this element instead of adding a second one.
-  state.pendingUserBubble = addUserBubble(prompt);
+  const userBubble = addUserBubble(prompt);
+  state.pendingUserBubble = userBubble;
   try {
     const accepted = await api(`/v1/sessions/${sessionId}/turns`, {
       method: "POST",
@@ -512,8 +517,8 @@ async function submitPrompt() {
       body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
     });
     if (!isCurrentView(sessionId, viewEpoch)) return;
-    if (state.pendingUserBubble !== null) {
-      state.userBubbles.set(accepted.turnId, state.pendingUserBubble);
+    if (state.pendingUserBubble === userBubble) {
+      state.userBubbles.set(accepted.turnId, userBubble);
       state.pendingUserBubble = null;
     }
     ensureAssistantBubble(accepted.turnId);
@@ -522,16 +527,22 @@ async function submitPrompt() {
     if (!state.finishedTurns.has(accepted.turnId)) setActiveTurn(accepted.turnId);
   } catch (error) {
     if (!isCurrentView(sessionId, viewEpoch)) return;
-    state.pendingUserBubble = null;
+    if (state.pendingUserBubble === userBubble) state.pendingUserBubble = null;
     const element = document.createElement("div");
     element.className = "bubble assistant error";
     element.textContent = `turn 제출 실패: ${error.message}`;
     ui.messages.append(element);
-    setActiveTurn(null);
     if (error.status === 404) {
       // The session is gone (backend restarted, evicted, deleted elsewhere).
       element.textContent += " · 새 세션을 시작합니다.";
       await newSession();
+    }
+  } finally {
+    if (isCurrentView(sessionId, viewEpoch) && state.pendingSubmission === submission) {
+      state.pendingSubmission = null;
+      // SSE may have already accepted or completed this turn while the POST
+      // was pending. Preserve its current state when releasing the POST lock.
+      setActiveTurn(state.activeTurnId);
     }
   }
 }
