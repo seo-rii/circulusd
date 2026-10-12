@@ -137,7 +137,11 @@ export function parsePortableConversationMessages(value: unknown, complete: bool
       if((pending.size>0)!==(m.stopReason==="toolUse"))fail("historic tool stop reason mismatch");
       assistantSeen=true;
     }else if(role==="toolResult"){
-      const m=record(entry,["role","toolCallId","toolName","content","isError","timestamp"],["details"]);
+      const m=record(entry,["role","toolCallId","toolName","content","isError","timestamp"],["details","detailsEncoding"]);
+      if(m.detailsEncoding!==undefined){
+        if(m.detailsEncoding!=="pi-tool-details-json-v1"||!Object.hasOwn(m,"details"))fail("invalid portable tool details encoding");
+        assertEncodedPiJson(m.details as NormalizedValue);
+      }
       const key=text(m.toolCallId,true),name=text(m.toolName,true);natural(m.timestamp);contentBlocks(m.content);
       if(typeof m.isError!=="boolean"||pending.get(key)!==name)fail("unpaired historic tool result");pending.delete(key);
     }else fail("unsupported portable role");

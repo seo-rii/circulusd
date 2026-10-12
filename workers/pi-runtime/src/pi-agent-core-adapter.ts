@@ -980,7 +980,7 @@ export function createPiAgentCoreFactory(
           const resultRecord = exactRecord(
             entry.settlement.result,
             ["version", "toolCallId", "toolName", "content", "isError", "timestamp"],
-            ["details"],
+            ["details", "detailsEncoding"],
             `piAgentCore.toolSettlements[${index}].result`,
             "CORE_OUTPUT_INVALID",
           );
@@ -1073,6 +1073,9 @@ export function createPiAgentCoreFactory(
             ...(resultRecord.details === undefined
               ? {}
               : { details: normalizeProtocolValue(resultRecord.details) }),
+            ...(resultRecord.detailsEncoding === undefined
+              ? {}
+              : { detailsEncoding: resultRecord.detailsEncoding }),
             isError: resultRecord.isError,
             timestamp,
           }));

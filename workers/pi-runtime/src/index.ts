@@ -5,5 +5,6 @@ export * from "./errors.ts";
 export * from "./pi-agent-core-adapter.ts";
 export * from "./pi-cost-codec.ts";
 export * from "./pi-json-codec.ts";
+export * from "./pi-tool-details-codec.ts";
 export * from "./session-host-adapter.ts";
 export * from "./types.ts";

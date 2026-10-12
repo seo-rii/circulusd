@@ -2,6 +2,9 @@ package mcpgateway
 
 import (
 	"bytes"
+	"encoding/json"
+	"math"
+	"strconv"
 
 	"github.com/hancomac/circulusd/internal/canonical"
 )
@@ -35,9 +38,15 @@ func ValidateSessionPiResult(encodedLedgerResult, normalizedCBOR []byte, bounds 
 		return nil, ErrInvalidRequest
 	}
 	result, ok := sessionPiRecord(value,
-		[]string{"version", "toolCallId", "toolName", "content", "isError", "timestamp"}, []string{"details"})
+		[]string{"version", "toolCallId", "toolName", "content", "isError", "timestamp"}, []string{"details", "detailsEncoding"})
 	if !ok || result["version"] != int64(1) {
 		return nil, ErrInvalidRequest
+	}
+	if encoding, marked := result["detailsEncoding"]; marked {
+		details, present := result["details"]
+		if encoding != "pi-tool-details-json-v1" || !present || !validPiToolDetailsJSON(details) {
+			return nil, ErrInvalidRequest
+		}
 	}
 	for _, key := range []string{"toolCallId", "toolName"} {
 		if text, ok := result[key].(string); !ok || text == "" || (key == "toolName" && len(text) > 256) {
@@ -105,4 +114,42 @@ func sessionPiRecord(value canonical.Value, required, optional []string) (canoni
 		}
 	}
 	return object, true
+}
+
+// Validate the marked JSON payload without interpreting unmarked legacy details.
+// The enclosing canonical decoder already bounds depth/items/bytes. Number
+// strings use the same shortest binary64 decimal as the existing Pi JSON codec.
+func validPiToolDetailsJSON(value canonical.Value) bool {
+	switch value := value.(type) {
+	case nil, bool, string, int64:
+		return true
+	case canonical.Array:
+		for _, child := range value {
+			if !validPiToolDetailsJSON(child) {
+				return false
+			}
+		}
+		return true
+	case canonical.Map:
+		if wrapped, present := value["$pi.number.v1"]; present {
+			decimal, ok := wrapped.(string)
+			if !ok || len(value) != 1 || len(decimal) > 32 {
+				return false
+			}
+			number, err := strconv.ParseFloat(decimal, 64)
+			if err != nil || math.IsInf(number, 0) || math.IsNaN(number) || (number == 0 && math.Signbit(number)) || (math.Trunc(number) == number && math.Abs(number) <= 9007199254740991) {
+				return false
+			}
+			encoded, err := json.Marshal(number)
+			return err == nil && string(encoded) == decimal
+		}
+		for _, child := range value {
+			if !validPiToolDetailsJSON(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }

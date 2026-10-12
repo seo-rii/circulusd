@@ -3,6 +3,11 @@ import type { EffectIntent, NormalizedValue } from "@circulusd/protocol-types";
 
 import { PiRuntimeError } from "./errors.ts";
 import { decodePiJson, encodePiJson, validatePiJson } from "./pi-json-codec.ts";
+import {
+  decodePiAgentCoreToolResultMessage,
+  encodePiAgentCoreToolResultMessage,
+  normalizePiAgentCoreToolSettlement,
+} from "./pi-tool-details-codec.ts";
 import { boundedProtocolValue, exactRecord } from "./validation.ts";
 
 export const PI_AGENT_CORE_MODEL_PROTOCOL_VERSION = 2 as const;
@@ -206,7 +211,7 @@ export function encodePiAgentCoreModelContext(value: Context): NormalizedValue {
     ...value,
     messages: value.messages.map((message) => message.role === "assistant"
       ? encodePiAgentCoreAssistantMessage(message)
-      : message),
+      : message.role === "toolResult" ? encodePiAgentCoreToolResultMessage(message) : message),
     ...(value.tools === undefined ? {} : { tools: contextTools(value.tools, true) }),
   }, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
 }
@@ -223,7 +228,8 @@ export function decodePiAgentCoreModelContext(value: unknown): DecodedPiContextR
     messages: context.messages.map((message) =>
       message !== null && typeof message === "object" && message.role === "assistant"
         ? decodePiAgentCoreAssistantMessage(message)
-        : message),
+        : message !== null && typeof message === "object" && message.role === "toolResult"
+          ? decodePiAgentCoreToolResultMessage(message) : message),
     ...(context.tools === undefined ? {} : { tools: contextTools(context.tools, false) }),
   };
 }
@@ -258,8 +264,10 @@ function hasRawToolArgumentNumber(message: unknown): boolean {
   return false;
 }
 
-/** Adapt raw Pi v1 responses only for an exact pending Pi model request. */
+/** Adapt raw Pi numbers only at the matching model or external-tool boundary. */
 export function normalizePiAgentCoreSettlement(value: unknown, request: EffectIntent | null): unknown {
+  const toolSettlement = normalizePiAgentCoreToolSettlement(value, request);
+  if (toolSettlement !== value) return toolSettlement;
   const payload = request?.payload;
   if (
     request?.service !== "model" || request.operation !== "complete" ||
