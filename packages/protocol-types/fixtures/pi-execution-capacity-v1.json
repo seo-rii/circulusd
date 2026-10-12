@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "profile": {
+    "version": 1,
+    "maximumPublicInputBytes": 458752,
+    "maximumPublicInputItems": 8192,
+    "maximumPublicInputDepth": 16,
+    "maximumPublicMessages": 1024,
+    "maximumPiConfigurationBytes": 262144,
+    "maximumPiConfigurationCloneBytes": 524288,
+    "maximumEnvironmentJsonBytes": 2097152,
+    "maximumPiConfigurationItems": 8192,
+    "maximumPiConfigurationDepth": 48,
+    "maximumConversationBytes": 524288,
+    "maximumConversationItems": 16384,
+    "maximumConversationDepth": 56,
+    "maximumConversationGroups": 64,
+    "maximumCoreOutputBytes": 3145728,
+    "maximumCheckpointBytes": 3145728,
+    "maximumCanonicalItems": 100000,
+    "maximumCanonicalDepth": 64,
+    "maximumStepInputBytes": 8388608,
+    "maximumHostEventBytes": 8388608,
+    "maximumHostNodes": 131072,
+    "maximumHostDepth": 128,
+    "maximumRpcRequestBytes": 12582912,
+    "maximumRpcReplyBytes": 10485760,
+    "maximumRpcDepth": 128
+  }
+}
