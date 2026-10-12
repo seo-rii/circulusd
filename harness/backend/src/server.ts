@@ -257,6 +257,11 @@ export function createApp(options: AppOptions): App {
     session: Session,
   ): Promise<void> => {
     const body = await readJson(request);
+    // Removal can finish while a valid request body is still arriving. The
+    // captured Session must still be the store's session before starting work.
+    if (store.get(session.id) !== session) {
+      throw new HttpError(404, "SESSION_NOT_FOUND", `session ${session.id} does not exist`);
+    }
     const prompt = extractPrompt(body);
     if (prompt === null) {
       throw new HttpError(
