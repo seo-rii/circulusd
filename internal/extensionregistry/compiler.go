@@ -79,9 +79,14 @@ func (registry *Registry) CompileRuntime(request CompileRequest) (RuntimeRevisio
 			return RuntimeRevision{}, fmt.Errorf("%w: configuration for selected extension %q is missing", ErrInvalidRequest, extensionID)
 		}
 	}
-	configurationDigest, err := canonical.StructuredDigest("circulusd.runtime.extension-configuration", 1, request.Configuration)
+	configurationValue, configurationVersion2, err := normalizeExtensionJSON(request.Configuration)
 	if err != nil {
 		return RuntimeRevision{}, fmt.Errorf("%w: configuration is not canonical: %v", ErrInvalidRequest, err)
+	}
+	configuration := configurationValue.(canonical.Map)
+	configurationDigest, err := extensionJSONDigest("circulusd.runtime.extension-configuration", configuration, configurationVersion2)
+	if err != nil {
+		return RuntimeRevision{}, fmt.Errorf("%w: digest configuration: %v", ErrInvalidRequest, err)
 	}
 
 	minimumIsolation := request.PolicyMinimumIsolation

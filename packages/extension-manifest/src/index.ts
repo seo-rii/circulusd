@@ -1,4 +1,6 @@
-import { digestBytes, digestStructuredValue } from "@circulusd/protocol-types";
+import { digestBytes } from "@circulusd/protocol-types";
+import { digestExtensionJson, normalizeExtensionJson, type JsonValue } from "./configuration-codec.ts";
+export * from "./configuration-codec.ts";
 import type { Digest } from "@circulusd/protocol-types";
 import * as ts from "typescript/unstable/ast";
 import { createVirtualFileSystem } from "typescript/unstable/fs";
@@ -16,7 +18,6 @@ const BUNDLE_SEGMENT_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})?$/;
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:(?:0|[1-9]\d*)|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:(?:0|[1-9]\d*)|[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const VERSION_RANGE_PATTERN = /^(?:(?:(?:<=|>=|<|>|=|~|\^)?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?: +(?:<=|>=|<|>|=|~|\^)?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))*|(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?\.x)$/;
 
-const MAX_MANIFEST_ITEMS = 10_000;
 const MAX_FILES = 512;
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_SCHEMA_BYTES = 262_144;
@@ -71,14 +72,6 @@ type Backend = (typeof BACKENDS)[number];
 type ProcessScope = (typeof PROCESS_SCOPES)[number];
 type OuterIsolation = (typeof OUTER_ISOLATIONS)[number];
 type NetworkMode = (typeof NETWORK_MODES)[number];
-
-export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | readonly JsonValue[]
-  | { readonly [key: string]: JsonValue };
 
 export interface NormalizedExtensionManifest {
   readonly apiVersion: "pi.platform/v1alpha2";
@@ -335,44 +328,11 @@ function uniqueSortedStrings(
 }
 
 function normalizeJson(value: unknown, path: string): JsonValue {
-  let items = 0;
-  const visit = (current: unknown, currentPath: string, depth: number): JsonValue => {
-    items += 1;
-    if (items > MAX_MANIFEST_ITEMS) {
-      fail(path, `must contain at most ${MAX_MANIFEST_ITEMS} JSON values`);
-    }
-    if (depth > 64) {
-      fail(currentPath, "must not exceed 64 levels");
-    }
-    if (current === null || typeof current === "boolean") {
-      return current;
-    }
-    if (typeof current === "number") {
-      if (!Number.isFinite(current) || Object.is(current, -0)) {
-        fail(currentPath, "must be a finite JSON number other than negative zero");
-      }
-      return current;
-    }
-    if (typeof current === "string") {
-      return boundedString(current, currentPath, 65_536);
-    }
-    if (Array.isArray(current)) {
-      return boundedArray(current, currentPath, MAX_MANIFEST_ITEMS).map((entry, index) =>
-        visit(entry, `${currentPath}[${index}]`, depth + 1),
-      );
-    }
-    const record = plainRecord(current, currentPath);
-    const normalized: Record<string, JsonValue> = {};
-    for (const key of Object.keys(record).sort()) {
-      boundedString(key, `${currentPath}.$key`, 256);
-      if (key === "__proto__" || key === "constructor" || key === "prototype") {
-        fail(`${currentPath}.${key}`, "dangerous object key is not allowed");
-      }
-      normalized[key] = visit(record[key], `${currentPath}.${key}`, depth + 1);
-    }
-    return normalized;
-  };
-  return visit(value, path, 0);
+  try {
+    return normalizeExtensionJson(value);
+  } catch (error) {
+    fail(path, error instanceof Error ? error.message : "invalid extension JSON");
+  }
 }
 
 function normalizeManifest(value: unknown): NormalizedExtensionManifest {
@@ -1034,7 +994,7 @@ async function contentDigest(prepared: PreparedExtension): Promise<Digest> {
     ...prepared.manifest,
     metadata: { ...prepared.manifest.metadata, digest: ZERO_DIGEST },
   };
-  return digestStructuredValue("circulusd.extension.content", 1, {
+  return digestExtensionJson("circulusd.extension.content", {
     manifest: manifestWithoutDigest,
     files: fileDigests,
   });
@@ -1087,7 +1047,7 @@ export async function compileExtensionManifest(
     }
     schemaDigests.push({ path: schema.path, digest: await digestBytes(file.bytes) });
   }
-  const revisionDigest = await digestStructuredValue("circulusd.extension.revision", 1, {
+  const revisionDigest = await digestExtensionJson("circulusd.extension.revision", {
     manifest: prepared.manifest,
     moduleGraph,
     schemaDigests,

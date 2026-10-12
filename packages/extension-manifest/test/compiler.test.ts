@@ -369,4 +369,17 @@ describe("extension manifest compiler", () => {
   it("rejects an otherwise valid bundle when its declared digest does not match", async () => {
     await expect(compileExtensionManifest(manifest(), files())).rejects.toThrow(/digest/i);
   });
+
+  it("supports finite fractional and empty JSON configuration values", async () => {
+    const raw = manifest({ configuration: {
+      schema: "schemas/config.schema.json",
+      defaults: { temperature: 0.5, prefix: "", nested: { values: [0.25, "", -0] } },
+    } });
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({
+      type: "object", properties: { temperature: { type: "number" }, prefix: { enum: [""] }, nested: { type: "object" } },
+    }) });
+    const compiled = await compileExtensionManifest(await signedManifest(raw, bundleFiles), bundleFiles);
+    expect(compiled.manifest.configuration.defaults).toEqual({ temperature: 0.5, prefix: "", nested: { values: [0.25, "", 0] } });
+  });
+
 });
