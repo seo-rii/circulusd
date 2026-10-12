@@ -419,8 +419,11 @@ function openEvents(sessionId) {
   for (const type of EVENT_TYPES) {
     source.addEventListener(type, (message) => {
       if (state.source !== source || !isCurrentView(sessionId, viewEpoch)) return;
-      const id = message.lastEventId === "" ? null : Number(message.lastEventId);
-      handleEvent(JSON.parse(message.data), id);
+      const event = JSON.parse(message.data);
+      // EventSource retains the last durable cursor for events without id:.
+      // The payload identifies ephemeral events without changing that cursor.
+      if (event.id !== null && (!Number.isSafeInteger(event.id) || event.id < 1)) return;
+      handleEvent(event, event.id);
     });
   }
   let probing = false;
