@@ -382,4 +382,91 @@ describe("extension manifest compiler", () => {
     expect(compiled.manifest.configuration.defaults).toEqual({ temperature: 0.5, prefix: "", nested: { values: [0.25, "", 0] } });
   });
 
+  it.each([
+    ["invalid type", { type: "not-a-json-type" }],
+    ["invalid required", { type: "object", required: "temperature" }],
+    ["unresolved reference", { $ref: "#/$defs/missing" }],
+  ])("rejects semantically malformed JSON Schema: %s", async (_name, schema) => {
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify(schema) });
+    await expect(computeExtensionContentDigest(manifest(), bundleFiles)).rejects.toBeInstanceOf(ExtensionManifestError);
+  });
+
+  it("rejects a supplied default that violates its configuration schema", async () => {
+    const raw = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { temperature: "hot" } } });
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({ type: "object", properties: { temperature: { type: "number" } } }) });
+    await expect(computeExtensionContentDigest(raw, bundleFiles)).rejects.toBeInstanceOf(ExtensionManifestError);
+  });
+
+  it("requires complete supplied defaults but allows defaults to be omitted", async () => {
+    const raw = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { temperature: 0.5, prefix: "" } } });
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object", required: ["temperature", "apiProfile"], minProperties: 3,
+      $defs: { temperature: { type: "number", minimum: 0, maximum: 2 } },
+      properties: { temperature: { $ref: "#/$defs/temperature" }, prefix: { enum: [""] }, apiProfile: { type: "string" } },
+      additionalProperties: false,
+    }) });
+    await expect(computeExtensionContentDigest(raw, bundleFiles)).rejects.toThrow(/defaults violate/i);
+    const complete = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { temperature: 0.5, prefix: "", apiProfile: "local" } } });
+    const compiled = await compileExtensionManifest(await signedManifest(complete, bundleFiles), bundleFiles);
+    expect(compiled.manifest.configuration.defaults).toEqual({ temperature: 0.5, prefix: "", apiProfile: "local" });
+    const omitted = manifest({ configuration: { schema: "schemas/config.schema.json" } });
+    const withoutDefaults = await compileExtensionManifest(await signedManifest(omitted, bundleFiles), bundleFiles);
+    expect(withoutDefaults.manifest.configuration).not.toHaveProperty("defaults");
+    const wrong = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { temperature: 3, prefix: "", apiProfile: "local" } } });
+    await expect(computeExtensionContentDigest(wrong, bundleFiles)).rejects.toThrow(/defaults violate/i);
+  });
+
+  it.each([
+    ["remote reference", { $ref: "https://example.invalid/schema.json" }],
+    ["bundle reference", { $ref: "other.schema.json" }],
+    ["unsupported dialect", { $schema: "http://json-schema.org/draft-07/schema#", type: "object" }],
+    ["custom vocabulary", { $vocabulary: { "https://example.invalid/custom": true } }],
+  ])("rejects unsupported offline schema metadata: %s", async (_name, schema) => {
+    await expect(computeExtensionContentDigest(manifest(), files({ "schemas/config.schema.json": JSON.stringify(schema) }))).rejects.toBeInstanceOf(ExtensionManifestError);
+  });
+
+  it("validates tool schema semantics as well as configuration schemas", async () => {
+    await expect(computeExtensionContentDigest(manifest(), files({ "schemas/render.input.json": '{"type":"invalid"}' }))).rejects.toBeInstanceOf(ExtensionManifestError);
+  });
+
+  it("enforces original oneOf constraints on supplied defaults", async () => {
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({ type: "object", oneOf: [
+      { required: ["mode", "left"], properties: { mode: { const: "left" }, left: { type: "number" } } },
+      { required: ["mode", "right"], properties: { mode: { const: "right" }, right: { type: "number" } } },
+    ] }) });
+    const raw = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: {} } });
+    await expect(computeExtensionContentDigest(raw, bundleFiles)).rejects.toThrow(/defaults violate/i);
+    const complete = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { mode: "left", left: 0.5 } } });
+    await expect(computeExtensionContentDigest(complete, bundleFiles)).resolves.toMatch(/^sha256:/);
+    const invalid = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { mode: "left", left: "wrong" } } });
+    await expect(computeExtensionContentDigest(invalid, bundleFiles)).rejects.toThrow(/defaults violate/i);
+  });
+
+  it("enforces original conditional constraints on supplied defaults", async () => {
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({
+      type: "object", required: ["mode"], properties: { mode: { type: "string" }, temperature: { type: "number" } },
+      if: { required: ["mode"], properties: { mode: { const: "strict" } } },
+      // oxlint-disable-next-line unicorn/no-thenable -- JSON Schema conditional keyword.
+      ["then"]: { properties: { temperature: { maximum: 1 } } },
+      else: { properties: { temperature: { maximum: 10 } } },
+    }) });
+    const raw = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { temperature: 5 } } });
+    await expect(computeExtensionContentDigest(raw, bundleFiles)).rejects.toThrow(/defaults violate/i);
+    const complete = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { mode: "relaxed", temperature: 5 } } });
+    await expect(computeExtensionContentDigest(complete, bundleFiles)).resolves.toMatch(/^sha256:/);
+    const invalid = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { mode: "strict", temperature: 5 } } });
+    await expect(computeExtensionContentDigest(invalid, bundleFiles)).rejects.toThrow(/defaults violate/i);
+  });
+
+  it("keeps original negation semantics when required properties are absent", async () => {
+    const bundleFiles = files({ "schemas/config.schema.json": JSON.stringify({
+      type: "object", not: { required: ["blocked"] }, properties: { safe: { type: "boolean" } }, additionalProperties: false,
+    }) });
+    const raw = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { safe: true } } });
+    await expect(computeExtensionContentDigest(raw, bundleFiles)).resolves.toMatch(/^sha256:/);
+    const allowedExtraFiles = files({ "schemas/config.schema.json": JSON.stringify({ type: "object", not: { required: ["blocked"] } }) });
+    const invalid = manifest({ configuration: { schema: "schemas/config.schema.json", defaults: { blocked: true } } });
+    await expect(computeExtensionContentDigest(invalid, allowedExtraFiles)).rejects.toThrow(/defaults violate/i);
+  });
 });

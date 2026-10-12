@@ -84,6 +84,16 @@ func (registry *Registry) CompileRuntime(request CompileRequest) (RuntimeRevisio
 		return RuntimeRevision{}, fmt.Errorf("%w: configuration is not canonical: %v", ErrInvalidRequest, err)
 	}
 	configuration := configurationValue.(canonical.Map)
+	for _, installed := range selected {
+		// Configuration is the caller's complete defaults-plus-overrides
+		// snapshot. Required fields and every other schema constraint apply.
+		if installed.configurationSchema == nil {
+			return RuntimeRevision{}, fmt.Errorf("%w: selected extension has no verified configuration schema", ErrInvalidRequest)
+		}
+		if err := installed.configurationSchema.Validate(extensionJSONInstance(configuration[installed.revision.ID])); err != nil {
+			return RuntimeRevision{}, fmt.Errorf("%w: configuration for %q violates its signed schema", ErrInvalidRequest, installed.revision.ID)
+		}
+	}
 	configurationDigest, err := extensionJSONDigest("circulusd.runtime.extension-configuration", configuration, configurationVersion2)
 	if err != nil {
 		return RuntimeRevision{}, fmt.Errorf("%w: digest configuration: %v", ErrInvalidRequest, err)

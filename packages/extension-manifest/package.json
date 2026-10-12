@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@circulusd/protocol-types": "workspace:*",
+    "ajv": "8.20.0",
     "typescript": "7.0.2"
   }
 }

@@ -293,7 +293,7 @@ func newFixture(t *testing.T) *fixture {
 	f.redigest(t)
 	for i, name := range []string{"python", "report"} {
 		revision := extensionregistry.CompiledRevision{ID: "official/" + name, Version: "1.0.0", Publisher: "platform", ContentDigest: digest(byte('a' + i)),
-			RevisionDigest: digest(byte('c' + i)), BundleDigest: digest('1'), BundleSize: 1024, SBOMDigest: digest('2'), ConfigurationSchemaDigest: digest('3'),
+			RevisionDigest: digest(byte('c' + i)), BundleDigest: digest('1'), BundleSize: 1024, SBOMDigest: digest('2'), ConfigurationSchemaDigest: "sha256:a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0", ConfigurationSchema: []byte(`{"type":"object"}`),
 			Tools: []string{name + ".run"}, NativeRequirements: []environment.Requirement{{PackageID: "python", Constraint: "3.13.x"}},
 			SupportedBackends: []environment.Backend{environment.BackendNsJail}, StateSchemaVersion: 1,
 			RequestedMinimumIsolation: extensionregistry.Isolation{ProcessScope: extensionregistry.ProcessScopeSession, OuterIsolation: extensionregistry.OuterIsolationNsJail}}

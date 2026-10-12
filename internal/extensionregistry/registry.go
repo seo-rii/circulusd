@@ -79,6 +79,10 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 		if !bundleTrusted || len(record.BundleSignature.Value) != ed25519.SignatureSize || !ed25519.Verify(bundlePublicKey, []byte(bundleDigest), record.BundleSignature.Value) {
 			return nil, fmt.Errorf("%w at index %d: bundle signature", ErrUntrusted, index)
 		}
+		configurationSchema, err := compileConfigurationSchema(record.Revision.ConfigurationSchema)
+		if err != nil {
+			return nil, fmt.Errorf("%w at index %d: configuration schema: %v", ErrInvalidRecord, index, err)
+		}
 		assessmentDigest, err := AssessmentSignatureDigest(record.Assessment)
 		if err != nil {
 			return nil, fmt.Errorf("%w at index %d: %v", ErrInvalidRecord, index, err)
@@ -132,6 +136,7 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 		revision.Tools = append([]string(nil), revision.Tools...)
 		revision.NativeRequirements = append([]environment.Requirement(nil), revision.NativeRequirements...)
 		revision.SupportedBackends = append([]environment.Backend(nil), revision.SupportedBackends...)
+		revision.ConfigurationSchema = append([]byte(nil), revision.ConfigurationSchema...)
 		sort.Strings(revision.Tools)
 		sort.Slice(revision.NativeRequirements, func(left, right int) bool {
 			return revision.NativeRequirements[left].PackageID < revision.NativeRequirements[right].PackageID
@@ -142,7 +147,7 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 		assessment := record.Assessment
 		assessment.AllowedExecutionBackends, _ = normalizedBackends(assessment.AllowedExecutionBackends)
 		assessment.Signature.Value = append([]byte(nil), assessment.Signature.Value...)
-		installed[coordinate] = installedRevision{revision: revision, assessment: assessment}
+		installed[coordinate] = installedRevision{revision: revision, assessment: assessment, configurationSchema: configurationSchema}
 	}
 	return &Registry{revisions: installed, resolver: resolver}, nil
 }
@@ -231,6 +236,9 @@ func validateCompiledRevision(revision CompiledRevision) error {
 		if !digestPattern.MatchString(digest) {
 			return fmt.Errorf("%s digest is not canonical SHA-256", name)
 		}
+	}
+	if len(revision.ConfigurationSchema) == 0 || len(revision.ConfigurationSchema) > 262_144 || configurationSchemaDigest(revision.ConfigurationSchema) != revision.ConfigurationSchemaDigest {
+		return fmt.Errorf("configuration schema bytes do not match the signed bounded schema digest")
 	}
 	if revision.BundleSize == 0 || revision.BundleSize > maxBundleBytes || revision.Priority < -1_000_000 || revision.Priority > 1_000_000 || revision.StateSchemaVersion == 0 || revision.StateSchemaVersion > maxSafeInteger {
 		return fmt.Errorf("extension numeric metadata is outside supported bounds")

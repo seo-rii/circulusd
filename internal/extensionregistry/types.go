@@ -64,6 +64,9 @@ type CompiledRevision struct {
 	BundleSize                uint64
 	SBOMDigest                string
 	ConfigurationSchemaDigest string
+	// ConfigurationSchema is the original JSON file whose bytes are bound by
+	// ConfigurationSchemaDigest in the publisher signature. Required at install.
+	ConfigurationSchema       []byte
 	Priority                  int
 	Tools                     []string
 	NativeRequirements        []environment.Requirement
@@ -123,7 +126,11 @@ type PiRevision struct {
 }
 
 type CompileRequest struct {
-	Selections             []Selection
+	Selections []Selection
+	// Configuration is the complete per-extension snapshot after the caller
+	// merges manifest defaults and user overrides. CompileRuntime does not
+	// mutate it or fill defaults; it enforces the original signed JSON schema,
+	// including required fields, before resolving an environment or revision.
 	Configuration          canonical.Map
 	Workerd                WorkerdRevision
 	Pi                     PiRevision
@@ -156,8 +163,9 @@ type RuntimeRevision struct {
 }
 
 type installedRevision struct {
-	revision   CompiledRevision
-	assessment SecurityAssessment
+	revision            CompiledRevision
+	assessment          SecurityAssessment
+	configurationSchema *configurationSchemaValidator
 }
 
 type Registry struct {

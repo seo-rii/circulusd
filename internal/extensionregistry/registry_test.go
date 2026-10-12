@@ -400,7 +400,7 @@ func newFixture(t *testing.T) testFixture {
 	pdf := CompiledRevision{
 		ID: "official/pdf", Version: "1.4.2", Publisher: "platform",
 		ContentDigest: testDigest('a'), RevisionDigest: testDigest('b'), BundleDigest: testDigest('c'), BundleSize: 4096,
-		SBOMDigest: testDigest('d'), ConfigurationSchemaDigest: testDigest('e'), Priority: 100,
+		SBOMDigest: testDigest('d'), ConfigurationSchemaDigest: "sha256:a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0", ConfigurationSchema: []byte(`{"type":"object"}`), Priority: 100,
 		Tools:                     []string{"pdf.render"},
 		NativeRequirements:        []environment.Requirement{{PackageID: "document-tools", Constraint: ">=3.2.0 <4.0.0"}},
 		SupportedBackends:         []environment.Backend{environment.BackendDocker, environment.BackendNsJail},
@@ -417,7 +417,7 @@ func newFixture(t *testing.T) testFixture {
 	python := CompiledRevision{
 		ID: "official/python", Version: "2.0.0", Publisher: "platform",
 		ContentDigest: testDigest('3'), RevisionDigest: testDigest('4'), BundleDigest: testDigest('5'), BundleSize: 2048,
-		SBOMDigest: testDigest('6'), ConfigurationSchemaDigest: testDigest('7'), Priority: 50,
+		SBOMDigest: testDigest('6'), ConfigurationSchemaDigest: "sha256:a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0", ConfigurationSchema: []byte(`{"type":"object"}`), Priority: 50,
 		Tools:                     []string{"python.run"},
 		NativeRequirements:        []environment.Requirement{{PackageID: "python-runtime", Constraint: "3.13.x"}},
 		SupportedBackends:         []environment.Backend{environment.BackendNsJail, environment.BackendDocker},
@@ -497,6 +497,7 @@ func validEnvironment(t *testing.T) environment.Revision {
 }
 
 func cloneSignedRevision(record SignedRevision) SignedRevision {
+	record.Revision.ConfigurationSchema = append([]byte(nil), record.Revision.ConfigurationSchema...)
 	record.Revision.Tools = append([]string(nil), record.Revision.Tools...)
 	record.Revision.NativeRequirements = append([]environment.Requirement(nil), record.Revision.NativeRequirements...)
 	record.Revision.SupportedBackends = append([]environment.Backend(nil), record.Revision.SupportedBackends...)

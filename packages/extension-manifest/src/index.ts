@@ -1,6 +1,8 @@
 import { digestBytes } from "@circulusd/protocol-types";
 import { digestExtensionJson, normalizeExtensionJson, type JsonValue } from "./configuration-codec.ts";
+import { validateExtensionSchema } from "./configuration-schema.ts";
 export * from "./configuration-codec.ts";
+export { EXTENSION_CONFIGURATION_DIALECT } from "./configuration-schema.ts";
 import type { Digest } from "@circulusd/protocol-types";
 import * as ts from "typescript/unstable/ast";
 import { createVirtualFileSystem } from "typescript/unstable/fs";
@@ -90,7 +92,7 @@ export interface NormalizedExtensionManifest {
   };
   readonly configuration: {
     readonly schema: string;
-    readonly defaults: JsonValue;
+    readonly defaults?: JsonValue;
   };
   readonly hooks: readonly Hook[];
   readonly tools: readonly {
@@ -389,8 +391,8 @@ function normalizeManifest(value: unknown): NormalizedExtensionManifest {
 
   const configuration = exactRecord(
     root.configuration,
-    ["schema", "defaults"],
-    [],
+    ["schema"],
+    ["defaults"],
     "$manifest.configuration",
   );
   const hooks = uniqueSortedStrings(root.hooks, "$manifest.hooks", HOOKS.length, (hook, path) =>
@@ -597,7 +599,9 @@ function normalizeManifest(value: unknown): NormalizedExtensionManifest {
         "$manifest.configuration.schema",
         ".json",
       ),
-      defaults: normalizeJson(configuration.defaults, "$manifest.configuration.defaults"),
+      ...(Object.prototype.hasOwnProperty.call(configuration, "defaults")
+        ? { defaults: normalizeJson(configuration.defaults, "$manifest.configuration.defaults") }
+        : {}),
     },
     hooks,
     tools,
@@ -958,7 +962,13 @@ function prepareExtension(value: unknown, bundleFiles: ExtensionBundleFiles): Pr
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         fail(`$files[${JSON.stringify(path)}]`, "JSON Schema root must be an object");
       }
-      return { path, value: normalizeJson(parsed, `$files[${JSON.stringify(path)}]`) };
+      const value = normalizeJson(parsed, `$files[${JSON.stringify(path)}]`);
+      try {
+        validateExtensionSchema(value, path === manifest.configuration.schema ? manifest.configuration.defaults : undefined);
+      } catch (error) {
+        fail(`$files[${JSON.stringify(path)}]`, error instanceof Error ? error.message : "invalid JSON Schema");
+      }
+      return { path, value };
     });
 
   return {
