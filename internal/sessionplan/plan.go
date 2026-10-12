@@ -139,22 +139,13 @@ func (planner *Planner) Plan(ctx context.Context, request Request) (Plan, error)
 		len(request.Selections) < 1 || len(request.Selections) > 256 || request.Configuration == nil {
 		return Plan{}, ErrInvalidRequest
 	}
-	// Own nested extension configuration before invoking the resolver embedded
-	// in Registry, which may call back into its caller. Strings and identity.ID
-	// are values; only these two request fields need a deep snapshot.
+	// Snapshot selections before compilation. Registry owns and validates a
+	// deep extension-JSON configuration snapshot before invoking its resolver,
+	// preserving finite numeric options as well as caller-mutation isolation.
 	selections := append([]extensionregistry.Selection(nil), request.Selections...)
-	options := canonical.Options{MaxDepth: 64, MaxBytes: 1 << 20, MaxItems: 100_000}
-	encoded, err := canonical.Encode(request.Configuration, options)
-	if err != nil {
-		return Plan{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
-	}
-	configuration, err := canonical.Decode(encoded, options)
-	if err != nil {
-		return Plan{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
-	}
 	policy := planner.policy
 	runtime, err := planner.registry.CompileRuntime(extensionregistry.CompileRequest{
-		Selections: selections, Configuration: configuration.(canonical.Map), Workerd: policy.Workerd, Pi: policy.Pi,
+		Selections: selections, Configuration: request.Configuration, Workerd: policy.Workerd, Pi: policy.Pi,
 		Architecture: policy.Architecture, Backend: environment.BackendNsJail,
 		PolicyGeneration: policy.PolicyGeneration, PolicyMinimumIsolation: policy.MinimumIsolation,
 	})
