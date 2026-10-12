@@ -3,5 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "Static single-page test UI served by @circulusd/harness-backend (no build step)",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "files": ["index.html", "app.js", "style.css"]
 }

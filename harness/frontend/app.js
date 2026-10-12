@@ -40,6 +40,7 @@ const THINKING_PREVIEW_CHARS = 160;
 
 const state = {
   sessionId: null,
+  viewEpoch: 0,
   source: null,
   activeTurnId: null,
   bubbles: new Map(), // turnId -> assistant bubble record
@@ -414,14 +415,17 @@ function openEvents(sessionId) {
   if (state.source) state.source.close();
   setConnection("retry");
   const source = new EventSource(`/v1/sessions/${sessionId}/events`);
+  const viewEpoch = state.viewEpoch;
   for (const type of EVENT_TYPES) {
     source.addEventListener(type, (message) => {
+      if (state.source !== source || !isCurrentView(sessionId, viewEpoch)) return;
       const id = message.lastEventId === "" ? null : Number(message.lastEventId);
       handleEvent(JSON.parse(message.data), id);
     });
   }
   let probing = false;
   source.onerror = () => {
+    if (state.source !== source || !isCurrentView(sessionId, viewEpoch)) return;
     setConnection("retry");
     // EventSource retries forever, also when the session is gone (backend
     // restarted, session deleted). Check once per error and start over then.
@@ -447,6 +451,10 @@ function openEvents(sessionId) {
   state.source = source;
 }
 
+function isCurrentView(sessionId, viewEpoch) {
+  return state.sessionId === sessionId && state.viewEpoch === viewEpoch;
+}
+
 function resetView() {
   state.bubbles.clear();
   state.userBubbles.clear();
@@ -464,10 +472,19 @@ function resetView() {
 }
 
 async function newSession() {
+  const viewEpoch = ++state.viewEpoch;
   if (state.source) state.source.close();
+  state.source = null;
   state.sessionId = null;
   resetView();
-  const session = await api("/v1/sessions", { method: "POST", body: "{}" });
+  let session;
+  try {
+    session = await api("/v1/sessions", { method: "POST", body: "{}" });
+  } catch (error) {
+    if (state.viewEpoch !== viewEpoch) return;
+    throw error;
+  }
+  if (state.viewEpoch !== viewEpoch) return;
   state.sessionId = session.sessionId;
   ui.sessionId.textContent = session.sessionId;
   ui.revision.textContent = session.runtimeRevisionDigest;
@@ -479,16 +496,19 @@ async function newSession() {
 async function submitPrompt() {
   const prompt = ui.prompt.value.trim();
   if (prompt === "" || state.sessionId === null || state.activeTurnId !== null) return;
+  const sessionId = state.sessionId;
+  const viewEpoch = state.viewEpoch;
   ui.prompt.value = "";
   ui.send.disabled = true;
   // Drawn once here; turn.accepted adopts this element instead of adding a second one.
   state.pendingUserBubble = addUserBubble(prompt);
   try {
-    const accepted = await api(`/v1/sessions/${state.sessionId}/turns`, {
+    const accepted = await api(`/v1/sessions/${sessionId}/turns`, {
       method: "POST",
       headers: { "idempotency-key": crypto.randomUUID() },
       body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
     });
+    if (!isCurrentView(sessionId, viewEpoch)) return;
     if (state.pendingUserBubble !== null) {
       state.userBubbles.set(accepted.turnId, state.pendingUserBubble);
       state.pendingUserBubble = null;
@@ -498,6 +518,7 @@ async function submitPrompt() {
     // re-arm the composer lock for a turn that is already over.
     if (!state.finishedTurns.has(accepted.turnId)) setActiveTurn(accepted.turnId);
   } catch (error) {
+    if (!isCurrentView(sessionId, viewEpoch)) return;
     state.pendingUserBubble = null;
     const element = document.createElement("div");
     element.className = "bubble assistant error";
@@ -514,26 +535,35 @@ async function submitPrompt() {
 
 async function abortTurn() {
   if (state.sessionId === null || state.activeTurnId === null) return;
+  const sessionId = state.sessionId;
+  const turnId = state.activeTurnId;
+  const viewEpoch = state.viewEpoch;
   try {
-    await api(`/v1/sessions/${state.sessionId}/turns/${state.activeTurnId}/abort`, { method: "POST", body: "{}" });
+    await api(`/v1/sessions/${sessionId}/turns/${turnId}/abort`, { method: "POST", body: "{}" });
   } catch (error) {
+    if (!isCurrentView(sessionId, viewEpoch)) return;
     console.warn("abort failed", error);
   }
 }
 
 async function resumeOrCreate() {
+  const viewEpoch = ++state.viewEpoch;
+  if (state.source) state.source.close();
+  state.source = null;
+  state.sessionId = null;
+  resetView();
   const wanted = location.hash.replace(/^#/, "");
   if (wanted !== "") {
     try {
       const snapshot = await api(`/v1/sessions/${wanted}`);
-      if (state.source) state.source.close();
-      resetView();
+      if (state.viewEpoch !== viewEpoch) return;
       state.sessionId = snapshot.sessionId;
       ui.sessionId.textContent = snapshot.sessionId;
       ui.revision.textContent = snapshot.runtimeRevisionDigest;
       openEvents(snapshot.sessionId); // replays the durable log from id 0
       return;
     } catch {
+      if (state.viewEpoch !== viewEpoch) return;
       // fall through: the backend restarted, or the session was deleted
     }
   }
