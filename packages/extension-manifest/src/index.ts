@@ -769,7 +769,10 @@ function prepareExtension(value: unknown, bundleFiles: ExtensionBundleFiles): Pr
         noLib: true,
         target: "esnext",
       },
-      include: ["**/*.js", "**/*.mjs", "**/*.ts", "**/*.mts"],
+      // Explicit roots preserve JavaScript beside TypeScript and declaration siblings.
+      files: files
+        .filter((file) => MODULE_EXTENSIONS.some((extension) => file.path.endsWith(extension)))
+        .map((file) => file.path),
     }),
   };
   for (const file of files) {
