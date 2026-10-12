@@ -805,7 +805,7 @@ test("mock model does not call a tool the turn's context does not offer", async 
 });
 
 test(
-  "python tool re-runs code that arrived on one line with literal \\n escapes",
+  "python tool compiles code with literal \\n escapes before executing the repaired source",
   { skip: pythonInterpreter === null ? "no Python 3 interpreter on this host" : false },
   async () => {
     assert.equal(unescapeNewlines("print(1)\nprint(2)"), null);

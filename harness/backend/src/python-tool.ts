@@ -180,6 +180,77 @@ export function unescapeNewlines(code: string): string | null {
   return output;
 }
 
+/**
+ * Select the source inside the executor's interpreter before any user code
+ * runs. A separate host compile probe would use the wrong interpreter for the
+ * sandbox, and retrying after execution can repeat effects from valid scripts.
+ */
+function preparePythonSource(code: string): string {
+  const repaired = unescapeNewlines(code);
+  if (repaired === null || repaired === code) return code;
+
+  // Encode only the original source: at the 64 KiB tool limit the wrapper is
+  // under 100 KiB, the sandbox agent's existing single-argv code limit. The
+  // scanner below matches unescapeNewlines without embedding a second copy.
+  const encoded = Buffer.from(code, "utf8").toString("base64");
+  return `def __circulusd_prepare_python():
+    import base64
+    source = base64.b64decode("${encoded}").decode("utf-8")
+    filename = globals().get("__file__", "<string>")
+    try:
+        body = compile(source, filename, "exec", dont_inherit=True)
+    except SyntaxError as original_error:
+        output = []
+        quote = None
+        index = 0
+        while index < len(source):
+            char = source[index]
+            if quote is not None:
+                if char == "\\\\":
+                    output.append(source[index:index + 2])
+                    index += 2
+                elif source.startswith(quote, index):
+                    output.append(quote)
+                    index += len(quote)
+                    quote = None
+                else:
+                    output.append(char)
+                    index += 1
+            elif char in ("'", '"'):
+                quote = char * 3 if source.startswith(char * 3, index) else char
+                output.append(quote)
+                index += len(quote)
+            elif char == "#":
+                end = source.find("\\\\n", index)
+                output.append(source[index:] if end == -1 else source[index:end] + "\\n")
+                index = len(source) if end == -1 else end + 2
+            elif source.startswith("\\\\r\\\\n", index):
+                output.append("\\n")
+                index += 4
+            elif source.startswith("\\\\n", index):
+                output.append("\\n")
+                index += 2
+            elif source.startswith("\\\\t", index):
+                output.append("\\t")
+                index += 2
+            else:
+                output.append(char)
+                index += 1
+        candidate = "".join(output)
+        if candidate == source:
+            raise
+        try:
+            body = compile(candidate, filename, "exec", dont_inherit=True)
+        except SyntaxError:
+            raise original_error from None
+        print('note: the code arrived on a single line with literal "\\\\n" escapes; they were converted to real newlines before running.', flush=True)
+    # Keep the user's __main__ module and globals, without helper bindings.
+    del globals()["__circulusd_prepare_python"]
+    return body
+exec(__circulusd_prepare_python())
+`;
+}
+
 export class HostPythonExecutor implements PythonExecutor {
   readonly kind = "host" as const;
   readonly #interpreter: PythonInterpreter;
@@ -250,22 +321,16 @@ export function createPythonTool(executor: PythonExecutor): ToolDefinition {
       if (Buffer.byteLength(stdin, "utf8") > PYTHON_STDIN_LIMIT_BYTES) {
         throw new Error(`stdin exceeds ${PYTHON_STDIN_LIMIT_BYTES} bytes`);
       }
-      const first = await executor.run({ code, stdin, timeoutMs: PYTHON_TIMEOUT_MS, context });
-      // Small models sometimes emit the whole script on one line with literal
-      // "\n" two-character escapes. Python then fails on the first backslash;
-      // rather than let the model loop on the same broken call, run the
-      // unescaped script once and say so in the result.
-      const repaired = unescapeNewlines(code);
-      if (repaired === null || !first.isError || context.signal.aborted || !/line continuation character/.test(first.text)) {
-        return first;
+      if (context.signal.aborted) {
+        return formatOutcome({
+          stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false,
+          exitCode: -1, timedOut: false, cancelled: true, outputLimitExceeded: false,
+          signal: null, timeoutMs: PYTHON_TIMEOUT_MS, scriptPath: null,
+        });
       }
-      const second = await executor.run({ code: repaired, stdin, timeoutMs: PYTHON_TIMEOUT_MS, context });
-      return {
-        ...second,
-        text:
-          'note: the code arrived on a single line with literal "\\n" escapes; they were converted to real newlines before running.\n' +
-          second.text,
-      };
+      // Compilation and the single selected execution share the executor's
+      // interpreter, process, cancellation signal, timeout, and effect identity.
+      return executor.run({ code: preparePythonSource(code), stdin, timeoutMs: PYTHON_TIMEOUT_MS, context });
     },
   };
 }
