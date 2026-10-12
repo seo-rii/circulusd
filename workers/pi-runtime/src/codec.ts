@@ -7,7 +7,7 @@ import {
 
 import { PiRuntimeError } from "./errors.ts";
 
-const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 class CanonicalCborReader {
   readonly #bytes: Uint8Array;
