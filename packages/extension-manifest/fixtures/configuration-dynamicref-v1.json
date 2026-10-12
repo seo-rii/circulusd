@@ -1,0 +1,1244 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "static pointer",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#/$defs/quantity"
+          }
+        },
+        "$defs": {
+          "quantity": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": {}
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "static anchor",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#quantity"
+          }
+        },
+        "$defs": {
+          "quantity": {
+            "$anchor": "quantity",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": 2
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "encoded pointer",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#/%24defs/ratio~1step"
+          }
+        },
+        "$defs": {
+          "ratio/step": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": 2
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "ordinary reference control",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$ref": "#/$defs/quantity"
+          }
+        },
+        "$defs": {
+          "quantity": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": {}
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "nonroot dynamic anchor fallback",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#quantity"
+          }
+        },
+        "$defs": {
+          "quantity": {
+            "$dynamicAnchor": "quantity",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": {}
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "nested recursive dynamic anchor",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "tree": {
+            "$dynamicRef": "#node"
+          }
+        },
+        "$defs": {
+          "tree": {
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 0.25
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": "wrong"
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "pointer to dynamic anchor stays static",
+      "schema": {
+        "$id": "https://schemas.invalid/root",
+        "$dynamicAnchor": "node",
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "$dynamicRef": "#/$defs/quantity"
+          }
+        },
+        "$defs": {
+          "quantity": {
+            "$id": "quantity",
+            "$dynamicAnchor": "node",
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": {}
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "nested resource static anchor scope",
+      "schema": {
+        "$id": "https://schemas.invalid/outer",
+        "type": "object",
+        "$defs": {
+          "settings": {
+            "$id": "settings",
+            "type": "object",
+            "properties": {
+              "value": {
+                "$dynamicRef": "#quantity"
+              }
+            },
+            "$defs": {
+              "quantity": {
+                "$anchor": "quantity",
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        "properties": {
+          "settings": {
+            "$ref": "#/$defs/settings"
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "settings": {
+              "value": 0.5
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "settings": {
+              "value": 2
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "outermost dynamic override and annotations",
+      "schema": {
+        "$id": "https://schemas.invalid/strict",
+        "$dynamicAnchor": "node",
+        "$ref": "#/$defs/tree",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "maximum": 1
+          }
+        },
+        "unevaluatedProperties": false,
+        "$defs": {
+          "tree": {
+            "$id": "tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            }
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 0.25
+              }
+            ]
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 2
+              }
+            ]
+          },
+          "valid": false
+        },
+        {
+          "name": "nested required field",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {}
+            ]
+          },
+          "valid": false
+        },
+        {
+          "name": "nested unevaluated property",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 0.25,
+                "extra": true
+              }
+            ]
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "outermost wins over nested override",
+      "schema": {
+        "$id": "https://schemas.invalid/outermost",
+        "$dynamicAnchor": "node",
+        "$ref": "#/$defs/wrapper",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "maximum": 1
+          }
+        },
+        "$defs": {
+          "wrapper": {
+            "$id": "wrapper",
+            "$dynamicAnchor": "node",
+            "$ref": "#/$defs/tree",
+            "properties": {
+              "value": {
+                "maximum": 10
+              }
+            },
+            "$defs": {
+              "tree": {
+                "$id": "tree",
+                "$dynamicAnchor": "node",
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "number"
+                  },
+                  "children": {
+                    "type": "array",
+                    "items": {
+                      "$dynamicRef": "#node"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 0.25
+              }
+            ]
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 2
+              }
+            ]
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "dynamic item annotations",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "values": {
+            "$dynamicRef": "#values",
+            "unevaluatedItems": false
+          }
+        },
+        "$defs": {
+          "values": {
+            "$dynamicAnchor": "values",
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              }
+            ]
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "values": [
+              0.5
+            ]
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "values": [
+              0.5,
+              1
+            ]
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "missing pointer",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#/$defs/missing"
+          }
+        }
+      },
+      "schemaValid": false,
+      "instances": []
+    },
+    {
+      "name": "missing anchor",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "#missing"
+          }
+        }
+      },
+      "schemaValid": false,
+      "instances": []
+    },
+    {
+      "name": "nonstring",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": 7
+          }
+        }
+      },
+      "schemaValid": false,
+      "instances": []
+    },
+    {
+      "name": "external reference",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$dynamicRef": "https://schemas.invalid/other"
+          }
+        }
+      },
+      "schemaValid": false,
+      "instances": []
+    },
+    {
+      "name": "sibling referenced resources",
+      "schema": {
+        "$id": "https://schemas.invalid/siblings",
+        "type": "object",
+        "required": [
+          "first",
+          "second"
+        ],
+        "properties": {
+          "first": {
+            "$ref": "#/$defs/first"
+          },
+          "second": {
+            "$ref": "#/$defs/second"
+          }
+        },
+        "additionalProperties": false,
+        "$defs": {
+          "first": {
+            "$id": "first",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "first"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "second": {
+            "$id": "second",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "second"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "independent scopes",
+          "value": {
+            "first": {
+              "value": "first",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            },
+            "second": {
+              "value": "second",
+              "children": [
+                {
+                  "value": "second"
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "wrong sibling child",
+          "value": {
+            "first": {
+              "value": "first",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            },
+            "second": {
+              "value": "second",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "sibling inline resources",
+      "schema": {
+        "$id": "https://schemas.invalid/siblings",
+        "type": "object",
+        "required": [
+          "first",
+          "second"
+        ],
+        "properties": {
+          "first": {
+            "$id": "first",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "first"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "second": {
+            "$id": "second",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "second"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "independent scopes",
+          "value": {
+            "first": {
+              "value": "first",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            },
+            "second": {
+              "value": "second",
+              "children": [
+                {
+                  "value": "second"
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "wrong sibling child",
+          "value": {
+            "first": {
+              "value": "first",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            },
+            "second": {
+              "value": "second",
+              "children": [
+                {
+                  "value": "first"
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "failed branch resource does not leak",
+      "schema": {
+        "$id": "https://schemas.invalid/branches",
+        "$defs": {
+          "first": {
+            "$id": "first",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "first"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "second": {
+            "$id": "second",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "const": "second"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "anyOf": [
+          {
+            "$ref": "#/$defs/first"
+          },
+          {
+            "$ref": "#/$defs/second"
+          }
+        ]
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "second branch succeeds",
+          "value": {
+            "value": "second",
+            "children": [
+              {
+                "value": "second"
+              }
+            ]
+          },
+          "valid": true
+        },
+        {
+          "name": "wrong second child",
+          "value": {
+            "value": "second",
+            "children": [
+              {
+                "value": "first"
+              }
+            ]
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "unvisited outer definition anchor",
+      "schema": {
+        "$id": "https://schemas.invalid/outer-unvisited",
+        "type": "object",
+        "$defs": {
+          "constraint": {
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number",
+                "maximum": 1
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "tree": {
+            "$id": "tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "properties": {
+          "tree": {
+            "$ref": "#/$defs/tree"
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "outer constraint reached only through dynamicRef",
+          "value": {
+            "tree": {
+              "value": 2,
+              "children": [
+                {
+                  "value": 0.5
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "outer anchor rejects inner permissive child",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 2
+                }
+              ]
+            }
+          },
+          "valid": false
+        },
+        {
+          "name": "outer anchor remains recursive",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 0.5,
+                  "children": [
+                    {
+                      "value": 2
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "unvisited outer anchor with inline resource",
+      "schema": {
+        "$id": "https://schemas.invalid/outer-unvisited",
+        "type": "object",
+        "$defs": {
+          "constraint": {
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number",
+                "maximum": 1
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "properties": {
+          "tree": {
+            "$id": "tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#node"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "outer constraint reached only through dynamicRef",
+          "value": {
+            "tree": {
+              "value": 2,
+              "children": [
+                {
+                  "value": 0.5
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "outer anchor rejects inner permissive child",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 2
+                }
+              ]
+            }
+          },
+          "valid": false
+        },
+        {
+          "name": "outer anchor remains recursive",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 0.5,
+                  "children": [
+                    {
+                      "value": 2
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "empty fragment stays static in nested resource",
+      "schema": {
+        "$id": "https://schemas.invalid/empty-fragment",
+        "$dynamicAnchor": "node",
+        "type": "object",
+        "properties": {
+          "tree": {
+            "$id": "tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "required": [
+              "value"
+            ],
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid nested root recursion",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": 0.25
+                }
+              ]
+            }
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid nested root recursion",
+          "value": {
+            "tree": {
+              "value": 0.5,
+              "children": [
+                {
+                  "value": "wrong"
+                }
+              ]
+            }
+          },
+          "valid": false
+        }
+      ]
+    },
+    {
+      "name": "prototype-named dynamic anchors remain own bindings",
+      "schema": {
+        "$id": "https://schemas.invalid/strict",
+        "$dynamicAnchor": "__proto__",
+        "$ref": "#/$defs/tree",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "maximum": 1
+          }
+        },
+        "unevaluatedProperties": false,
+        "$defs": {
+          "tree": {
+            "$id": "tree",
+            "$dynamicAnchor": "__proto__",
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "children": {
+                "type": "array",
+                "items": {
+                  "$dynamicRef": "#__proto__"
+                }
+              }
+            }
+          }
+        }
+      },
+      "schemaValid": true,
+      "instances": [
+        {
+          "name": "valid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 0.25
+              }
+            ]
+          },
+          "valid": true
+        },
+        {
+          "name": "invalid",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 2
+              }
+            ]
+          },
+          "valid": false
+        },
+        {
+          "name": "nested required field",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {}
+            ]
+          },
+          "valid": false
+        },
+        {
+          "name": "nested unevaluated property",
+          "value": {
+            "value": 0.5,
+            "children": [
+              {
+                "value": 0.25,
+                "extra": true
+              }
+            ]
+          },
+          "valid": false
+        }
+      ]
+    }
+  ]
+}

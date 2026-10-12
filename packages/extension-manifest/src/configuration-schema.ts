@@ -1,5 +1,6 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import type { JsonValue } from "./configuration-codec.ts";
+import { installLocalDynamicRef } from "./configuration-dynamic-ref.ts";
 
 /**
  * Schemas without $schema use this pinned dialect; other dialects are rejected.
@@ -66,6 +67,7 @@ function checkOfflineSchema(value: JsonValue): void {
 export function validateExtensionSchema(schema: JsonValue, defaults?: JsonValue): void {
   checkOfflineSchema(schema);
   const ajv = new Ajv2020({ strict: false, validateFormats: false, allErrors: false, ownProperties: true, addUsedSchema: false });
+  installLocalDynamicRef(ajv);
   ajv.removeKeyword("multipleOf");
   ajv.addKeyword({
     keyword: "multipleOf",
