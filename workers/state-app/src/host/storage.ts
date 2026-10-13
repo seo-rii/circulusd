@@ -450,6 +450,15 @@ export class ChunkedAggregateStorage<State> {
         ) {
           throw new TypeError("aggregate migration returned an invalid result");
         }
+        // The rewrite deletes every stored blob absent from referencedBlobs, so an
+        // omitted set must not silently drop references the manifest still holds.
+        if (
+          migration.migrated &&
+          migration.referencedBlobs === undefined &&
+          manifest.referencedBlobs.length > 0
+        ) {
+          throw new TypeError("aggregate migration omitted its referenced blobs");
+        }
         state = migration.state;
         migrated = migration.migrated;
         migrationBlobs = migration.blobs;

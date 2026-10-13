@@ -1635,6 +1635,87 @@ describe("named aggregate cells", () => {
     expect(storage.revision).toBe(boundaryRevision);
   });
 
+  it("keeps the externalized blobs of a persisted schema-v6 Session through its migration", async () => {
+    const storage = new FakeTransactionalStorage();
+    const initialization = sessionInitialization();
+    const logicalName = sessionCellName("tenant-1", "session-1");
+    const route = routedCellContext(storage, "SESSION_CELL", logicalName);
+    const command = await enqueueSessionCommand();
+    if (command.kind !== "enqueue_turn") throw new Error("enqueue fixture required");
+    const committed = await applySessionCommand(createSessionState(initialization), command);
+    // Schema v6 already stored the input and checkpoint payloads as blobs.
+    const legacyState = { ...structuredClone(committed.state), schemaVersion: 6 };
+    const referenced = committed.referencedBlobs ?? [];
+    expect(referenced).toHaveLength(2);
+    const initializationDigest = await digestStructuredValue(
+      "circulusd.state-app.session-initialization",
+      1,
+      initialization,
+    );
+    const legacyRecords = new ChunkedAggregateStorage<Record<string, unknown>>(
+      "session",
+      () => undefined,
+      route.route,
+    );
+    await storage.transaction(async (transaction) => {
+      await legacyRecords.write(
+        transaction,
+        legacyRecords.buildInitialRecord(initializationDigest, legacyState, logicalName),
+        undefined,
+        committed.blobs,
+        referenced,
+      );
+    });
+    const legacyRevision = storage.revision;
+
+    // A migration that omits its blob set fails closed instead of deleting blobs.
+    const omitting = new ChunkedAggregateStorage<Record<string, unknown>>(
+      "session",
+      () => undefined,
+      route.route,
+      (state) => ({ state: { ...(state as Record<string, unknown>), schemaVersion: 7 }, migrated: true }),
+    );
+    await expect(storage.transaction((transaction) => omitting.read(transaction)))
+      .rejects.toMatchObject({ code: "CORRUPT_STATE" });
+    expect(storage.revision).toBe(legacyRevision);
+
+    const cell = new SessionCell(route.state, route.environment, () => 200);
+    await expect(hostRpcResult(
+      "session.read",
+      { authority: sessionAuthority(), now: 200 },
+      (request) => cell.readSession(request),
+    )).resolves.toMatchObject({ schemaVersion: 7, eventSequence: 1 });
+    expect(storage.revision).toBe(legacyRevision + 1);
+    for (const blobDigest of referenced) {
+      const read = await hostRpcResult<{ readonly bytes: Uint8Array } | null>(
+        "session.read-blob",
+        { authority: sessionAuthority(), now: 200, digest: blobDigest },
+        (request) => cell.readSessionBlob(request),
+      );
+      expect(read).not.toBeNull();
+      expect(await digestBytes(read!.bytes)).toBe(blobDigest);
+    }
+
+    // The next engine boundary still finds every blob the migrated state carries.
+    await expect(hostRpcResult(
+      "session.execute",
+      {
+        kind: "commit_engine_step", commandId: "checkpoint-after-v6-migration",
+        expectedEventSequence: 1, turnId: "turn-1", transactionTime: 200,
+        fence: { turnLeaseGeneration: 10, placementGeneration: 4, sandboxGeneration: 5, authorizationGeneration: 6 },
+        consumedSettlementEffectId: null, effectIdentity: null,
+        step: {
+          kind: "checkpoint",
+          checkpoint: {
+            ...command.genesisCheckpoint, kind: "engine", checkpointSequence: 1,
+            predecessorDigest: await checkpointDigest(command.genesisCheckpoint),
+          },
+        },
+      } satisfies SessionCommand,
+      (request) => cell.executeSessionCommand(request),
+    )).resolves.toMatchObject({ version: 2, replayed: false });
+  });
+
   it("fails closed when a Session read authority is forged, expired, or stale", async () => {
     const storage = new FakeTransactionalStorage();
     const route = routedCellContext(
