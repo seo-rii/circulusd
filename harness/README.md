@@ -50,10 +50,11 @@ durable 전사에는 남지 않습니다. 엔진과 무관하게 Ollama 모델�
 circulusd 의 코드는 그대로 쓰고(수정 없음), 이 저장소는 circulusd 에 아직 없는 **session host + executord 역할**만 채웁니다.
 
 - `harness/sandbox/bin/sandboxd`: circulusd 의 `cmd/sandboxd` 를 그대로 크로스 컴파일한 것 (`corepack pnpm harness:sandbox:build`; `bin/` 은 git 에 들어가지 않음).
-- `harness/sandbox/agent` (Go, `harness/sandbox/bin/sandbox-agent`): executord 대역. circulusd 가 생성한 protobuf 타입과 connect-go 클라이언트
-  (`api/generated/circulus/v1alpha`, `.../circulusv1alphaconnect`)를 그대로 import 해서 sandboxd 와 대화합니다. 같은 저장소의
-  `internal/sandboxrpc` request digest / nonce proof 함수를 직접 사용하며, 호환성은 `protocol_test.go` 로 검사합니다
-  (`corepack pnpm harness:sandbox:test`). 에이전트는 Linux 또는 WSL2 안에서 돌며 다음을 합니다.
+- `harness/sandbox/agent` (Go, `harness/sandbox/bin/sandbox-agent`): executord 대역. circulusd 가 생성한 protobuf 타입
+  (`api/generated/circulus/v1alpha`)과 같은 저장소의 `internal/sandboxrpc` 공유 클라이언트(`sandboxrpc.NewClient`)를 그대로 써서
+  sandboxd 와 대화하며, wire protocol·launch 인증(request digest / nonce proof)·응답 검증은 이 공유 클라이언트가 맡습니다.
+  호환성은 `internal/sandboxrpc/protocol_vectors_test.go` 의 공유 vector 와 Linux 전용 `harness/sandbox/agent/client_linux_test.go`
+  로 검사합니다(`corepack pnpm harness:sandbox:test`). 에이전트는 Linux 또는 WSL2 안에서 돌며 다음을 합니다.
   1. 32 바이트 일회용 nonce 를 만들어 sandboxd 가 요구하는 대로 fd 3 으로 넘기고, jail 안에서 `sandboxd --backend ...` 을 띄웁니다.
   2. `ControlService.Handshake` 로 nonce 를 소비하고 nonce proof 를 검증한 뒤, 호출마다 `SandboxProcessService.Spawn` →
      (`WriteStdin`/`CloseStdin`) → `Attach` 스트림으로 stdout/stderr/exit 를 받습니다. 요청 메타와 `DispatchPermit`/`WorkspaceProtectionPermit`

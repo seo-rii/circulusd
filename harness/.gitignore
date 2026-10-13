@@ -3,5 +3,5 @@ node_modules/
 .env.*
 !.env.example
 *.log
-# Linux binaries built by `pnpm sandbox:build` (13 MB each); rebuild, do not commit.
+# Linux binaries built by `corepack pnpm harness:sandbox:build` (13 MB each); rebuild, do not commit.
 sandbox/bin/
