@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/ed25519key"
 	"github.com/hancomac/circulusd/internal/environment"
 )
 
@@ -43,14 +44,14 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 	}
 	bundleRoots := make(map[string]ed25519.PublicKey, len(roots.Bundle))
 	for keyID, publicKey := range roots.Bundle {
-		if !identifierPattern.MatchString(keyID) || len(publicKey) != ed25519.PublicKeySize {
+		if !identifierPattern.MatchString(keyID) || !ed25519key.IsCanonicalPrimeOrder(publicKey) {
 			return nil, fmt.Errorf("%w: bundle trust root %q is invalid", ErrInvalidRecord, keyID)
 		}
 		bundleRoots[keyID] = append(ed25519.PublicKey(nil), publicKey...)
 	}
 	assessmentRoots := make(map[string]ed25519.PublicKey, len(roots.Assessment))
 	for keyID, publicKey := range roots.Assessment {
-		if !identifierPattern.MatchString(keyID) || len(publicKey) != ed25519.PublicKeySize {
+		if !identifierPattern.MatchString(keyID) || !ed25519key.IsCanonicalPrimeOrder(publicKey) {
 			return nil, fmt.Errorf("%w: assessment trust root %q is invalid", ErrInvalidRecord, keyID)
 		}
 		assessmentRoots[keyID] = append(ed25519.PublicKey(nil), publicKey...)

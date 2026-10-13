@@ -49,9 +49,12 @@ func TestLoadTrustStoreVerifiesPromotionFromStrictOfflineFile(t *testing.T) {
 func TestLoadTrustStoreRejectsAmbiguousAndUnboundedFiles(t *testing.T) {
 	t.Parallel()
 
-	publicKey := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	publicKey := base64.StdEncoding.EncodeToString(
+		ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public().(ed25519.PublicKey),
+	)
 	validRoot := `{"keyId":"release-root-1","algorithm":"ed25519","publicKey":"` +
 		publicKey + `"}`
+	identityKey := base64.StdEncoding.EncodeToString(append([]byte{1}, make([]byte, ed25519.PublicKeySize-1)...))
 	tests := map[string][]byte{
 		"case alias":         []byte(`{"SchemaVersion":1,"roots":[` + validRoot + `]}`),
 		"nested case alias":  []byte(`{"schemaVersion":1,"roots":[` + strings.Replace(validRoot, `"keyId"`, `"KeyId"`, 1) + `]}`),
@@ -63,6 +66,8 @@ func TestLoadTrustStoreRejectsAmbiguousAndUnboundedFiles(t *testing.T) {
 		"duplicate key ID":   []byte(`{"schemaVersion":1,"roots":[` + validRoot + `,` + validRoot + `]}`),
 		"wrong algorithm":    []byte(`{"schemaVersion":1,"roots":[{"keyId":"release-root-1","algorithm":"rsa","publicKey":"` + publicKey + `"}]}`),
 		"wrong key size":     []byte(`{"schemaVersion":1,"roots":[{"keyId":"release-root-1","algorithm":"ed25519","publicKey":"` + base64.StdEncoding.EncodeToString([]byte{1}) + `"}]}`),
+		"small-order key":    []byte(`{"schemaVersion":1,"roots":[{"keyId":"release-root-1","algorithm":"ed25519","publicKey":"` + identityKey + `"}]}`),
+		"duplicate key":      []byte(`{"schemaVersion":1,"roots":[` + validRoot + `,` + strings.Replace(validRoot, "release-root-1", "release-root-2", 1) + `]}`),
 		"oversized":          bytes.Repeat([]byte{' '}, 1_048_577),
 	}
 	for name, contents := range tests {

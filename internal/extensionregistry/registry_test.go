@@ -154,6 +154,63 @@ func TestRegistryRejectsInvalidSignaturesAndImmutableCoordinateConflicts(t *test
 	}
 }
 
+func TestRegistryRejectsSmallOrderAndNonCanonicalTrustRoots(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+
+	identity := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	identity[0] = 1
+	// R = identity and S = 0 satisfy the verification equation for every
+	// message under the identity key, so this signature forges anything.
+	forged := make([]byte, ed25519.SignatureSize)
+	forged[0] = 1
+	if !ed25519.Verify(identity, []byte("any extension digest"), forged) {
+		t.Fatal("identity-key forgery precondition does not hold")
+	}
+	record := cloneSignedRevision(fixture.pdf)
+	record.BundleSignature = Signature{KeyID: "publisher-forged", Value: forged}
+	record.Assessment.Signature = Signature{KeyID: "assessor-forged", Value: forged}
+	forgedRoots := TrustRoots{
+		Bundle:     map[string]ed25519.PublicKey{"publisher-forged": identity},
+		Assessment: map[string]ed25519.PublicKey{"assessor-forged": identity},
+	}
+	if _, err := New(forgedRoots, []SignedRevision{record}, fixture.resolver); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("New(identity roots, forged signatures) error = %v, want ErrInvalidRecord", err)
+	}
+
+	nonCanonicalIdentity := append(ed25519.PublicKey(nil), identity...)
+	nonCanonicalIdentity[31] = 0x80
+	orderTwo := bytes.Repeat([]byte{0xff}, ed25519.PublicKeySize)
+	orderTwo[0], orderTwo[31] = 0xec, 0x7f
+	for name, publicKey := range map[string]ed25519.PublicKey{
+		"identity":               identity,
+		"non-canonical identity": nonCanonicalIdentity,
+		"order two":              orderTwo,
+		"order four":             make(ed25519.PublicKey, ed25519.PublicKeySize),
+	} {
+		t.Run(name, func(t *testing.T) {
+			bundle := TrustRoots{
+				Bundle:     map[string]ed25519.PublicKey{"publisher-platform-1": fixture.bundlePublic, "publisher-invalid": publicKey},
+				Assessment: fixture.roots.Assessment,
+			}
+			if _, err := New(bundle, []SignedRevision{fixture.pdf}, fixture.resolver); !errors.Is(err, ErrInvalidRecord) {
+				t.Fatalf("New(invalid bundle root) error = %v, want ErrInvalidRecord", err)
+			}
+			assessment := TrustRoots{
+				Bundle:     fixture.roots.Bundle,
+				Assessment: map[string]ed25519.PublicKey{"platform-security-1": fixture.assessmentPublic, "assessor-invalid": publicKey},
+			}
+			if _, err := New(assessment, []SignedRevision{fixture.pdf}, fixture.resolver); !errors.Is(err, ErrInvalidRecord) {
+				t.Fatalf("New(invalid assessment root) error = %v, want ErrInvalidRecord", err)
+			}
+		})
+	}
+
+	if _, err := New(fixture.roots, []SignedRevision{fixture.pdf}, fixture.resolver); err != nil {
+		t.Fatalf("New(prime-order roots) error = %v", err)
+	}
+}
+
 func TestSignedThirdPartyAssessmentAcceptsEitherSharedKernelBoundaryButNeverNone(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)

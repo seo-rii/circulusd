@@ -80,6 +80,48 @@ func TestTrustStoreRejectsDevelopmentAndInvalidRoots(t *testing.T) {
 	}
 }
 
+func TestTrustStoreRejectsSmallOrderNonCanonicalAndDuplicateRoots(t *testing.T) {
+	t.Parallel()
+
+	manifest, publicKey := signedPromotion(t, "candidate")
+	identity := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	identity[0] = 1
+	nonCanonicalIdentity := append(ed25519.PublicKey(nil), identity...)
+	nonCanonicalIdentity[31] = 0x80
+	orderTwo := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	for index := range orderTwo {
+		orderTwo[index] = 0xff
+	}
+	orderTwo[0], orderTwo[31] = 0xec, 0x7f
+	for name, root := range map[string]ed25519.PublicKey{
+		"identity":               identity,
+		"non-canonical identity": nonCanonicalIdentity,
+		"order two":              orderTwo,
+		"order four":             make(ed25519.PublicKey, ed25519.PublicKeySize),
+	} {
+		if _, err := NewTrustStore(map[string]ed25519.PublicKey{
+			"release-root-1": publicKey,
+			"release-root-2": root,
+		}); err == nil {
+			t.Fatalf("NewTrustStore(%s root) error = nil", name)
+		}
+	}
+	if _, err := NewTrustStore(map[string]ed25519.PublicKey{
+		"release-root-1": publicKey,
+		"release-root-2": append(ed25519.PublicKey(nil), publicKey...),
+	}); err == nil {
+		t.Fatal("NewTrustStore(duplicate key material) error = nil")
+	}
+
+	store, err := NewTrustStore(map[string]ed25519.PublicKey{"release-root-1": publicKey})
+	if err != nil {
+		t.Fatalf("NewTrustStore(prime-order root) error = %v", err)
+	}
+	if err := store.VerifyPromotion(manifest); err != nil {
+		t.Fatalf("VerifyPromotion() error = %v", err)
+	}
+}
+
 func TestSigningDigestIsDeterministicAcrossToolchainMapOrder(t *testing.T) {
 	t.Parallel()
 
