@@ -567,12 +567,122 @@ func TestCapabilitiesCommandQueriesPlatformdAndEmitsStableJSON(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesCommandAuthenticatesTheSelectedServerRole(t *testing.T) {
+	socketDirectory, err := os.MkdirTemp("/tmp", "cpr-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(socketDirectory); err != nil {
+			t.Errorf("RemoveAll(%q) error = %v", socketDirectory, err)
+		}
+	})
+	agentdSocket := filepath.Join(socketDirectory, "agentd.sock")
+	executordSocket := filepath.Join(socketDirectory, "executord.sock")
+	for _, daemon := range []struct {
+		socketPath string
+		serverPeer v1.ProtocolPeer
+		capability string
+	}{
+		{socketPath: agentdSocket, serverPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD, capability: "daemon.agentd"},
+		{socketPath: executordSocket, serverPeer: v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD, capability: "daemon.executord"},
+	} {
+		server, err := controlrpc.ListenServer(controlrpc.ServerConfig{
+			SocketPath: daemon.socketPath,
+			PeerUIDAuthorities: []controlrpc.PeerUIDAuthority{{
+				UID:  uint32(os.Getuid()),
+				Peer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL,
+			}},
+			ServerPeer: daemon.serverPeer,
+			Capabilities: []*v1.CapabilityStatus{{
+				Name:         daemon.capability,
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverContext, stopServer := context.WithCancel(context.Background())
+		serverDone := make(chan error, 1)
+		go func() { serverDone <- server.Serve(serverContext) }()
+		t.Cleanup(func() {
+			stopServer()
+			_ = server.Close()
+			select {
+			case serveErr := <-serverDone:
+				if serveErr != nil {
+					t.Errorf("Server.Serve() error = %v", serveErr)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("control server did not stop")
+			}
+		})
+	}
+
+	tests := []struct {
+		name           string
+		arguments      []string
+		wantExitCode   int
+		wantCapability string
+	}{
+		{
+			name:           "agentd role",
+			arguments:      []string{"capabilities", "--server-role", "agentd", "--socket", agentdSocket, "--timeout", "2s"},
+			wantExitCode:   0,
+			wantCapability: "daemon.agentd",
+		},
+		{
+			name:           "executord role",
+			arguments:      []string{"capabilities", "--server-role", "executord", "--socket", executordSocket, "--timeout", "2s"},
+			wantExitCode:   0,
+			wantCapability: "daemon.executord",
+		},
+		{
+			name:         "default platformd role rejects agentd",
+			arguments:    []string{"capabilities", "--socket", agentdSocket, "--timeout", "2s"},
+			wantExitCode: 1,
+		},
+		{
+			name:         "mismatched role",
+			arguments:    []string{"capabilities", "--server-role", "agentd", "--socket", executordSocket, "--timeout", "2s"},
+			wantExitCode: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			dependencies := defaultDependencies()
+			dependencies.stdout = &stdout
+			dependencies.stderr = &stderr
+			exitCode := execute(context.Background(), test.arguments, dependencies)
+			if exitCode != test.wantExitCode {
+				t.Fatalf("execute() = %d, want %d; stdout=%q stderr=%q", exitCode, test.wantExitCode, stdout.String(), stderr.String())
+			}
+			if test.wantExitCode != 0 {
+				if stdout.Len() != 0 || !strings.Contains(stderr.String(), "code=data_loss") {
+					t.Fatalf("role mismatch stdout=%q stderr=%q", stdout.String(), stderr.String())
+				}
+				return
+			}
+			var document capabilitiesOutput
+			if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+				t.Fatalf("capabilities JSON: %v; output=%q", err, stdout.String())
+			}
+			if len(document.Capabilities) != 1 || document.Capabilities[0].Name != test.wantCapability ||
+				document.Capabilities[0].Availability != "available" {
+				t.Fatalf("capabilities = %+v", document.Capabilities)
+			}
+		})
+	}
+}
+
 func TestCapabilitiesCommandRejectsInvalidInputBeforeDialing(t *testing.T) {
 	called := false
 	dependencies := commandDependencies{
 		stdout: &bytes.Buffer{},
 		stderr: &bytes.Buffer{},
-		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+		getCapabilities: func(context.Context, string, v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
 			called = true
 			return nil, errors.New("must not dial")
 		},
@@ -581,6 +691,11 @@ func TestCapabilitiesCommandRejectsInvalidInputBeforeDialing(t *testing.T) {
 		{"capabilities", "--socket", "relative.sock"},
 		{"capabilities", "--timeout", "0s"},
 		{"capabilities", "--timeout", "10m"},
+		{"capabilities", "--server-role", ""},
+		{"capabilities", "--server-role", "AGENTD"},
+		{"capabilities", "--server-role", "sandboxd"},
+		{"capabilities", "--server-role", "platformctl"},
+		{"capabilities", "--server-role", "agentd", "--socket", "relative.sock"},
 		{"capabilities", "unexpected"},
 		{"capabilities", "--unknown"},
 	}
@@ -591,6 +706,42 @@ func TestCapabilitiesCommandRejectsInvalidInputBeforeDialing(t *testing.T) {
 	}
 	if called {
 		t.Fatal("invalid capabilities command dialed platformd")
+	}
+}
+
+func TestCapabilitiesCommandDefaultsSocketAndPeerFromServerRole(t *testing.T) {
+	tests := []struct {
+		arguments      []string
+		wantSocketPath string
+		wantServerPeer v1.ProtocolPeer
+	}{
+		{arguments: []string{"capabilities"}, wantSocketPath: defaultPlatformdSocket, wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD},
+		{arguments: []string{"capabilities", "--server-role", "platformd"}, wantSocketPath: defaultPlatformdSocket, wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD},
+		{arguments: []string{"capabilities", "--server-role", "agentd"}, wantSocketPath: defaultAgentdSocket, wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD},
+		{arguments: []string{"capabilities", "--server-role", "executord"}, wantSocketPath: defaultExecutordSocket, wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD},
+		{arguments: []string{"capabilities", "--socket", "/run/custom/control.sock", "--server-role", "agentd"}, wantSocketPath: "/run/custom/control.sock", wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_AGENTD},
+		{arguments: []string{"capabilities", "--server-role", "executord", "--socket", defaultPlatformdSocket}, wantSocketPath: defaultPlatformdSocket, wantServerPeer: v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD},
+	}
+	for index, test := range tests {
+		var gotSocketPath string
+		var gotServerPeer v1.ProtocolPeer
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		exitCode := execute(context.Background(), test.arguments, commandDependencies{
+			stdout: &stdout,
+			stderr: &stderr,
+			getCapabilities: func(_ context.Context, socketPath string, serverPeer v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
+				gotSocketPath, gotServerPeer = socketPath, serverPeer
+				return &v1.GetCapabilitiesResponse{
+					Meta:             &v1.RpcResponseMeta{ServerSequence: 1},
+					ProtocolVersion:  &v1.ProtocolVersion{Major: 1},
+					DescriptorDigest: &v1.Digest{Algorithm: v1.DigestAlgorithm_DIGEST_ALGORITHM_SHA256, Value: make([]byte, sha256.Size)},
+				}, nil
+			},
+		})
+		if exitCode != 0 || gotSocketPath != test.wantSocketPath || gotServerPeer != test.wantServerPeer {
+			t.Fatalf("tests[%d]: execute()=%d socket=%q peer=%s stderr=%q", index, exitCode, gotSocketPath, gotServerPeer, stderr.String())
+		}
 	}
 }
 
@@ -613,7 +764,7 @@ func TestExecuteRejectsTypedNilWritersWithoutPanicking(t *testing.T) {
 	exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
 		stdout: typedNil,
 		stderr: &stderr,
-		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+		getCapabilities: func(context.Context, string, v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
 			return &v1.GetCapabilitiesResponse{
 				Meta:             &v1.RpcResponseMeta{ServerSequence: 1},
 				ProtocolVersion:  &v1.ProtocolVersion{Major: 1},
@@ -684,7 +835,7 @@ func TestCapabilitiesCommandFailsClosedOnContradictoryOrDuplicateStatus(t *testi
 			exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
 				stdout: &stdout,
 				stderr: &stderr,
-				getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+				getCapabilities: func(context.Context, string, v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
 					return &v1.GetCapabilitiesResponse{
 						Meta:             &v1.RpcResponseMeta{ServerSequence: 1},
 						ProtocolVersion:  &v1.ProtocolVersion{Major: 1},
@@ -706,7 +857,7 @@ func TestCapabilitiesCommandReportsOnlyStructuredTransportCode(t *testing.T) {
 	exitCode := execute(context.Background(), []string{"capabilities"}, commandDependencies{
 		stdout: &stdout,
 		stderr: &stderr,
-		getCapabilities: func(context.Context, string) (*v1.GetCapabilitiesResponse, error) {
+		getCapabilities: func(context.Context, string, v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
 			return nil, errors.New("credential=must-not-leak")
 		},
 	})
