@@ -1,7 +1,8 @@
 # 오프라인 멀티테넌트 Pi 에이전트 플랫폼 기술 스펙
 
-- **문서 상태:** Draft v0.3
+- **문서 상태:** Draft v0.3 (구현 진행 중 계속 개정)
 - **기준일:** 2026-08-22
+- **최종 개정일:** 2026-10-14. 기준일 이후의 개별 개정 이력은 `git log -- SPEC.md`를 기준으로 한다.
 - **개정 사유:** v0.2 설계 리뷰 반영
 - **배포 형태:** 완전 오프라인 셀프호스팅
 - **핵심 기술:** Pi Agent Core, stock workerd, celld, Computer-inspired Workspace, sandboxd, NsJail, Docker, Firecracker
@@ -718,6 +719,8 @@ const worker = await env.LOADER.get(
 ```
 
 Worker Loader가 노출하는 resource limit과 별개로, `agentd`는 workerd process 전체를 cgroup으로 제한해야 한다. per-isolate memory hard limit을 전제로 설계해서는 안 된다.
+
+**현재 구현 상태:** `SessionHost`는 `limits.cpuMs`와 `subRequests`를 검증한 뒤 Worker Loader에 그대로 전달한다. 그러나 release pin된 stock `workerd 1.20260825.1`은 Dynamic Worker의 `limits.cpuMs`를 parse만 하고 강제하지 않는다. Unit 10 qualification에서 runaway Worker는 이 limit으로 중단되지 않았다. 따라서 현재 `cpuMs`를 CPU 자원 경계나 보안 경계로 간주해서는 안 된다. 현재 인증된 CPU 경계는 workerd shard cgroup의 `cpu.max` throttling과 supervisor의 whole-shard kill/recycle이다(§53.3, `docs/unit10-operator.md`). 또한 이 pin에서는 도달 가능한 in-isolate fault가 Worker Loader isolate를 파괴하지 않으므로, per-isolate fault 뒤 Dynamic Worker 재구성(`workerd.dynamic-worker-reconstruction`)은 `cpuMs`와 별개로 기록된 `FAIL`로 남는다. per-isolate limit을 강제하는 workerd로 re-pin하거나 rebuild하기 전까지 이 상태가 유지된다.
 
 ### 9.4 Turn Authority 주입
 
@@ -4156,7 +4159,7 @@ protocol/authority 오류는 structured RPC status로 fail-closed 처리한다. 
 
 v0.3 reference 인증은 오프라인에서 완결되어야 한다.
 
-- **Local account store.** 비밀번호는 memory-hard hash(예: argon2id)로 저장하고 bootstrap admin은 `platformctl create-admin`으로 생성한다.
+- **Local account store.** 비밀번호는 memory-hard hash(예: argon2id)로 저장하고 bootstrap admin은 `platformctl create-admin`으로 생성한다. 이 command는 아직 구현되지 않은 목표 상태다(§43 참조).
 - **세션과 토큰.** Web UI는 http-only cookie 세션을, API는 scope가 제한된 personal access token(PAT)을 사용한다. PAT는 해시로 저장하고 만료/revoke를 지원한다.
 - **선택 연동.** LAN 내 OIDC provider와 LDAP/AD 연동은 tenant/role mapping 규칙과 함께 Phase 2 범위로 설계한다. 인터넷 IdP 의존은 비목표다.
 - **MFA.** 오프라인 친화적인 TOTP를 MAY 제공한다.
@@ -4252,6 +4255,14 @@ pi-platform/
 │
 └── docs/
 ```
+
+**현재 구현 상태:** 위 트리는 권장 목표 구조다. 현재 `circulusd` 저장소는 다음 점에서 다르며, 실제 경로는 저장소를 기준으로 한다.
+
+- `cmd/`에는 위 다섯 command 외에 `platformd-dev`와 qualification/관측용 command(`celld-storage-issue`, `celld-storage-observe`, `native-owner-observe`, `native-storage-cas-observe`, `objectstore-qualify`)가 있다.
+- `internal/`은 위 목록과 다른 package 단위로 나뉜다. NsJail provider는 `internal/executor/nsjail/`, conformance gate는 `internal/conformance/<component>/`에 있으며, `acl`, `policy`, `capability`, `scheduler`, `quota`, `gc`, `nsjail`, `docker`, `firecracker` top-level package는 없다.
+- `api/`에는 `descriptors/`가 추가로 있다. `packages/`에는 `protocol-types`, `extension-manifest`만 있으며 `pi-adapter`, `extension-sdk`, `manifest-compiler`는 없다.
+- 최상위 `environments/`, `sandbox/`, `firecracker/`, `conformance/`는 없다. `deploy/`에는 `airgap/`, `helm/`, `images/`, `native-celld/`가 있고 `systemd/`, `config/`는 없다.
+- 위 트리에 없는 `harness/`(비프로덕션 테스트 하네스), `scripts/`, `testdata/`가 있다.
 
 upstream `computerd` fork는 core repository의 필수 component로 두지 않는다. 실험이 필요하면 `experimental/computerd-provider/`와 같이 별도 provider로 격리한다.
 
@@ -4592,6 +4603,8 @@ release:
 
 ## 43. 설치 절차
 
+**현재 구현 상태:** 이 절은 목표 상태다. 현재 저장소에는 release bundle의 `install.sh`가 없다. `cmd/platformctl`은 `platformctl doctor`와 `platformctl capabilities`만 구현하며, 그 밖의 subcommand는 usage 오류(종료 코드 2)로 거부한다. §43.3의 `init`, `up`, `create-admin`과 §43.4의 `status`는 아직 구현되지 않은 목표 command다. §53.18 install/upgrade 항목은 conformance gate(`install.profile`)가 provisioned host에서 외부 `PASS`를 얻기 전까지 `NOT_RUN`으로 남는다. provisioned host가 없으면 이 gate는 `UNAVAILABLE`을 반환한다.
+
 ### 43.1 기본 설치
 
 ```bash
@@ -4636,16 +4649,16 @@ sudo ./install.sh --profile full
 ### 43.3 초기 설정
 
 ```bash
-sudo platformctl init
-sudo platformctl up
+sudo platformctl init           # 목표 상태: 미구현
+sudo platformctl up             # 목표 상태: 미구현
 sudo platformctl doctor
-sudo platformctl create-admin
+sudo platformctl create-admin   # 목표 상태: 미구현
 ```
 
 ### 43.4 상태 확인
 
 ```bash
-platformctl status
+platformctl status              # 목표 상태: 미구현
 platformctl capabilities
 platformctl doctor
 ```

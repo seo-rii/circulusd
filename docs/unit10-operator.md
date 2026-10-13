@@ -11,9 +11,9 @@ The gate certifies the **kernel-enforced** resource safety boundary — cgroup-v
 `cpu.max` throttling, `memory.max` OOM, and pidfd whole-shard `SIGKILL` with
 reconstruction — because the pinned workerd's in-isolate limits are advisory
 only (`limits.cpuMs` is parsed but not enforced, and no reachable in-isolate
-fault destroys a Worker Loader isolate). See
-[`workerd-cpums-not-enforced`](../SPEC.md) context and
-`docs/implementation-plan.md`.
+fault destroys a Worker Loader isolate). See the implementation-status note in
+[SPEC §9.3](../SPEC.md#93-worker-loader-경계), the historical `cpuMs` blocker
+in `docs/unit10-handoff.md`, and Unit 10 in `docs/implementation-plan.md`.
 
 ## Achievable bar
 
