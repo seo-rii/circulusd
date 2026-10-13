@@ -193,6 +193,12 @@ wired. Each maps to the correct container alone:
 --set privilege.executord.devKvm=true
 ```
 
+`privilege.executord.privileged=true` also renders
+`allowPrivilegeEscalation: true` on the `executord` container only: the
+Kubernetes API server rejects a privileged container whose
+`allowPrivilegeEscalation` is `false`, and a privileged container can escalate
+regardless.
+
 Do not move any of these onto the `platformd` container — that would violate
 §6.1.
 

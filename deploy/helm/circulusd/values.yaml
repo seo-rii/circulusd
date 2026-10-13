@@ -88,6 +88,8 @@ privilege:
     hostCgroupPath: /sys/fs/cgroup
   executord:
     # Run executord privileged and/or expose Docker socket and /dev/kvm.
+    # privileged also sets allowPrivilegeEscalation: true on executord, which
+    # the Kubernetes API server requires for a privileged container.
     privileged: false
     dockerSocket: false
     dockerSocketPath: /var/run/docker.sock

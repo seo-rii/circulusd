@@ -193,9 +193,11 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
             {{- if .Values.privilege.executord.privileged }}
-            privileged: true
+            {{- /* The API server rejects privileged: true with allowPrivilegeEscalation: false; merge keeps these keys over the baseline. */}}
+            {{- toYaml (merge (dict "privileged" true "allowPrivilegeEscalation" true) .Values.securityContext) | nindent 12 }}
+            {{- else }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
             {{- end }}
           readinessProbe:
             exec:
