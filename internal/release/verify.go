@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/ed25519key"
 )
 
 const (
@@ -23,13 +24,18 @@ func NewTrustStore(roots map[string]ed25519.PublicKey) (*TrustStore, error) {
 	}
 
 	copied := make(map[string]ed25519.PublicKey, len(roots))
+	materials := make(map[string]struct{}, len(roots))
 	for keyID, publicKey := range roots {
 		if !signingKeyPattern.MatchString(keyID) {
 			return nil, fmt.Errorf("release trust root %q has an invalid key ID", keyID)
 		}
-		if len(publicKey) != ed25519.PublicKeySize {
+		if !ed25519key.IsCanonicalPrimeOrder(publicKey) {
 			return nil, fmt.Errorf("release trust root %q has an invalid Ed25519 public key", keyID)
 		}
+		if _, duplicate := materials[string(publicKey)]; duplicate {
+			return nil, fmt.Errorf("release trust root %q reuses another root's public key", keyID)
+		}
+		materials[string(publicKey)] = struct{}{}
 		copied[keyID] = append(ed25519.PublicKey(nil), publicKey...)
 	}
 
