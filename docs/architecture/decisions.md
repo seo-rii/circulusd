@@ -106,6 +106,10 @@ Workspace revision, invocation ledger result, and lease consumption/release comm
 
 ## ADR-006: Structured digests use deterministic CBOR
 
+Amended by ADR-015. The floating-point rejection below still governs the
+canonical CBOR codec itself; ADR-015 records the versioned wrappers through
+which JSON-originated non-integer numbers reach that codec.
+
 Raw file bytes use `sha256(rawBytes)`. Structured values use RFC 8949 Core Deterministic Encoding:
 
 ```text
@@ -308,3 +312,45 @@ Retained Unit 10 resource evidence is run-, host-, boot-, release-, config-,
 cgroup-, and runner-bound historical evidence. It is not daemon startup
 authority and cannot be relabeled as a current result without a fresh run and
 semantic identity validation.
+
+## ADR-015: JSON numbers reach canonical CBOR only through versioned wrappers
+
+Date: 2026-10-14. This record amends ADR-006 by documenting numeric codecs that
+are already implemented. It changes no previously accepted bytes.
+
+The canonical CBOR codec stays integer-only. Go `internal/canonical` and
+TypeScript `@circulusd/protocol-types` accept integers only within
+±(2^53 − 1), reject floating-point inputs, and on decode reject CBOR
+floating-point values and every simple value other than `false`, `true`, and
+`null`. The TypeScript encoder also rejects `-0`.
+
+JSON-originated data whose numbers are not all safe integers crosses that codec
+only through an explicit, versioned representation. Each of the following
+codecs rejects NaN and ±Infinity, and none relaxes the canonical codec:
+
+- **Extension JSON** (extension configuration values; Go
+  `internal/extensionregistry`, TypeScript `@circulusd/extension-manifest`).
+  Finite binary64 numbers are accepted and `-0` normalizes to `+0`. If every
+  number is a safe integer, the value keeps its existing schema-version-1
+  digest. Otherwise the digest uses schema version 2 in the same domain, and
+  its payload is a CBOR byte string encoding
+  `["circulusd.extension-json", 2, taggedTree]`. Every node of `taggedTree` is
+  type-tagged (`["null"]`, `["boolean", b]`, `["string", s]`,
+  `["number", hex]`, `["array", items]`, `["object", map]`), and `hex` is the
+  16 lowercase hexadecimal digits of the big-endian binary64 value, so user
+  keys or arrays cannot imitate a number.
+- **Pi JSON numbers** (Pi tool-call arguments and tool details). A finite
+  number that is not a safe integer becomes the single-key map
+  `{"$pi.number.v1": decimal}`, where `decimal` is the ECMAScript
+  `Number.prototype.toString()` form of at most 32 characters. `-0` is rejected
+  rather than normalized, raw input that already uses the reserved key is
+  rejected, and decoding accepts only the canonical decimal of a finite
+  non-safe-integer value.
+- **Pi cost** (`pi-cost-decimal-v1`). Model usage cost fields are stored as
+  canonical `Number.prototype.toString()` decimal strings of finite,
+  nonnegative binary64 values; `-0` is rejected.
+
+Shared Go and TypeScript vectors for the first two codecs
+(`packages/extension-manifest/fixtures/configuration-json-v2.json` and
+`packages/protocol-types/fixtures/pi-json-numbers-v1.json`) are authoritative
+compatibility fixtures, as in ADR-006.
