@@ -446,6 +446,42 @@ func TestSessionDispatchBoundsProviderCallCloseAfterAcceptedUnknown(t *testing.T
 	}
 }
 
+func TestSessionDispatchRecordsInHandResultAfterStartContextEnds(t *testing.T) {
+	fixture := newGatewayFixture(t, ReplayNever)
+	route := broker.Digest(digestWithByte(98))
+	store := effectledger.NewReferenceStore()
+	ledger := newSessionLedger(t, store, route)
+	starter := mustSessionStarter(t, fixture.gateway, ledger, route)
+	callRequest := sessionCall(fixture)
+	dispatch := sessionDispatch(t, fixture, callRequest, route)
+	digest, err := starter.Prepare(context.Background(), dispatch, fixture.scope.RuntimeRevision, callRequest)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	// The complete response arrives as the bounded start context ends. Its
+	// terminal result is already in hand and must not be recorded as unknown.
+	fixture.provider.start = func(ctx context.Context, _ ProviderCommand) (ProviderStartResult, error) {
+		<-ctx.Done()
+		return ProviderStartResult{ProviderRequestID: "accepted-with-result", Call: completedCall(`{"ok":true}`)}, nil
+	}
+	consumer := mustSessionConsumer(t, newSessionClaimer(t, dispatch, digest), starter)
+	execution, err := consumer.StartExactAttempt(context.Background(), broker.DispatchStartRequest{
+		Dispatch: dispatch, CommandDigest: digest,
+	})
+	if err != nil || execution.Outcome != broker.DispatchStartOutcomeStarted {
+		t.Fatalf("StartExactAttempt() = %#v, %v", execution, err)
+	}
+	facts, err := ledger.Inspect(context.Background(), sessionLookup(dispatch))
+	if err != nil || facts.ExternalProviderRequestID != "accepted-with-result" ||
+		facts.Terminal.Status != effectledger.TerminalCommitted {
+		t.Fatalf("Inspect() = %#v, %v", facts, err)
+	}
+	result, err := DecodeSessionDispatchResult(facts.Terminal.Result, testBounds())
+	if err != nil || string(result.Output) != `{"ok":true}` || result.ExternalCommitID != "commit-1" {
+		t.Fatalf("DecodeSessionDispatchResult() = %#v, %v", result, err)
+	}
+}
+
 type countingSessionRepository struct {
 	EffectRepository
 	claims  atomic.Int64

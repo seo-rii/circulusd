@@ -227,6 +227,47 @@ func TestNativeHTTPProviderLostResponseNeverRestartsClaimedInvocation(t *testing
 	}
 }
 
+func TestNativeHTTPProviderRetainsResultReceivedBeforeCallerCancellation(t *testing.T) {
+	var calls atomic.Int32
+	var responded atomic.Bool
+	server := nativeHTTPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		nativeHTTPResult(w, r)
+		responded.Store(true)
+	})
+	fixture := newNativeHTTPFixture(t, server.URL)
+	_, command, _ := prepareNativeHTTPCommand(t, fixture)
+	provider := fixture.factory.providers[fixture.effect.ProviderID]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The handler's buffered response is sent only after it returns, so the
+	// caller is cancelled after the complete response exists but before the
+	// provider persists it.
+	check := fixture.factory.repository.check
+	fixture.factory.repository.check = func() error {
+		if responded.Load() {
+			cancel()
+		}
+		return check()
+	}
+	result, err := provider.Start(ctx, command)
+	fixture.factory.repository.check = check
+	if ctx.Err() == nil {
+		t.Fatal("fixture did not cancel the caller after the response arrived")
+	}
+	if err != nil || result.ProviderRequestID == "" || result.Call == nil {
+		t.Fatalf("received result was dropped after caller cancellation: %v", err)
+	}
+	event, err := result.Call.Next(ctx)
+	if err != nil || event.Kind != ProviderCompleted || !json.Valid(event.Output) {
+		t.Fatalf("in-hand result was not delivered after caller cancellation: %v", err)
+	}
+	record, err := provider.Lookup(context.Background(), LedgerQuery{Scope: command.Scope, Server: command.Server, ToolName: command.ToolName, InvocationID: command.InvocationID, RequestDigest: command.RequestDigest, Negotiation: command.Negotiation, Start: command.Start})
+	if err != nil || record.Status != LedgerCommitted || record.ProviderRequestID != result.ProviderRequestID || !json.Valid(record.Output) || calls.Load() != 1 {
+		t.Fatalf("received result was not durably retained: %v/%s/%d", err, record.Status, calls.Load())
+	}
+}
+
 func TestNativeHTTPProviderRPCErrorDoesNotProveExternalRollback(t *testing.T) {
 	for _, valid := range []bool{true, false} {
 		t.Run(fmt.Sprint(valid), func(t *testing.T) {
