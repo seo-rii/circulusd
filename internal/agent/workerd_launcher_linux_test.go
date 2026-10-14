@@ -437,8 +437,11 @@ func TestWorkerdProcessLauncherHistoryCapacityRejectsBeforeAllocationOrStart(t *
 	t.Parallel()
 	starter := &recordingWorkerdStarter{}
 	readinessFailure := errors.New("injected readiness failure")
-	config, _ := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error {
-		return readinessFailure
+	config, _ := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(_ context.Context, info WorkerdProcessInfo) error {
+		if strings.HasPrefix(info.ShardID, "failed-") {
+			return readinessFailure
+		}
+		return nil
 	}))
 	config.HistoryCapacity = 4
 	launcher, err := newWorkerdProcessLauncherForTest(t, config, starter)
@@ -449,23 +452,45 @@ func TestWorkerdProcessLauncherHistoryCapacityRejectsBeforeAllocationOrStart(t *
 		_, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0),
 			ShardID: fmt.Sprintf("failed-history-%02d", index), ShardGeneration: 1,
 		})
-		if index < config.HistoryCapacity {
-			if !errors.Is(ensureErr, ErrWorkerdNotReady) {
-				t.Fatalf("Ensure(within capacity %d) error = %v", index, ensureErr)
-			}
-		} else if !errors.Is(ensureErr, ErrWorkerdHistoryCapacity) {
-			t.Fatalf("Ensure(over capacity %d) error = %v, want history capacity", index, ensureErr)
+		if !errors.Is(ensureErr, ErrWorkerdNotReady) {
+			t.Fatalf("Ensure(failed shard %d) error = %v, want readiness failure", index, ensureErr)
 		}
 	}
-	if starts := len(starter.commandSnapshot()); starts != config.HistoryCapacity {
-		t.Fatalf("process starts = %d, want cap %d", starts, config.HistoryCapacity)
+	handles := make([]*WorkerdShardHandle, 0, config.HistoryCapacity)
+	for index := range config.HistoryCapacity {
+		handle, ensureErr := launcher.Ensure(context.Background(), WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0),
+			ShardID: fmt.Sprintf("live-history-%d", index), ShardGeneration: 1,
+		})
+		if ensureErr != nil {
+			t.Fatalf("Ensure(live shard %d) error = %v", index, ensureErr)
+		}
+		handles = append(handles, handle)
+	}
+	overflow := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0), ShardID: "live-history-overflow", ShardGeneration: 1}
+	if _, ensureErr := launcher.Ensure(context.Background(), overflow); !errors.Is(ensureErr, ErrWorkerdHistoryCapacity) {
+		t.Fatalf("Ensure(over live capacity) error = %v, want history capacity", ensureErr)
+	}
+	if starts := len(starter.commandSnapshot()); starts != 32+config.HistoryCapacity {
+		t.Fatalf("process starts = %d, want %d", starts, 32+config.HistoryCapacity)
 	}
 	launcher.mu.Lock()
 	latest, identities := len(launcher.latestGenerations), len(launcher.launchIdentities)
 	pending, instances := len(launcher.pending), len(launcher.instances)
 	launcher.mu.Unlock()
-	if latest > config.HistoryCapacity || identities > config.HistoryCapacity || pending != 0 || instances != 0 {
+	if latest != config.HistoryCapacity || identities != config.HistoryCapacity || pending != 0 || instances != config.HistoryCapacity {
 		t.Fatalf("bounded state latest=%d identities=%d pending=%d instances=%d cap=%d", latest, identities, pending, instances, config.HistoryCapacity)
+	}
+	if err := handles[0].Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(live shard 0) error = %v", err)
+	}
+	handle, err := launcher.Ensure(context.Background(), overflow)
+	if err != nil {
+		t.Fatalf("Ensure(after a live shard stopped) error = %v", err)
+	}
+	for _, handle := range append(handles[1:], handle) {
+		if err := handle.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop(%s) error = %v", handle.ShardID(), err)
+		}
 	}
 }
 
@@ -482,7 +507,8 @@ func TestWorkerdProcessLauncherCanceledShardHistoryRemainsBounded(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := range config.HistoryCapacity {
+	launches := 2 * config.HistoryCapacity
+	for index := range launches {
 		request := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0), ShardID: fmt.Sprintf("canceled-history-%d", index), ShardGeneration: 1}
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
@@ -497,12 +523,168 @@ func TestWorkerdProcessLauncherCanceledShardHistoryRemainsBounded(t *testing.T) 
 		}
 		waitForNoPendingWorkerdLaunch(t, launcher, request)
 	}
-	_, err = launcher.Ensure(context.Background(), WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0), ShardID: "over-canceled-cap", ShardGeneration: 1})
-	if !errors.Is(err, ErrWorkerdHistoryCapacity) {
-		t.Fatalf("Ensure(over capacity) error = %v, want history capacity", err)
+	if starts := len(starter.commandSnapshot()); starts != launches {
+		t.Fatalf("process starts = %d, want %d", starts, launches)
 	}
-	if starts := len(starter.commandSnapshot()); starts != config.HistoryCapacity {
-		t.Fatalf("process starts = %d, want %d", starts, config.HistoryCapacity)
+	launcher.mu.Lock()
+	latest, retired, identities := len(launcher.latestGenerations), len(launcher.retiredGenerations), len(launcher.launchIdentities)
+	launcher.mu.Unlock()
+	if latest != 0 || retired != 0 || identities != 0 {
+		t.Fatalf("canceled history latest=%d retired=%d identities=%d, want none", latest, retired, identities)
+	}
+}
+
+func TestWorkerdProcessLauncherForgetsIdleShardHistoryBeyondCapacity(t *testing.T) {
+	t.Parallel()
+	starter := &recordingWorkerdStarter{}
+	config, _ := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(_ context.Context, info WorkerdProcessInfo) error {
+		if strings.HasPrefix(info.ShardID, "failed-") {
+			return errors.New("injected readiness failure")
+		}
+		return nil
+	}))
+	config.HistoryCapacity = 4
+	launcher, err := newWorkerdProcessLauncherForTest(t, config, starter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycles := 4 * config.HistoryCapacity
+	for index := range cycles {
+		published := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0),
+			ShardID: fmt.Sprintf("cycled-%02d", index), ShardGeneration: ShardGeneration(2*index + 1),
+		}
+		handle, ensureErr := launcher.Ensure(context.Background(), published)
+		if ensureErr != nil {
+			t.Fatalf("Ensure(cycled shard %d) error = %v", index, ensureErr)
+		}
+		if stopErr := handle.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("Stop(cycled shard %d) error = %v", index, stopErr)
+		}
+		failed := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0),
+			ShardID: fmt.Sprintf("failed-%02d", index), ShardGeneration: ShardGeneration(2*index + 2),
+		}
+		if _, ensureErr := launcher.Ensure(context.Background(), failed); !errors.Is(ensureErr, ErrWorkerdNotReady) {
+			t.Fatalf("Ensure(failed shard %d) error = %v, want readiness failure", index, ensureErr)
+		}
+	}
+	if starts := len(starter.commandSnapshot()); starts != 2*cycles {
+		t.Fatalf("process starts = %d, want %d", starts, 2*cycles)
+	}
+	launcher.mu.Lock()
+	latest, retired, identities := len(launcher.latestGenerations), len(launcher.retiredGenerations), len(launcher.launchIdentities)
+	launcher.mu.Unlock()
+	if latest != 0 || identities != 0 || retired != config.HistoryCapacity {
+		t.Fatalf("idle history latest=%d identities=%d retired=%d, want 0/0/%d", latest, identities, retired, config.HistoryCapacity)
+	}
+}
+
+func TestWorkerdProcessLauncherForgottenShardNeverRestartsRetiredGeneration(t *testing.T) {
+	t.Parallel()
+	oldProcess := newFakeWorkerdProcess(1_301, true)
+	newProcess := newFakeWorkerdProcess(1_302, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{oldProcess, newProcess}}
+	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	request := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0), ShardID: "forgotten-shard", ShardGeneration: 5, Arguments: []string{"serve"}}
+	oldHandle, err := launcher.Ensure(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Ensure(generation 5) error = %v", err)
+	}
+	if err := oldHandle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(generation 5) error = %v", err)
+	}
+	shardKey := workerdShardKey{agentInstanceID: request.AgentInstanceID, shardID: request.ShardID}
+	launcher.mu.Lock()
+	_, live := launcher.latestGenerations[shardKey]
+	_, identity := launcher.launchIdentities[workerdLaunchKey{agentInstanceID: request.AgentInstanceID, shardID: request.ShardID, generation: 5}]
+	launcher.mu.Unlock()
+	if live || identity {
+		t.Fatalf("idle shard history kept latest=%v identity=%v after its process group was gone", live, identity)
+	}
+
+	differentArguments := request
+	differentArguments.Arguments = []string{"other"}
+	olderGeneration := request
+	olderGeneration.ShardGeneration = 4
+	for _, stale := range []WorkerdEnsureRequest{request, differentArguments, olderGeneration} {
+		handle, ensureErr := launcher.Ensure(context.Background(), stale)
+		if handle != nil || !errors.Is(ensureErr, ErrStaleWorkerdGeneration) {
+			t.Fatalf("Ensure(%s generation %d %v) = %#v, %v, want stale generation", stale.ShardID, stale.ShardGeneration, stale.Arguments, handle, ensureErr)
+		}
+	}
+	if starts := len(starter.commandSnapshot()); starts != 1 {
+		t.Fatalf("process starts after stale re-placements = %d, want 1", starts)
+	}
+
+	request.ShardGeneration = 6
+	newHandle, err := launcher.Ensure(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Ensure(generation 6) error = %v", err)
+	}
+	if newHandle.PID() != newProcess.pid || newHandle.ShardGeneration() != 6 {
+		t.Fatalf("replacement handle pid=%d generation=%d", newHandle.PID(), newHandle.ShardGeneration())
+	}
+	if err := oldHandle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(forgotten generation) error = %v", err)
+	}
+	if err := oldHandle.KillProcessInstance(); !errors.Is(err, errWorkerdProcessIdentityUnavailable) {
+		t.Fatalf("KillProcessInstance(forgotten generation) error = %v, want identity unavailable", err)
+	}
+	if signals := newProcess.signalSnapshot(); len(signals) != 0 {
+		t.Fatalf("forgotten handle signaled replacement: %#v", signals)
+	}
+	if err := newHandle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(generation 6) error = %v", err)
+	}
+}
+
+func TestWorkerdProcessLauncherEvictedRetirementRaisesGenerationFloor(t *testing.T) {
+	t.Parallel()
+	starter := &recordingWorkerdStarter{}
+	config, _ := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	config.HistoryCapacity = 2
+	launcher, err := newWorkerdProcessLauncherForTest(t, config, starter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID := workerdTestAgentInstanceID(0)
+	for _, retired := range []WorkerdEnsureRequest{
+		{AgentInstanceID: agentID, ShardID: "retired-a", ShardGeneration: 3},
+		{AgentInstanceID: agentID, ShardID: "retired-b", ShardGeneration: 1},
+		{AgentInstanceID: agentID, ShardID: "retired-c", ShardGeneration: 2},
+	} {
+		handle, ensureErr := launcher.Ensure(context.Background(), retired)
+		if ensureErr != nil {
+			t.Fatalf("Ensure(%s) error = %v", retired.ShardID, ensureErr)
+		}
+		if stopErr := handle.Stop(context.Background()); stopErr != nil {
+			t.Fatalf("Stop(%s) error = %v", retired.ShardID, stopErr)
+		}
+	}
+	launcher.mu.Lock()
+	remembered, floor := len(launcher.retiredGenerations), launcher.retiredFloor
+	launcher.mu.Unlock()
+	if remembered != config.HistoryCapacity || floor != 1 {
+		t.Fatalf("remembered retirements = %d, floor = %d, want %d and the lowest evicted generation 1", remembered, floor, config.HistoryCapacity)
+	}
+	for _, stale := range []WorkerdEnsureRequest{
+		{AgentInstanceID: agentID, ShardID: "retired-a", ShardGeneration: 3},
+		{AgentInstanceID: agentID, ShardID: "retired-b", ShardGeneration: 1},
+		{AgentInstanceID: agentID, ShardID: "never-seen", ShardGeneration: 1},
+	} {
+		handle, ensureErr := launcher.Ensure(context.Background(), stale)
+		if handle != nil || !errors.Is(ensureErr, ErrStaleWorkerdGeneration) {
+			t.Fatalf("Ensure(%s generation %d) = %#v, %v, want stale generation", stale.ShardID, stale.ShardGeneration, handle, ensureErr)
+		}
+	}
+	if starts := len(starter.commandSnapshot()); starts != 3 {
+		t.Fatalf("process starts after stale re-placements = %d, want 3", starts)
+	}
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{AgentInstanceID: agentID, ShardID: "retired-b", ShardGeneration: 2})
+	if err != nil {
+		t.Fatalf("Ensure(evicted shard above floor) error = %v", err)
+	}
+	if err := handle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(evicted shard above floor) error = %v", err)
 	}
 }
 
