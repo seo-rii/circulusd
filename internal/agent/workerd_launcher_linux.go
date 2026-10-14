@@ -289,6 +289,7 @@ type WorkerdProcessLauncher struct {
 	readinessProbe       WorkerdReadinessProbe
 	starter              workerdProcessStarter
 	captureIdentity      workerdProcessIdentityCapturer
+	publishedHook        func()
 	observationSink      WorkerdObservationSink
 	observationInterval  time.Duration
 	observationPageSize  uint64
@@ -1053,6 +1054,12 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	}
 	resultHandle = &WorkerdShardHandle{launcher: launcher, instance: instance}
 	launcher.current[shardKey] = instance
+	// Retire the pending launch in the publishing critical section. A waiter
+	// canceled from here on finds it completed and takes the handle, so a
+	// published generation is never left without an owner.
+	delete(launcher.pending, pending.key)
+	pending.handle = resultHandle
+	close(pending.done)
 	var observer *workerdShardObserver
 	if launcher.observationSink != nil && instance.stop == nil && !instance.handleStopRequested {
 		observerContext, cancelObserver := context.WithCancel(context.Background())
@@ -1064,6 +1071,11 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 	launcher.mu.Unlock()
 	if observer != nil {
 		go launcher.runWorkerdObserver(instance, observer)
+	}
+	// publishedHook is a test seam between publication and this function's
+	// deferred bookkeeping; it is nil outside tests.
+	if launcher.publishedHook != nil {
+		launcher.publishedHook()
 	}
 }
 

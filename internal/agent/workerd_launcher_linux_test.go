@@ -1159,6 +1159,49 @@ func TestWorkerdProcessLauncherLastWaiterCancellationAbandonsAndCleansStart(t *t
 	}
 }
 
+func TestWorkerdProcessLauncherLastWaiterCanceledAfterPublicationReceivesHandle(t *testing.T) {
+	t.Parallel()
+	process := newFakeWorkerdProcess(1_401, true)
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	_, launcher := newWorkerdLauncherFixture(t, starter, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	request := WorkerdEnsureRequest{AgentInstanceID: workerdTestAgentInstanceID(0), ShardID: "published-then-canceled", ShardGeneration: 1}
+	waiterContext, cancelWaiter := context.WithCancel(context.Background())
+	defer cancelWaiter()
+	resultChannel := make(chan workerdEnsureResult, 1)
+	waiterReturned := make(chan struct{})
+	hookReturned := make(chan struct{})
+	// Cancel the only waiter after the generation is published but before the
+	// launch goroutine finishes, and let the waiter settle inside that window.
+	launcher.publishedHook = func() {
+		defer close(hookReturned)
+		cancelWaiter()
+		<-waiterReturned
+	}
+	go func() {
+		handle, ensureErr := launcher.Ensure(waiterContext, request)
+		resultChannel <- workerdEnsureResult{handle: handle, err: ensureErr}
+		close(waiterReturned)
+	}()
+	result := <-resultChannel
+	<-hookReturned
+	if result.err != nil || result.handle == nil {
+		t.Fatalf("Ensure(last waiter canceled after publication) = %#v, %v, want the published handle", result.handle, result.err)
+	}
+	launcher.mu.Lock()
+	pending := len(launcher.pending)
+	current := launcher.current[workerdShardKey{agentInstanceID: request.AgentInstanceID, shardID: request.ShardID}]
+	launcher.mu.Unlock()
+	if pending != 0 || current != result.handle.instance {
+		t.Fatalf("launcher after publication pending=%d current=%p, want 0 and the returned instance %p", pending, current, result.handle.instance)
+	}
+	if err := result.handle.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop(published handle) error = %v", err)
+	}
+	if signals := process.signalSnapshot(); !reflect.DeepEqual(signals, []syscall.Signal{syscall.SIGTERM}) {
+		t.Fatalf("published process signals = %#v, want one TERM from the handle owner", signals)
+	}
+}
+
 func TestWorkerdShardHandleStopIsIdempotentTermThenKill(t *testing.T) {
 	t.Parallel()
 	process := newFakeWorkerdProcess(801, false)
