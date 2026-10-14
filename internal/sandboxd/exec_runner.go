@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -28,18 +29,28 @@ func (developmentExecRunner) Start(ctx context.Context, spec RunSpec) (RunningPr
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := command.StdoutPipe()
+	// StdoutPipe and StderrPipe read ends are closed by Wait as soon as the
+	// leader exits, discarding unread output. Own the pipes instead so the
+	// supervisor can wait for the leader while it drains them.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
 		return nil, err
 	}
-	stderr, err := command.StderrPipe()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
+		_ = stdoutWriter.Close()
 		return nil, err
 	}
-	if err := command.Start(); err != nil {
+	command.Stdout = stdoutWriter
+	command.Stderr = stderrWriter
+	err = command.Start()
+	// The child holds its own copies; the parent's must not delay EOF.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()

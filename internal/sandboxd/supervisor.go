@@ -347,6 +347,8 @@ func (supervisor *Supervisor) Spawn(
 		close(call.done)
 		supervisor.mu.Unlock()
 		_ = running.SignalGroup(SignalKill)
+		_ = running.Stdout().Close()
+		_ = running.Stderr().Close()
 		go running.Wait()
 		return SpawnResult{}, ErrSandboxFenced
 	}
@@ -374,15 +376,17 @@ func (supervisor *Supervisor) Spawn(
 	supervisor.mu.Unlock()
 
 	supervisor.publish(record, ProcessEvent{Type: EventStarted})
+	stdout := &detachableStream{ReadCloser: running.Stdout()}
+	stderr := &detachableStream{ReadCloser: running.Stderr()}
 	var streams sync.WaitGroup
 	streams.Add(2)
 	go func() {
 		defer streams.Done()
-		supervisor.consumeStream(record, running.Stdout(), EventStdout)
+		supervisor.consumeStream(record, stdout, EventStdout)
 	}()
 	go func() {
 		defer streams.Done()
-		supervisor.consumeStream(record, running.Stderr(), EventStderr)
+		supervisor.consumeStream(record, stderr, EventStderr)
 	}()
 	streamsDone := make(chan struct{})
 	go func() {
@@ -390,8 +394,26 @@ func (supervisor *Supervisor) Spawn(
 		close(streamsDone)
 	}()
 	go func() {
-		<-streamsDone
+		// Wait for the leader while its output drains. Descendants can hold
+		// the pipes open indefinitely, so draining after exit is bounded:
+		// the process group is killed, as a deadline would, and pipes held
+		// from outside the group (for example after setsid) are detached.
 		runResult := running.Wait()
+		drain := time.NewTimer(exitedOutputDrainTimeout)
+		select {
+		case <-streamsDone:
+		case <-drain.C:
+			_ = running.SignalGroup(SignalKill)
+			drain.Reset(killedOutputDrainTimeout)
+			select {
+			case <-streamsDone:
+			case <-drain.C:
+				stdout.detach()
+				stderr.detach()
+				<-streamsDone
+			}
+		}
+		drain.Stop()
 
 		record.stdinGate <- struct{}{}
 		if !record.stdinClosed {
@@ -733,6 +755,35 @@ func (supervisor *Supervisor) consumeStream(
 			return
 		}
 	}
+}
+
+// exitedOutputDrainTimeout bounds how long output may keep arriving after the
+// leader exits. Pipes still open by then are held by descendants; those in the
+// process group are killed and get killedOutputDrainTimeout to release them.
+// Holders outside the group are beyond any supervisor signal.
+const (
+	exitedOutputDrainTimeout = 2 * time.Second
+	killedOutputDrainTimeout = 500 * time.Millisecond
+)
+
+// detachableStream ends with io.EOF once the supervisor stops draining it.
+type detachableStream struct {
+	io.ReadCloser
+	detached atomic.Bool
+}
+
+func (stream *detachableStream) Read(buffer []byte) (int, error) {
+	count, err := stream.ReadCloser.Read(buffer)
+	if err != nil && stream.detached.Load() {
+		err = io.EOF
+	}
+	return count, err
+}
+
+// detach closes the read end, which interrupts a blocked Read.
+func (stream *detachableStream) detach() {
+	stream.detached.Store(true)
+	_ = stream.ReadCloser.Close()
 }
 
 func (supervisor *Supervisor) terminate(
