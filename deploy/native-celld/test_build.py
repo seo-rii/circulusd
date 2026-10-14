@@ -1,10 +1,21 @@
 """Exercise reviewed fork validation against real staged/unstaged Git edits."""
+import contextlib
 import importlib.util
+import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+
+
+def load_build_module():
+    spec = importlib.util.spec_from_file_location("native_build_fixture", Path(__file__).with_name("build.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ReviewedSourceTests(unittest.TestCase):
@@ -16,9 +27,7 @@ class ReviewedSourceTests(unittest.TestCase):
         self.source.mkdir()
         self.package = self.root / "package"
         self.package.mkdir()
-        spec = importlib.util.spec_from_file_location("native_build_fixture", Path(__file__).with_name("build.py"))
-        self.module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.module)
+        self.module = load_build_module()
         self.module.__file__ = str(self.package / "build.py")
         originals = {
             "crates/celld/Cargo.toml": "[package]\nname = 'celld'\n",
@@ -89,6 +98,71 @@ class ReviewedSourceTests(unittest.TestCase):
         self.module.COMMIT = "0" * 40
         with self.assertRaisesRegex(ValueError, "not the pinned source commit"):
             self.module.validate_source(self.source)
+
+    def test_untracked_source_files_are_rejected(self):
+        (self.source / "circulusd-native-source.json").write_text("{}\n")
+        expected = self.module.validate_source(self.source)
+        for name in ("crates/celld/build.rs", ".cargo/config.toml", "crates/circulusd-native-proof/src/extra.rs"):
+            file = self.source / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("// untracked\n")
+            with self.assertRaisesRegex(ValueError, "unexpected untracked source files"):
+                self.module.validate_source(self.source)
+            file.unlink()
+        self.assertEqual(self.module.validate_source(self.source), expected)
+
+
+class BuildEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="circulusd-native-build-environment-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.module = load_build_module()
+
+    def test_inherited_cargo_and_rustc_settings_do_not_reach_cargo(self):
+        captured = {}
+
+        class FailedCargo:
+            pid = 0
+
+            def poll(self):
+                return 1
+
+            def wait(self, timeout=None):
+                return 1
+
+        def popen(command, **options):
+            captured.update(options["env"])
+            return FailedCargo()
+
+        build_settings = {
+            "RUSTFLAGS": "-C opt-level=0",
+            "RUSTDOCFLAGS": "--cfg inherited",
+            "RUSTC": "/inherited/rustc",
+            "RUSTC_WRAPPER": "/inherited/wrapper",
+            "RUSTC_BOOTSTRAP": "1",
+            "CARGO_ENCODED_RUSTFLAGS": "-Cdebuginfo=2",
+            "CARGO_BUILD_RUSTFLAGS": "-Ctarget-cpu=native",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL": "0",
+            "CARGO_BUILD_TARGET": "x86_64-unknown-linux-musl",
+        }
+        network_settings = {"CARGO_NET_OFFLINE": "true", "CARGO_HTTP_TIMEOUT": "60"}
+        inherited = {**build_settings, **network_settings, "CARGO_TARGET_DIR": "/inherited/target"}
+        with mock.patch.dict(os.environ, inherited), \
+                mock.patch.object(self.module, "validate_source", return_value={}), \
+                mock.patch.object(self.module.os, "nice"), \
+                mock.patch.object(self.module.os, "sched_setaffinity"), \
+                mock.patch.object(self.module.subprocess, "check_output", return_value="rustc 1.97.0\n"), \
+                mock.patch.object(self.module.subprocess, "Popen", side_effect=popen), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = self.module.build(self.root, self.root, self.root / "build", self.root / "status.json")
+        self.assertEqual(code, 1)
+        # Compare names only so a failure never prints the inherited environment.
+        self.assertEqual(sorted(build_settings.keys() & captured.keys()), [])
+        self.assertEqual({name: captured.get(name) for name in network_settings}, network_settings)
+        self.assertEqual(captured["CARGO_TARGET_DIR"], str(self.root / "build/target"))
+        self.assertEqual(captured["CARGO_PROFILE_RELEASE_LTO"], "false")
+        self.assertTrue(captured.get("PATH") == os.environ["PATH"], "PATH must still be inherited")
 
 
 if __name__ == "__main__":

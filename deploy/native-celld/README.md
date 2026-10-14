@@ -114,6 +114,10 @@ mode `0700` cache named `circulusd-native-celld-build-*` directly under `/dev/sh
 or the pinned source checkout's parent. A disk cache avoids charging compiler
 output against host RAM and can be reused after its prior process fully exits.
 The source lockfile must already
-include the added proof crate; Cargo runs with `--locked`. A successful build
+include the added proof crate; Cargo runs with `--locked`. Validation rejects
+untracked source files other than the copied proof crate and
+`circulusd-native-source.json`. Cargo does not inherit `CARGO_*`, `RUSTFLAGS`,
+`RUSTC*` or `RUSTDOC*` settings, except network-only `CARGO_NET_*` and
+`CARGO_HTTP_*`. A successful build
 retains a mode `0700` executable and mode `0600` provenance, without claiming
 qualification. The final status JSON is the authoritative process result.

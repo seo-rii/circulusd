@@ -49,6 +49,12 @@ def validate_source(source):
     allowed = {"Cargo.lock", "crates/celld/Cargo.toml", "crates/celld/lib.rs", "crates/celld/fleet.rs", "crates/celld/main.rs", "crates/celld/control_plane.rs", "crates/celld/js/harness.js"}
     if not changed <= allowed:
         raise ValueError("unexpected source edits")
+    # `git diff` ignores untracked files, yet Cargo builds any new module, build script or
+    # .cargo/config it finds. Only the copied proof crate and apply.py's record may be new.
+    untracked = set(subprocess.check_output(["git", "-C", str(source), "ls-files", "--others", "--exclude-standard"], text=True).splitlines())
+    expected = {"circulusd-native-source.json", "crates/circulusd-native-proof/Cargo.toml", "crates/circulusd-native-proof/src/lib.rs", "crates/circulusd-native-proof/" + fixture}
+    if not untracked <= expected:
+        raise ValueError("unexpected untracked source files")
     return {"patchDigest": digest(package / "celld-native.patch"), "nativeProofSourceDigest": digest(payload), "cargoLockDigest": digest(source / "Cargo.lock")}
 
 
@@ -60,7 +66,13 @@ def build(source, output, build_root, status):
         os.nice(10)
         affinity = sorted(os.sched_getaffinity(0))
         os.sched_setaffinity(0, set(affinity[:1]))
-        environment = os.environ.copy()
+        # Inherited Cargo and rustc settings (RUSTFLAGS, CARGO_PROFILE_*, wrappers) would change
+        # the binary without changing its provenance. Only network transport settings pass.
+        environment = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith(("CARGO_", "RUSTC", "RUSTDOC", "RUSTFLAGS"))
+            or name.startswith(("CARGO_NET_", "CARGO_HTTP_"))
+        }
         environment.update({
             "CARGO_HOME": str(build_root / "cargo"),
             "CARGO_TARGET_DIR": str(build_root / "target"),
