@@ -129,3 +129,110 @@ func TestFileStoreConfinesToOriginalRootAfterSwap(t *testing.T) {
 		t.Fatalf("Get(after swap) data = %q, want the original %q", object.Data, "INSIDE")
 	}
 }
+
+// TestFileStoreKeysThatArePathPrefixesFailClosed covers keys such as "a" and
+// "a/b": the file layout cannot hold both, so the second key must be rejected
+// as a key error, and reads of it must report a missing object rather than an
+// unsafe path.
+func TestFileStoreKeysThatArePathPrefixesFailClosed(t *testing.T) {
+	t.Parallel()
+	store := newTestFileStore(t)
+	defer store.Close()
+	ctx := context.Background()
+	missing := ETagFor([]byte("missing"))
+
+	shortETag, err := store.PutIfAbsent(ctx, BucketArtifacts, "short", []byte("short"))
+	if err != nil {
+		t.Fatalf("PutIfAbsent(short) error = %v", err)
+	}
+	if _, err := store.PutIfAbsent(ctx, BucketArtifacts, "short/nested", []byte("nested")); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("PutIfAbsent(below an object) error = %v, want ErrInvalidKey", err)
+	}
+	if _, err := store.Get(ctx, BucketArtifacts, "short/nested"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(below an object) error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.CompareAndSwap(ctx, BucketArtifacts, "short/nested", missing, []byte("x")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CompareAndSwap(below an object) error = %v, want ErrNotFound", err)
+	}
+	if err := store.DeleteIfMatch(ctx, BucketArtifacts, "short/nested", missing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteIfMatch(below an object) error = %v, want ErrNotFound", err)
+	}
+	if object, err := store.Get(ctx, BucketArtifacts, "short"); err != nil || string(object.Data) != "short" || object.ETag != shortETag {
+		t.Fatalf("Get(short) = %q/%q, %v; want the original object", object.Data, object.ETag, err)
+	}
+
+	if _, err := store.PutIfAbsent(ctx, BucketArtifacts, "parent/child", []byte("child")); err != nil {
+		t.Fatalf("PutIfAbsent(parent/child) error = %v", err)
+	}
+	if _, err := store.PutIfAbsent(ctx, BucketArtifacts, "parent", []byte("parent")); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("PutIfAbsent(prefix of an object) error = %v, want ErrInvalidKey", err)
+	}
+	if _, err := store.Get(ctx, BucketArtifacts, "parent"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(prefix of an object) error = %v, want ErrNotFound", err)
+	}
+	if _, err := store.CompareAndSwap(ctx, BucketArtifacts, "parent", missing, []byte("x")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CompareAndSwap(prefix of an object) error = %v, want ErrNotFound", err)
+	}
+	if err := store.DeleteIfMatch(ctx, BucketArtifacts, "parent", missing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteIfMatch(prefix of an object) error = %v, want ErrNotFound", err)
+	}
+	if object, err := store.Get(ctx, BucketArtifacts, "parent/child"); err != nil || string(object.Data) != "child" {
+		t.Fatalf("Get(parent/child) = %q, %v; want the original object", object.Data, err)
+	}
+
+	// Keys must not alias the store's own temporary files, which live next to
+	// objects and can be left behind by a crash.
+	for _, key := range []string{".circulusd-object-0123", "dir/.circulusd-object-0123", ".circulusd-object-/x"} {
+		if _, err := store.PutIfAbsent(ctx, BucketArtifacts, key, []byte("x")); !errors.Is(err, ErrInvalidKey) {
+			t.Fatalf("PutIfAbsent(%q) error = %v, want ErrInvalidKey", key, err)
+		}
+		if _, err := store.Get(ctx, BucketArtifacts, key); !errors.Is(err, ErrInvalidKey) {
+			t.Fatalf("Get(%q) error = %v, want ErrInvalidKey", key, err)
+		}
+	}
+}
+
+// TestFileStoreGetRacingDeleteReportsNotFound checks that a Get that observes
+// an object and then loses it to a concurrent delete reports ErrNotFound, not
+// a generic open error. Get takes no key lock, so the race is real.
+func TestFileStoreGetRacingDeleteReportsNotFound(t *testing.T) {
+	t.Parallel()
+	store := newTestFileStore(t)
+	defer store.Close()
+	ctx := context.Background()
+
+	stop := make(chan struct{})
+	writer := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				writer <- nil
+				return
+			default:
+			}
+			etag, err := store.PutIfAbsent(ctx, BucketArtifacts, "raced", []byte("raced"))
+			if err != nil {
+				writer <- err
+				return
+			}
+			if err := store.DeleteIfMatch(ctx, BucketArtifacts, "raced", etag); err != nil {
+				writer <- err
+				return
+			}
+		}
+	}()
+	var raceErr error
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline) && raceErr == nil; {
+		if _, err := store.Get(ctx, BucketArtifacts, "raced"); err != nil && !errors.Is(err, ErrNotFound) {
+			raceErr = err
+		}
+	}
+	close(stop)
+	if err := <-writer; err != nil {
+		t.Fatalf("writer error = %v", err)
+	}
+	if raceErr != nil {
+		t.Fatalf("Get(racing delete) error = %v, want nil or ErrNotFound", raceErr)
+	}
+}
