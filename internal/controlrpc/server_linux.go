@@ -61,6 +61,7 @@ type ServerConfig struct {
 
 type Server struct {
 	socketPath string
+	socketID   socketIdentity
 	listener   net.Listener
 	httpServer *http.Server
 	handler    *controlHandler
@@ -193,7 +194,8 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		cleanup()
 		return nil, fmt.Errorf("controlrpc: set socket permissions: %w", err)
 	}
-	if _, err := inspectSocket(config.SocketPath); err != nil {
+	identity, err := inspectSocket(config.SocketPath)
+	if err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -226,6 +228,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 	listener := &credentialListener{Listener: unixListener, allowedUIDs: allowedUIDs}
 	server := &Server{
 		socketPath: config.SocketPath,
+		socketID:   identity,
 		listener:   listener,
 		handler:    handler,
 	}
@@ -302,6 +305,17 @@ func (server *Server) Close() error {
 		}
 		if listenerError != nil && !errors.Is(listenerError, net.ErrClosed) {
 			server.closeError = errors.Join(server.closeError, listenerError)
+		}
+		// net.UnixListener ignores unlink errors. A leftover socket would make the
+		// next ListenServer fail, so retry removing this server's own socket and
+		// report the failure instead of exiting as if cleanup succeeded.
+		if info, err := os.Lstat(server.socketPath); err == nil {
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if ok && uint64(stat.Dev) == server.socketID.device && stat.Ino == server.socketID.inode {
+				if err := os.Remove(server.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					server.closeError = errors.Join(server.closeError, fmt.Errorf("controlrpc: remove Unix socket: %w", err))
+				}
+			}
 		}
 	})
 	return server.closeError

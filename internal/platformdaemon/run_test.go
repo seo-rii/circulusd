@@ -3,6 +3,7 @@ package platformdaemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -173,8 +174,8 @@ func TestServeCancellationClosesBlockedDiagnosticControlAndRuntime(t *testing.T)
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Serve() error = %v, want context cancellation", err)
+		if !errors.Is(err, context.Canceled) || !OnlyCancellation(err) {
+			t.Fatalf("Serve() error = %v, want only context cancellation", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Serve() did not close blocked control listener after cancellation")
@@ -190,6 +191,27 @@ func TestServeCancellationClosesBlockedDiagnosticControlAndRuntime(t *testing.T)
 	}
 	if !control.serveContextCanceled() {
 		t.Fatal("diagnostic listener context remained active after Serve returned")
+	}
+}
+
+func TestOnlyCancellationRejectsShutdownFailures(t *testing.T) {
+	cleanup := errors.New("cleanup failed")
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "canceled", err: context.Canceled, want: true},
+		{name: "joined cancellations", err: errors.Join(context.Canceled, errors.Join(context.Canceled), context.DeadlineExceeded), want: true},
+		{name: "cleanup failure", err: errors.Join(context.Canceled, nil, cleanup), want: false},
+		{name: "nested cleanup failure", err: errors.Join(context.Canceled, errors.Join(cleanup)), want: false},
+		{name: "wrapped cancellation", err: errors.Join(context.Canceled, fmt.Errorf("close: %w", context.Canceled)), want: false},
+	}
+	for _, test := range tests {
+		if got := OnlyCancellation(test.err); got != test.want {
+			t.Errorf("%s: OnlyCancellation() = %v, want %v", test.name, got, test.want)
+		}
 	}
 }
 

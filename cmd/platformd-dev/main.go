@@ -237,7 +237,7 @@ func executeDevelopment(ctx context.Context, arguments []string, dependencies de
 		return 1
 	}
 	if err := platformdaemon.Serve(ctx, control, application, runtime); err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && platformdaemon.OnlyCancellation(err) {
 			return 0
 		}
 		fmt.Fprintf(dependencies.stderr, "platformd-dev: serve diagnostic listeners: %v\n", err)

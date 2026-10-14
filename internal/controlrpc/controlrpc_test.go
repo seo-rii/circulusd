@@ -1064,6 +1064,32 @@ func TestServerServeReturnsCleanupErrorOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestServerCloseReportsSocketItCouldNotRemove(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this test relies on")
+	}
+	socketPath := testSocketPath(t)
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  socketPath,
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	directory := filepath.Dir(socketPath)
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+
+	if err := server.Close(); err == nil || !strings.Contains(err.Error(), "remove Unix socket") {
+		t.Fatalf("Close() error = %v, want the socket removal failure", err)
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		t.Fatalf("socket should remain when its directory is read-only: %v", err)
+	}
+}
+
 type closeErrorListener struct {
 	net.Listener
 	err           error
