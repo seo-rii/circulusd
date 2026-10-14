@@ -89,7 +89,8 @@ file whose extracted digest matches the `workerd` artifact in the pinned release
 manifest. Set `memoryMaxBytes` low enough that the pressure probe can reach OOM
 (256 MiB is comfortable for stock workerd, whose serve RSS is ~50 MiB) and
 `memorySwapMaxBytes` to 0 so anonymous growth cannot be swapped away from the
-cap.
+cap. `memoryMaxBytes` must be a multiple of the host page size, because the
+kernel rounds `memory.max` down to a whole page.
 
 ## Running the gate
 

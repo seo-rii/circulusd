@@ -23,7 +23,7 @@ func TestNewWorkerdCgroupControllerRejectsConfigurationOutsideClosedBounds(t *te
 		RootPath:       "/sys/fs/cgroup/circulusd-workerd",
 		MaximumShards:  1,
 		DrainTimeout:   time.Nanosecond,
-		MemoryMaxBytes: 1,
+		MemoryMaxBytes: uint64(os.Getpagesize()),
 		SwapMaxBytes:   0,
 		CPUMax:         CPUMax{QuotaMicros: 1_000, PeriodMicros: 1_000},
 		PIDsMax:        1,
@@ -41,6 +41,8 @@ func TestNewWorkerdCgroupControllerRejectsConfigurationOutsideClosedBounds(t *te
 		{name: "excessive drain", mutate: func(config *workerdCgroupConfig) { config.DrainTimeout = 30*time.Second + time.Nanosecond }},
 		{name: "zero memory", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = 0 }},
 		{name: "excessive memory", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = (1 << 50) + 1 }},
+		{name: "memory below one page", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = 1 }},
+		{name: "memory not page aligned", mutate: func(config *workerdCgroupConfig) { config.MemoryMaxBytes = uint64(os.Getpagesize()) + 1 }},
 		{name: "nonzero swap", mutate: func(config *workerdCgroupConfig) { config.SwapMaxBytes = 1 }},
 		{name: "zero cpu quota", mutate: func(config *workerdCgroupConfig) { config.CPUMax.QuotaMicros = 0 }},
 		{name: "cpu quota below minimum", mutate: func(config *workerdCgroupConfig) { config.CPUMax.QuotaMicros = 999 }},
@@ -67,7 +69,7 @@ func TestNewWorkerdCgroupControllerAcceptsClosedConfigurationBounds(t *testing.T
 	minimum := validWorkerdCgroupConfig()
 	minimum.MaximumShards = 1
 	minimum.DrainTimeout = time.Nanosecond
-	minimum.MemoryMaxBytes = 1
+	minimum.MemoryMaxBytes = uint64(os.Getpagesize())
 	minimum.CPUMax = CPUMax{QuotaMicros: 1_000, PeriodMicros: 1_000}
 	minimum.PIDsMax = 1
 	maximum := validWorkerdCgroupConfig()
