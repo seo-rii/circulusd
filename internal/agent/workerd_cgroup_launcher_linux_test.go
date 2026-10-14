@@ -80,6 +80,23 @@ func TestProbeWorkerdCgroupProvisioningClassifiesTheOperatorRoot(t *testing.T) {
 		}
 	})
 
+	t.Run("missing kernel interface is host unavailable", func(t *testing.T) {
+		for name, mutate := range map[string]func(*workerdCgroupRootInspection){
+			"cgroup.kill":     func(inspection *workerdCgroupRootInspection) { inspection.KillInterface = false },
+			"memory.swap.max": func(inspection *workerdCgroupRootInspection) { inspection.SwapMaxInterface = false },
+		} {
+			backend := newFakeWorkerdCgroupBackend()
+			mutate(&backend.inspection)
+			provisioning := probeWorkerdCgroupProvisioningWithBackend(config, backend)
+			if provisioning.Satisfied || !provisioning.HostUnavailable {
+				t.Fatalf("provisioning without %s = %+v, want host unavailable", name, provisioning)
+			}
+			if descriptors := backend.openFileDescriptors(); descriptors != 0 {
+				t.Fatalf("open descriptors after probe without %s = %d, want the root closed", name, descriptors)
+			}
+		}
+	})
+
 	t.Run("available but disabled controller is a FAIL", func(t *testing.T) {
 		backend := newFakeWorkerdCgroupBackend()
 		backend.inspection.SubtreeControl = "cpu pids\n"

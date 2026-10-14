@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -132,6 +133,12 @@ func TestNewWorkerdCgroupControllerValidatesDelegatedRootFailClosed(t *testing.T
 			backend.inspection.SubtreeControl = "memory\n"
 		}, wantErr: errWorkerdCgroupContract},
 		{name: "existing child cgroup", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.ChildDirectories = 1 }, wantErr: errWorkerdCgroupContract},
+		{name: "missing cgroup.kill", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.KillInterface = false }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "missing memory.swap.max", mutate: func(backend *fakeWorkerdCgroupBackend) { backend.inspection.SwapMaxInterface = false }, wantErr: errWorkerdCgroupUnavailable},
+		{name: "existing child dominates missing interface", mutate: func(backend *fakeWorkerdCgroupBackend) {
+			backend.inspection.ChildDirectories = 1
+			backend.inspection.KillInterface = false
+		}, wantErr: errWorkerdCgroupContract},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -177,6 +184,48 @@ func TestWorkerdCgroupProvisionedOpenFailuresNeverBecomeUnavailable(t *testing.T
 				t.Fatalf("close() error = %v, want cached poison", closeErr)
 			}
 		})
+	}
+}
+
+func TestLinuxWorkerdCgroupInspectRootReportsKernelInterfaces(t *testing.T) {
+	membership, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Skipf("read /proc/self/cgroup: %v", err)
+	}
+	line := strings.TrimSuffix(string(membership), "\n")
+	if !strings.HasPrefix(line, "0::/") || strings.Contains(line, "\n") {
+		t.Skip("test process is not in a single cgroup v2 hierarchy")
+	}
+	rootPath := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(line, "0::"))
+	var filesystem unix.Statfs_t
+	if rootPath == "/sys/fs/cgroup" || unix.Statfs(rootPath, &filesystem) != nil || filesystem.Type != unix.CGROUP2_SUPER_MAGIC {
+		t.Skipf("own cgroup %q is not a non-root cgroup v2 directory", rootPath)
+	}
+	if _, err := os.Stat(filepath.Join(rootPath, "cgroup.type")); err != nil {
+		t.Skipf("own cgroup %q has no cgroup.type: %v", rootPath, err)
+	}
+	backend := linuxWorkerdCgroupBackend{}
+	inspection, err := backend.inspectRoot(rootPath)
+	if err != nil {
+		t.Fatalf("inspectRoot(%q) error = %v", rootPath, err)
+	}
+	if err := backend.closeFD(inspection.DirectoryFD); err != nil {
+		t.Fatalf("close inspected root: %v", err)
+	}
+	for _, check := range []struct {
+		name    string
+		present bool
+	}{
+		{name: "cgroup.kill", present: inspection.KillInterface},
+		{name: "memory.swap.max", present: inspection.SwapMaxInterface},
+	} {
+		info, statErr := os.Lstat(filepath.Join(rootPath, check.name))
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("lstat %s: %v", check.name, statErr)
+		}
+		if want := statErr == nil && info.Mode().IsRegular(); check.present != want {
+			t.Fatalf("inspection reports %s present = %v, want %v", check.name, check.present, want)
+		}
 	}
 }
 
@@ -1626,10 +1675,12 @@ func newFakeWorkerdCgroupBackend() *fakeWorkerdCgroupBackend {
 				{Device: 1, Inode: 3, UID: 0, GID: 0, Mode: unix.S_IFDIR | 0o755},
 				{Device: 2, Inode: 4, UID: uid, GID: gid, Mode: unix.S_IFDIR | 0o700},
 			},
-			CgroupType:     "domain\n",
-			Processes:      "",
-			Controllers:    "cpu memory pids\n",
-			SubtreeControl: "cpu memory pids\n",
+			CgroupType:       "domain\n",
+			Processes:        "",
+			Controllers:      "cpu memory pids\n",
+			SubtreeControl:   "cpu memory pids\n",
+			KillInterface:    true,
+			SwapMaxInterface: true,
 		},
 		nextFD:               11,
 		openFDs:              map[int]struct{}{},

@@ -53,9 +53,12 @@ echo '+cpu +memory +pids' > /sys/fs/cgroup/pi-qual/cgroup.subtree_control
 ```
 
 The host also needs cgroup-v2 `memory.max` enforcement with OOM (the pressure
-probe drives a real OOM-kill), `clone3(CLONE_INTO_CGROUP)`, pidfd, and
-`memfd_create` support. The evidence output directory must be canonical,
-absolute, caller-owned, and mode `0700` (not group/other accessible).
+probe drives a real OOM-kill), `cgroup.kill` (Linux 5.14 or newer), cgroup
+swap accounting (`memory.swap.max`), `clone3(CLONE_INTO_CGROUP)`, pidfd, and
+`memfd_create` support. The cgroup preflight reports the host as unavailable
+when the root lacks `cgroup.kill` or `memory.swap.max`. The evidence output
+directory must be canonical, absolute, caller-owned, and mode `0700` (not
+group/other accessible).
 
 ## Qualification document
 
