@@ -1,3 +1,8 @@
+// Source of the committed pi-worker.mjs conformance bundle. After changing
+// this file, workers/pi-runtime/src, packages/protocol-types/src or the locked
+// Pi dependencies, run `pnpm generate:workerd-fixture`: it rebuilds the bundle
+// deterministically and re-pins its sha256 in session-host.mjs. Commit both
+// files; `pnpm check` (check:workerd-fixture) fails while either is stale.
 import {
   LowLevelPiAgentEngine,
   createOpaqueTurnAuthority,

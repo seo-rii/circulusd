@@ -9,10 +9,11 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
-    "check": "pnpm -r --if-present check",
+    "check": "pnpm -r --if-present check && pnpm check:workerd-fixture",
+    "check:workerd-fixture": "node scripts/workerd-fixture.mjs --check",
     "fuzz": "python3 scripts/fuzz.py",
     "fuzz:list": "python3 scripts/fuzz.py --list",
-    "generate:workerd-fixture": "esbuild internal/conformance/workerd/fixture/pi-worker.entry.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:sockets --outfile=internal/conformance/workerd/fixture/pi-worker.mjs",
+    "generate:workerd-fixture": "node scripts/workerd-fixture.mjs",
     "harness:dev": "pnpm --filter @circulusd/harness-backend dev",
     "harness:sandbox:build": "node harness/sandbox/build.mjs",
     "harness:sandbox:test": "node harness/sandbox/build.mjs --test",
