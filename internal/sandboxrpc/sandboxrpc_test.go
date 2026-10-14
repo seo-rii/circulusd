@@ -1334,6 +1334,84 @@ func TestSandboxWirePropagatesInFlightCancellation(t *testing.T) {
 	process.Complete(sandboxd.RunResult{ExitCode: 0})
 }
 
+func TestSandboxWireCallerCancellationLeavesNoIdempotencyReceipt(t *testing.T) {
+	t.Parallel()
+
+	server, client, runner := startTestTransport(t)
+	defer server.Close()
+	defer client.Close()
+	spawned, err := client.Spawn(context.Background(), validSpawnRequest("receipt-wire-spawn", "receipt-wire-invoc"))
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	process := nextFakeProcess(t, runner)
+	waitRequest := &v1.WaitProcessRequest{
+		Meta:    idempotentMeta("receipt-wire-wait"),
+		Process: spawned.GetProcess(),
+	}
+	waitKey := "wait\x00" + string(waitRequest.GetMeta().GetIdempotencyKey())
+	type waitOutcome struct {
+		response *v1.WaitProcessResponse
+		err      error
+	}
+	callWait := func(ctx context.Context) <-chan waitOutcome {
+		outcome := make(chan waitOutcome, 1)
+		go func() {
+			response, err := client.Wait(ctx, proto.Clone(waitRequest).(*v1.WaitProcessRequest))
+			outcome <- waitOutcome{response: response, err: err}
+		}()
+		return outcome
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := callWait(ctx)
+	var firstCall *operationCall
+	deadline := time.Now().Add(3 * time.Second)
+	for firstCall == nil {
+		server.handler.mu.Lock()
+		firstCall = server.handler.operations[waitKey]
+		server.handler.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("Wait() did not reach the server")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A concurrent retry with a live context joins the in-flight call and must
+	// not inherit the first caller's cancellation.
+	joined := callWait(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case outcome := <-first:
+		if got := connect.CodeOf(outcome.err); got != connect.CodeCanceled {
+			t.Fatalf("cancelled Wait() code = %v error=%v, want canceled", got, outcome.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled Wait() did not return")
+	}
+	select {
+	case <-firstCall.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not finish the cancelled Wait()")
+	}
+
+	process.Complete(sandboxd.RunResult{ExitCode: 3})
+	for name, outcome := range map[string]<-chan waitOutcome{
+		"joined": joined,
+		"retry":  callWait(context.Background()),
+	} {
+		select {
+		case got := <-outcome:
+			if got.err != nil || got.response.GetResult().GetExitCode() != 3 {
+				t.Fatalf("%s Wait() = (%v, %v), want exit code 3", name, got.response, got.err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s Wait() did not return", name)
+		}
+	}
+}
+
 type wrongPeerSandboxControlClient struct{}
 
 func (wrongPeerSandboxControlClient) Handshake(

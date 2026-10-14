@@ -78,8 +78,9 @@ func TestSandboxWireStdinCancellationSettlesReceiptsAndFencesPartialRetry(t *tes
 	for _, call := range []*operationCall{queuedWrite, queuedClose} {
 		select {
 		case <-call.done:
-			if connect.CodeOf(call.err) != connect.CodeCanceled {
-				t.Fatalf("queued server receipt error = %v, want canceled", call.err)
+			// Cancelled before acting, so no receipt remains for a retry to replay.
+			if !call.abandoned || call.err != nil {
+				t.Fatalf("queued server call = (abandoned %v, err %v), want abandoned without a receipt", call.abandoned, call.err)
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("queued server operation remained in flight after client cancellation")

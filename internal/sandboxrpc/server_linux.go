@@ -95,11 +95,20 @@ type processBinding struct {
 	acceptedBytes    uint64
 }
 
+// receiptAfterEffect marks an operation failure that runOnce records even when
+// the caller's context caused it, because the operation may already have acted.
+type receiptAfterEffect struct{ err error }
+
+func (failure receiptAfterEffect) Error() string { return failure.err.Error() }
+
 type operationCall struct {
 	digest   [sha256.Size]byte
 	done     chan struct{}
 	response proto.Message
 	err      error
+	// abandoned marks a call that its own caller's deadline or cancellation
+	// ended. It leaves no receipt, so joined callers start over.
+	abandoned bool
 }
 
 type peerCredential struct {
@@ -697,7 +706,9 @@ func (handler *rpcHandler) WriteStdin(ctx context.Context, request *connect.Requ
 			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("stdin sequence is not contiguous"))
 		}
 		if err := handler.supervisor.WriteStdin(requestContext, binding.handle, append([]byte(nil), message.GetData()...)); err != nil {
-			return nil, redactedError(err)
+			// A cancelled write may already have delivered a prefix before the
+			// supervisor closed stdin, so its receipt is kept.
+			return nil, receiptAfterEffect{err: redactedError(err)}
 		}
 		binding.acceptedSequence = message.GetChunkSequence()
 		binding.acceptedDigest = dataDigest
@@ -984,7 +995,11 @@ func (handler *rpcHandler) process(handle *v1.ProcessHandle) (*processBinding, e
 func (handler *rpcHandler) runOnce(ctx context.Context, method string, meta *v1.RpcRequestMeta, digest [sha256.Size]byte, execute func() (proto.Message, error)) (proto.Message, error) {
 	key := method + "\x00" + string(meta.GetIdempotencyKey())
 	handler.mu.Lock()
-	if call := handler.operations[key]; call != nil {
+	for {
+		call := handler.operations[key]
+		if call == nil {
+			break
+		}
 		if subtle.ConstantTimeCompare(call.digest[:], digest[:]) != 1 {
 			handler.mu.Unlock()
 			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("idempotency key conflicts with another request"))
@@ -992,13 +1007,16 @@ func (handler *rpcHandler) runOnce(ctx context.Context, method string, meta *v1.
 		handler.mu.Unlock()
 		select {
 		case <-call.done:
-			if call.err != nil {
-				return nil, call.err
+			if !call.abandoned {
+				if call.err != nil {
+					return nil, call.err
+				}
+				return proto.Clone(call.response), nil
 			}
-			return proto.Clone(call.response), nil
 		case <-ctx.Done():
 			return nil, redactedError(ctx.Err())
 		}
+		handler.mu.Lock()
 	}
 	if len(handler.operations) >= maximumIdempotencyKeys {
 		handler.mu.Unlock()
@@ -1009,6 +1027,11 @@ func (handler *rpcHandler) runOnce(ctx context.Context, method string, meta *v1.
 	handler.mu.Unlock()
 
 	response, err := execute()
+	var afterEffect receiptAfterEffect
+	mayHaveActed := errors.As(err, &afterEffect)
+	if mayHaveActed {
+		err = afterEffect.err
+	}
 	if err == nil && response == nil {
 		err = connect.NewError(connect.CodeInternal, errors.New("operation returned no response"))
 	}
@@ -1016,10 +1039,19 @@ func (handler *rpcHandler) runOnce(ctx context.Context, method string, meta *v1.
 		err = redactedError(err)
 	}
 	handler.mu.Lock()
-	if response != nil {
-		call.response = proto.Clone(response)
+	if err != nil && !mayHaveActed && ctx.Err() != nil &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		// The caller's own deadline or cancellation ended the attempt before
+		// the operation acted. That is not an outcome of the operation, so
+		// keep no receipt and let a same-key retry run it.
+		call.abandoned = true
+		delete(handler.operations, key)
+	} else {
+		if response != nil {
+			call.response = proto.Clone(response)
+		}
+		call.err = err
 	}
-	call.err = err
 	close(call.done)
 	handler.mu.Unlock()
 	if err != nil {
