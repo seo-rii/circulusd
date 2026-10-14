@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hancomac/circulusd/internal/canonical"
@@ -81,5 +82,19 @@ func TestExtensionJSONRejectsNonFiniteAndLossyNativeNumbers(t *testing.T) {
 	}
 	if _, _, err := normalizeExtensionJSON(canonical.Map{"__proto__": canonical.Map{"polluted": true}}); err == nil {
 		t.Fatal("accepted dangerous object keys")
+	}
+}
+
+func TestExtensionJSONRejectsTextThatXTextNormalizesIncorrectly(t *testing.T) {
+	t.Parallel()
+	for _, value := range []canonical.Map{
+		{"value": "\u00e1" + strings.Repeat("\u0301", 30)},
+		{"\U00010041" + strings.Repeat("\u0301", 31): int64(1)},
+		{"value": canonical.Array{"\u00e1" + strings.Repeat("\u0301", 30)}},
+		{"value": "a" + strings.Repeat("\u0301", 31)},
+	} {
+		if normalized, _, err := normalizeExtensionJSON(value); err == nil {
+			t.Fatalf("normalizeExtensionJSON(%+q) = %+q, want an error", value, normalized)
+		}
 	}
 }
