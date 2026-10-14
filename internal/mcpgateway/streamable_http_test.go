@@ -100,10 +100,33 @@ func TestStreamableHTTPRejectsRedirectProxyUnknownTargetAndDuplicateJSON(t *test
 	}
 }
 
+func TestDecodeMCPMessageBindsOnlyExactEnvelopeMembers(t *testing.T) {
+	for _, encoded := range []string{
+		`{"jsonrpc":"2.0","id":"one","Result":{}}`,
+		`{"jsonrpc":"2.0","id":"one","result":{},"Result":{"x":1}}`,
+		`{"jsonrpc":"2.0","id":"one","result":{},"ERROR":{"code":1,"message":"x"}}`,
+		`{"JSONRPC":"2.0","id":"one","result":{}}`,
+		`{"jsonrpc":"2.0","Id":"one","method":"tools/call"}`,
+		`{"jsonrpc":"2.0","id":"one","Method":"tools/call"}`,
+		// encoding/json folds the long s (U+017F) to "s" as well.
+		`{"jsonrpc":"2.0","id":"one","method":"tools/call","param` + "ſ" + `":{}}`,
+	} {
+		if _, err := decodeMCPMessage([]byte(encoded)); !errors.Is(err, ErrProtocolMismatch) {
+			t.Errorf("decodeMCPMessage(%s) error = %v, want protocol mismatch", encoded, err)
+		}
+	}
+	message, err := decodeMCPMessage([]byte(`{"jsonrpc":"2.0","id":"one","result":{"x":1},"extension":{"Result":2}}`))
+	if err != nil || message.JSONRPC != "2.0" || string(message.ID) != `"one"` || string(message.Result) != `{"x":1}` ||
+		message.Method != "" || len(message.Params) != 0 || len(message.Error) != 0 {
+		t.Fatalf("decodeMCPMessage(unknown member) = %#v, %v", message, err)
+	}
+}
+
 func TestStreamableHTTPRejectsUnboundedInvalidAndServerInitiatedMessages(t *testing.T) {
 	for _, test := range []struct{ name, contentType, body string }{
 		{"wrong-id", "application/json", `{"jsonrpc":"2.0","id":"wrong","result":{}}`},
 		{"duplicate-response", "application/json", `{"jsonrpc":"2.0","id":"one","result":{"x":1,"x":2}}`},
+		{"aliased-result", "application/json", `{"jsonrpc":"2.0","id":"one","Result":{}}`},
 		{"server-request", "text/event-stream", "data: {\"jsonrpc\":\"2.0\",\"id\":\"sampling\",\"method\":\"sampling/createMessage\"}\n\n"},
 		{"oversized", "application/json", strings.Repeat(" ", 8193)},
 		{"too-many-events", "text/event-stream", strings.Repeat("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n", 9)},
