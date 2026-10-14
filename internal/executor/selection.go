@@ -158,6 +158,14 @@ func ResolveBackend(selection BackendSelection) (BackendSelectionResult, error) 
 					backend,
 				)
 			}
+			// Checked for the whole order, so the outcome cannot depend on
+			// which earlier entry happens to be available.
+			if backend == BackendMock && requested != BackendMock {
+				return BackendSelectionResult{}, fmt.Errorf(
+					"%w: mock cannot satisfy a native backend request",
+					ErrDevelopmentOnly,
+				)
+			}
 			seenFallbacks[backend] = struct{}{}
 		}
 	default:
@@ -242,12 +250,6 @@ func ResolveBackend(selection BackendSelection) (BackendSelectionResult, error) 
 		}
 		if !fallbackEligible {
 			continue
-		}
-		if fallback == BackendMock && requested != BackendMock {
-			return BackendSelectionResult{}, fmt.Errorf(
-				"%w: mock cannot satisfy a native backend request",
-				ErrDevelopmentOnly,
-			)
 		}
 		securityDowngrade := requested == BackendFirecracker && fallback != BackendFirecracker
 		if securityDowngrade && !selection.Fallback.AllowSecurityDowngrade {

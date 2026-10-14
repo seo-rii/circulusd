@@ -249,6 +249,30 @@ func TestResolveBackendRejectsMockOutsideExplicitDevelopmentSelection(t *testing
 	if !errors.Is(err, executor.ErrDevelopmentOnly) {
 		t.Fatalf("ResolveBackend(mock fallback) error = %v, want ErrDevelopmentOnly", err)
 	}
+
+	// Mock is rejected wherever it appears in the order, even when an earlier
+	// fallback or the requested backend itself would resolve.
+	for _, docker := range []executor.Capability{
+		{Backend: executor.BackendDocker, Available: false, UnavailableReason: "daemon unavailable"},
+		{Backend: executor.BackendDocker, Available: true},
+	} {
+		selection.HostCapabilities = []executor.Capability{
+			{Backend: executor.BackendNsJail, Available: true},
+			docker,
+			{Backend: executor.BackendMock, Available: true, DevelopmentOnly: true},
+		}
+		for _, order := range [][]executor.Backend{
+			{executor.BackendNsJail, executor.BackendMock},
+			{executor.BackendMock, executor.BackendNsJail},
+		} {
+			selection.Fallback.Order = order
+			result, err := executor.ResolveBackend(selection)
+			if !errors.Is(err, executor.ErrDevelopmentOnly) {
+				t.Fatalf("ResolveBackend(docker available %v, fallback %v) = %#v, %v, want ErrDevelopmentOnly",
+					docker.Available, order, result, err)
+			}
+		}
+	}
 }
 
 func TestResolveBackendRejectsMalformedAndDuplicateInputs(t *testing.T) {
