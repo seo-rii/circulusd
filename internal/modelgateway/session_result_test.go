@@ -58,6 +58,59 @@ func TestSessionPiModelResultMatchesActualSessionDispatchTerminalEncoder(t *test
 	}
 }
 
+func TestSessionDispatchDoesNotCommitCompletionsPiCannotSettle(t *testing.T) {
+	arguments, err := NewCanonicalToolArguments(canonical.Map{"ok": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ToolCall{ID: "call-a", Name: "lookup", Arguments: arguments, Order: ToolCallOrder{Declared: true}}
+	for _, test := range []struct {
+		name     string
+		response ProviderResponse
+		want     effectledger.TerminalStatus
+	}{
+		{"stop", ProviderResponse{FinishReason: "stop"}, effectledger.TerminalCommitted},
+		{"tool use", ProviderResponse{FinishReason: "tool_calls", ToolCalls: []ToolCall{call}}, effectledger.TerminalCommitted},
+		{"content filter", ProviderResponse{FinishReason: "content_filter"}, effectledger.TerminalUnknown},
+		{"cancelled", ProviderResponse{FinishReason: "cancelled"}, effectledger.TerminalUnknown},
+		{"unrecognized reason", ProviderResponse{FinishReason: "provider_specific"}, effectledger.TerminalUnknown},
+		{"tool use without calls", ProviderResponse{FinishReason: "tool_calls"}, effectledger.TerminalUnknown},
+		{"stop with calls", ProviderResponse{FinishReason: "stop", ToolCalls: []ToolCall{call}}, effectledger.TerminalUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := test.response
+			response.Text, response.Usage = "done", Usage{InputTokens: 11, OutputTokens: 3}
+			fixture := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{
+				{Kind: ProviderEventResponseCompleted, Response: &response},
+			}}, nil, true)
+			gateway := *fixture.gateway
+			gateway.bounds.MaxEventBytes = 1024
+			gateway.bounds.MaxResponseBytes = 1024
+			starter, err := NewReferenceSessionDispatchStarter(&gateway, fixture.ledger, fixture.starter.RouteDigest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.starter = starter
+			digest, err := fixture.starter.Prepare(context.Background(), fixture.dispatch, fixture.transition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			consumer, _ := fixture.consumer(t, digest)
+			if _, err := consumer.StartExactAttempt(context.Background(), fixture.startRequest(digest)); err != nil {
+				t.Fatal(err)
+			}
+			facts, err := fixture.ledger.Inspect(context.Background(), sessionLookup(fixture.dispatch))
+			if err != nil || facts.Terminal.Status != test.want {
+				t.Fatalf("terminal status = %q, %v; want %q", facts.Terminal.Status, err, test.want)
+			}
+			result, err := DecodeSessionDispatchResult(facts.Terminal.Result)
+			if err != nil || (result.State == StateCompleted) != (test.want == effectledger.TerminalCommitted) {
+				t.Fatalf("terminal result = %#v, %v", result, err)
+			}
+		})
+	}
+}
+
 func TestSessionPiModelResultPreservesActualColdEngineFixture(t *testing.T) {
 	for _, name := range []string{"model_tool_call", "model_final"} {
 		t.Run(name, func(t *testing.T) {

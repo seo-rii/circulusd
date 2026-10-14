@@ -163,6 +163,9 @@ func TestSessionModelRetainsEscapedCompletionAndBase64ToolArguments(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			event := completedSessionProviderEvent()
 			event.Response.Text, event.Response.ToolCalls = test.text, test.calls
+			if len(test.calls) > 0 {
+				event.Response.FinishReason = string(FinishReasonToolCalls)
+			}
 			fixture := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{event}}, nil, true)
 			configuration := fixture.model.configuration()
 			configuration.Bounds.MaxEventBytes, configuration.Bounds.MaxResponseBytes = 1<<20, 1<<20

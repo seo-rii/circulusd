@@ -288,6 +288,12 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 				break
 			}
 			event.ExpectedRevision = current.Revision
+			if _, settleable := sessionPiStopReason(event.Response); event.Kind == EventResponseCompleted && !settleable {
+				// No Pi settlement can carry this response, so committing it
+				// would charge a result that can never be settled.
+				terminalStatus = effectledger.TerminalUnknown
+				break
+			}
 			applied, applyErr := starter.gateway.Apply(current, event)
 			if applyErr != nil {
 				terminalStatus = effectledger.TerminalUnknown

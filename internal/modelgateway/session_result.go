@@ -100,9 +100,7 @@ func ValidateSessionPiResult(encodedLedgerResult, normalizedCBOR []byte) ([]byte
 		}
 	}
 	stop, ok := message["stopReason"].(string)
-	if !ok || !((stop == "stop" && facts.Response.FinishReason == FinishReasonStop) ||
-		(stop == "length" && facts.Response.FinishReason == FinishReasonLength) ||
-		(stop == "toolUse" && facts.Response.FinishReason == FinishReasonToolCalls)) {
+	if want, settleable := sessionPiStopReason(facts.Response); !ok || !settleable || stop != want {
 		return nil, ErrInvalidRequest
 	}
 	content, ok := message["content"].(canonical.Array)
@@ -169,6 +167,31 @@ func ValidateSessionPiResult(encodedLedgerResult, normalizedCBOR []byte) ([]byte
 	// Decode rejects non-canonical encodings; retain precisely those bytes rather
 	// than rebuilding a provider message or rounding its decimal fields.
 	return bytes.Clone(normalizedCBOR), nil
+}
+
+// sessionPiStopReason returns the Pi v2 stop reason for a completed response.
+// Pi has no stop reason for content filtering, cancellation or unrecognized
+// provider reasons, and reports toolUse exactly when tool calls are present,
+// so any other response can never be settled as a Session model result.
+func sessionPiStopReason(response *ModelResponse) (string, bool) {
+	if response == nil {
+		return "", false
+	}
+	var stop string
+	switch response.FinishReason {
+	case FinishReasonStop:
+		stop = "stop"
+	case FinishReasonLength:
+		stop = "length"
+	case FinishReasonToolCalls:
+		stop = "toolUse"
+	default:
+		return "", false
+	}
+	if (stop == "toolUse") != (len(response.ToolCalls) > 0) {
+		return "", false
+	}
+	return stop, true
 }
 
 func sessionPiRecord(value canonical.Value, required, optional []string) (canonical.Map, bool) {
