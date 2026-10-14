@@ -1,6 +1,8 @@
 module github.com/hancomac/circulusd
 
-go 1.25.0
+go 1.26.0
+
+toolchain go1.26.9
 
 require (
 	connectrpc.com/connect v1.19.1
@@ -12,7 +14,7 @@ require (
 	github.com/dlclark/regexp2/v2 v2.8.4
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	golang.org/x/crypto v0.48.0
-	golang.org/x/text v0.41.0
+	golang.org/x/text v0.43.0
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/yaml.v3 v3.0.1
 )
