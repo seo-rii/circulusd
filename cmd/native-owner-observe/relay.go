@@ -86,20 +86,23 @@ func newRelay(cfg config) (*relay, error) {
 	// The held parent fd closes before listener shutdown. Never let the net
 	// package unlink through a possibly reused /proc/self/fd number.
 	controlListener.(*net.UnixListener).SetUnlinkOnClose(false)
-	if err = unix.Fchmodat(parent, filepath.Base(cfg.ControlSocket), 0600, 0); err != nil {
+	// Every later failure removes the socket this call bound, through the
+	// still-held parent.
+	abandon := func(err error) (*relay, error) {
 		controlListener.Close()
+		_ = unix.Unlinkat(parent, filepath.Base(cfg.ControlSocket), 0)
 		return nil, err
+	}
+	if err = unix.Fchmodat(parent, filepath.Base(cfg.ControlSocket), 0600, 0); err != nil {
+		return abandon(err)
 	}
 	info, err := os.Lstat(cfg.ControlSocket)
 	if err != nil {
-		controlListener.Close()
-		return nil, err
+		return abandon(err)
 	}
 	listener, err := net.Listen("tcp", cfg.ListenAddress)
 	if err != nil {
-		controlListener.Close()
-		os.Remove(cfg.ControlSocket)
-		return nil, err
+		return abandon(err)
 	}
 	u, _ := loopbackEndpoint(cfg.UpstreamEndpoint)
 	r := &relay{cfg: cfg, upstream: u, listener: listener, controlListener: controlListener, failed: make(chan struct{}), closed: make(chan struct{}), socketInfo: info,

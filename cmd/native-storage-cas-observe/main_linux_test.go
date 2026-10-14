@@ -33,7 +33,10 @@ type conditionalFixture struct {
 	firstFailure      int
 	staleFailure      int
 	foreignAfterFresh bool
-	requests          []string
+	// ignorePreconditions models a store that accepts conditional writes
+	// without enforcing them.
+	ignorePreconditions bool
+	requests            []string
 }
 
 func (fixture *conditionalFixture) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
@@ -63,7 +66,9 @@ func (fixture *conditionalFixture) serve(t *testing.T, w http.ResponseWriter, r 
 		if strings.HasPrefix(string(body), "circulusd-raw-cas-winner-") {
 			fixture.contenders++
 		}
-		if r.Header.Get("If-None-Match") == "*" {
+		if fixture.ignorePreconditions && (r.Header.Get("If-None-Match") == "*" || r.Header.Get("If-Match") != "") {
+			// Accept the write below without checking the precondition.
+		} else if r.Header.Get("If-None-Match") == "*" {
 			if fixture.data != nil {
 				failure(412)
 				return
@@ -178,6 +183,37 @@ func TestObserveRefusesForeignObjectCleanup(t *testing.T) {
 	defer fixture.mu.Unlock()
 	if string(fixture.data) != "unrelated-object" || fixture.deletes != 1 {
 		t.Fatalf("foreign object was deleted: %+v", fixture)
+	}
+}
+
+func TestObserveCleansProbeWrittenDespiteIgnoredPreconditions(t *testing.T) {
+	fixture := &conditionalFixture{ignorePreconditions: true}
+	facts, err := observe(context.Background(), fixtureOptions(t, fixture), time.Second, bytes.NewReader(make([]byte, 16)))
+	if err == nil || facts.StaleUpdateStatus != 0 || facts.DuplicateCreateStatus != 0 || facts.Contenders != 0 {
+		t.Fatalf("ignored preconditions produced observations: %+v %v", facts, err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.data != nil {
+		t.Fatalf("probe object left behind: %q", fixture.data)
+	}
+}
+
+func TestReadPrivateJSONRejectsHardLinkedInput(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "credentials.json")
+	if err := os.WriteFile(path, []byte(`{"accessKeyId":"fixture","secretAccessKey":"fixture"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var values credentialValues
+	if err := readPrivateJSON(path, &values); err != nil {
+		t.Fatalf("private input rejected: %v", err)
+	}
+	if err := os.Link(path, filepath.Join(parent, "alias.json")); err != nil {
+		t.Fatal(err)
+	}
+	if readPrivateJSON(path, &values) == nil {
+		t.Fatal("hard-linked private input accepted")
 	}
 }
 
