@@ -236,6 +236,12 @@ func (gateway *Gateway) Apply(effect Effect, event Event) (Transition, error) {
 			next.Outcome = OutcomeUncertain
 		}
 	}
+	if recoveryEvent {
+		// A not-prevented cancellation already proved the request was sent; the
+		// recovery permit now governs the outcome. The cancellation permit is
+		// bound to its resolution revision and may not coexist with recovery.
+		next.CancellationPermit = CancellationPermit{}
+	}
 
 	projectedEventCount := next.EventCount + 1
 	if next.Outcome == "" && uint64(projectedEventCount)+uint64(minimumTerminalEvents(next)) > uint64(gateway.bounds.MaxEvents) {
