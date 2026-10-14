@@ -57,6 +57,11 @@ func NewHost(config Config) (*Host, error) {
 	if uint64(limits.MaxCapabilityClaims) > uint64(^uint32(0)) {
 		return nil, fmt.Errorf("%w: capability claim count exceeds permit index range", ErrInvalidConfig)
 	}
+	// Claims are sealed only after commit, so a claim larger than a permit
+	// can carry would be durable yet fail every response and receipt replay.
+	if limits.MaxCapabilityClaimBytes > permitMaximumPayloadBytes {
+		return nil, fmt.Errorf("%w: capability claim bytes exceed the sealed permit payload limit", ErrInvalidConfig)
+	}
 	return &Host{
 		storage:       config.Storage,
 		aggregate:     config.Aggregate,
