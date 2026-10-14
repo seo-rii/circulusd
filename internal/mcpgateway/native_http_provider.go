@@ -464,10 +464,14 @@ func (call *nativeHTTPCall) Close(ctx context.Context) error {
 }
 
 func nativeWireLedger(row nativeWireInvocation, scope ValidatedAuthority, digest Digest) LedgerRecord {
-	record := LedgerRecord{InvocationID: scope.InvocationID, RequestDigest: digest, ProviderRequestID: row.ProviderRequestID, Status: LedgerUnknown}
+	// Absent and unknown ledger records are identity-free. A retained RPC
+	// error or late cancelled response keeps its request ID privately; the
+	// accepted identity reaches the effect only through Start.
+	record := LedgerRecord{InvocationID: scope.InvocationID, RequestDigest: digest, Status: LedgerUnknown}
 	if row.TerminalStatus == LedgerCommitted {
 		rpc, _ := decodeMCPMessage(row.TerminalJSON)
 		record.Status = LedgerCommitted
+		record.ProviderRequestID = row.ProviderRequestID
 		record.Output = bytes.Clone(rpc.Result)
 	}
 	if !row.StartClaimed {

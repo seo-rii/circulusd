@@ -246,18 +246,58 @@ func TestNativeHTTPProviderRPCErrorDoesNotProveExternalRollback(t *testing.T) {
 			_, command, _ := prepareNativeHTTPCommand(t, fixture)
 			provider := fixture.factory.providers[fixture.effect.ProviderID]
 			for range 2 {
-				if _, err := provider.Start(context.Background(), command); err == nil {
+				result, err := provider.Start(context.Background(), command)
+				if err == nil {
 					t.Fatal("RPC error was promoted to a completed tool result")
+				}
+				if valid != (result.ProviderRequestID != "") {
+					t.Fatal("malformed error supplied acceptance authority")
 				}
 			}
 			record, err := provider.Lookup(context.Background(), LedgerQuery{Scope: command.Scope, Server: command.Server, ToolName: command.ToolName, InvocationID: command.InvocationID, RequestDigest: command.RequestDigest, Negotiation: command.Negotiation, Start: command.Start})
 			if err != nil || record.Status != LedgerUnknown || calls.Load() != 1 {
 				t.Fatal("RPC error manufactured rollback or replay authority")
 			}
-			if valid != (record.ProviderRequestID != "") {
-				t.Fatal("malformed error supplied acceptance authority")
+			// Unknown is identity-free; acceptance is reported only by Start.
+			if record.ProviderRequestID != "" || fixture.factory.validator.validateLedgerRecord(record, true) != nil {
+				t.Fatal("unknown ledger record violates the gateway record contract")
 			}
 		})
+	}
+}
+
+func TestNativeHTTPProviderRPCErrorRecoversWithoutLedgerMismatch(t *testing.T) {
+	var calls atomic.Int32
+	server := nativeHTTPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		message, _ := decodeMCPMessage(body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"bad params"}}`, message.ID)
+	})
+	fixture := newNativeHTTPFixture(t, server.URL)
+	provisionNativeFixture(t, fixture)
+	gateway, err := NewProductionGateway(fixture.configuration, qualifyNativeFactory(t, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := fixture.factory.repository.Admit(context.Background(), fixture.effect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := gateway.Execute(context.Background(), fixture.bearer, stored.Effect, discardSink())
+	attempt, _ := current.CurrentAttempt()
+	if err != nil || current.State != StateUncertain || attempt.ProviderRequestID == "" || attempt.Failure != FailureUnknown || calls.Load() != 1 {
+		t.Fatalf("RPC error was not retained as an accepted unknown outcome: %v/%s/%s", err, current.State, attempt.Failure)
+	}
+	// Every retry must reach the same terminal decision; a rejected ledger
+	// record would leave the turn's MCP slot blocked forever.
+	for range 2 {
+		result, err := gateway.Recover(context.Background(), fixture.bearer, current)
+		if err != nil || result.Action != RecoveryInterrupted || result.Effect.State != StateUncertain || calls.Load() != 1 {
+			t.Fatalf("recovery after RPC error: %v/%s/%s", err, result.Action, result.Effect.State)
+		}
+		current = result.Effect
 	}
 }
 
@@ -305,6 +345,10 @@ func TestNativeHTTPProviderCancellationNotificationCannotProvePrevention(t *test
 	record, err := provider.Lookup(context.Background(), LedgerQuery{Scope: command.Scope, Server: command.Server, ToolName: command.ToolName, InvocationID: command.InvocationID, RequestDigest: command.RequestDigest, Negotiation: command.Negotiation, Start: command.Start})
 	if err != nil || record.Status != LedgerUnknown || calls.Load() != 1 {
 		t.Fatal("cancellation lost conservative unknown fact")
+	}
+	recovered, err := gateway.Recover(context.Background(), fixture.bearer, cancelled)
+	if err != nil || recovered.Action != RecoveryInterrupted || recovered.Effect.State != StateUncertain || calls.Load() != 1 {
+		t.Fatalf("late cancelled response blocked recovery: %v/%s/%s", err, recovered.Action, recovered.Effect.State)
 	}
 	repository, err := newNativeRepository(fixture.source, fixture.factory.repository.binding, fixture.factory.repository.check, "native-http-fixture", 128, 1<<20, fixture.factory.repository.now)
 	if err != nil {
