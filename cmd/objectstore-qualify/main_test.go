@@ -255,6 +255,28 @@ func TestQualificationRejectsCaseFoldedTargetAndCredentialAliases(t *testing.T) 
 	}
 }
 
+func TestQualificationRequiresExactFieldNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "exact.json")
+	valid := `{"schemaVersion":1,"endpoint":"https://example.com","region":"us-east-1","bucket":"existing-bucket","credentials":{"source":"environment"}}`
+	os.WriteFile(path, []byte(valid), 0600)
+	var config qualificationConfig
+	if err := readJSONFile(path, &config, false); err != nil || config.Endpoint != "https://example.com" || config.Credentials.Source != "environment" {
+		t.Fatalf("exact configuration rejected: %#v %v", config, err)
+	}
+	for _, alias := range [][2]string{{`"endpoint"`, `"Endpoint"`}, {`"schemaVersion"`, `"SCHEMAVERSION"`}, {`"source"`, `"\u017Fource"`}} {
+		os.WriteFile(path, []byte(strings.Replace(valid, alias[0], alias[1], 1)), 0600)
+		var config qualificationConfig
+		if err := readJSONFile(path, &config, false); err == nil {
+			t.Fatalf("configuration field alias %s accepted", alias[1])
+		}
+	}
+	os.WriteFile(path, []byte(`{"AccessKeyId":"fixture-access","secretAccessKey":"fixture-secret"}`), 0600)
+	var values credentialValues
+	if err := readJSONFile(path, &values, true); err == nil {
+		t.Fatal("credential field alias accepted")
+	}
+}
+
 func TestQualificationNetworkUnavailableIsBoundedAndRedacted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(403)
