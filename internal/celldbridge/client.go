@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -117,9 +118,11 @@ func (client *Client) begin(ctx context.Context) (context.Context, func(), [32]b
 		return nil, nil, zero, zero, ErrInvalidConfig
 	}
 	client.active.Add(1)
-	active, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(client.lifecycle, cancel)
-	return active, func() { stop(); cancel(); client.active.Done() }, client.requestKey, client.responseKey, nil
+	// Close cancels with ErrClosed so an interrupted request does not look
+	// like caller cancellation.
+	active, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(client.lifecycle, func() { cancel(ErrClosed) })
+	return active, func() { stop(); cancel(nil); client.active.Done() }, client.requestKey, client.responseKey, nil
 }
 func (client *Client) post(ctx context.Context, path, contentType string, body []byte, headers http.Header, limit int) ([]byte, http.Header, int, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.endpoint+path, bytes.NewReader(body))
@@ -136,6 +139,9 @@ func (client *Client) post(ctx context.Context, path, contentType string, body [
 			response.Body.Close()
 		}
 		if err := ctx.Err(); err != nil {
+			if errors.Is(context.Cause(ctx), ErrClosed) {
+				return nil, nil, 0, ErrClosed
+			}
 			return nil, nil, 0, err
 		}
 		return nil, nil, 0, ErrUnavailable
@@ -147,6 +153,9 @@ func (client *Client) post(ctx context.Context, path, contentType string, body [
 	encoded, err := io.ReadAll(io.LimitReader(response.Body, int64(limit)+1))
 	if err != nil {
 		if err := ctx.Err(); err != nil {
+			if errors.Is(context.Cause(ctx), ErrClosed) {
+				return nil, nil, 0, ErrClosed
+			}
 			return nil, nil, 0, err
 		}
 		return nil, nil, 0, ErrInvalidResponse

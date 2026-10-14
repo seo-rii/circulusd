@@ -380,8 +380,8 @@ func TestClientPinsOriginAndBoundsWholeRequestLifetime(t *testing.T) {
 	client.Close()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("closed source returned successful result")
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("request interrupted by Close = %v, want %v", err, ErrClosed)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Close did not cancel owned request")
@@ -389,6 +389,37 @@ func TestClientPinsOriginAndBoundsWholeRequestLifetime(t *testing.T) {
 	_, err = client.ReadSnapshot(context.Background(), SnapshotRequest{ObjectID: clientFixtureObject()})
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed request=%v", err)
+	}
+}
+
+func TestClientReportsCallerCancellationBeforeClose(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		close(started)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Endpoint: server.URL, KeyID: "fixture-storage", RootKey: clientFixtureKey(), Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.ReadSnapshot(ctx, SnapshotRequest{ObjectID: clientFixtureObject()})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("caller-cancelled request = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not stop the request")
 	}
 }
 
