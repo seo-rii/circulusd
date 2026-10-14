@@ -148,7 +148,30 @@ func decodeMCPMessage(data []byte) (mcpRPCMessage, error) {
 	if _, err := d.Token(); !errors.Is(err, io.EOF) {
 		return message, ErrProtocolMismatch
 	}
-	if json.Unmarshal(data, &message) != nil || message.JSONRPC != "2.0" {
+	// Bind envelope members by exact name. Unmarshalling into the struct would
+	// also bind case variants such as "Result" (BUG-011 class), so such a
+	// variant is rejected; other unknown members are ignored as before.
+	var members map[string]json.RawMessage
+	if json.Unmarshal(data, &members) != nil || members == nil {
+		return mcpRPCMessage{}, ErrProtocolMismatch
+	}
+	fields := map[string]any{"jsonrpc": &message.JSONRPC, "id": &message.ID, "method": &message.Method,
+		"params": &message.Params, "result": &message.Result, "error": &message.Error}
+	for name, raw := range members {
+		field, known := fields[name]
+		if !known {
+			for envelopeName := range fields {
+				if strings.EqualFold(name, envelopeName) {
+					return mcpRPCMessage{}, ErrProtocolMismatch
+				}
+			}
+			continue
+		}
+		if json.Unmarshal(raw, field) != nil {
+			return mcpRPCMessage{}, ErrProtocolMismatch
+		}
+	}
+	if message.JSONRPC != "2.0" {
 		return mcpRPCMessage{}, ErrProtocolMismatch
 	}
 	return message, nil
