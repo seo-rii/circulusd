@@ -414,6 +414,56 @@ func TestRootDigestUsesDomainSeparatedSHA256(t *testing.T) {
 	}
 }
 
+func TestCanonicalMatchesPackageFunctionsAndOwnsItsEntries(t *testing.T) {
+	t.Parallel()
+
+	input := []manifest.Entry{
+		{Path: "docs/cafe\u0301.txt", Type: manifest.File, Mode: 0o600, Size: 3, ContentDigest: abcSHA256},
+		{Path: "docs", Type: manifest.Directory, Mode: 0o700},
+		{Path: "docs/latest", Type: manifest.Symlink, SymlinkTarget: "./cafe\u0301.txt"},
+	}
+	wantEntries, err := manifest.Canonicalize(input)
+	if err != nil {
+		t.Fatalf("Canonicalize() error = %v", err)
+	}
+	wantEncoded, err := manifest.MarshalCanonical(input)
+	if err != nil {
+		t.Fatalf("MarshalCanonical() error = %v", err)
+	}
+	wantDigest, err := manifest.RootDigest(input)
+	if err != nil {
+		t.Fatalf("RootDigest() error = %v", err)
+	}
+
+	canonicalManifest, err := manifest.NewCanonical(input)
+	if err != nil {
+		t.Fatalf("NewCanonical() error = %v", err)
+	}
+	entries := canonicalManifest.Entries()
+	if !reflect.DeepEqual(entries, wantEntries) {
+		t.Fatalf("Entries() = %#v, want %#v", entries, wantEntries)
+	}
+	// Neither the input nor a returned copy can change what is encoded.
+	input[0].Path = "mutated"
+	entries[0].Path = "../escape"
+	encoded, err := canonicalManifest.MarshalCanonical()
+	if err != nil || !bytes.Equal(encoded, wantEncoded) {
+		t.Fatalf("MarshalCanonical() = %x, %v, want %x", encoded, err, wantEncoded)
+	}
+	digest, err := canonicalManifest.RootDigest()
+	if err != nil || digest != wantDigest {
+		t.Fatalf("RootDigest() = %q, %v, want %q", digest, err, wantDigest)
+	}
+
+	if _, err := manifest.NewCanonical([]manifest.Entry{{Path: "/abs", Type: manifest.Directory}}); !errors.Is(err, manifest.ErrInvalidPath) {
+		t.Fatalf("NewCanonical(invalid) error = %v, want ErrInvalidPath", err)
+	}
+	empty, err := manifest.NewCanonical(nil)
+	if err != nil || empty.Entries() == nil {
+		t.Fatalf("NewCanonical(nil) = %#v, %v, want a non-nil empty entry list like Canonicalize", empty.Entries(), err)
+	}
+}
+
 func TestCanonicalOperationsAreSafeForConcurrentUse(t *testing.T) {
 	entries := []manifest.Entry{
 		{Path: "data", Type: manifest.Directory, Mode: 0o755},
