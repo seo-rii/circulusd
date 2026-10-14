@@ -420,7 +420,7 @@ func TestScanRejectsUnsupportedOrUnsafeFilesystemState(t *testing.T) {
 					t.Fatalf("Symlink() error = %v", err)
 				}
 			},
-			want: manifest.ErrInvalidEntry,
+			want: manifest.ErrInvalidSymlink,
 		},
 		{
 			name: "escaping relative symlink",
@@ -430,7 +430,7 @@ func TestScanRejectsUnsupportedOrUnsafeFilesystemState(t *testing.T) {
 					t.Fatalf("Symlink() error = %v", err)
 				}
 			},
-			want: manifest.ErrInvalidEntry,
+			want: manifest.ErrInvalidSymlink,
 		},
 		{
 			name: "fifo",
