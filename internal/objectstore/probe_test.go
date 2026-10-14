@@ -226,6 +226,76 @@ func TestCASProbeCleansUpAnUncertainCreateResponse(t *testing.T) {
 	}
 }
 
+func TestCASProbeRequiresUpdatesOfMissingObjectsToBeRejected(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status conformance.Status
+		cas    func(Store, context.Context, Bucket, string, ETag, []byte) (ETag, error)
+	}{
+		{name: "not found", status: conformance.Pass},
+		{name: "precondition failed", status: conformance.Pass, cas: func(store Store, ctx context.Context, bucket Bucket, key string, expected ETag, data []byte) (ETag, error) {
+			etag, err := store.CompareAndSwap(ctx, bucket, key, expected, data)
+			if errors.Is(err, ErrNotFound) {
+				err = ErrPreconditionFailed
+			}
+			return etag, err
+		}},
+		{name: "creates missing object", status: conformance.Fail, cas: func(store Store, ctx context.Context, bucket Bucket, key string, expected ETag, data []byte) (ETag, error) {
+			etag, err := store.CompareAndSwap(ctx, bucket, key, expected, data)
+			if errors.Is(err, ErrNotFound) {
+				return store.PutIfAbsent(ctx, bucket, key, data)
+			}
+			return etag, err
+		}},
+		{name: "unavailable", status: conformance.Unavailable, cas: func(store Store, ctx context.Context, bucket Bucket, key string, expected ETag, data []byte) (ETag, error) {
+			etag, err := store.CompareAndSwap(ctx, bucket, key, expected, data)
+			if errors.Is(err, ErrNotFound) {
+				err = ErrUnavailable
+			}
+			return etag, err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			var stages []string
+			result := ProbeCAS(context.Background(), ProbeConfig{
+				Component: "object-store/missing-cas",
+				Observe:   func(o ProbeObservation) { stages = append(stages, o.Stage) },
+				Open: func(context.Context) (Store, error) {
+					store, err := NewFileStore(root, FileStoreOptions{MaximumObjectBytes: 1 << 20})
+					if err != nil {
+						return nil, err
+					}
+					if test.cas == nil {
+						return store, nil
+					}
+					return &missingCASStore{FileStore: store, cas: test.cas}, nil
+				},
+			})
+			if result.Status != test.status {
+				t.Fatalf("ProbeCAS() = %#v, want %s", result, test.status)
+			}
+			if test.status == conformance.Pass && stages[len(stages)-1] != "missing object update rejected" {
+				t.Fatalf("stages = %v", stages)
+			}
+			if objects := objectCount(t, root); objects != 0 {
+				t.Fatalf("probe left %d test objects behind", objects)
+			}
+		})
+	}
+}
+
+type missingCASStore struct {
+	*FileStore
+	cas func(Store, context.Context, Bucket, string, ETag, []byte) (ETag, error)
+}
+
+func (store *missingCASStore) CompareAndSwap(ctx context.Context, bucket Bucket, key string, expected ETag, data []byte) (ETag, error) {
+	return store.cas(store.FileStore, ctx, bucket, key, expected, data)
+}
+
 type brokenConditionalStore struct {
 	Store
 }
