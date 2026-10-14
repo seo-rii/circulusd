@@ -16,6 +16,7 @@ import (
 	"github.com/hancomac/circulusd/internal/authstate"
 	"github.com/hancomac/circulusd/internal/celld"
 	"github.com/hancomac/circulusd/internal/dependency"
+	"github.com/hancomac/circulusd/internal/ed25519key"
 	"github.com/hancomac/circulusd/internal/identity"
 )
 
@@ -122,7 +123,7 @@ func New(config Config) (*Publisher, error) {
 	if _, err := dependency.RequireAtomicDomain([]dependency.AtomicGroup{group}, config.Reader, config.Storage); err != nil {
 		return nil, err
 	}
-	if _, err := identity.Parse(identity.Tenant, config.TenantID); err != nil || !validIdentifier(config.KeyID) || !validPublicKey(config.PublicKey) {
+	if _, err := identity.Parse(identity.Tenant, config.TenantID); err != nil || !validIdentifier(config.KeyID) || !ed25519key.IsCanonicalPrimeOrder(config.PublicKey) {
 		return nil, ErrInvalidConfiguration
 	}
 	// The storage descriptor supplies the transaction identity. Require the

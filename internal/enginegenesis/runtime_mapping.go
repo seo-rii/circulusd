@@ -1,11 +1,10 @@
 package enginegenesis
 
 import (
-	"bytes"
 	"crypto/ed25519"
 
-	"filippo.io/edwards25519"
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/ed25519key"
 )
 
 const (
@@ -173,22 +172,7 @@ func VerifySignedRuntimeMapping(document []byte, expectedMappingDigest string, r
 // and small-order or mixed-order roots from becoming signing authorities.
 func runtimeMappingPublicKey(publicKey ed25519.PublicKey) ([ed25519.PublicKeySize]byte, bool) {
 	var material [ed25519.PublicKeySize]byte
-	if len(publicKey) != ed25519.PublicKeySize {
-		return material, false
-	}
-	point, err := new(edwards25519.Point).SetBytes(publicKey)
-	if err != nil || !bytes.Equal(point.Bytes(), publicKey) || point.Equal(edwards25519.NewIdentityPoint()) == 1 {
-		return material, false
-	}
-	var encoded [32]byte
-	encoded[0] = 8
-	cofactor, err := edwards25519.NewScalar().SetCanonicalBytes(encoded[:])
-	if err != nil {
-		return material, false
-	}
-	inverse := new(edwards25519.Scalar).Invert(cofactor)
-	projection := new(edwards25519.Point).ScalarMult(inverse, new(edwards25519.Point).MultByCofactor(point))
-	if projection.Equal(point) != 1 {
+	if !ed25519key.IsCanonicalPrimeOrder(publicKey) {
 		return material, false
 	}
 	copy(material[:], publicKey)
