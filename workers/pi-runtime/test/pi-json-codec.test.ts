@@ -21,6 +21,10 @@ const vectors = JSON.parse(readFileSync(new URL(
   invalidNumbers: { name: string; bitsHex: string }[];
 };
 
+const canonicalText = JSON.parse(readFileSync(new URL(
+  "../../../packages/protocol-types/fixtures/canonical-text-nfc-v1.json", import.meta.url,
+), "utf8")) as { text: { name: string; inputHex: string; canonicalHex: string }[] };
+
 function fromBits(bits: string): number {
   const buffer = new ArrayBuffer(8);
   const view = new DataView(buffer);
@@ -50,6 +54,13 @@ describe("pi JSON fractional-number codec (R3)", () => {
 
   it.each(vectors.invalidNumbers)("rejects shared invalid number $name", ({ bitsHex }) => {
     expect(() => encodePiJson(fromBits(bitsHex))).toThrow();
+  });
+
+  it.each(canonicalText.text)("normalizes $name text to the NFC shared with Go", (vector) => {
+    const input = Buffer.from(vector.inputHex, "hex").toString("utf8");
+    const canonical = Buffer.from(vector.canonicalHex, "hex").toString("utf8");
+    expect(encodePiJson({ [input]: [input] })).toEqual({ [canonical]: [canonical] });
+    expect(decodePiJson({ [canonical]: [canonical] })).toEqual({ [canonical]: [canonical] });
   });
 
   it("round-trips fractional tool-call arguments through the integer-only boundary", () => {

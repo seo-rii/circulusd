@@ -1,5 +1,7 @@
 import { validationError } from "./errors.ts";
-import { assertUnicodeScalarString } from "./text.ts";
+import {
+  assertUnicodeScalarString, isCanonicalText, normalizeCanonicalText,
+} from "./text.ts";
 import type { CanonicalCborOptions, NormalizedValue } from "./types.ts";
 
 const DEFAULT_MAX_DEPTH = 64;
@@ -45,7 +47,7 @@ function normalize(
   }
   if (typeof value === "string") {
     assertUnicodeScalarString(value, path);
-    return value.normalize("NFC");
+    return normalizeCanonicalText(value);
   }
   if (typeof value === "number") {
     if (Object.is(value, -0)) {
@@ -152,7 +154,7 @@ function normalize(
     }
     itemBudget.items += 1;
     assertUnicodeScalarString(key, `${path}.${key}`);
-    const normalizedKey = key.normalize("NFC");
+    const normalizedKey = normalizeCanonicalText(key);
     if (normalizedKeys.has(normalizedKey)) {
       validationError(path, `duplicate normalized key ${JSON.stringify(normalizedKey)}`);
     }
@@ -460,7 +462,7 @@ class CanonicalCborDecoder {
         validationError(path, "text string must contain valid UTF-8");
       }
       assertUnicodeScalarString(value, path);
-      if (value !== value.normalize("NFC")) {
+      if (!isCanonicalText(value)) {
         validationError(path, "text string must already be NFC-normalized");
       }
       return value;
@@ -650,7 +652,7 @@ export function normalizeStringSet(values: readonly string[]): readonly string[]
     if (typeof value !== "string") {
       validationError(`$[${index}]`, "must be a string");
     }
-    return assertUnicodeScalarString(value, `$[${index}]`).normalize("NFC");
+    return normalizeCanonicalText(assertUnicodeScalarString(value, `$[${index}]`));
   });
   const unique = new Set(normalized);
   if (unique.size !== normalized.length) {
