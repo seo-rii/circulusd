@@ -16,11 +16,13 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/sandboxd"
 	"github.com/hancomac/circulusd/internal/sandboxrpc"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 	workspaceRoot            = "/workspace"
 	launchNonceFD            = 3
 	launchNonceBytes         = 32
+	launchNonceEOFTimeout    = 5 * time.Second
 	maximumAllowedClientUIDs = 64
 	maximumSharedGeneration  = uint64(9_007_199_254_740_991)
 	defaultReplayLimitBytes  = 1 << 20
@@ -45,7 +48,7 @@ type daemonServer interface {
 
 type daemonDependencies struct {
 	stderr        io.Writer
-	readNonce     func() ([]byte, error)
+	readNonce     func(context.Context) ([]byte, error)
 	loadCommands  func(string, uint32) (map[string]string, error)
 	newSupervisor func(sandboxd.Config) (*sandboxd.Supervisor, error)
 	listen        func(sandboxrpc.ServerConfig) (daemonServer, error)
@@ -193,7 +196,7 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		fmt.Fprintf(dependencies.stderr, "sandboxd: load command manifest: %v\n", err)
 		return 1
 	}
-	nonce, err := dependencies.readNonce()
+	nonce, err := dependencies.readNonce(ctx)
 	if err != nil || len(nonce) != launchNonceBytes {
 		clearBytes(nonce)
 		fmt.Fprintln(dependencies.stderr, "sandboxd: read launch capability")
@@ -251,8 +254,8 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 func defaultDependencies() daemonDependencies {
 	return daemonDependencies{
 		stderr: os.Stderr,
-		readNonce: func() ([]byte, error) {
-			return readLaunchNonceFD(launchNonceFD)
+		readNonce: func(ctx context.Context) ([]byte, error) {
+			return readLaunchNonceFD(ctx, launchNonceFD, launchNonceEOFTimeout)
 		},
 		loadCommands:  sandboxd.LoadCommandManifest,
 		newSupervisor: sandboxd.NewSupervisor,
@@ -263,9 +266,15 @@ func defaultDependencies() daemonDependencies {
 	}
 }
 
-func readLaunchNonceFD(fileDescriptor int) ([]byte, error) {
+func readLaunchNonceFD(ctx context.Context, fileDescriptor int, eofTimeout time.Duration) ([]byte, error) {
 	if fileDescriptor < 0 {
 		return nil, errors.New("sandboxd: invalid launch capability descriptor")
+	}
+	// A non-blocking descriptor is pollable, so read deadlines and launch
+	// cancellation can interrupt a launcher that never writes or closes it.
+	if err := unix.SetNonblock(fileDescriptor, true); err != nil {
+		_ = unix.Close(fileDescriptor)
+		return nil, errors.New("sandboxd: launch capability descriptor is unavailable")
 	}
 	file := os.NewFile(uintptr(fileDescriptor), "sandboxd-launch-capability")
 	if file == nil {
@@ -276,10 +285,23 @@ func readLaunchNonceFD(fileDescriptor int) ([]byte, error) {
 	if err != nil || information.Mode().Type() != os.ModeNamedPipe {
 		return nil, errors.New("sandboxd: launch capability must be supplied through a pipe")
 	}
-	nonce, err := io.ReadAll(io.LimitReader(file, launchNonceBytes+1))
-	if err != nil || len(nonce) != launchNonceBytes {
+	stop := context.AfterFunc(ctx, func() { _ = file.SetReadDeadline(time.Now()) })
+	defer stop()
+	nonce := make([]byte, launchNonceBytes)
+	if _, err := io.ReadFull(file, nonce); err != nil {
 		clearBytes(nonce)
 		return nil, errors.New("sandboxd: launch capability has an invalid length")
+	}
+	// The nonce must be the whole pipe content. Set the EOF bound before
+	// checking cancellation so a later cancellation still overrides it.
+	if err := file.SetReadDeadline(time.Now().Add(eofTimeout)); err != nil || ctx.Err() != nil {
+		clearBytes(nonce)
+		return nil, errors.New("sandboxd: launch capability was not closed")
+	}
+	var trailing [1]byte
+	if count, err := file.Read(trailing[:]); count != 0 || !errors.Is(err, io.EOF) {
+		clearBytes(nonce)
+		return nil, errors.New("sandboxd: launch capability has an invalid length or was not closed")
 	}
 	return nonce, nil
 }
