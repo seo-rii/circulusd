@@ -2725,6 +2725,118 @@ func TestWorkerdLauncherRejectsIncoherentExecutableHandoff(t *testing.T) {
 	_ = digest
 }
 
+func TestWorkerdLauncherClosesAcceptedExecutableHandoffOnEveryError(t *testing.T) {
+	t.Parallel()
+	content := []byte("sealed-snapshot-workerd")
+	probe := WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil })
+	handoffConfig := func(t *testing.T) WorkerdLauncherConfig {
+		config := newWorkerdLauncherConfigForTest(t, probe)
+		config.ExecutablePath = ""
+		config.Executable = newWorkerdSealedExecutableForTest(t, content)
+		return config
+	}
+	withResources := func(config WorkerdLauncherConfig) (*WorkerdProcessLauncher, error) {
+		return newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+	}
+	for _, test := range []struct {
+		name      string
+		construct func(WorkerdLauncherConfig) (*WorkerdProcessLauncher, error)
+		mutate    func(*WorkerdLauncherConfig)
+	}{
+		{
+			name:      "invalid launcher setting",
+			construct: withResources,
+			mutate:    func(config *WorkerdLauncherConfig) { config.ReadinessTimeout = 0 },
+		},
+		{
+			name:      "malformed digest",
+			construct: withResources,
+			mutate: func(config *WorkerdLauncherConfig) {
+				config.ExecutableDigest = "sha256:" + strings.Repeat("z", sha256.Size*2)
+			},
+		},
+		{
+			name:      "disallowed environment",
+			construct: withResources,
+			mutate:    func(config *WorkerdLauncherConfig) { config.Environment = map[string]string{"PATH": "/bin"} },
+		},
+		{
+			name:      "missing cgroup config",
+			construct: NewWorkerdProcessLauncher,
+			mutate:    func(*WorkerdLauncherConfig) {},
+		},
+		{
+			name:      "invalid cgroup config",
+			construct: NewWorkerdProcessLauncher,
+			mutate:    func(config *WorkerdLauncherConfig) { config.Cgroup = &WorkerdCgroupConfig{} },
+		},
+		{
+			name: "missing cgroup controller",
+			construct: func(config WorkerdLauncherConfig) (*WorkerdProcessLauncher, error) {
+				return newWorkerdProcessLauncherWithCgroup(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+			},
+			mutate: func(*WorkerdLauncherConfig) {},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			config := handoffConfig(t)
+			test.mutate(&config)
+			launcher, err := test.construct(config)
+			if launcher != nil || err == nil {
+				t.Fatalf("constructor = %#v, %v, want an error", launcher, err)
+			}
+			if _, statErr := config.Executable.Stat(); !errors.Is(statErr, os.ErrClosed) {
+				t.Fatalf("supplied executable Stat() error = %v, want it closed by the constructor", statErr)
+			}
+		})
+	}
+	t.Run("rejected input pair stays with the caller", func(t *testing.T) {
+		t.Parallel()
+		config := handoffConfig(t)
+		config.ExecutablePath = "/usr/bin/workerd"
+		launcher, err := withResources(config)
+		if launcher != nil || !errors.Is(err, ErrInvalidWorkerdLauncherConfig) {
+			t.Fatalf("constructor = %#v, %v, want exactly one executable input", launcher, err)
+		}
+		if _, statErr := config.Executable.Stat(); statErr != nil {
+			t.Fatalf("supplied executable Stat() error = %v, want the caller to keep it", statErr)
+		}
+		_ = config.Executable.Close()
+	})
+}
+
+func TestWorkerdLauncherRejectsFIFOExecutableWithoutBlocking(t *testing.T) {
+	t.Parallel()
+	config := newWorkerdLauncherConfigForTest(t, WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }))
+	fifoPath := filepath.Join(filepath.Dir(config.ExecutablePath), "workerd-fifo")
+	if err := unix.Mkfifo(fifoPath, 0o700); err != nil {
+		t.Fatalf("Mkfifo() error = %v", err)
+	}
+	config.ExecutablePath = fifoPath
+	result := make(chan error, 1)
+	go func() {
+		launcher, err := newWorkerdProcessLauncherWithResources(config, &recordingWorkerdStarter{}, unix.MemfdCreate, nil, newFakeWorkerdIdentityCapture().capture)
+		if launcher != nil {
+			err = errors.Join(errors.New("constructed a launcher from a FIFO"), err)
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrUnsafeWorkerdExecutable) {
+			t.Fatalf("constructor error = %v, want unsafe executable", err)
+		}
+	case <-time.After(5 * time.Second):
+		// Release the blocked open so the constructor goroutine can finish.
+		if writer, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); err == nil {
+			_ = unix.Close(writer)
+		}
+		<-result
+		t.Fatal("constructor blocked opening a FIFO executable path")
+	}
+}
+
 func TestWorkerdShardHandleKillsExactPinnedProcessInstance(t *testing.T) {
 	t.Parallel()
 	process := newFakeWorkerdProcess(31_020, false)

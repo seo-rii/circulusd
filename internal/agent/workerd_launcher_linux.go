@@ -327,6 +327,7 @@ type boundedWorkerdWriter struct {
 // NewWorkerdProcessLauncher constructs the production Linux launcher.
 func NewWorkerdProcessLauncher(config WorkerdLauncherConfig) (*WorkerdProcessLauncher, error) {
 	if config.Cgroup == nil {
+		closeAcceptedWorkerdExecutable(config)
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
 	cgroups, err := newWorkerdCgroupController(workerdCgroupConfig{
@@ -339,6 +340,7 @@ func NewWorkerdProcessLauncher(config WorkerdLauncherConfig) (*WorkerdProcessLau
 		PIDsMax:        config.Cgroup.PIDsMax,
 	})
 	if err != nil {
+		closeAcceptedWorkerdExecutable(config)
 		return nil, err
 	}
 	return newWorkerdProcessLauncherWithCgroup(config, osWorkerdProcessStarter{}, unix.MemfdCreate, cgroups, captureLinuxWorkerdProcessIdentity)
@@ -354,6 +356,7 @@ func newWorkerdProcessLauncherWithMemfd(config WorkerdLauncherConfig, starter wo
 
 func newWorkerdProcessLauncherWithCgroup(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController, captureIdentity workerdProcessIdentityCapturer) (*WorkerdProcessLauncher, error) {
 	if cgroups == nil {
+		closeAcceptedWorkerdExecutable(config)
 		return nil, ErrInvalidWorkerdLauncherConfig
 	}
 	launcher, err := newWorkerdProcessLauncherWithResources(config, starter, createMemfd, cgroups, captureIdentity)
@@ -363,7 +366,17 @@ func newWorkerdProcessLauncherWithCgroup(config WorkerdLauncherConfig, starter w
 	return launcher, nil
 }
 
+// closeAcceptedWorkerdExecutable closes a supplied executable descriptor. The
+// launcher owns it once exactly one executable input is set, so every
+// constructor return after that point, including an error, must close it.
+func closeAcceptedWorkerdExecutable(config WorkerdLauncherConfig) {
+	if config.Executable != nil && config.ExecutablePath == "" {
+		_ = config.Executable.Close()
+	}
+}
+
 func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starter workerdProcessStarter, createMemfd workerdMemfdCreator, cgroups *workerdCgroupController, captureIdentity workerdProcessIdentityCapturer) (*WorkerdProcessLauncher, error) {
+	defer closeAcceptedWorkerdExecutable(config)
 	if starter == nil || config.ReadinessProbe == nil || config.ReadinessTimeout <= 0 ||
 		config.ReadinessTimeout > maximumWorkerdReadinessTimeout ||
 		config.StopGracePeriod <= 0 || config.StopGracePeriod > maximumWorkerdStopGracePeriod ||
@@ -409,7 +422,6 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 	if config.Executable != nil {
 		sourceExecutable = config.Executable
 		if _, err := sourceExecutable.Seek(0, io.SeekStart); err != nil {
-			_ = sourceExecutable.Close()
 			return nil, fmt.Errorf("%w: rewind supplied executable: %v", ErrUnsafeWorkerdExecutable, err)
 		}
 	} else {
@@ -422,7 +434,9 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 		for index, component := range components {
 			flags := uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC)
 			if index == len(components)-1 {
-				flags = uint64(unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW)
+				// O_NONBLOCK keeps a FIFO from blocking the open until a
+				// writer appears; the file-type check below rejects it.
+				flags = uint64(unix.O_RDONLY | unix.O_NONBLOCK | unix.O_CLOEXEC | unix.O_NOFOLLOW)
 			}
 			nextFD, openErr := unix.Openat2(currentFD, component, &unix.OpenHow{
 				Flags:   flags,
@@ -439,8 +453,8 @@ func newWorkerdProcessLauncherWithResources(config WorkerdLauncherConfig, starte
 			_ = unix.Close(currentFD)
 			return nil, fmt.Errorf("%w: wrap opened executable", ErrUnsafeWorkerdExecutable)
 		}
+		defer sourceExecutable.Close()
 	}
-	defer sourceExecutable.Close()
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(sourceExecutable.Fd()), &stat); err != nil {
 		return nil, fmt.Errorf("%w: stat opened executable: %v", ErrUnsafeWorkerdExecutable, err)
