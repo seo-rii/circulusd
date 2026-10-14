@@ -205,6 +205,40 @@ func TestDevelopmentMockRejectsUnknownAndCrossProviderHandles(t *testing.T) {
 	}
 }
 
+func TestDevelopmentMockHandlesNeverEqualIssuedHandles(t *testing.T) {
+	t.Parallel()
+
+	// A provider's first sandbox uses slot 1 and generation 1, so two
+	// providers' first handles are equal exactly when the providers share an
+	// identifier. Creating many of each makes any shared numbering overlap.
+	const providers = 256
+	issued := make(map[executor.SandboxHandle]bool, providers)
+	mocks := make([]*executor.MockProvider, 0, providers)
+	for range providers {
+		handle, err := executor.NewHandleIssuer().Issue(1, 1)
+		if err != nil {
+			t.Fatalf("Issue() error = %v", err)
+		}
+		issued[handle] = true
+		mocks = append(mocks, executor.NewDevelopmentMockProvider(nil))
+	}
+	for _, provider := range mocks {
+		created, err := provider.EnsureSandbox(context.Background(), executor.EnsureRequest{
+			Mode: executor.DeploymentDevelopment,
+			Spec: validSpec(),
+		})
+		if err != nil {
+			t.Fatalf("EnsureSandbox() error = %v", err)
+		}
+		if created.Handle.Generation() != 1 {
+			t.Fatalf("first sandbox generation = %d, want 1", created.Handle.Generation())
+		}
+		if issued[created.Handle] {
+			t.Fatalf("mock handle %v equals a handle issued by a HandleIssuer", created.Handle)
+		}
+	}
+}
+
 type gateInjector struct {
 	point   executor.FaultPoint
 	entered chan struct{}

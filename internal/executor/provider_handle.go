@@ -24,13 +24,20 @@ type HandleIssuer struct {
 // NewHandleIssuer creates one process-local handle authority. Issuers must be
 // retained for the complete lifetime of their provider.
 func NewHandleIssuer() *HandleIssuer {
+	return &HandleIssuer{providerID: nextProviderID()}
+}
+
+// nextProviderID returns a process-unique provider identifier. HandleIssuer
+// and the development mock share it, so a handle from one provider can never
+// equal a handle from another.
+func nextProviderID() uint64 {
 	identifier := handleIssuerID.Add(1)
 	if identifier == 0 {
 		// A zero provider ID is permanently invalid. Reaching this branch would
 		// require issuing 2^64 authorities in one process lifetime.
 		identifier = handleIssuerID.Add(1)
 	}
-	return &HandleIssuer{providerID: identifier}
+	return identifier
 }
 
 func (issuer *HandleIssuer) String() string {
