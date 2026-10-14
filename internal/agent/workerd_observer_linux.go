@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"math"
 	"time"
 )
@@ -17,7 +18,9 @@ const maximumWorkerdObservationInterval = time.Minute
 // Handle.Stop that drains the observed shard; stop epochs cancel the observer
 // without joining it, so that reentrant stop completes and the sink call
 // returns before the launcher's final observer join. A sink must eventually
-// return for every delivery.
+// return for every delivery. ErrShardNotFound means the sink has not adopted
+// the shard yet, and the observer retries on its next tick; any other error
+// ends the observer for that generation.
 type WorkerdObservationSink interface {
 	Observe(ShardObservation) error
 }
@@ -54,10 +57,15 @@ func (instance *workerdInstance) cancelObserver() {
 
 // runWorkerdObserver serializes complete cgroup and process-RSS samples into
 // strictly increasing generation-local sequences and delivers them to the
-// configured sink. Any sample failure, sink failure, sequence exhaustion, or
-// cancellation ends the producer; a sample whose cancellation wins after I/O
-// but before delivery is suppressed, leaving a sequence gap instead of a
-// stale delivery.
+// configured sink. Ending the producer disables OOM and RSS draining for the
+// generation, so only failures that no later tick can recover end it: a
+// cgroup lease that was released or poisoned, a process identity that was
+// closed or recycled, sequence exhaustion, cancellation, and every sink error
+// except ErrShardNotFound. A sample that fails for any other reason, and a
+// delivery the sink rejects because it has not adopted the shard yet, are
+// retried on the next tick, so the observation interval bounds the retry
+// rate. A sample whose cancellation wins after I/O but before delivery is
+// suppressed, leaving a sequence gap instead of a stale delivery.
 func (launcher *WorkerdProcessLauncher) runWorkerdObserver(instance *workerdInstance, observer *workerdShardObserver) {
 	defer func() {
 		launcher.mu.Lock()
@@ -76,11 +84,19 @@ func (launcher *WorkerdProcessLauncher) runWorkerdObserver(instance *workerdInst
 		}
 		cgroupSample, cgroupErr := instance.cgroup.sampleResources(observer.ctx)
 		if cgroupErr != nil {
-			return
+			if errors.Is(cgroupErr, errWorkerdCgroupLeaseUnavailable) || errors.Is(cgroupErr, errWorkerdCgroupPoisoned) ||
+				errors.Is(cgroupErr, errInvalidWorkerdCgroupRequest) {
+				return
+			}
+			continue
 		}
 		rssSample, rssErr := instance.processIdentity.sampleRSS(launcher.observationPageSize)
 		if rssErr != nil {
-			return
+			if errors.Is(rssErr, errWorkerdProcessIdentityUnavailable) || errors.Is(rssErr, errStaleWorkerdProcessIdentity) ||
+				errors.Is(rssErr, errInvalidWorkerdProcessRequest) {
+				return
+			}
+			continue
 		}
 		nextSequence, sequenceAvailable := nextWorkerdObservationSequence(sequence)
 		if !sequenceAvailable {
@@ -103,7 +119,7 @@ func (launcher *WorkerdProcessLauncher) runWorkerdObserver(instance *workerdInst
 				cgroupSample.MemoryEventsDelta.Max > 0,
 			ObservedAt: time.Now(),
 		}
-		if sinkErr := launcher.observationSink.Observe(observation); sinkErr != nil {
+		if sinkErr := launcher.observationSink.Observe(observation); sinkErr != nil && !errors.Is(sinkErr, ErrShardNotFound) {
 			return
 		}
 	}

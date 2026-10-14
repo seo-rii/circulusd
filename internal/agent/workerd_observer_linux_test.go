@@ -449,6 +449,189 @@ func TestWorkerdObserverSinkErrorEndsProducerWithoutStoppingShard(t *testing.T) 
 	}
 }
 
+func TestWorkerdObserverRetriesUntilTheSinkAdoptsTheShard(t *testing.T) {
+	process := newFakeWorkerdProcess(32_007, true)
+	_, backend, cgroups := newWorkerdCgroupLauncherController(t)
+	installWorkerdObserverKillOrder(backend, []*fakeWorkerdProcess{process})
+	starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+	sink := newRecordingWorkerdObservationSink()
+	var deliveriesMu sync.Mutex
+	deliveries := 0
+	sink.observe = func(ShardObservation) error {
+		deliveriesMu.Lock()
+		defer deliveriesMu.Unlock()
+		deliveries++
+		if deliveries <= 2 {
+			return ErrShardNotFound
+		}
+		return nil
+	}
+	launcher, _ := newWorkerdObserverLauncherForTest(t, starter, backend, cgroups,
+		WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }),
+		sink, 2*time.Millisecond)
+	handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+		AgentInstanceID: workerdTestAgentInstanceID(6), ShardID: "observer-before-adoption", ShardGeneration: 1,
+	})
+	if err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	var observations []ShardObservation
+	for index := range 4 {
+		observations = append(observations, sink.receive(t, 2*time.Second, fmt.Sprintf("observation %d was not delivered after the sink had not adopted the shard yet", index+1)))
+	}
+	for index, observation := range observations {
+		if observation.ObservationSequence != uint64(index+1) {
+			t.Fatalf("observation %d sequence = %d, want %d", index+1, observation.ObservationSequence, index+1)
+		}
+	}
+	if registry := observerRegistrySize(launcher); registry != 1 {
+		t.Fatalf("observer registry size = %d, want the observer still running", registry)
+	}
+	if stopErr := handle.Stop(context.Background()); stopErr != nil {
+		t.Fatalf("Stop() error = %v", stopErr)
+	}
+}
+
+func TestWorkerdObserverRetriesTransientSampleFailures(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		pid      int
+		inject   func(*fakeWorkerdCgroupBackend, *fakeWorkerdProcessReader, bool)
+		attempts func(*fakeWorkerdCgroupBackend, *fakeWorkerdProcessReader) int
+	}{
+		{
+			name: "process RSS read",
+			pid:  32_008,
+			inject: func(_ *fakeWorkerdCgroupBackend, reader *fakeWorkerdProcessReader, failing bool) {
+				reader.mu.Lock()
+				defer reader.mu.Unlock()
+				reader.err = nil
+				if failing {
+					reader.err = unix.EMFILE
+				}
+			},
+			attempts: func(_ *fakeWorkerdCgroupBackend, reader *fakeWorkerdProcessReader) int {
+				_, snapshots := reader.calls()
+				return len(snapshots)
+			},
+		},
+		{
+			name: "cgroup control read",
+			pid:  32_009,
+			inject: func(backend *fakeWorkerdCgroupBackend, _ *fakeWorkerdProcessReader, failing bool) {
+				backend.mu.Lock()
+				defer backend.mu.Unlock()
+				delete(backend.corruptReadback, "pids.current")
+				if failing {
+					backend.corruptReadback["pids.current"] = "unreadable\n"
+				}
+			},
+			attempts: func(backend *fakeWorkerdCgroupBackend, _ *fakeWorkerdProcessReader) int {
+				reads := 0
+				for _, read := range backend.controlReads() {
+					if read.Name == "pids.current" {
+						reads++
+					}
+				}
+				return reads
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			process := newFakeWorkerdProcess(test.pid, true)
+			_, backend, cgroups := newWorkerdCgroupLauncherController(t)
+			installWorkerdObserverKillOrder(backend, []*fakeWorkerdProcess{process})
+			starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+			sink := newRecordingWorkerdObservationSink()
+			launcher, capture := newWorkerdObserverLauncherForTest(t, starter, backend, cgroups,
+				WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }),
+				sink, 2*time.Millisecond)
+			handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+				AgentInstanceID: workerdTestAgentInstanceID(7), ShardID: "observer-transient-sample", ShardGeneration: 1,
+			})
+			if err != nil {
+				t.Fatalf("Ensure() error = %v", err)
+			}
+			captured := capture.capturedForPID(test.pid)
+			if captured == nil {
+				t.Fatalf("identity was not captured for pid %d", test.pid)
+			}
+			first := sink.receive(t, 2*time.Second, "no observation was delivered before the failing samples")
+			test.inject(backend, captured.reader, true)
+			failedFrom := test.attempts(backend, captured.reader)
+			waitUntilWorkerdCondition(t, 2*time.Second, func() bool {
+				return test.attempts(backend, captured.reader) >= failedFrom+3 || observerRegistrySize(launcher) == 0
+			}, "observer stopped sampling during the transient failure")
+			test.inject(backend, captured.reader, false)
+			deadline := time.After(2 * time.Second)
+			for {
+				select {
+				case observation := <-sink.received:
+					if observation.ObservationSequence <= first.ObservationSequence {
+						t.Fatalf("observation sequence = %d after %d, want strictly increasing", observation.ObservationSequence, first.ObservationSequence)
+					}
+					if observerRegistrySize(launcher) != 1 {
+						t.Fatal("observer left the registry while still delivering")
+					}
+					if stopErr := handle.Stop(context.Background()); stopErr != nil {
+						t.Fatalf("Stop() error = %v", stopErr)
+					}
+					return
+				case <-deadline:
+					t.Fatal("observer did not resume delivering after a transient sample failure")
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerdObserverEndsOnPermanentFailures(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		pid     int
+		sinkErr error
+		rssErr  error
+	}{
+		{name: "stale sink identity", pid: 32_010, sinkErr: ErrStaleObservation},
+		{name: "closed sink", pid: 32_011, sinkErr: ErrManagerClosed},
+		{name: "recycled process identity", pid: 32_012, rssErr: fmt.Errorf("%w: test", errStaleWorkerdProcessIdentity)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			process := newFakeWorkerdProcess(test.pid, true)
+			_, backend, cgroups := newWorkerdCgroupLauncherController(t)
+			installWorkerdObserverKillOrder(backend, []*fakeWorkerdProcess{process})
+			starter := &recordingWorkerdStarter{processes: []*fakeWorkerdProcess{process}}
+			sink := newRecordingWorkerdObservationSink()
+			sink.observeErr = test.sinkErr
+			launcher, capture := newWorkerdObserverLauncherForTest(t, starter, backend, cgroups,
+				WorkerdReadinessProbeFunc(func(context.Context, WorkerdProcessInfo) error { return nil }),
+				sink, 2*time.Millisecond)
+			handle, err := launcher.Ensure(context.Background(), WorkerdEnsureRequest{
+				AgentInstanceID: workerdTestAgentInstanceID(8), ShardID: "observer-permanent-failure", ShardGeneration: 1,
+			})
+			if err != nil {
+				t.Fatalf("Ensure() error = %v", err)
+			}
+			sink.receive(t, 2*time.Second, "no observation was delivered before the permanent failure")
+			if test.rssErr != nil {
+				captured := capture.capturedForPID(test.pid)
+				if captured == nil {
+					t.Fatalf("identity was not captured for pid %d", test.pid)
+				}
+				captured.reader.mu.Lock()
+				captured.reader.err = test.rssErr
+				captured.reader.mu.Unlock()
+			}
+			waitUntilWorkerdCondition(t, 2*time.Second, func() bool {
+				return observerRegistrySize(launcher) == 0
+			}, "observer kept running after a permanent failure")
+			if stopErr := handle.Stop(context.Background()); stopErr != nil {
+				t.Fatalf("Stop() error = %v", stopErr)
+			}
+		})
+	}
+}
+
 func TestWorkerdShardHandleSamplesResourcesWithExactIdentity(t *testing.T) {
 	baselineMemory := workerdCgroupMemoryEvents{Low: 1, High: 2, Max: 3, OOM: 4, OOMKill: 5, OOMGroupKill: 6}
 	baselineCPU := workerdCgroupCPUStat{UsageMicros: 10, UserMicros: 4, SystemMicros: 6, Periods: 8, ThrottledPeriods: 3, ThrottledMicros: 2}
