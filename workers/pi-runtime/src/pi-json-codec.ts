@@ -1,4 +1,6 @@
-import { assertUnicodeScalarString, normalizeProtocolValue } from "@circulusd/protocol-types";
+import {
+  assertUnicodeScalarString, normalizeCanonicalText, normalizeProtocolValue,
+} from "@circulusd/protocol-types";
 import type { NormalizedValue } from "@circulusd/protocol-types";
 
 import { PiRuntimeError } from "./errors.ts";
@@ -27,7 +29,7 @@ function walkPiJson(value: unknown, path: string, depth: number, traversal: Trav
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "string") {
     assertUnicodeScalarString(value, path);
-    return value.normalize("NFC");
+    return normalizeCanonicalText(value);
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) invalid(path, "must be a finite JSON number");
@@ -83,7 +85,7 @@ function walkPiJson(value: unknown, path: string, depth: number, traversal: Trav
       invalid(`${path}.${key}`, "must be an enumerable data property");
     }
     assertUnicodeScalarString(key, path);
-    const normalizedKey = key.normalize("NFC");
+    const normalizedKey = normalizeCanonicalText(key);
     if (normalizedKeys.has(normalizedKey)) invalid(path, `has duplicate normalized key ${JSON.stringify(normalizedKey)}`);
     normalizedKeys.add(normalizedKey);
     entries.push([normalizedKey, descriptor.value]);
