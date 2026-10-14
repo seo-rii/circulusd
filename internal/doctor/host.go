@@ -280,7 +280,9 @@ func HostProbes(requirements HostRequirements, sources HostSources) ([]Probe, er
 					containsDataDirectory := mountPoint == requirements.DataDirectory ||
 						mountPoint == "/" ||
 						strings.HasPrefix(requirements.DataDirectory, mountPoint+"/")
-					if !containsDataDirectory || len(mountPoint) <= bestMountLength {
+					// mountinfo lists mounts in mount order, so a later entry at an
+					// equally long mount point is mounted over the earlier one.
+					if !containsDataDirectory || len(mountPoint) < bestMountLength {
 						continue
 					}
 					bestMountLength = len(mountPoint)
