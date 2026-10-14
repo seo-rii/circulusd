@@ -55,9 +55,12 @@ control sockets are mutually reachable:
 | `executord` | `executord` | Docker socket, `/dev/kvm`, mount namespace | least privilege (diagnostic-only) |
 
 The image also carries `platformctl`, which is used as the readiness/liveness
-probe (`platformctl capabilities -socket <path>`); the probe exercises the real
-credentialed control handshake, so a passing probe means the daemon completed
-the v1α role/capability exchange over its socket.
+probe (`platformctl capabilities -server-role <role> -socket <path>`); the probe
+exercises the real credentialed control handshake, so a passing probe means the
+daemon completed the v1α role/capability exchange over its socket.
+`-server-role` (`platformd`, the default, `agentd`, or `executord`) is the role
+the daemon must authenticate as; the handshake fails closed on any other role,
+so the agentd and executord probes pass their own role.
 
 A small root init container (the same image, `CAP_CHOWN` only) runs first to
 `chmod 0700` and `chown` the shared socket directory to the daemon UID. This is
@@ -154,11 +157,14 @@ helm template circ deploy/helm/circulusd --set image.tag=0.3.0-dev | kubectl app
 ```sh
 POD=$(kubectl get pod -l app.kubernetes.io/instance=circ -o jsonpath='{.items[0].metadata.name}')
 
-# Honest capability report over the control handshake (any daemon socket):
+# Honest capability report over the control handshake (any daemon socket;
+# -server-role names the role that daemon authenticates as):
 kubectl exec "$POD" -c platformd -- \
   platformctl capabilities -socket /run/pi-platform/platformd-dev.sock
 kubectl exec "$POD" -c agentd -- \
-  platformctl capabilities -socket /run/pi-platform/agentd.sock
+  platformctl capabilities -server-role agentd -socket /run/pi-platform/agentd.sock
+kubectl exec "$POD" -c executord -- \
+  platformctl capabilities -server-role executord -socket /run/pi-platform/executord.sock
 
 # development-reference /v1/status. It binds 127.0.0.1 only, so it is NOT
 # reachable via a Service or an httpGet kubelet probe. port-forward connects to

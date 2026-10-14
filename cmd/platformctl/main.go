@@ -65,7 +65,7 @@ type commandDependencies struct {
 	runnerBinaryDigest func() (string, error)
 	targetInstanceID   func() (string, error)
 	buildUDSProbe      func(doctoruds.Config) (doctor.Probe, error)
-	getCapabilities    func(context.Context, string) (*v1.GetCapabilitiesResponse, error)
+	getCapabilities    func(context.Context, string, v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error)
 }
 
 type capabilitiesOutput struct {
@@ -131,10 +131,34 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 	if arguments[0] == "capabilities" {
 		flags := flag.NewFlagSet("platformctl capabilities", flag.ContinueOnError)
 		flags.SetOutput(dependencies.stderr)
-		socketPath := flags.String("socket", defaultPlatformdSocket, "canonical absolute platformd control socket path")
+		socketPath := flags.String("socket", defaultPlatformdSocket, "canonical absolute control socket path; defaults to the selected server role's socket")
+		serverRole := flags.String("server-role", doctoruds.Platformd, "control server role to authenticate: platformd, agentd, or executord")
 		timeout := flags.Duration("timeout", defaultControlTimeout, "control request timeout")
 		if err := flags.Parse(arguments[1:]); err != nil || flags.NArg() != 0 {
 			return 2
+		}
+		socketSet := false
+		flags.Visit(func(set *flag.Flag) {
+			if set.Name == "socket" {
+				socketSet = true
+			}
+		})
+		serverPeer := v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD
+		roleSocketPath := defaultPlatformdSocket
+		switch *serverRole {
+		case doctoruds.Platformd:
+		case doctoruds.Agentd:
+			serverPeer, roleSocketPath = v1.ProtocolPeer_PROTOCOL_PEER_AGENTD, defaultAgentdSocket
+		case doctoruds.Executord:
+			serverPeer, roleSocketPath = v1.ProtocolPeer_PROTOCOL_PEER_EXECUTORD, defaultExecutordSocket
+		default:
+			if dependencies.stderr != nil {
+				fmt.Fprintln(dependencies.stderr, "platformctl: server role must be platformd, agentd, or executord")
+			}
+			return 2
+		}
+		if !socketSet {
+			*socketPath = roleSocketPath
 		}
 		if !filepath.IsAbs(*socketPath) || filepath.Clean(*socketPath) != *socketPath ||
 			*socketPath == string(filepath.Separator) || *timeout <= 0 || *timeout > maximumControlTimeout {
@@ -147,7 +171,7 @@ func execute(ctx context.Context, arguments []string, dependencies commandDepend
 			return 1
 		}
 		requestContext, cancel := context.WithTimeout(ctx, *timeout)
-		response, err := dependencies.getCapabilities(requestContext, *socketPath)
+		response, err := dependencies.getCapabilities(requestContext, *socketPath, serverPeer)
 		cancel()
 		if err != nil {
 			fmt.Fprintf(dependencies.stderr, "platformctl: query capabilities failed (code=%s)\n", connect.CodeOf(err))
@@ -586,10 +610,11 @@ func defaultDependencies() commandDependencies {
 			return "boot-" + hex.EncodeToString(digest[:]), nil
 		},
 		buildUDSProbe: doctoruds.BuildProbe,
-		getCapabilities: func(ctx context.Context, socketPath string) (*v1.GetCapabilitiesResponse, error) {
+		getCapabilities: func(ctx context.Context, socketPath string, serverPeer v1.ProtocolPeer) (*v1.GetCapabilitiesResponse, error) {
 			client, err := controlrpc.NewClient(controlrpc.ClientConfig{
-				SocketPath: socketPath,
-				Peer:       v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL,
+				SocketPath:         socketPath,
+				Peer:               v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMCTL,
+				ExpectedServerPeer: serverPeer,
 			})
 			if err != nil {
 				return nil, err
