@@ -13,9 +13,14 @@ import (
 )
 
 var (
-	ErrInvalidConfig           = errors.New("engine genesis: invalid configuration")
-	ErrInvalidRequest          = errors.New("engine genesis: invalid request")
-	ErrInvalidResponse         = errors.New("engine genesis: invalid response")
+	ErrInvalidConfig   = errors.New("engine genesis: invalid configuration")
+	ErrInvalidRequest  = errors.New("engine genesis: invalid request")
+	ErrInvalidResponse = errors.New("engine genesis: invalid response")
+	// ErrUnauthenticatedRequest and ErrUnauthenticatedResponse report a failed
+	// key ID or MAC check in either direction: the two sides do not share the
+	// key, or the exchange was altered. Retrying the same request cannot fix
+	// either, so they are never folded into ErrUnavailable.
+	ErrUnauthenticatedRequest  = errors.New("engine genesis: request authentication rejected")
 	ErrUnauthenticatedResponse = errors.New("engine genesis: unauthenticated response")
 	ErrUnavailable             = errors.New("engine genesis: qualified source unavailable")
 	ErrClosed                  = errors.New("engine genesis: transport closed")
@@ -84,6 +89,12 @@ func (provider *Provider) CreateGenesis(ctx context.Context, request stateappadm
 	checkpoint, err := provider.transport.RequestGenesis(ctx, owned)
 	if contextErr := ctx.Err(); contextErr != nil {
 		return nil, contextErr
+	}
+	if errors.Is(err, ErrUnauthenticatedRequest) {
+		return nil, ErrUnauthenticatedRequest
+	}
+	if errors.Is(err, ErrUnauthenticatedResponse) {
+		return nil, ErrUnauthenticatedResponse
 	}
 	if err != nil {
 		return nil, ErrUnavailable

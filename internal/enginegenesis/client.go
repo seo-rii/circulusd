@@ -142,6 +142,11 @@ func (client *Client) post(ctx context.Context, path, contentType string, body [
 		return nil, nil, 0, ErrUnavailable
 	}
 	defer response.Body.Close()
+	// The Go and Pi genesis servers answer an unknown key ID or a bad request
+	// MAC with a bare 401. It is unsigned, so it only classifies a failure.
+	if response.StatusCode == http.StatusUnauthorized && path == genesisPath {
+		return nil, nil, 0, ErrUnauthenticatedRequest
+	}
 	if len(response.Header.Values("Content-Type")) != 1 || response.Header.Get("Content-Type") != contentType || len(response.Header.Values("Cache-Control")) != 1 || response.Header.Get("Cache-Control") != "no-store" || len(response.Header.Values("Content-Encoding")) != 0 || response.ContentLength > int64(limit) {
 		return nil, nil, 0, ErrInvalidResponse
 	}
