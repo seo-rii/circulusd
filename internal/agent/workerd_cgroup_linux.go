@@ -478,12 +478,29 @@ func (controller *workerdCgroupController) prepare(ctx context.Context, agentIns
 	}
 	fd, identity, err := controller.backend.openChild(controller.rootFD, name)
 	if err != nil {
+		openErr := classifyWorkerdCgroupError(workerdCgroupErrorScopeProvisioned, "open shard cgroup", err)
+		// Running out of descriptors or memory says nothing about the new
+		// leaf's integrity, so remove it by name and keep the controller. A
+		// cgroup with processes or children cannot be removed, so a leaf
+		// replaced in the meantime makes the removal fail and still poisons.
+		if errno, isErrno := err.(unix.Errno); isErrno && (errno == unix.EMFILE || errno == unix.ENFILE || errno == unix.ENOMEM) {
+			controller.beginAuthorityWrite()
+			removeErr := controller.backend.removeChild(controller.rootFD, name)
+			controller.endAuthorityWrite()
+			if removeErr == nil {
+				controller.mu.Lock()
+				controller.reserved--
+				controller.mu.Unlock()
+				return nil, openErr
+			}
+			openErr = errors.Join(openErr, classifyWorkerdCgroupError(workerdCgroupErrorScopeProvisioned, "remove unopened shard cgroup", removeErr))
+		}
 		controller.mu.Lock()
 		controller.reserved--
 		controller.poisoned = true
 		controller.notifyAuthorityChangedLocked()
 		controller.mu.Unlock()
-		return nil, errors.Join(classifyWorkerdCgroupError(workerdCgroupErrorScopeProvisioned, "open shard cgroup", err), errWorkerdCgroupPoisoned)
+		return nil, errors.Join(openErr, errWorkerdCgroupPoisoned)
 	}
 	lease := &workerdCgroupLease{
 		controller: controller, name: name, agentInstanceID: agentInstanceID,
