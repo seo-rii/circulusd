@@ -1,10 +1,17 @@
-# Build-context excludes for deploy/images/Dockerfile (built from the repo root).
-# Keep the Go module sources; drop everything the daemon build does not need.
-.git
+# Build context for deploy/images/Dockerfile, which is built from the repository root.
+# This is an allowlist: exclude everything, then re-include only what that Dockerfile
+# uses. It builds ./cmd/{platformd,platformd-dev,agentd,executord,platformctl} with
+# GOWORK=off, so it needs go.mod, go.sum and the Go packages under api/, cmd/ and
+# internal/. go:embed files always live inside their package directory, so they are
+# covered too. Re-include a path here when the Dockerfile starts to COPY or build it.
+*
+!go.mod
+!go.sum
+!api/
+!cmd/
+!internal/
+
+# Never send local dependencies or environment files, even from re-included trees.
 **/node_modules
-out.bundle
-*.bundle
-dist
-**/*.tsbuildinfo
-deploy/helm
-docs
+**/.env
+**/.env.*
