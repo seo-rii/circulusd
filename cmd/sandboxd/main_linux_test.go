@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
 	"github.com/hancomac/circulusd/internal/sandboxd"
@@ -35,7 +36,7 @@ func TestExecuteServesLaunchAuthorityAndFencesOnExit(t *testing.T) {
 	var observedNonce []byte
 	dependencies := daemonDependencies{
 		stderr: io.Discard,
-		readNonce: func() ([]byte, error) {
+		readNonce: func(context.Context) ([]byte, error) {
 			return append([]byte(nil), nonce...), nil
 		},
 		loadCommands: func(path string, ownerUID uint32) (map[string]string, error) {
@@ -166,7 +167,7 @@ func TestExecuteRejectsInvalidLaunchArgumentsBeforeReadingAuthority(t *testing.T
 			read := false
 			exitCode := execute(context.Background(), test.arguments, daemonDependencies{
 				stderr: io.Discard,
-				readNonce: func() ([]byte, error) {
+				readNonce: func(context.Context) ([]byte, error) {
 					read = true
 					return nil, errors.New("must not be called")
 				},
@@ -206,7 +207,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 				t.Fatal("pre-canceled daemon loaded the command manifest")
 				return nil, nil
 			},
-			readNonce: func() ([]byte, error) {
+			readNonce: func(context.Context) ([]byte, error) {
 				read = true
 				return nil, nil
 			},
@@ -227,7 +228,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 			loadCommands: func(string, uint32) (map[string]string, error) {
 				return map[string]string{"echo": "/usr/bin/echo"}, nil
 			},
-			readNonce: func() ([]byte, error) { return nil, errors.New("read failed") },
+			readNonce: func(context.Context) ([]byte, error) { return nil, errors.New("read failed") },
 		})
 		if exitCode != 1 {
 			t.Fatalf("execute() = %d, want 1", exitCode)
@@ -243,7 +244,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 			loadCommands: func(string, uint32) (map[string]string, error) {
 				return map[string]string{"echo": "/usr/bin/echo"}, nil
 			},
-			readNonce:     func() ([]byte, error) { return nonce, nil },
+			readNonce:     func(context.Context) ([]byte, error) { return nonce, nil },
 			newSupervisor: sandboxd.NewSupervisor,
 			listen: func(config sandboxrpc.ServerConfig) (daemonServer, error) {
 				passedNonce = config.OneTimeNonce
@@ -265,7 +266,7 @@ func TestExecuteFailsClosedAndClearsNonceOnStartupErrors(t *testing.T) {
 			loadCommands: func(string, uint32) (map[string]string, error) {
 				return map[string]string{"echo": "/usr/bin/echo"}, nil
 			},
-			readNonce:     func() ([]byte, error) { return bytes.Repeat([]byte{0x5a}, launchNonceBytes), nil },
+			readNonce:     func(context.Context) ([]byte, error) { return bytes.Repeat([]byte{0x5a}, launchNonceBytes), nil },
 			newSupervisor: sandboxd.NewSupervisor,
 			listen: func(sandboxrpc.ServerConfig) (daemonServer, error) {
 				return server, nil
@@ -300,7 +301,7 @@ func TestExecuteFailsClosedOnIncompleteDependencyAdapters(t *testing.T) {
 		loadCommands: func(string, uint32) (map[string]string, error) {
 			return map[string]string{"echo": "/usr/bin/echo"}, nil
 		},
-		readNonce: func() ([]byte, error) {
+		readNonce: func(context.Context) ([]byte, error) {
 			return bytes.Repeat([]byte{0x5a}, launchNonceBytes), nil
 		},
 		runner: sandboxd.NewFakeRunner(),
@@ -362,7 +363,7 @@ func TestReadLaunchNonceFDRequiresExactAnonymousPipe(t *testing.T) {
 			if err := write.Close(); err != nil {
 				t.Fatal(err)
 			}
-			nonce, err := readLaunchNonceFD(duplicate)
+			nonce, err := readLaunchNonceFD(context.Background(), duplicate, time.Second)
 			if test.wantErr {
 				if err == nil || nonce != nil {
 					t.Fatalf("readLaunchNonceFD() = %x, %v", nonce, err)
@@ -388,9 +389,87 @@ func TestReadLaunchNonceFDRequiresExactAnonymousPipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if nonce, err := readLaunchNonceFD(duplicate); err == nil || nonce != nil {
+	if nonce, err := readLaunchNonceFD(context.Background(), duplicate, time.Second); err == nil || nonce != nil {
 		t.Fatalf("readLaunchNonceFD(regular) = %x, %v", nonce, err)
 	}
+}
+
+func TestReadLaunchNonceFDBoundsAnOpenPipe(t *testing.T) {
+	t.Parallel()
+
+	openPipe := func(t *testing.T, payload []byte) int {
+		t.Helper()
+		read, write, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = write.Close() })
+		duplicate, err := unix.Dup(int(read.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := read.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := write.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		return duplicate
+	}
+	type readOutcome struct {
+		nonce []byte
+		err   error
+	}
+	readAsync := func(ctx context.Context, fileDescriptor int, eofTimeout time.Duration) <-chan readOutcome {
+		outcome := make(chan readOutcome, 1)
+		go func() {
+			nonce, err := readLaunchNonceFD(ctx, fileDescriptor, eofTimeout)
+			outcome <- readOutcome{nonce: nonce, err: err}
+		}()
+		return outcome
+	}
+	expectRejected := func(t *testing.T, outcome <-chan readOutcome) {
+		t.Helper()
+		select {
+		case got := <-outcome:
+			if got.err == nil || got.nonce != nil {
+				t.Fatalf("readLaunchNonceFD() = %x, %v, want rejection", got.nonce, got.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("readLaunchNonceFD() kept waiting on a pipe that was never closed")
+		}
+	}
+
+	t.Run("nonce without EOF", func(t *testing.T) {
+		t.Parallel()
+		descriptor := openPipe(t, bytes.Repeat([]byte{0x5a}, launchNonceBytes))
+		expectRejected(t, readAsync(context.Background(), descriptor, 50*time.Millisecond))
+	})
+	t.Run("extra bytes without EOF", func(t *testing.T) {
+		t.Parallel()
+		descriptor := openPipe(t, bytes.Repeat([]byte{0x5a}, 2*launchNonceBytes))
+		expectRejected(t, readAsync(context.Background(), descriptor, time.Hour))
+	})
+	t.Run("cancelled before the nonce", func(t *testing.T) {
+		t.Parallel()
+		descriptor := openPipe(t, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		outcome := readAsync(ctx, descriptor, time.Hour)
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		expectRejected(t, outcome)
+	})
+	t.Run("cancelled before EOF", func(t *testing.T) {
+		t.Parallel()
+		descriptor := openPipe(t, bytes.Repeat([]byte{0x5a}, launchNonceBytes))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		outcome := readAsync(ctx, descriptor, time.Hour)
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		expectRejected(t, outcome)
+	})
 }
 
 type recordingServer struct {
