@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-	"sync/atomic"
 )
-
-var mockProviderSequence atomic.Uint64
 
 // MockProvider is a thread-safe, process-free development implementation of
 // Provider. It is suitable for state-machine and fault-recovery tests only.
@@ -46,7 +43,7 @@ type mockEnsureCall struct {
 // injector disables fault injection.
 func NewDevelopmentMockProvider(faults FaultInjector) *MockProvider {
 	return &MockProvider{
-		providerID: mockProviderSequence.Add(1),
+		providerID: nextProviderID(),
 		faults:     faults,
 		byKey:      make(map[CacheKey]*mockSandbox),
 		bySlot:     make(map[uint64]*mockSandbox),
