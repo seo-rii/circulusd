@@ -790,8 +790,16 @@ function prepareExtension(value: unknown, bundleFiles: ExtensionBundleFiles): Pr
     cwd: "/extension",
     fs: createVirtualFileSystem(virtualSources),
   });
-  const snapshot = typeScript.updateSnapshot({ openProjects: ["/extension/tsconfig.json"] });
-  const project = snapshot.getProjects()[0];
+  // The API owns a tsgo child process, so every exit path must close it.
+  let snapshot: ReturnType<typeof typeScript.updateSnapshot>;
+  let project: ReturnType<typeof snapshot.getProjects>[number] | undefined;
+  try {
+    snapshot = typeScript.updateSnapshot({ openProjects: ["/extension/tsconfig.json"] });
+    project = snapshot.getProjects()[0];
+  } catch (error) {
+    typeScript.close();
+    throw error;
+  }
   if (project === undefined) {
     snapshot.dispose();
     typeScript.close();
