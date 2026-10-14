@@ -48,8 +48,9 @@ func validOpaqueETag(etag ETag) bool {
 
 // ProbeCAS exercises the complete state-plane object-store admission gate. A
 // PASS means the configured endpoint demonstrated conditional create, ETag
-// CAS, read-after-write, a single concurrent winner, and persistence through a
-// newly opened client. It does not infer capabilities from an S3 version string.
+// CAS, read-after-write, a single concurrent winner, persistence through a
+// newly opened client, conditional delete, and a rejected update of a missing
+// object. It does not infer capabilities from an S3 version string.
 func ProbeCAS(ctx context.Context, config ProbeConfig) conformance.Result {
 	evidence := conformance.Evidence{Mock: config.Mock}
 	component := config.Component
@@ -106,7 +107,8 @@ func ProbeCAS(ctx context.Context, config ProbeConfig) conformance.Result {
 	clients := []Store{store}
 	initialData := append([]byte("circulusd-cas-probe-v1:"), nonce[:]...)
 	secondData := append([]byte("circulusd-cas-probe-v2:"), nonce[:]...)
-	ownedData := map[string]bool{string(initialData): true, string(secondData): true}
+	missingData := append([]byte("circulusd-cas-probe-missing:"), nonce[:]...)
+	ownedData := map[string]bool{string(initialData): true, string(secondData): true, string(missingData): true}
 	for contender := range 32 {
 		ownedData[fmt.Sprintf("circulusd-cas-winner-%02d:%x", contender, nonce)] = true
 	}
@@ -263,5 +265,28 @@ func ProbeCAS(ctx context.Context, config ProbeConfig) conformance.Result {
 		return finish(failed("restart persistence/read-after-write check", err))
 	}
 	observed("fresh client persistence")
+
+	if err := store.DeleteIfMatch(ctx, BucketCelldState, key, afterRestart.ETag); err != nil {
+		return finish(failed("conditional delete with the current ETag", err))
+	}
+	if _, err := store.Get(ctx, BucketCelldState, key); !errors.Is(err, ErrNotFound) {
+		if err == nil {
+			err = errors.New("conditional delete did not remove isolated object")
+		}
+		return finish(failed("read after conditional delete", err))
+	}
+	observed("conditional delete")
+	// A conditional update must never create a missing object. FileStore and
+	// S3 report ErrNotFound; some S3-compatible providers answer 412 instead.
+	if _, err := store.CompareAndSwap(ctx, BucketCelldState, key, afterRestart.ETag, missingData); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrPreconditionFailed) {
+		return finish(failed("conditional update of a missing object was not rejected", err))
+	}
+	if _, err := store.Get(ctx, BucketCelldState, key); !errors.Is(err, ErrNotFound) {
+		if err == nil {
+			err = errors.New("rejected conditional update created the object")
+		}
+		return finish(failed("read after rejected missing-object update", err))
+	}
+	observed("missing object update rejected")
 	return finish(conformance.Result{Component: component, Status: conformance.Pass, Evidence: evidence})
 }

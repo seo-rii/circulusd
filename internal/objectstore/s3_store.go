@@ -204,14 +204,16 @@ func (store *S3Store) put(ctx context.Context, bucket Bucket, key string, expect
 		return "", ErrObjectTooLarge
 	}
 	input := &s3.PutObjectInput{Bucket: aws.String(store.bucket), Key: aws.String(key), Body: bytes.NewReader(data)}
+	operation := "create"
 	if expected == "" {
 		input.IfNoneMatch = aws.String("*")
 	} else {
 		input.IfMatch = aws.String(string(expected))
+		operation = "update"
 	}
 	output, err := store.client.PutObject(ctx, input)
 	if err != nil {
-		return "", s3Error(ctx, err, "put")
+		return "", s3Error(ctx, err, operation)
 	}
 	etag := ETag(aws.ToString(output.ETag))
 	if !validS3ETag(etag) {
@@ -253,7 +255,10 @@ func s3Error(ctx context.Context, err error, operation string) error {
 		case 412, 409:
 			return ErrPreconditionFailed
 		case 404:
-			if operation == "get" || operation == "delete" {
+			// Like FileStore, a missing object is ErrNotFound for reads and
+			// conditional updates or deletes. A conditional create has no
+			// object to miss, so its 404 stays unavailable.
+			if operation == "get" || operation == "update" || operation == "delete" {
 				return ErrNotFound
 			}
 		}

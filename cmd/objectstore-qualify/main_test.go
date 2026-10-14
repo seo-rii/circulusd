@@ -140,7 +140,7 @@ func TestQualificationActualHTTPFixturePassesAndWritesOnlyIsolatedNonceObjects(t
 	var messages bytes.Buffer
 	code := run(context.Background(), []string{"--config", fixtureConfiguration(t, server.URL), "--output", output}, &messages, &messages, fixtureEnvironment)
 	report := readReport(t, output)
-	if code != 0 || report.Result.Status != conformance.Pass || len(report.Observations) != 11 || len(objects) != 0 {
+	if code != 0 || report.Result.Status != conformance.Pass || len(report.Observations) != 12 || len(objects) != 0 {
 		t.Fatalf("code=%d report=%#v objects=%d", code, report, len(objects))
 	}
 	data, _ := os.ReadFile(output)

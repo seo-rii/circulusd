@@ -181,7 +181,14 @@ func newS3Fixture(t *testing.T) *httptest.Server {
 					fail(412, "PreconditionFailed")
 					return
 				}
-			} else if r.Header.Get("If-Match") == "" || !exists || r.Header.Get("If-Match") != string(current.ETag) {
+			} else if r.Header.Get("If-Match") == "" {
+				fail(412, "PreconditionFailed")
+				return
+			} else if !exists {
+				// AWS answers a conditional update of a missing key with 404.
+				fail(404, "NoSuchKey")
+				return
+			} else if r.Header.Get("If-Match") != string(current.ETag) {
 				fail(412, "PreconditionFailed")
 				return
 			}
@@ -229,7 +236,7 @@ func TestS3StoreQualifiesOpaqueNativeETagsWithSignedConditionalHeaders(t *testin
 	if result.Status != conformance.Pass {
 		t.Fatalf("CAS=%#v", result)
 	}
-	if len(observations) != 11 {
+	if len(observations) != 12 {
 		t.Fatalf("observations=%#v", observations)
 	}
 	for _, o := range observations {
@@ -239,6 +246,21 @@ func TestS3StoreQualifiesOpaqueNativeETagsWithSignedConditionalHeaders(t *testin
 		if o.Stage == "single concurrent winner" && (o.Contenders != 32 || o.Winners != 1 || o.Losers != 31) {
 			t.Fatalf("incorrect CAS count evidence %#v", o)
 		}
+	}
+}
+
+func TestS3StoreReportsCompareAndSwapOfMissingObjectAsNotFound(t *testing.T) {
+	server := newS3Fixture(t)
+	store, err := NewS3Store(s3Options(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, e := store.CompareAndSwap(context.Background(), BucketCelldState, "missing", "\"native-001-multipart\"", []byte("data")); !errors.Is(e, ErrNotFound) {
+		t.Fatalf("missing-object CAS=%v, want ErrNotFound", e)
+	}
+	if _, e := store.Get(context.Background(), BucketCelldState, "missing"); !errors.Is(e, ErrNotFound) {
+		t.Fatalf("missing-object CAS created the object: %v", e)
 	}
 }
 
