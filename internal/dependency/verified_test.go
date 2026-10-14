@@ -159,6 +159,63 @@ func TestVerificationRejectsMissingAtomicGroupsAndStaleEvidenceBeforeProbe(t *te
 	}
 }
 
+func TestVerificationRejectsEvidenceThatGoesStaleDuringTheProbe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		advance time.Duration
+	}{
+		// The fixture evidence was issued one minute before now and expires one
+		// hour after now; the requirements allow one hour of evidence age.
+		{name: "expired", advance: time.Hour},
+		{name: "older than the maximum age", advance: time.Hour - 30*time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newVerificationFixture(t, "state-domain-a")
+			var clock atomic.Int64
+			clock.Store(fixture.now.UnixNano())
+			verifier, err := NewVerifier(VerifierConfig{
+				ConformanceRoots: map[string]ed25519.PublicKey{"conformance-root": fixture.conformancePublicKey},
+				RuntimeRoots:     map[string]ed25519.PublicKey{"state-instance-key": fixture.runtimePublicKey},
+				Clock:            func() time.Time { return time.Unix(0, clock.Load()) },
+				Entropy:          strings.NewReader(strings.Repeat("n", ChallengeBytes)),
+			})
+			if err != nil {
+				t.Fatalf("NewVerifier() error = %v", err)
+			}
+			probe := &clockAdvancingProbe{
+				signedProbe: &signedProbe{descriptor: fixture.descriptor, privateKey: fixture.runtimePrivateKey},
+				advance:     func() { clock.Add(int64(test.advance)) },
+			}
+
+			verified, err := VerifyDependency(context.Background(), verifier, probe, fixture.evidence, fixture.requirements())
+			if !errors.Is(err, ErrEvidenceExpired) {
+				t.Fatalf("VerifyDependency(evidence stale after probe) error = %v, want ErrEvidenceExpired", err)
+			}
+			if _, _, openErr := verified.Open(); !errors.Is(openErr, ErrUnverifiedDependency) {
+				t.Fatalf("Open() after stale evidence error = %v, want ErrUnverifiedDependency", openErr)
+			}
+			if probe.calls.Load() != 1 {
+				t.Fatalf("ProbeProduction() calls = %d, want 1", probe.calls.Load())
+			}
+		})
+	}
+}
+
+type clockAdvancingProbe struct {
+	*signedProbe
+	advance func()
+}
+
+func (probe *clockAdvancingProbe) ProbeProduction(ctx context.Context, challenge ProbeChallenge) (ProbeResponse, error) {
+	response, err := probe.signedProbe.ProbeProduction(ctx, challenge)
+	probe.advance()
+	return response, err
+}
+
 func TestRuntimeProofIsBoundToChallengeAndExactDescriptor(t *testing.T) {
 	t.Parallel()
 

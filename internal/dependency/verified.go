@@ -295,6 +295,11 @@ func VerifyDependency[T ProductionProbe](
 	if err != nil {
 		return Verified[T]{}, ErrUnverifiedDependency
 	}
+	// The probe may take up to its HTTP timeout, so the evidence must still be
+	// fresh when the dependency is accepted, not only when probing started.
+	if !verifier.evidenceFresh(evidence, requirements) {
+		return Verified[T]{}, ErrEvidenceExpired
+	}
 	if err := ctx.Err(); err != nil {
 		return Verified[T]{}, err
 	}
@@ -358,8 +363,7 @@ func (verifier *Verifier) verifyEvidence(evidence Evidence, requirements Require
 	if !trusted || !ed25519.Verify(root, []byte(digest), evidence.Signature) {
 		return "", ErrUnverifiedDependency
 	}
-	now := verifier.clock().Unix()
-	if now < evidence.IssuedAtUnix || now >= evidence.ExpiresAtUnix || time.Duration(now-evidence.IssuedAtUnix)*time.Second > requirements.MaximumEvidenceAge {
+	if !verifier.evidenceFresh(evidence, requirements) {
 		return "", ErrEvidenceExpired
 	}
 	descriptor := evidence.Descriptor
@@ -371,6 +375,12 @@ func (verifier *Verifier) verifyEvidence(evidence Evidence, requirements Require
 		return "", ErrRequirementMismatch
 	}
 	return digest, nil
+}
+
+func (verifier *Verifier) evidenceFresh(evidence Evidence, requirements Requirements) bool {
+	now := verifier.clock().Unix()
+	return now >= evidence.IssuedAtUnix && now < evidence.ExpiresAtUnix &&
+		time.Duration(now-evidence.IssuedAtUnix)*time.Second <= requirements.MaximumEvidenceAge
 }
 
 func EvidenceSigningDigest(evidence Evidence) (string, error) {
