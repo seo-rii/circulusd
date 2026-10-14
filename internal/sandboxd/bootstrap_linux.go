@@ -3,8 +3,6 @@
 package sandboxd
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/hancomac/circulusd/internal/strictjson"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,65 +62,6 @@ func LoadCommandManifest(path string, expectedOwnerUID uint32) (map[string]strin
 		return nil, fmt.Errorf("%w: file changed while it was read", ErrInvalidCommandManifest)
 	}
 
-	duplicateScanner := json.NewDecoder(bytes.NewReader(document))
-	duplicateScanner.UseNumber()
-	var scanValue func() error
-	scanValue = func() error {
-		token, err := duplicateScanner.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, isDelimiter := token.(json.Delim)
-		if !isDelimiter {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			keys := make(map[string]struct{})
-			for duplicateScanner.More() {
-				keyToken, err := duplicateScanner.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return errors.New("object key is not a string")
-				}
-				if _, duplicate := keys[key]; duplicate {
-					return fmt.Errorf("duplicate object field %q", key)
-				}
-				keys[key] = struct{}{}
-				if err := scanValue(); err != nil {
-					return err
-				}
-			}
-			closing, err := duplicateScanner.Token()
-			if err != nil || closing != json.Delim('}') {
-				return errors.New("object is not closed")
-			}
-			return nil
-		case '[':
-			for duplicateScanner.More() {
-				if err := scanValue(); err != nil {
-					return err
-				}
-			}
-			closing, err := duplicateScanner.Token()
-			if err != nil || closing != json.Delim(']') {
-				return errors.New("array is not closed")
-			}
-			return nil
-		default:
-			return errors.New("unexpected closing delimiter")
-		}
-	}
-	if err := scanValue(); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidCommandManifest, err)
-	}
-	if _, err := duplicateScanner.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: trailing JSON document", ErrInvalidCommandManifest)
-	}
-
 	type commandRecord struct {
 		Name string `json:"name"`
 		Path string `json:"path"`
@@ -130,14 +70,11 @@ func LoadCommandManifest(path string, expectedOwnerUID uint32) (map[string]strin
 		SchemaVersion int             `json:"schemaVersion"`
 		Commands      []commandRecord `json:"commands"`
 	}
-	decoder := json.NewDecoder(bytes.NewReader(document))
-	decoder.DisallowUnknownFields()
+	// encoding/json alone would bind case variants such as "PATH" to "path",
+	// letting a second spelling silently replace the reviewed executable.
 	var manifest manifestDocument
-	if err := decoder.Decode(&manifest); err != nil {
+	if err := strictjson.Decode(document, &manifest); err != nil {
 		return nil, fmt.Errorf("%w: decode: %v", ErrInvalidCommandManifest, err)
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: trailing JSON document", ErrInvalidCommandManifest)
 	}
 	if manifest.SchemaVersion != 1 || len(manifest.Commands) == 0 ||
 		len(manifest.Commands) > maximumCommandCount {

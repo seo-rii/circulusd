@@ -56,6 +56,10 @@ func TestLoadCommandManifestRejectsAmbiguousOrUnsafeDocuments(t *testing.T) {
 		{name: "mutable executable", document: `{"schemaVersion":1,"commands":[{"name":"tool","path":"/workspace/tool"}]}`},
 		{name: "raw command path", document: `{"schemaVersion":1,"commands":[{"name":"/bin/sh","path":"/bin/sh"}]}`},
 		{name: "unknown command field", document: `{"schemaVersion":1,"commands":[{"name":"echo","path":"/bin/echo","args":[]}]}`},
+		{name: "case-variant duplicate path", document: `{"schemaVersion":1,"commands":[{"name":"tool","path":"/usr/bin/tool","PATH":"/opt/other/tool"}]}`},
+		{name: "case-variant duplicate name", document: `{"schemaVersion":1,"commands":[{"name":"echo","Name":"tool","path":"/bin/echo"}]}`},
+		{name: "case-variant root field", document: `{"SchemaVersion":1,"commands":[{"name":"echo","path":"/bin/echo"}]}`},
+		{name: "case-variant command field", document: `{"schemaVersion":1,"Commands":[{"name":"echo","path":"/bin/echo"}]}`},
 		{name: "trailing document", document: `{"schemaVersion":1,"commands":[{"name":"echo","path":"/bin/echo"}]} {}`},
 	}
 	for _, test := range tests {
