@@ -316,9 +316,13 @@ func commit(ctx context.Context, cfg config) (commitFacts, error) {
 	}
 	defer through.Close()
 	_, operationErr := through.CompareAndCommit(ctx, request)
-	select {
-	case <-completed:
-	case <-time.After(clientConfig.Timeout + time.Second):
+	transcribed := awaitTranscript(completed, clientConfig.Timeout+time.Second)
+	// A handler holds captureMu until it returns, and closing the relay aborts
+	// its pending I/O, so facts is read only after every handler write.
+	_ = server.Close()
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	if !transcribed {
 		return facts, errors.New("pending transcript unavailable")
 	}
 	facts.Acknowledged = operationErr == nil
@@ -338,6 +342,17 @@ func commit(ctx context.Context, cfg config) (commitFacts, error) {
 		return facts, errors.New("prior native write was not rejected")
 	}
 	return facts, nil
+}
+
+// awaitTranscript reports whether the relayed write finished within wait.
+// Tests replace it to take the timeout path deterministically.
+var awaitTranscript = func(completed <-chan struct{}, wait time.Duration) bool {
+	select {
+	case <-completed:
+		return true
+	case <-time.After(wait):
+		return false
+	}
 }
 
 func digest(body []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(body)) }

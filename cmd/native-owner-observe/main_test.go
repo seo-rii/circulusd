@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +21,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hancomac/circulusd/internal/canonical"
 )
 
 func testConfig(t *testing.T, upstream string) config {
@@ -304,5 +312,89 @@ func TestReportCreationDoesNotClobberOrFollowSymlink(t *testing.T) {
 	os.Symlink(path, link)
 	if _, err = createPrivate(link); err == nil {
 		t.Fatal("followed output symlink")
+	}
+}
+
+// nativeStorageResponseMAC mirrors the native storage response signature so
+// the direct snapshot read that precedes the relayed write authenticates.
+func nativeStorageResponseMAC(root []byte, parts ...[]byte) string {
+	derive := hmac.New(sha256.New, root)
+	derive.Write([]byte("circulusd.native-storage.key.response.v1\x00"))
+	mac := hmac.New(sha256.New, derive.Sum(nil))
+	for _, part := range parts {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(part)))
+		mac.Write(size[:])
+		mac.Write(part)
+	}
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func TestCommitReportsRelayFactsOnlyAfterHandlerStops(t *testing.T) {
+	for _, mode := range []string{"rejected", "timeout"} {
+		t.Run(mode, func(t *testing.T) {
+			root := bytes.Repeat([]byte{0x5a}, 32)
+			const keyID, objectID, contentType = "observer", "native-owner-object", "application/vnd.circulusd.native-storage+cbor"
+			options := canonical.Options{MaxBytes: 1 << 20, MaxDepth: 72, MaxItems: 100_000}
+			forwarded := make(chan struct{})
+			var forwardOnce sync.Once
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				value, err := canonical.Decode(body, options)
+				request, ok := value.(canonical.Map)
+				if err != nil || !ok {
+					t.Error("invalid native storage request")
+					return
+				}
+				if request["operation"] == "commit" {
+					forwardOnce.Do(func() { close(forwarded) })
+					if mode == "rejected" {
+						http.Error(w, "prior owner fenced", http.StatusServiceUnavailable)
+						return
+					}
+					// Stall the relayed write until the relay abandons it.
+					<-r.Context().Done()
+					return
+				}
+				framed, _ := canonical.Encode(canonical.Array{"circulusd.hash", int64(1), "circulusd.native.storage.request", int64(1), request}, options)
+				response, _ := canonical.Encode(canonical.Map{"protocol": request["protocol"], "major": int64(1), "minor": int64(0), "schemaDigest": request["schemaDigest"],
+					"requestId": request["requestId"], "requestDigest": fmt.Sprintf("sha256:%x", sha256.Sum256(framed)), "payload": canonical.Map{"ok": true, "result": canonical.Map{
+						"snapshot": canonical.Map{"objectId": objectID, "exists": false, "revision": int64(0), "stateDigest": fmt.Sprintf("sha256:%x", sha256.Sum256(nil))}, "state": canonical.Bytes{}}}}, options)
+				requestSum, responseSum := sha256.Sum256(body), sha256.Sum256(response)
+				w.Header().Set("Content-Type", contentType)
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("X-Circulus-Storage-Key-Id", keyID)
+				w.Header().Set("X-Circulus-Storage-Signature", nativeStorageResponseMAC(root, []byte("circulusd.native-storage.response.v1"), []byte(keyID),
+					[]byte(request["requestId"].(string)), requestSum[:], []byte("200"), []byte(contentType), responseSum[:]))
+				_, _ = w.Write(response)
+			}))
+			defer upstream.Close()
+			if mode == "timeout" {
+				original := awaitTranscript
+				defer func() { awaitTranscript = original }()
+				awaitTranscript = func(<-chan struct{}, time.Duration) bool {
+					select {
+					case <-forwarded:
+					case <-time.After(5 * time.Second):
+						t.Error("relayed write never reached the native source")
+					}
+					return false
+				}
+			}
+			cfg := config{SchemaVersion: 1, RequestTimeoutMillis: 200, Endpoint: upstream.URL, KeyID: keyID, RootKeyHex: hex.EncodeToString(root), ObjectID: objectID}
+			facts, err := commit(context.Background(), cfg)
+			if mode == "rejected" {
+				if err != nil || facts.HTTPStatus != http.StatusServiceUnavailable || facts.ClientErrorCode != "HTTP_FAILURE" || facts.Acknowledged || facts.RequestCount != 1 {
+					t.Fatalf("rejected write: facts=%+v err=%v", facts, err)
+				}
+				return
+			}
+			if err == nil || err.Error() != "pending transcript unavailable" {
+				t.Fatalf("commit() error = %v, want pending transcript timeout", err)
+			}
+			if facts.RequestCount != 1 || facts.StartedSequence == 0 || facts.ResponseSequence < facts.StartedSequence {
+				t.Fatalf("timed-out report omitted the relay's facts: %+v", facts)
+			}
+		})
 	}
 }
