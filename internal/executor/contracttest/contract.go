@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hancomac/circulusd/internal/executor"
 )
@@ -105,6 +106,63 @@ func Run(t *testing.T, factory Factory) {
 		}
 		if len(snapshot) != 1 || snapshot[0].Handle != first {
 			t.Fatalf("Snapshot() = %#v, want one ensured sandbox", snapshot)
+		}
+	})
+
+	t.Run("waiter outlives a cancelled in-flight ensure", func(t *testing.T) {
+		faults := &blockFirstInjector{point: executor.FaultEnsure, entered: make(chan struct{})}
+		provider := factory.New(faults)
+		request := executor.EnsureRequest{Mode: factory.Mode, Spec: factory.Spec}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		leaderContext, cancelLeader := context.WithCancel(ctx)
+		defer cancelLeader()
+		leaderErr := make(chan error, 1)
+		go func() {
+			_, err := provider.EnsureSandbox(leaderContext, request)
+			leaderErr <- err
+		}()
+		select {
+		case <-faults.entered:
+		case <-ctx.Done():
+			t.Fatal("EnsureSandbox() did not reach the ensure fault point")
+		}
+
+		waiterContext := &selectSignalContext{Context: ctx, selected: make(chan struct{})}
+		type outcome struct {
+			result executor.EnsureResult
+			err    error
+		}
+		waiter := make(chan outcome, 1)
+		go func() {
+			result, err := provider.EnsureSandbox(waiterContext, request)
+			waiter <- outcome{result: result, err: err}
+		}()
+		select {
+		case <-waiterContext.selected:
+		case <-ctx.Done():
+			t.Fatal("second EnsureSandbox() did not wait for the in-flight ensure")
+		}
+		cancelLeader()
+
+		if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled EnsureSandbox() error = %v, want context.Canceled", err)
+		}
+		joined := <-waiter
+		if joined.err != nil {
+			t.Fatalf("waiting EnsureSandbox() error = %v, want the leader's cancellation not to leak", joined.err)
+		}
+		health, err := provider.Health(context.Background(), joined.result.Handle)
+		if err != nil || health.State != executor.LifecycleReady {
+			t.Fatalf("Health(waiter handle) = %#v, %v, want ready", health, err)
+		}
+		snapshot, err := provider.Snapshot(context.Background())
+		if err != nil {
+			t.Fatalf("Snapshot() error = %v", err)
+		}
+		if len(snapshot) != 1 || snapshot[0].Handle != joined.result.Handle {
+			t.Fatalf("Snapshot() = %#v, want only the waiter's sandbox", snapshot)
 		}
 	})
 
@@ -229,4 +287,38 @@ func (injector *failOnceInjector) Inject(
 		return injector.err
 	}
 	return nil
+}
+
+// blockFirstInjector holds the first call at point until that caller's
+// context ends; later calls pass through.
+type blockFirstInjector struct {
+	point   executor.FaultPoint
+	entered chan struct{}
+	used    atomic.Bool
+}
+
+func (injector *blockFirstInjector) Inject(
+	ctx context.Context,
+	point executor.FaultPoint,
+	_ executor.FaultMetadata,
+) error {
+	if point != injector.point || !injector.used.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(injector.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// selectSignalContext reports the first call to Done. A caller that joins an
+// in-flight ensure first selects on Done when it starts waiting.
+type selectSignalContext struct {
+	context.Context
+	selected chan struct{}
+	once     sync.Once
+}
+
+func (ctx *selectSignalContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.selected) })
+	return ctx.Context.Done()
 }

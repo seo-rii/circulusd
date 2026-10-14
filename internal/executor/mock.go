@@ -40,6 +40,9 @@ type mockEnsureCall struct {
 	done   chan struct{}
 	result EnsureResult
 	err    error
+	// leaderCanceled reports that the creating caller's own context ended
+	// before creation finished.
+	leaderCanceled bool
 }
 
 // NewDevelopmentMockProvider constructs an isolated provider instance. A nil
@@ -105,85 +108,96 @@ func (provider *MockProvider) EnsureSandbox(
 		return EnsureResult{}, err
 	}
 
-	provider.mu.Lock()
-	if sandbox := provider.byKey[cacheKey]; sandbox != nil {
-		switch sandbox.state {
-		case LifecycleReady:
-			result := EnsureResult{
+	for {
+		provider.mu.Lock()
+		if sandbox := provider.byKey[cacheKey]; sandbox != nil {
+			switch sandbox.state {
+			case LifecycleReady:
+				result := EnsureResult{
+					Handle:   provider.handleFor(sandbox),
+					CacheKey: cacheKey,
+					Reused:   true,
+				}
+				provider.mu.Unlock()
+				return result, nil
+			case LifecycleDraining:
+				provider.mu.Unlock()
+				return EnsureResult{}, ErrSandboxDraining
+			case LifecycleStopped:
+				provider.mu.Unlock()
+				return EnsureResult{}, ErrSandboxStopped
+			case LifecycleDestroyed:
+			}
+		}
+
+		if call := provider.inflight[cacheKey]; call != nil {
+			provider.mu.Unlock()
+			select {
+			case <-call.done:
+				if call.leaderCanceled {
+					// The leader's own cancellation is not this caller's
+					// failure; a waiter whose context is live retries.
+					if err := ctx.Err(); err != nil {
+						return EnsureResult{}, err
+					}
+					continue
+				}
+				if call.err != nil {
+					return EnsureResult{}, call.err
+				}
+				result := call.result
+				result.Reused = true
+				return result, nil
+			case <-ctx.Done():
+				return EnsureResult{}, ctx.Err()
+			}
+		}
+
+		call := &mockEnsureCall{done: make(chan struct{})}
+		provider.inflight[cacheKey] = call
+		previous := provider.byKey[cacheKey]
+		provider.mu.Unlock()
+
+		err = provider.inject(ctx, FaultEnsure, FaultMetadata{
+			Backend:  BackendMock,
+			CacheKey: cacheKey,
+			State:    LifecycleReady,
+		})
+
+		provider.mu.Lock()
+		if err == nil {
+			var slotID uint64
+			if previous == nil {
+				provider.nextSlotID++
+				slotID = provider.nextSlotID
+			} else {
+				slotID = previous.slotID
+			}
+			provider.nextGeneration++
+			sandbox := &mockSandbox{
+				slotID:     slotID,
+				generation: provider.nextGeneration,
+				cacheKey:   cacheKey,
+				spec:       request.Spec,
+				state:      LifecycleReady,
+			}
+			provider.byKey[cacheKey] = sandbox
+			provider.bySlot[slotID] = sandbox
+			call.result = EnsureResult{
 				Handle:   provider.handleFor(sandbox),
 				CacheKey: cacheKey,
-				Reused:   true,
 			}
-			provider.mu.Unlock()
-			return result, nil
-		case LifecycleDraining:
-			provider.mu.Unlock()
-			return EnsureResult{}, ErrSandboxDraining
-		case LifecycleStopped:
-			provider.mu.Unlock()
-			return EnsureResult{}, ErrSandboxStopped
-		case LifecycleDestroyed:
-		}
-	}
-
-	if call := provider.inflight[cacheKey]; call != nil {
-		provider.mu.Unlock()
-		select {
-		case <-call.done:
-			if call.err != nil {
-				return EnsureResult{}, call.err
-			}
-			result := call.result
-			result.Reused = true
-			return result, nil
-		case <-ctx.Done():
-			return EnsureResult{}, ctx.Err()
-		}
-	}
-
-	call := &mockEnsureCall{done: make(chan struct{})}
-	provider.inflight[cacheKey] = call
-	previous := provider.byKey[cacheKey]
-	provider.mu.Unlock()
-
-	err = provider.inject(ctx, FaultEnsure, FaultMetadata{
-		Backend:  BackendMock,
-		CacheKey: cacheKey,
-		State:    LifecycleReady,
-	})
-
-	provider.mu.Lock()
-	if err == nil {
-		var slotID uint64
-		if previous == nil {
-			provider.nextSlotID++
-			slotID = provider.nextSlotID
 		} else {
-			slotID = previous.slotID
+			call.err = err
+			call.leaderCanceled = ctx.Err() != nil
 		}
-		provider.nextGeneration++
-		sandbox := &mockSandbox{
-			slotID:     slotID,
-			generation: provider.nextGeneration,
-			cacheKey:   cacheKey,
-			spec:       request.Spec,
-			state:      LifecycleReady,
-		}
-		provider.byKey[cacheKey] = sandbox
-		provider.bySlot[slotID] = sandbox
-		call.result = EnsureResult{
-			Handle:   provider.handleFor(sandbox),
-			CacheKey: cacheKey,
-		}
-	} else {
-		call.err = err
+		delete(provider.inflight, cacheKey)
+		close(call.done)
+		result := call.result
+		callErr := call.err
+		provider.mu.Unlock()
+		return result, callErr
 	}
-	delete(provider.inflight, cacheKey)
-	close(call.done)
-	result := call.result
-	callErr := call.err
-	provider.mu.Unlock()
-	return result, callErr
 }
 
 func (provider *MockProvider) Stop(ctx context.Context, handle SandboxHandle) error {
