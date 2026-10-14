@@ -258,6 +258,44 @@ func TestFinalizedPermitCannotProtectRestoredIncarnation(t *testing.T) {
 	}
 }
 
+// A finalized permit no longer pins its object. Replaying Protect with it must
+// not report protection that the guard does not hold.
+func TestFinalizedPermitReplayDoesNotReportProtection(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_800_000_000, 0)
+	table := NewGuardTable(0)
+	key := validKey("tenant-a", "6")
+	if err := table.Register(key, start); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if _, err := table.Protect(key, "permit-finalized"); err != nil {
+		t.Fatalf("Protect() error = %v", err)
+	}
+	if err := table.Finalize("permit-finalized"); err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	if _, err := table.Sweep(1, true, nil, start); err != nil {
+		t.Fatalf("Sweep(candidate) error = %v", err)
+	}
+	if _, err := table.Protect(key, "permit-finalized"); !errors.Is(err, ErrStalePermit) {
+		t.Fatalf("Protect(finalized replay) error = %v, want ErrStalePermit", err)
+	}
+	if err := table.Finalize("permit-finalized"); err != nil {
+		t.Fatalf("Finalize(replay) error = %v", err)
+	}
+	if snapshot := table.Snapshot(key); snapshot.State != Candidate || snapshot.PendingPermits != 0 {
+		t.Fatalf("Snapshot() = %#v, want an unprotected candidate", snapshot)
+	}
+	// A fresh permit still protects the same incarnation.
+	if _, err := table.Protect(key, "permit-fresh"); err != nil {
+		t.Fatalf("Protect(fresh) error = %v", err)
+	}
+	if deletions, err := table.Sweep(2, true, nil, start); err != nil || len(deletions) != 0 {
+		t.Fatalf("Sweep(protected) = %#v, %v, want no deletions", deletions, err)
+	}
+}
+
 func TestAbandonedPermitIDRemainsReserved(t *testing.T) {
 	t.Parallel()
 
