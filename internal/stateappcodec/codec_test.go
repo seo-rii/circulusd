@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	v1 "github.com/hancomac/circulusd/api/generated/circulus/v1alpha"
@@ -268,6 +269,37 @@ func TestSettlementReferenceValidationAndNonSuccessNeedNoReader(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatal("invalid or non-success outcome read blob")
+	}
+}
+
+// The state app accepts error settlement messages of up to 4,096 UTF-8 bytes
+// (parseAgentError), so hydration must accept the same bound.
+func TestSettlementErrorMessageMatchesStateAppBound(t *testing.T) {
+	request := value(t, golden(t).Settlements[0].WireHex)["requestDigest"].(string)
+	codec, _ := New(testScope(), func(context.Context, BlobRequest) (*Blob, error) { return nil, errors.New("unexpected I/O") })
+	for _, test := range []struct {
+		message string
+		ok      bool
+	}{
+		{strings.Repeat("a", 256), true},
+		{strings.Repeat("a", 257), true},
+		{strings.Repeat("a", 4094) + "\u00e9", true},
+		{strings.Repeat("a", 4096), true},
+		{strings.Repeat("a", 4097), false},
+		{strings.Repeat("a", 4095) + "\u00e9", false},
+		{"", false},
+		{strings.Repeat("a", 300) + "\xff", false},
+		{strings.Repeat("a", 300) + "\n", false},
+		{strings.Repeat("a", 300) + "e\u0301", false},
+	} {
+		outcome := canonical.Map{"kind": "error", "code": "FAILED", "message": test.message, "retryable": true}
+		result, err := codec.HydrateSettlement(context.Background(), request, outcome)
+		if test.ok && (err != nil || result["outcome"].(canonical.Map)["message"] != test.message) {
+			t.Fatalf("valid %d-byte message rejected: %v", len(test.message), err)
+		}
+		if !test.ok && !errors.Is(err, ErrInvalidSettlement) {
+			t.Fatalf("invalid %d-byte message accepted: %v", len(test.message), err)
+		}
 	}
 }
 
