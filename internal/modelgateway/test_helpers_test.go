@@ -383,6 +383,7 @@ type fakeDispatchCoordinator struct {
 	claimed            map[string]struct{}
 	claims             int
 	acceptances        int
+	resumeClaims       int
 	mutate             func(*DispatchCommitRequest)
 	acceptedContextErr error
 	concurrent         bool
@@ -505,6 +506,7 @@ func (coordinator *fakeDispatchCoordinator) CommitAndClaimResume(_ context.Conte
 	if coordinator.durable != nil && !reflect.DeepEqual(*coordinator.durable, request.Effect) {
 		return ResumePermit{}, ErrConcurrentTransition
 	}
+	coordinator.resumeClaims++
 	var proof OpaqueResumePermit
 	proof[0], proof[1] = byte(request.Effect.Attempt), byte(request.CurrentScope.Generations.Placement)
 	return ResumePermit{

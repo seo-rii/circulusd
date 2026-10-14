@@ -158,6 +158,9 @@ func (gateway *Gateway) executeProviderDispatch(
 // ExecuteCancel durably linearizes cancellation against provider dispatch. A
 // request is classified as definitely not sent only when the coordinator
 // revoked the dispatch claim before BeginProviderDispatch could start I/O.
+// When the provider cancellation call fails, the returned execution still
+// carries the durable Resolution, which the caller must apply; the error only
+// reports that the provider did not acknowledge the cancellation.
 func (gateway *Gateway) ExecuteCancel(ctx context.Context, authority OpaqueAuthority, transition Transition) (CancellationExecution, error) {
 	if err := ctx.Err(); err != nil {
 		return CancellationExecution{}, err
@@ -209,9 +212,17 @@ func (gateway *Gateway) ExecuteCancel(ctx context.Context, authority OpaqueAutho
 	providerCommand := command
 	providerCommand.Scope = currentScope
 	providerCommand.Permit = permit
-	_, _ = gateway.providers[effect.ProviderID].Cancel(ctx, providerCommand)
+	// ProviderCancellation is advisory only; the durable permit alone decides
+	// the resolution, so only the provider's failure is reported.
+	_, cancelErr := gateway.providers[effect.ProviderID].Cancel(ctx, providerCommand)
+	if cancelErr != nil {
+		cancelErr = fmt.Errorf("%w: provider cancellation failed", ErrProviderUnavailable)
+		if contextErr := ctx.Err(); contextErr != nil {
+			cancelErr = contextErr
+		}
+	}
 	resolution.DispatchPrevented = false
-	return CancellationExecution{Permit: permit, Effect: effect, Resolution: resolution}, nil
+	return CancellationExecution{Permit: permit, Effect: effect, Resolution: resolution}, cancelErr
 }
 
 // ResumeProviderRequest uses a provider's explicitly advertised durable
@@ -227,7 +238,8 @@ func (gateway *Gateway) ResumeProviderRequest(ctx context.Context, authority Opa
 	if err := gateway.validateEffect(effect); err != nil {
 		return nil, err
 	}
-	if !effect.DurableRequestRetrieval || effect.ProviderRequestID == "" {
+	retriever, supported := gateway.providers[effect.ProviderID].(ProviderRequestRetriever)
+	if !effect.DurableRequestRetrieval || effect.ProviderRequestID == "" || !supported {
 		return nil, ErrDurableRetrievalUnavailable
 	}
 	switch effect.State {
@@ -254,10 +266,6 @@ func (gateway *Gateway) ResumeProviderRequest(ctx context.Context, authority Opa
 	}
 	if !validResumePermit(effect, permit) || permit.CurrentScope != currentScope || permit.EffectRevision != effect.Revision {
 		return nil, ErrDispatchNotDurable
-	}
-	retriever, supported := gateway.providers[effect.ProviderID].(ProviderRequestRetriever)
-	if !supported {
-		return nil, ErrDurableRetrievalUnavailable
 	}
 	stream, err := retriever.Resume(ctx, ProviderResumeCommand{
 		ProviderID: effect.ProviderID, Scope: currentScope, OriginScope: effect.Scope, EffectID: effect.Scope.EffectID,

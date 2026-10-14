@@ -3,6 +3,7 @@ package modelgateway
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -182,6 +183,58 @@ func TestResumeProviderRequestFailsClosedWithoutAnAdvertisedDurableContract(t *t
 	}
 	if fixture.provider.resumeCalls != 0 {
 		t.Fatalf("resume calls = %d, want 0", fixture.provider.resumeCalls)
+	}
+}
+
+// retrieverlessProvider hides fakeProvider's Resume method, as after a
+// provider reconfiguration that withdrew durable retrieval support.
+type retrieverlessProvider struct{ Provider }
+
+func TestResumeProviderRequestChecksRetrieverSupportBeforeClaiming(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	fixture.provider.availability.DurableRequestRetrieval = true
+	effect := fixture.admit(t, fixture.gateway(t))
+	dependencies := fixture.dependencies()
+	dependencies.Providers = map[string]Provider{"provider-a": retrieverlessProvider{fixture.provider}}
+	gateway, err := NewGateway(fixture.configuration(), dependencies)
+	if err != nil {
+		t.Fatalf("NewGateway() error = %v", err)
+	}
+	effect = apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventBeginDispatch}).Effect
+	effect = apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventProviderAccepted, ProviderRequestID: "provider-request-1"}).Effect
+
+	if _, err := gateway.ResumeProviderRequest(context.Background(), OpaqueAuthority("renewed"), effect); !errors.Is(err, ErrDurableRetrievalUnavailable) {
+		t.Fatalf("ResumeProviderRequest(no retriever) error = %v, want ErrDurableRetrievalUnavailable", err)
+	}
+	if fixture.dispatches.resumeClaims != 0 || fixture.provider.resumeCalls != 0 {
+		t.Fatalf("unsupported resume claimed %d times and called the provider %d times", fixture.dispatches.resumeClaims, fixture.provider.resumeCalls)
+	}
+}
+
+func TestExecuteCancelReportsAFailedProviderCancellation(t *testing.T) {
+	t.Parallel()
+	const secret = "Authorization: Bearer provider-secret"
+	fixture := newFixture(t)
+	fixture.provider.cancelErr = errors.New(secret)
+	gateway := fixture.gateway(t)
+	effect := fixture.admit(t, gateway)
+	effect = apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventBeginDispatch}).Effect
+	effect = apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventProviderAccepted, ProviderRequestID: "provider-request-1"}).Effect
+	requested := apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventCancelRequested})
+
+	execution, err := gateway.ExecuteCancel(context.Background(), OpaqueAuthority("renewed"), requested)
+	if !errors.Is(err, ErrProviderUnavailable) || strings.Contains(err.Error(), secret) {
+		t.Fatalf("ExecuteCancel(provider cancel failed) error = %v, want a redacted ErrProviderUnavailable", err)
+	}
+	if fixture.provider.cancelCalls != 1 || fixture.provider.lastCancel.ProviderRequestID != "provider-request-1" {
+		t.Fatalf("provider cancel calls/command = %d/%#v", fixture.provider.cancelCalls, fixture.provider.lastCancel)
+	}
+	// The durable linearization result stays usable: the request is uncertain
+	// whether or not the provider acknowledged the cancellation.
+	resolved := apply(t, gateway, execution.Effect, execution.Resolution)
+	if resolved.Effect.State != StateUncertain || resolved.Effect.CancellationPermit != execution.Permit {
+		t.Fatalf("resolved cancellation = %#v", resolved.Effect)
 	}
 }
 
