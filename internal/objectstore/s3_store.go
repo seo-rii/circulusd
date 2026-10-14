@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -56,12 +57,21 @@ type S3Store struct {
 
 func NewS3Store(options S3StoreOptions) (*S3Store, error) {
 	endpoint, err := url.Parse(options.Endpoint)
-	if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.RawFragment != "" || (endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawPath != "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
+	if err != nil || endpoint.String() != options.Endpoint || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.RawFragment != "" || (endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawPath != "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") {
 		return nil, ErrInvalidConfiguration
 	}
+	// The endpoint grammar matches the platform configuration: an IP literal or
+	// DNS host name and an explicit port of 1..65535. Together with the
+	// canonical round trip above this excludes control, format (bidi) and other
+	// non-ASCII characters, including percent-encoded ones in the host.
 	hostname := endpoint.Hostname()
-	if hostname == "" || strings.ContainsAny(hostname, "\\% \r\n\t") {
+	if !validS3EndpointHost(hostname) || strings.HasSuffix(endpoint.Host, ":") {
 		return nil, ErrInvalidConfiguration
+	}
+	if port := endpoint.Port(); port != "" {
+		if number, err := strconv.ParseUint(port, 10, 16); err != nil || number == 0 {
+			return nil, ErrInvalidConfiguration
+		}
 	}
 	if endpoint.Scheme == "http" {
 		ip := net.ParseIP(hostname)
@@ -114,6 +124,31 @@ func NewS3Store(options S3StoreOptions) (*S3Store, error) {
 		RequestChecksumCalculation:  aws.RequestChecksumCalculationWhenRequired, ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
 	return &S3Store{client: client, bucket: options.Bucket, maximumObjectBytes: maximum, transport: transport}, nil
+}
+
+func validS3EndpointHost(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	trimmed := strings.TrimSuffix(host, ".")
+	if trimmed == "" {
+		return false
+	}
+	for _, label := range strings.Split(trimmed, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') && character != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func credentialValue(value string, maximum int) bool {

@@ -365,3 +365,41 @@ func TestS3StoreHonorsBoundedHTTPTimeoutAndIgnoresProxyEnvironment(t *testing.T)
 		t.Fatalf("timeout not bounded: %v", e)
 	}
 }
+
+// TestS3StoreRejectsEndpointsOutsideTheConfigurationGrammar keeps NewS3Store
+// at least as strict as the platform configuration's endpoint grammar: the
+// host is an IP literal or a DNS host name, the port is 1..65535, the URL is in
+// canonical form, and no control or format character appears anywhere.
+func TestS3StoreRejectsEndpointsOutsideTheConfigurationGrammar(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://exam\u0085ple.com",
+		"https://%C2%85example.com",
+		"https://example.com\u202e",
+		"https://\u200bexample.com",
+		"https://ex_ample.com",
+		"https://example.com:0",
+		"https://example.com:65536",
+		"https://example.com:",
+		"HTTPS://example.com",
+		"https://example.com ",
+	} {
+		if _, err := NewS3Store(s3Options(endpoint)); !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("NewS3Store(%q) error = %v, want ErrInvalidConfiguration", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{
+		"https://example.com",
+		"https://example.com/",
+		"https://s3.example.com.:8443",
+		"http://127.0.0.1:9000",
+		"http://[::1]:9000",
+		"http://localhost:9000",
+	} {
+		store, err := NewS3Store(s3Options(endpoint))
+		if err != nil {
+			t.Errorf("NewS3Store(%q) error = %v", endpoint, err)
+			continue
+		}
+		_ = store.Close()
+	}
+}

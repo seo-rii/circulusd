@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/config"
+	"github.com/hancomac/circulusd/internal/objectstore"
 )
 
 const validConfiguration = `
@@ -597,6 +598,15 @@ func TestParseRejectsUnsafePathsAndEndpointForms(t *testing.T) {
 		{name: "network endpoint zero port", replace: func(value string) string {
 			return strings.Replace(value, "http://127.0.0.1:8333", "http://127.0.0.1:0", 1)
 		}, marker: config.ErrInvalidSyntax},
+		{name: "object store endpoint path", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8333", "http://127.0.0.1:8333/prefix", 1)
+		}, marker: config.ErrInvalidConfiguration},
+		{name: "model endpoint bidi control", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8000/v1", "\"http://127.0.0.1:8000/v1\u202e\"", 1)
+		}, marker: config.ErrInvalidSyntax},
+		{name: "model endpoint zero-width character", replace: func(value string) string {
+			return strings.Replace(value, "http://127.0.0.1:8000/v1", "\"http://127.0.0.1:8000/\u200bv1\"", 1)
+		}, marker: config.ErrInvalidSyntax},
 		{name: "single-node object store is not loopback", replace: func(value string) string {
 			return strings.Replace(value, "http://127.0.0.1:8333", "https://object-store.internal:8333", 1)
 		}, marker: config.ErrInvalidConfiguration},
@@ -611,6 +621,42 @@ func TestParseRejectsUnsafePathsAndEndpointForms(t *testing.T) {
 				t.Fatalf("Parse() error = %v, want %v", err, test.marker)
 			}
 		})
+	}
+}
+
+// TestObjectStoreEndpointsAcceptedByConfigurationOpenAnS3Store checks that the
+// configuration never accepts an object store endpoint that the S3 client
+// would reject at startup.
+func TestObjectStoreEndpointsAcceptedByConfigurationOpenAnS3Store(t *testing.T) {
+	accepted := 0
+	for _, endpoint := range []string{
+		"http://127.0.0.1:8333",
+		"http://127.0.0.1:8333/",
+		"http://127.0.0.1:8333/prefix",
+		"https://127.0.0.1:8333",
+		"\"http://[::1]:8333\"",
+		"http://127.0.0.1:08333",
+		"http://127.0.0.1",
+		"http://localhost:8333",
+		"http://127.0.0.1:8333/%2e",
+	} {
+		configuration, err := config.Parse(strings.NewReader(strings.Replace(validConfiguration, "http://127.0.0.1:8333", endpoint, 1)))
+		if err != nil {
+			continue
+		}
+		accepted++
+		store, err := objectstore.NewS3Store(objectstore.S3StoreOptions{
+			Endpoint: configuration.ObjectStore.Endpoint.String(), Region: "us-east-1", Bucket: configuration.ObjectStore.StateBucket,
+			AccessKeyID: "fixture-access", SecretAccessKey: "fixture-secret",
+		})
+		if err != nil {
+			t.Errorf("configuration accepted object store endpoint %s, but NewS3Store() error = %v", endpoint, err)
+			continue
+		}
+		_ = store.Close()
+	}
+	if accepted == 0 {
+		t.Fatal("no candidate endpoint was accepted by the configuration")
 	}
 }
 

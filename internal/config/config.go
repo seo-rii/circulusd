@@ -134,9 +134,12 @@ func (configuration Configuration) Validate() error {
 		}
 		seenStateFiles[path] = struct{}{}
 	}
+	// The S3 client addresses one bucket by path, so the endpoint itself must
+	// not carry a path; objectstore.NewS3Store enforces the same rule.
 	objectStoreIP := net.ParseIP(configuration.ObjectStore.Endpoint.host)
 	if (configuration.ObjectStore.Endpoint.scheme != "http" && configuration.ObjectStore.Endpoint.scheme != "https") ||
-		objectStoreIP == nil || !objectStoreIP.IsLoopback() {
+		objectStoreIP == nil || !objectStoreIP.IsLoopback() ||
+		(configuration.ObjectStore.Endpoint.path != "" && configuration.ObjectStore.Endpoint.path != "/") {
 		return fmt.Errorf("%w: object store endpoint", ErrInvalidConfiguration)
 	}
 	buckets := []string{
