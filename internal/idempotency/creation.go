@@ -223,13 +223,15 @@ func validateScopeAndKey(scope Scope, keyDigest string) error {
 			return fmt.Errorf("idempotency scope %s is invalid", field)
 		}
 	}
+	// Scope fields are untrusted and the method has no length limit, so errors
+	// quote at most a short prefix of them.
 	if !methodPattern.MatchString(scope.Method) {
-		return fmt.Errorf("idempotency scope method %q is not canonical", scope.Method)
+		return fmt.Errorf("idempotency scope method %.32q is not canonical", scope.Method)
 	}
 	if !strings.HasPrefix(scope.RouteTemplate, "/") ||
 		strings.ContainsAny(scope.RouteTemplate, "?#") ||
 		len(scope.RouteTemplate) > 512 {
-		return fmt.Errorf("idempotency route template %q is not canonical", scope.RouteTemplate)
+		return fmt.Errorf("idempotency route template %.32q is not canonical", scope.RouteTemplate)
 	}
 	if len(scope.TargetID) > 256 {
 		return fmt.Errorf("idempotency target ID is too long")
