@@ -3,6 +3,7 @@ package environment
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -148,7 +149,19 @@ func (resolver *Resolver) Resolve(request Request) (Revision, error) {
 		}})
 	}
 
-	candidates := make([]Revision, 0, len(resolver.revisions))
+	requestedIDs := make([]string, 0, len(parsed))
+	for _, requirement := range parsed {
+		requestedIDs = append(requestedIDs, requirement.packageID)
+	}
+	sort.Strings(requestedIDs)
+	requestedIDs = slices.Compact(requestedIDs)
+
+	type candidate struct {
+		revision Revision
+		// versions holds the requested packages' versions in requestedIDs order.
+		versions []semanticVersion
+	}
+	candidates := make([]candidate, 0, len(resolver.revisions))
 	for _, revision := range resolver.revisions {
 		if revision.Architecture != request.Architecture {
 			continue
@@ -181,19 +194,32 @@ func (resolver *Resolver) Resolve(request Request) (Revision, error) {
 			}
 		}
 		if matches {
-			candidates = append(candidates, revision)
+			versions := make([]semanticVersion, len(requestedIDs))
+			for index, packageID := range requestedIDs {
+				versions[index] = packages[packageID]
+			}
+			candidates = append(candidates, candidate{revision: revision, versions: versions})
 		}
 	}
 	if len(candidates) == 0 {
 		return Revision{}, ErrNoEnvironment
 	}
+	// Prefer the smallest superset, then the highest requested versions (in
+	// package ID order) so a curated package update wins over the revision it
+	// replaces, then the lowest digest.
 	sort.Slice(candidates, func(left, right int) bool {
-		if len(candidates[left].Packages) != len(candidates[right].Packages) {
-			return len(candidates[left].Packages) < len(candidates[right].Packages)
+		leftCandidate, rightCandidate := candidates[left], candidates[right]
+		if len(leftCandidate.revision.Packages) != len(rightCandidate.revision.Packages) {
+			return len(leftCandidate.revision.Packages) < len(rightCandidate.revision.Packages)
 		}
-		return candidates[left].Digest < candidates[right].Digest
+		for index := range leftCandidate.versions {
+			if order := leftCandidate.versions[index].compare(rightCandidate.versions[index]); order != 0 {
+				return order > 0
+			}
+		}
+		return leftCandidate.revision.Digest < rightCandidate.revision.Digest
 	})
-	return cloneRevision(candidates[0]), nil
+	return cloneRevision(candidates[0].revision), nil
 }
 
 func DigestRevision(revision Revision) (string, error) {

@@ -142,6 +142,76 @@ func TestResolverSelectionIsDeterministicAndUsesSmallestSuperset(t *testing.T) {
 	}
 }
 
+func TestResolverPrefersHighestRequestedVersions(t *testing.T) {
+	t.Parallel()
+	artifacts := func() BackendArtifacts {
+		return BackendArtifacts{NsJail: &NsJailArtifact{RootfsDigest: testDigest('2')}}
+	}
+	newer := validRevision(t, "J", []Package{{ID: "python-runtime", Version: "3.13.9", Digest: testDigest('9')}}, artifacts())
+	// Pick an older revision whose digest sorts first, so a digest tie-break
+	// alone would select it.
+	var older Revision
+	for fill := byte('0'); fill <= '8'; fill++ {
+		older = validRevision(t, "K", []Package{{ID: "python-runtime", Version: "3.13.1", Digest: testDigest(fill)}}, artifacts())
+		if older.Digest < newer.Digest {
+			break
+		}
+	}
+	if older.Digest >= newer.Digest {
+		t.Fatal("could not build an older revision with a lower digest")
+	}
+	for _, revisions := range [][]Revision{{older, newer}, {newer, older}} {
+		resolver, err := NewResolver(revisions)
+		if err != nil {
+			t.Fatalf("NewResolver() error = %v", err)
+		}
+		resolved, err := resolver.Resolve(Request{
+			Architecture:     ArchitectureX8664,
+			RequiredBackends: []Backend{BackendNsJail},
+			Requirements: []Requirement{
+				{PackageID: "python-runtime", Constraint: "<4.0.0"},
+				{PackageID: "python-runtime", Constraint: "3.13.x"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		if resolved.ID != newer.ID {
+			t.Fatalf("Resolve() selected python-runtime %s, want %s", resolved.Packages[0].Version, newer.Packages[0].Version)
+		}
+	}
+
+	// With several requirements, versions are compared in package ID order.
+	documentNewer := validRevision(t, "L", []Package{
+		{ID: "document-tools", Version: "3.5.0", Digest: testDigest('3')},
+		{ID: "python-runtime", Version: "3.13.1", Digest: testDigest('1')},
+	}, artifacts())
+	pythonNewer := validRevision(t, "M", []Package{
+		{ID: "document-tools", Version: "3.4.0", Digest: testDigest('4')},
+		{ID: "python-runtime", Version: "3.13.9", Digest: testDigest('9')},
+	}, artifacts())
+	for _, revisions := range [][]Revision{{documentNewer, pythonNewer}, {pythonNewer, documentNewer}} {
+		resolver, err := NewResolver(revisions)
+		if err != nil {
+			t.Fatalf("NewResolver() error = %v", err)
+		}
+		resolved, err := resolver.Resolve(Request{
+			Architecture:     ArchitectureX8664,
+			RequiredBackends: []Backend{BackendNsJail},
+			Requirements: []Requirement{
+				{PackageID: "python-runtime", Constraint: "3.x"},
+				{PackageID: "document-tools", Constraint: "3.x"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Resolve(two requirements) error = %v", err)
+		}
+		if resolved.ID != documentNewer.ID {
+			t.Fatalf("Resolve(two requirements) = %s, want %s", resolved.ID, documentNewer.ID)
+		}
+	}
+}
+
 func TestResolverIsSafeForConcurrentResolution(t *testing.T) {
 	t.Parallel()
 	revision := validRevision(t, "I", []Package{{ID: "shell", Version: "1.0.0", Digest: testDigest('1')}}, BackendArtifacts{
