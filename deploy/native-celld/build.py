@@ -58,7 +58,7 @@ def validate_source(source):
     return {"patchDigest": digest(package / "celld-native.patch"), "nativeProofSourceDigest": digest(payload), "cargoLockDigest": digest(source / "Cargo.lock")}
 
 
-def build(source, output, build_root, status):
+def build(source, output, build_root, status, remove_build_root=False):
     result = {"pid": os.getpid(), "exitCode": 1, "buildRoot": str(build_root)}
     process = None
     try:
@@ -143,6 +143,15 @@ def build(source, output, build_root, status):
             os.killpg(process.pid, signal.SIGTERM)
             process.wait()
     finally:
+        if remove_build_root:
+            # The default tmpfs cache belongs to this build alone; keeping it would pin
+            # gigabytes of RAM. The status is written last, so it reports the cleanup too.
+            try:
+                shutil.rmtree(build_root)
+                result["buildRootRemoved"] = True
+            except OSError as error:
+                result["buildRootRemoved"] = False
+                result["buildRootCleanupError"] = type(error).__name__
         fd = os.open(status, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as handle:
             json.dump(result, handle, sort_keys=True)
@@ -156,16 +165,20 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--build-root", type=Path)
     parser.add_argument("--status", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--remove-build-root", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     source = arguments.source.resolve(strict=True)
     if arguments.status:
-        code = build(source, arguments.output, arguments.build_root, arguments.status)
+        if arguments.remove_build_root and arguments.build_root.parent != Path("/dev/shm"):
+            raise SystemExit("only a default tmpfs build root is removed")
+        code = build(source, arguments.output, arguments.build_root, arguments.status, arguments.remove_build_root)
         sys.exit(code if code >= 0 else 128-code)
     validate_source(source)
     output = arguments.output.absolute()
     output.mkdir(mode=0o700)
     build_root = arguments.build_root
-    if build_root is None:
+    remove_build_root = build_root is None
+    if remove_build_root:
         build_root = Path(tempfile.mkdtemp(prefix="circulusd-native-celld-build-", dir="/dev/shm"))
         build_root.chmod(0o700)
         home = build_root / "cargo"
@@ -193,6 +206,7 @@ def main():
     process = subprocess.Popen([
         sys.executable, str(Path(__file__).resolve()), "--source", str(source),
         "--output", str(output), "--build-root", str(build_root), "--status", status,
+        *(["--remove-build-root"] if remove_build_root else []),
     ], stdout=fd, stderr=subprocess.STDOUT, start_new_session=True)
     os.close(fd)
     print(json.dumps({"pid": process.pid, "log": log, "status": status,

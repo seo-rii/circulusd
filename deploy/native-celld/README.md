@@ -109,7 +109,9 @@ resource limits must be retained separately from qualification evidence.
 starts a persistent background build and immediately reports its PID, private
 log and final status path. It defaults to a unique executable tmpfs Cargo cache
 with one CPU and job, and stops the build if available RAM falls below 1.5 GiB or
-cache filesystem free space falls below 6 GiB. `--build-root` accepts an owned
+cache filesystem free space falls below 6 GiB. The background build removes that
+default cache when it finishes, after publishing any artifact, and records
+`buildRootRemoved` in its status. `--build-root` accepts an owned
 mode `0700` cache named `circulusd-native-celld-build-*` directly under `/dev/shm`
 or the pinned source checkout's parent. A disk cache avoids charging compiler
 output against host RAM and can be reused after its prior process fully exits.

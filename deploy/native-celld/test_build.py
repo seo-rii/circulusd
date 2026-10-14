@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -163,6 +164,74 @@ class BuildEnvironmentTests(unittest.TestCase):
         self.assertEqual(captured["CARGO_TARGET_DIR"], str(self.root / "build/target"))
         self.assertEqual(captured["CARGO_PROFILE_RELEASE_LTO"], "false")
         self.assertTrue(captured.get("PATH") == os.environ["PATH"], "PATH must still be inherited")
+
+
+class BuildRootCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="circulusd-native-build-cleanup-")
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.module = load_build_module()
+        self.source = self.root / "source"
+        self.source.mkdir()
+        (self.source / "Cargo.lock").write_text("version = 4\n")
+        self.output = self.root / "output"
+        self.output.mkdir(mode=0o700)
+        self.build_root = self.root / "circulusd-native-celld-build-fixture"
+        (self.build_root / "target/release").mkdir(parents=True)
+        (self.build_root / "cargo/registry").mkdir(parents=True)
+        (self.build_root / "cargo/registry/large.crate").write_bytes(b"\0" * 4096)
+
+    def run_build(self, exit_code, remove_build_root):
+        build_root = self.build_root
+
+        class Cargo:
+            pid = 0
+
+            def __init__(self, command, **options):
+                if exit_code == 0:
+                    (build_root / "target/release/celld").write_bytes(b"native celld fixture\n")
+
+            def poll(self):
+                return exit_code
+
+            def wait(self, timeout=None):
+                return exit_code
+
+        def check_output(command, **options):
+            return "rustc 1.97.0\n" if command[0] == "rustc" else "celld 0.3.0\n"
+
+        space = mock.Mock(f_bavail=1 << 40, f_frsize=1)
+        status = self.root / "status.json"
+        with mock.patch.object(self.module, "validate_source", return_value={"patchDigest": "fixture"}), \
+                mock.patch.object(self.module.os, "nice"), \
+                mock.patch.object(self.module.os, "sched_setaffinity"), \
+                mock.patch.object(self.module.os, "statvfs", return_value=space), \
+                mock.patch.object(self.module.subprocess, "check_output", side_effect=check_output), \
+                mock.patch.object(self.module.subprocess, "Popen", side_effect=Cargo), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = self.module.build(self.source, self.output, self.build_root, status, remove_build_root)
+        return code, json.loads(status.read_text())
+
+    def test_default_build_root_is_removed_after_publication(self):
+        code, status = self.run_build(0, remove_build_root=True)
+        self.assertEqual((code, status["exitCode"]), (0, 0))
+        self.assertTrue((self.output / "celld-native").is_file())
+        self.assertTrue((self.output / "provenance.json").is_file())
+        self.assertFalse(self.build_root.exists())
+        self.assertIs(status["buildRootRemoved"], True)
+
+    def test_default_build_root_is_removed_after_a_failed_build(self):
+        code, status = self.run_build(101, remove_build_root=True)
+        self.assertEqual((code, status["exitCode"]), (101, 101))
+        self.assertFalse(self.build_root.exists())
+        self.assertIs(status["buildRootRemoved"], True)
+
+    def test_explicit_build_root_is_kept_for_reuse(self):
+        code, status = self.run_build(0, remove_build_root=False)
+        self.assertEqual(code, 0)
+        self.assertTrue((self.build_root / "cargo/registry/large.crate").is_file())
+        self.assertNotIn("buildRootRemoved", status)
 
 
 if __name__ == "__main__":
