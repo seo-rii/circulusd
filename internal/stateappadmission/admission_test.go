@@ -80,7 +80,10 @@ func TestTurnAdmitterPreservesFullInputAndUsesQualifiedPlan(t *testing.T) {
 	if client.request.CommandID != planner.plan.CommandID || client.request.TurnLeaseGeneration != 4 || client.request.ExpectedEventSequence != 9 || client.request.ExpectedAuthorizationGeneration != 7 || client.request.ActorSubjectID != permit.Principal.SubjectID {
 		t.Fatal("trusted plan or actor scope dropped")
 	}
-	for code, want := range map[string]error{"PERMISSION_DENIED": platformapi.ErrAccessDenied, "STALE_GENERATION": platformapi.ErrStaleAuthority, "IDEMPOTENCY_CONFLICT": platformapi.ErrIdempotencyConflict, "CONFLICT": platformapi.ErrSequenceConflict, "NOT_INITIALIZED": platformapi.ErrSessionNotFound, "INTERNAL_ERROR": platformapi.ErrRepositoryFailure} {
+	for code, want := range map[string]error{"PERMISSION_DENIED": platformapi.ErrAccessDenied, "STALE_GENERATION": platformapi.ErrStaleAuthority, "IDEMPOTENCY_CONFLICT": platformapi.ErrIdempotencyConflict, "CONFLICT": platformapi.ErrSequenceConflict, "NOT_INITIALIZED": platformapi.ErrSessionNotFound, "INTERNAL_ERROR": platformapi.ErrRepositoryFailure,
+		// The client verifies both digests before sending, so a remote mismatch
+		// is a Go/state-app contract divergence, not a caller error.
+		"DIGEST_MISMATCH": platformapi.ErrRepositoryFailure} {
 		client.err = &stateappclient.RemoteError{Code: code}
 		if _, err := store.AdmitTurn(context.Background(), request); !errors.Is(err, want) {
 			t.Fatalf("%s error=%v", code, err)
