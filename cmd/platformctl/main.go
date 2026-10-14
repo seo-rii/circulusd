@@ -1,3 +1,8 @@
+// platformctl is the operator CLI. It has two subcommands. capabilities
+// queries a daemon control socket and prints its capabilities as JSON.
+// doctor runs host, release-signature and daemon-socket probes for an install
+// profile, prints the doctor report as JSON, and exits 1 when the profile is
+// not qualified.
 package main
 
 import (

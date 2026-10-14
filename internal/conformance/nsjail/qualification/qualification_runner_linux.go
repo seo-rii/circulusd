@@ -1,5 +1,14 @@
 //go:build linux
 
+// Package qualification runs the live NsJail isolation qualification on a
+// provisioned dedicated host. RunQualification launches a preprovisioned,
+// signed fixture described by a qualification config file and returns a
+// conformance report. It installs nothing, and its result is historical
+// evidence, not a startup grant.
+//
+// The only caller is TestProvisionedNsJailQualification. It runs when
+// CIRCULUSD_NSJAIL_QUALIFICATION_CONFIG names the config file and is skipped
+// otherwise.
 package qualification
 
 import (

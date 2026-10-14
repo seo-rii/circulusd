@@ -1,3 +1,33 @@
+// Package canonical implements the canonical CBOR encoding and structured
+// digest shared by the Go and TypeScript code. The TypeScript side is
+// packages/protocol-types/src/cbor.ts and digest.ts, and both sides are
+// checked against packages/protocol-types/fixtures/v1alpha-golden.json.
+//
+// The canonical form is a subset of CBOR (RFC 8949) with these rules:
+//
+//   - Only null, false, true, integers, text strings, byte strings, arrays
+//     and maps with text-string keys are allowed. Floating-point numbers,
+//     tags, other simple values and indefinite-length items are rejected.
+//   - Integers must lie in the JavaScript safe-integer range,
+//     -(2^53-1) through 2^53-1.
+//   - Every integer and length argument uses its shortest encoding.
+//   - Text must be valid UTF-8. Encode normalizes text and map keys to NFC;
+//     Decode rejects text that is not already NFC.
+//   - Map keys must be unique after NFC normalization. Map entries are
+//     sorted by the length of the encoded key, then bytewise by the encoded
+//     key (the length-first order of RFC 7049 section 3.9).
+//   - Decode rejects bytes after the single top-level value.
+//
+// In Go a value is nil, a bool, a string, Bytes, an int or uint type (not
+// uintptr), Array or Map. Decode returns every integer as int64. Encode and
+// Decode also enforce the depth, byte and item limits in Options; every
+// field is an exact limit, including zero. DefaultOptions allows depth 64,
+// 16 MiB and 1,000,000 items.
+//
+// StructuredDigest returns "sha256:" followed by the lowercase hex SHA-256
+// of the canonical encoding of the array
+// ["circulusd.hash", 1, domain, schemaVersion, payload]. The domain must be
+// non-empty NFC UTF-8, and schemaVersion must be between 1 and 2^53-1.
 package canonical
 
 import (

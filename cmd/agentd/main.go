@@ -1,3 +1,8 @@
+// agentd is a diagnostic-only shell for the agentd role. It serves only the
+// private control socket (package daemonshell; default
+// /run/pi-platform/agentd.sock) and reports agent.isolation and
+// agent.workerd as unavailable (NOT_WIRED). It starts no workerd and admits
+// no workload.
 package main
 
 import (

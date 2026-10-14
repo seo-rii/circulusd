@@ -1,3 +1,14 @@
+// Package blob stores tenant-scoped, content-addressed workspace blobs in the
+// objectstore workspace-blobs bucket and tracks them for garbage collection.
+//
+// ContentStore writes each blob once under
+// <tenant>/sha256/<aa>/<bb>/<hex digest> and checks the digest of
+// deduplicated and read bytes. GuardTable is the process-local GC authority:
+// protection permits keep an object live, and Sweep moves unmarked objects
+// from live to candidate and, in a later epoch after the grace period, to
+// deleting. Stores that share an object namespace must share one GuardTable.
+//
+// No production code imports this package yet.
 package blob
 
 import (

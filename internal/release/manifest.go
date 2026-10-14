@@ -1,3 +1,19 @@
+// Package release loads and verifies signed release manifests.
+//
+// Load reads a manifest of at most 4 MiB as strict JSON, and
+// Manifest.Validate checks its shape. A candidate or production release must
+// also be signed, list every required component and protocol pair, and have
+// no unresolved artifacts. The matching JSON Schema is
+// api/json-schema/v1alpha/release-manifest.schema.json.
+//
+// A TrustStore holds offline Ed25519 roots; LoadTrustStore reads them from a
+// JSON file. VerifyPromotion checks each artifact signature over
+// ArtifactSigningDigest and requires one trusted manifest signature over
+// ManifestSigningDigest; both are structured digests from package canonical.
+// VerifyArtifacts also hashes the artifact bytes from an offline bundle, and
+// DeriveProductionStateArtifactDigests returns the expected celld and
+// state-app digests from one verified manifest. Nothing here installs
+// anything.
 package release
 
 import (

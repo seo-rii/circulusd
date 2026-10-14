@@ -1,3 +1,16 @@
+// Package sandboxrpc is the private Connect transport between the executord
+// role and sandboxd. sandboxd serves ControlService and SandboxProcessService
+// (api/proto/circulus/v1alpha) on one Unix socket through ListenServer.
+// Client is the calling side; package executor/nsjail uses it.
+//
+// The server accepts connections only from allowlisted peer UIDs, read with
+// SO_PEERCRED. A session starts with one Handshake from the executord peer
+// that consumes the 32-byte one-time launch nonce and returns a nonce proof
+// and a session token. Every later request must carry that token, protocol
+// version 1.0, a deadline at most five minutes ahead, and a domain-separated
+// SHA-256 digest of the request. Spawn, WriteStdin, CloseStdin, Signal,
+// Cancel and Wait are deduplicated by method and idempotency key. Messages
+// are limited to 1 MiB.
 package sandboxrpc
 
 import (

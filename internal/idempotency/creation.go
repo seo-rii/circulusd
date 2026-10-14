@@ -1,3 +1,12 @@
+// Package idempotency handles idempotency keys for public API creation
+// requests. DigestKey turns a raw client key (1 to 256 bytes) into
+// "hmac-sha256:<hex>" with a server secret of at least 32 bytes, so raw keys
+// are not stored. Production code uses only DigestKey.
+//
+// CreationRegistry is an in-memory model of the creation saga
+// (reserved, target_initialized, finalized), keyed by scope (tenant, subject,
+// method, route template and target) and key digest. Reusing a key with a
+// different request digest fails with ErrKeyReused.
 package idempotency
 
 import (

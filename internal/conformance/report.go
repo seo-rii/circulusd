@@ -1,3 +1,11 @@
+// Package conformance defines the report model shared by doctor and the
+// conformance gates in its subpackages. A Result gives one component a
+// status (PASS, FAIL, UNAVAILABLE or NOT_RUN), a reason and evidence.
+// Collector merges results into a Report, and Evaluate checks them against a
+// Profile: every required component must PASS. A production profile also
+// rejects mock evidence, components named mock or prefixed mock- or fake-,
+// and reference-only evidence, and accepts host-observation evidence only
+// for host.* components.
 package conformance
 
 import (

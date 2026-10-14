@@ -1,3 +1,14 @@
+// Package handshake implements a transport-independent model of the one-time
+// sandboxd handshake. A Negotiator accepts exactly one request from the
+// executord peer whose nonce, sandbox identity and generation match its
+// launch configuration. It negotiates the protocol minor version, feature
+// bitmap and frame size, and answers with an HMAC-SHA-256 nonce proof over a
+// canonical CBOR transcript of the request and response. VerifyNonceProof
+// checks that proof.
+//
+// No production code imports this package. The sandbox socket protocol in
+// package sandboxrpc performs its own handshake with a different nonce-proof
+// construction.
 package handshake
 
 import (
