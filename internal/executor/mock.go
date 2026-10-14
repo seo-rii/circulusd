@@ -24,6 +24,11 @@ type MockProvider struct {
 	byKey    map[CacheKey]*mockSandbox
 	bySlot   map[uint64]*mockSandbox
 	inflight map[CacheKey]*mockEnsureCall
+	// fences and authorities keep the newest admitted launch authority per
+	// cache key, as native providers do. They outlive the sandbox, so an
+	// older generation stays fenced after Destroy.
+	fences      map[CacheKey]LaunchFence
+	authorities map[CacheKey]LaunchAuthority
 }
 
 type mockSandbox struct {
@@ -37,9 +42,8 @@ type mockSandbox struct {
 }
 
 type mockEnsureCall struct {
-	done   chan struct{}
-	result EnsureResult
-	err    error
+	done chan struct{}
+	err  error
 	// leaderCanceled reports that the creating caller's own context ended
 	// before creation finished.
 	leaderCanceled bool
@@ -51,9 +55,12 @@ func NewDevelopmentMockProvider(faults FaultInjector) *MockProvider {
 	return &MockProvider{
 		providerID: mockProviderSequence.Add(1),
 		faults:     faults,
-		byKey:      make(map[CacheKey]*mockSandbox),
-		bySlot:     make(map[uint64]*mockSandbox),
-		inflight:   make(map[CacheKey]*mockEnsureCall),
+
+		byKey:       make(map[CacheKey]*mockSandbox),
+		bySlot:      make(map[uint64]*mockSandbox),
+		inflight:    make(map[CacheKey]*mockEnsureCall),
+		fences:      make(map[CacheKey]LaunchFence),
+		authorities: make(map[CacheKey]LaunchAuthority),
 	}
 }
 
@@ -107,10 +114,24 @@ func (provider *MockProvider) EnsureSandbox(
 	if err != nil {
 		return EnsureResult{}, err
 	}
+	candidateFence, err := NewLaunchFence(request.Spec.LaunchAuthority)
+	if err != nil {
+		return EnsureResult{}, err
+	}
 
 	for {
 		provider.mu.Lock()
+		if currentFence, exists := provider.fences[cacheKey]; exists {
+			candidateFence, err = currentFence.Admit(request.Spec.LaunchAuthority)
+			if err != nil {
+				provider.mu.Unlock()
+				return EnsureResult{}, err
+			}
+		}
+		provider.fences[cacheKey] = candidateFence
+		provider.authorities[cacheKey] = request.Spec.LaunchAuthority
 		if sandbox := provider.byKey[cacheKey]; sandbox != nil {
+			sandbox.spec.LaunchAuthority = request.Spec.LaunchAuthority
 			switch sandbox.state {
 			case LifecycleReady:
 				result := EnsureResult{
@@ -145,9 +166,9 @@ func (provider *MockProvider) EnsureSandbox(
 				if call.err != nil {
 					return EnsureResult{}, call.err
 				}
-				result := call.result
-				result.Reused = true
-				return result, nil
+				// Admit this caller again against the published sandbox
+				// and the newest fence.
+				continue
 			case <-ctx.Done():
 				return EnsureResult{}, ctx.Err()
 			}
@@ -165,6 +186,7 @@ func (provider *MockProvider) EnsureSandbox(
 		})
 
 		provider.mu.Lock()
+		var result EnsureResult
 		if err == nil {
 			var slotID uint64
 			if previous == nil {
@@ -174,18 +196,26 @@ func (provider *MockProvider) EnsureSandbox(
 				slotID = previous.slotID
 			}
 			provider.nextGeneration++
+			spec := request.Spec
+			spec.LaunchAuthority = provider.authorities[cacheKey]
 			sandbox := &mockSandbox{
 				slotID:     slotID,
 				generation: provider.nextGeneration,
 				cacheKey:   cacheKey,
-				spec:       request.Spec,
+				spec:       spec,
 				state:      LifecycleReady,
 			}
 			provider.byKey[cacheKey] = sandbox
 			provider.bySlot[slotID] = sandbox
-			call.result = EnsureResult{
+			result = EnsureResult{
 				Handle:   provider.handleFor(sandbox),
 				CacheKey: cacheKey,
+			}
+			if !provider.fences[cacheKey].Authorizes(request.Spec.LaunchAuthority) {
+				// A newer authority arrived while this creation was in
+				// flight. The sandbox is published for it, not for this
+				// caller.
+				result, err = EnsureResult{}, ErrStaleAuthority
 			}
 		} else {
 			call.err = err
@@ -193,10 +223,8 @@ func (provider *MockProvider) EnsureSandbox(
 		}
 		delete(provider.inflight, cacheKey)
 		close(call.done)
-		result := call.result
-		callErr := call.err
 		provider.mu.Unlock()
-		return result, callErr
+		return result, err
 	}
 }
 
