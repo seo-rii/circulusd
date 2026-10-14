@@ -204,6 +204,40 @@ func TestDeletionCompletionIsGenerationFenced(t *testing.T) {
 	}
 }
 
+func TestSweepReemitsUnfinishedDeletionClaims(t *testing.T) {
+	t.Parallel()
+
+	start := time.Unix(1_800_000_000, 0)
+	table := NewGuardTable(0)
+	key := validKey("tenant-a", "6")
+	if err := table.Register(key, start); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if _, err := table.Sweep(1, true, nil, start); err != nil {
+		t.Fatalf("Sweep(candidate) error = %v", err)
+	}
+	claims, err := table.Sweep(2, true, nil, start)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("Sweep(delete) = %#v, %v", claims, err)
+	}
+
+	// The claim is dropped without being executed. The next sweep must hand
+	// out the same claim again instead of leaving the guard in Deleting.
+	again, err := table.Sweep(3, true, nil, start)
+	if err != nil || len(again) != 1 || again[0] != claims[0] {
+		t.Fatalf("Sweep(after dropped claim) = %#v, %v, want %#v", again, err, claims)
+	}
+	if err := table.CompleteDeletion(again[0]); err != nil {
+		t.Fatalf("CompleteDeletion(re-emitted) error = %v", err)
+	}
+	if deletions, err := table.Sweep(4, true, nil, start); err != nil || len(deletions) != 0 {
+		t.Fatalf("Sweep(after completion) = %#v, %v, want no deletions", deletions, err)
+	}
+	if err := table.Register(key, start.Add(time.Second)); err != nil {
+		t.Fatalf("Register(after completion) error = %v", err)
+	}
+}
+
 func TestPermitIDCannotBeReusedForAnotherObject(t *testing.T) {
 	t.Parallel()
 
