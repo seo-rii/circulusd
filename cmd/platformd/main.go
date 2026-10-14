@@ -234,7 +234,7 @@ func execute(ctx context.Context, arguments []string, dependencies daemonDepende
 		return 1
 	}
 	if err := platformdaemon.Serve(ctx, server, publicServer, runtime); err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && platformdaemon.OnlyCancellation(err) {
 			return 0
 		}
 		fmt.Fprintf(dependencies.stderr, "platformd: serve platform listeners: %v\n", err)

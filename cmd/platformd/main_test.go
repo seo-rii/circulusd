@@ -36,6 +36,8 @@ type recordingServer struct {
 	mu        sync.Mutex
 	events    *[]string
 	serveErr  error
+	closeErr  error
+	onServe   func()
 	closes    int
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -48,7 +50,11 @@ func (server *recordingServer) Serve(context.Context) error {
 	}
 	err := server.serveErr
 	closed := server.closed
+	onServe := server.onServe
 	server.mu.Unlock()
+	if onServe != nil {
+		onServe()
+	}
 	if closed != nil {
 		<-closed
 	}
@@ -67,7 +73,7 @@ func (server *recordingServer) Close() error {
 			close(server.closed)
 		}
 	})
-	return nil
+	return server.closeErr
 }
 
 func blockingRecordingServer() *recordingServer {
@@ -649,6 +655,38 @@ func TestPlatformdServeOutcomesAlwaysCloseServerBeforeRuntime(t *testing.T) {
 				t.Fatalf("close counts = control %d public %d runtime %d, want one each", server.closes, publicServer.closes, runtime.closes)
 			}
 		})
+	}
+}
+
+func TestPlatformdReportsShutdownCleanupFailureAfterCancellation(t *testing.T) {
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := &recordingRuntime{}
+	server := blockingRecordingServer()
+	server.onServe = cancel
+	server.closeErr = errors.New("control socket cleanup failed")
+	publicServer := blockingRecordingServer()
+	dependencies := defaultDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context, statebootstrap.Files) (stateRuntime, error) {
+		return runtime, nil
+	}
+	dependencies.listen = func(controlrpc.ServerConfig) (controlServer, error) {
+		return server, nil
+	}
+	dependencies.listenPublic = func(context.Context, stateRuntime) (controlServer, error) {
+		return publicServer, nil
+	}
+
+	if exitCode := execute(ctx, []string{"--allow-uid", "1000"}, dependencies); exitCode != 1 {
+		t.Fatalf("execute() = %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "control socket cleanup failed") {
+		t.Fatalf("stderr = %q, want the cleanup failure", stderr.String())
+	}
+	if server.closes != 1 || publicServer.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = control %d public %d runtime %d, want one each", server.closes, publicServer.closes, runtime.closes)
 	}
 }
 

@@ -28,6 +28,22 @@ type serveResult struct {
 	err error
 }
 
+// OnlyCancellation reports whether err, as returned by Serve, carries nothing
+// but caller cancellation. A listener or close failure during shutdown makes it
+// false, so a signal never hides a cleanup failure behind a successful exit.
+func OnlyCancellation(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := joined.Unwrap()
+		for _, inner := range errs {
+			if !OnlyCancellation(inner) {
+				return false
+			}
+		}
+		return len(errs) != 0
+	}
+	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
 // Serve owns every non-nil argument. Application is closed before the
 // diagnostic control server, and the dependency runtime is always closed last.
 func Serve(ctx context.Context, control Server, application Server, runtime Runtime) (result error) {

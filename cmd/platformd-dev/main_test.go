@@ -82,6 +82,7 @@ type recordingServer struct {
 	started   chan struct{}
 	closed    chan struct{}
 	block     bool
+	closeErr  error
 	closeOnce sync.Once
 	closes    int
 }
@@ -108,7 +109,7 @@ func (server *recordingServer) Close() error {
 		server.mu.Unlock()
 		close(server.closed)
 	})
-	return nil
+	return server.closeErr
 }
 
 func TestPlatformdDevDependencyGraphStaysDiagnosticOnly(t *testing.T) {
@@ -678,6 +679,59 @@ func TestPlatformdDevComposesAndClosesItsSeparateGraphInOrder(t *testing.T) {
 	}
 	if applicationCloses != 1 || controlCloses != 1 || runtimeCloses != 1 {
 		t.Fatalf("close counts = application %d control %d runtime %d", applicationCloses, controlCloses, runtimeCloses)
+	}
+}
+
+func TestPlatformdDevReportsShutdownCleanupFailureAfterCancellation(t *testing.T) {
+	var stderr bytes.Buffer
+	var mu sync.Mutex
+	var events []string
+	runtime := &recordingRuntime{mu: &mu, events: &events}
+	application := &recordingServer{
+		name: "application", mu: &mu, events: &events,
+		started: make(chan struct{}), closed: make(chan struct{}), block: true,
+	}
+	control := &recordingServer{
+		name: "control", mu: &mu, events: &events,
+		started: make(chan struct{}), closed: make(chan struct{}), block: true,
+		closeErr: errors.New("control socket cleanup failed"),
+	}
+	dependencies := defaultDevelopmentDependencies()
+	dependencies.stderr = &stderr
+	dependencies.bootstrap = func(context.Context) (platformdaemon.Runtime, error) {
+		return runtime, nil
+	}
+	dependencies.listenApplication = func(context.Context, developmentListenAddress) (platformdaemon.Server, error) {
+		return application, nil
+	}
+	dependencies.listenControl = func(controlrpc.ServerConfig) (platformdaemon.Server, error) {
+		return control, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-control.started:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	exitCode := executeDevelopment(ctx, []string{
+		"--socket", "/tmp/platformd-dev-test.sock",
+		"--listen", "127.0.0.1:8081",
+		"--allow-uid", "1000",
+	}, dependencies)
+	if exitCode != 1 {
+		t.Fatalf("executeDevelopment() = %d, want 1; stderr=%q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "control socket cleanup failed") {
+		t.Fatalf("stderr = %q, want the cleanup failure", stderr.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if application.closes != 1 || control.closes != 1 || runtime.closes != 1 {
+		t.Fatalf("close counts = application %d control %d runtime %d", application.closes, control.closes, runtime.closes)
 	}
 }
 
