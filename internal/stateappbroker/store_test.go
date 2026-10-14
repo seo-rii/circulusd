@@ -250,6 +250,37 @@ func TestSettlementUsesActualBoundResultAndRejectsRelabelledInvocation(t *testin
 	}
 }
 
+// The state app stores an interrupted recovery's reason as the settlement
+// reason identifier, but projects a failed recovery to a constant settlement.
+func TestInterruptedRecoveryReasonMustBeStateAppIdentifier(t *testing.T) {
+	for _, test := range []struct {
+		kind   broker.RecoverySettlementKind
+		reason string
+		sent   bool
+	}{
+		{broker.RecoverySettlementInterrupted, "", true},
+		{broker.RecoverySettlementInterrupted, strings.Repeat("r", 256), true},
+		{broker.RecoverySettlementInterrupted, strings.Repeat("r", 257), false},
+		{broker.RecoverySettlementInterrupted, strings.Repeat("r", 255) + "é", false},
+		{broker.RecoverySettlementInterrupted, "provider\ninterrupted", false},
+		{broker.RecoverySettlementFailed, strings.Repeat("r", 300), true},
+	} {
+		store, client, _ := makeStore(t)
+		snapshot := broker.TurnSnapshot{TenantID: sid(identity.Tenant), WorkspaceID: sid(identity.Workspace), UserID: sid(identity.Subject), SessionID: sid(identity.Session), TurnID: sid(identity.Turn), Generations: broker.Generations{TurnLease: 3, Authorization: 7}, CheckpointDigest: broker.Digest{1}}
+		command := broker.SettleRecoveryCommand{Snapshot: snapshot, Key: broker.EffectKey{SessionID: snapshot.SessionID, TurnID: snapshot.TurnID, EffectID: sid(identity.Effect), InvocationID: sid(identity.Invocation), RequestDigest: broker.Digest{2}}, OperationKey: "recover", OperationDigest: broker.Digest{3}, Kind: test.kind,
+			Error: &v1.PublicError{Code: v1.ErrorCode_ERROR_CODE_UNAVAILABLE, Reason: test.reason, Message: "interrupted", Metadata: map[string]string{}}}
+		// The empty response is not a receipt; only whether the request was sent matters.
+		client.response = canonical.Map{}
+		_, err := store.SettleRecovery(context.Background(), command)
+		if test.sent && (client.calls != 1 || errors.Is(err, broker.ErrInvalidRequest)) {
+			t.Fatalf("%s %d-byte reason not sent: %v", test.kind, len(test.reason), err)
+		}
+		if !test.sent && (client.calls != 0 || !errors.Is(err, broker.ErrInvalidRequest)) {
+			t.Fatalf("%s %d-byte reason reached the state app: %v", test.kind, len(test.reason), err)
+		}
+	}
+}
+
 func TestMillisecondContractDoesNotSilentlyTruncateTime(t *testing.T) {
 	for _, invalid := range []time.Time{time.Time{}, time.Unix(0, 0), time.Unix(1900000000, 1)} {
 		if _, err := millis(invalid); err == nil {
