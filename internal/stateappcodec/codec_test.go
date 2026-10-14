@@ -283,14 +283,14 @@ func TestSettlementErrorMessageMatchesStateAppBound(t *testing.T) {
 	}{
 		{strings.Repeat("a", 256), true},
 		{strings.Repeat("a", 257), true},
-		{strings.Repeat("a", 4094) + "é", true},
+		{strings.Repeat("a", 4094) + "\u00e9", true},
 		{strings.Repeat("a", 4096), true},
 		{strings.Repeat("a", 4097), false},
-		{strings.Repeat("a", 4095) + "é", false},
+		{strings.Repeat("a", 4095) + "\u00e9", false},
 		{"", false},
 		{strings.Repeat("a", 300) + "\xff", false},
 		{strings.Repeat("a", 300) + "\n", false},
-		{strings.Repeat("a", 300) + "é", false},
+		{strings.Repeat("a", 300) + "e\u0301", false},
 	} {
 		outcome := canonical.Map{"kind": "error", "code": "FAILED", "message": test.message, "retryable": true}
 		result, err := codec.HydrateSettlement(context.Background(), request, outcome)
