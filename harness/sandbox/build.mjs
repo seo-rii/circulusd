@@ -48,8 +48,15 @@ if (argv.includes("--test")) {
   const result = spawnSync(go.command, ["test", "./internal/sandboxrpc", "./harness/sandbox/agent/..."], { cwd: circulusd, stdio: "inherit", windowsHide: true });
   process.exit(result.status ?? 1);
 }
+// The binaries run on this machine's CPU: directly on Linux, inside WSL on
+// Windows, or in a container of the host's native architecture.
+const goarch = { x64: "amd64", arm64: "arm64" }[process.arch];
+if (goarch === undefined) {
+  console.error(`unsupported host architecture ${process.arch} (expected x64 or arm64)`);
+  process.exit(2);
+}
 mkdirSync(binDirectory, { recursive: true });
-const env = { ...process.env, GOOS: "linux", GOARCH: "amd64", CGO_ENABLED: "0" };
+const env = { ...process.env, GOOS: "linux", GOARCH: goarch, CGO_ENABLED: "0" };
 
 function build(name, cwd, target) {
   const output = resolve(binDirectory, name);
