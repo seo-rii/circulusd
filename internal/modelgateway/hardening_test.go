@@ -444,6 +444,72 @@ func TestDurableRetrievalReservesAnEventForRecoveryAfterUncertainCancellation(t 
 	}
 }
 
+func TestRecoveryAfterAnUncertainCancellationPermitCanSettle(t *testing.T) {
+	t.Parallel()
+	completed := ProviderEvent{Kind: ProviderEventResponseCompleted, Response: &ProviderResponse{
+		Text: "recovered", FinishReason: "stop", Usage: Usage{InputTokens: 11, OutputTokens: 1},
+	}}
+	tests := []struct {
+		name   string
+		events []ProviderEvent
+		want   QuotaDisposition
+	}{
+		{name: "completed", events: []ProviderEvent{completed}, want: QuotaDispositionConsume},
+		{name: "delta then completed", events: []ProviderEvent{{Kind: ProviderEventDelta, Delta: "x"}, completed}, want: QuotaDispositionConsume},
+		{name: "still unknown", events: []ProviderEvent{{Kind: ProviderEventFailed, Failure: FailureTransportUnknown}}, want: QuotaDispositionHold},
+		{name: "rejected", events: []ProviderEvent{{Kind: ProviderEventFailed, Failure: FailureProviderRejected}}, want: QuotaDispositionRelease},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newFixture(t)
+			fixture.provider.availability.DurableRequestRetrieval = true
+			fixture.provider.stream = &scriptedSessionProviderStream{events: test.events}
+			gateway := fixture.gateway(t)
+			persist := func(effect Effect) {
+				stored := effect
+				fixture.dispatches.durable = &stored
+			}
+			effect := fixture.admit(t, gateway)
+			effect = apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventBeginDispatch}).Effect
+			effect = apply(t, gateway, effect, Event{
+				ExpectedRevision: effect.Revision, Kind: EventProviderAccepted, ProviderRequestID: "provider-request-1",
+			}).Effect
+			requested := apply(t, gateway, effect, Event{ExpectedRevision: effect.Revision, Kind: EventCancelRequested})
+			cancellation, err := gateway.ExecuteCancel(context.Background(), OpaqueAuthority("renewed"), requested)
+			if err != nil || cancellation.Permit.DispatchPrevented {
+				t.Fatalf("ExecuteCancel() = %#v, %v", cancellation, err)
+			}
+			effect = apply(t, gateway, cancellation.Effect, cancellation.Resolution).Effect
+			if effect.State != StateUncertain || effect.CancellationPermit == (CancellationPermit{}) {
+				t.Fatalf("uncertain cancellation = %#v", effect)
+			}
+			persist(effect)
+
+			stream, err := gateway.ResumeProviderRequest(context.Background(), OpaqueAuthority("renewed"), effect)
+			if err != nil {
+				t.Fatalf("ResumeProviderRequest() error = %v", err)
+			}
+			for range test.events {
+				event, err := stream.Next(context.Background())
+				if err != nil {
+					t.Fatalf("Next() error = %v", err)
+				}
+				event.ExpectedRevision = effect.Revision
+				effect = apply(t, gateway, effect, event).Effect
+				persist(effect)
+			}
+			settlement, err := gateway.AuthorizeSettlement(context.Background(), effect, OpaqueAuthority("renewed"))
+			if err != nil || settlement.QuotaReceipt.Disposition != test.want {
+				t.Fatalf("AuthorizeSettlement(recovered after cancellation) = %#v, %v; want %s", settlement.QuotaReceipt, err, test.want)
+			}
+			if effect.CancellationPermit != (CancellationPermit{}) || effect.RecoveryPermit == (ResumePermit{}) {
+				t.Fatalf("settled recovery permits = %#v / %#v, want only the recovery permit", effect.CancellationPermit, effect.RecoveryPermit)
+			}
+		})
+	}
+}
+
 func TestRepeatedUnknownRecoveryRefreshesTheQuotaHold(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
