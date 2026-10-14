@@ -123,6 +123,9 @@ func (store *ContentStore) Protect(ctx context.Context, tenant identity.ID, refe
 	return permit, nil
 }
 
+// Delete executes a deletion claim. A completed claim may be replayed. If the
+// physical deletion fails, the claim is released and a later Sweep issues a
+// new one.
 func (store *ContentStore) Delete(ctx context.Context, deletion Deletion) error {
 	release, err := store.guards.acquireStorage(ctx, deletion.Key)
 	if err != nil {
@@ -144,6 +147,7 @@ func (store *ContentStore) Delete(ctx context.Context, deletion Deletion) error 
 		objectstore.ETag(deletion.Key.Digest),
 	)
 	if err != nil && !errors.Is(err, objectstore.ErrNotFound) {
+		store.guards.releaseDeletion(deletion)
 		return fmt.Errorf("delete workspace blob: %w", err)
 	}
 	if err := store.guards.completeDeletion(deletion); err != nil {

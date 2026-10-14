@@ -284,7 +284,13 @@ func (table *GuardTable) Sweep(epoch uint64, rootsComplete bool, marked map[Key]
 	table.lastEpoch = epoch
 	deletions := make([]Deletion, 0)
 	for key, guard := range table.guards {
-		if guard.state == Deleting || guard.state == Deleted {
+		if guard.state == Deleting {
+			// Re-emit the unchanged claim so one that was dropped before its
+			// physical deletion ran cannot leave the guard in Deleting.
+			deletions = append(deletions, Deletion{Key: key, GuardGeneration: guard.generation, Epoch: guard.deletionEpoch})
+			continue
+		}
+		if guard.state == Deleted {
 			continue
 		}
 		if _, found := marked[key]; found || len(guard.pending) > 0 {
@@ -345,6 +351,25 @@ func (table *GuardTable) completeDeletion(deletion Deletion) error {
 	}
 	guard.state = Deleted
 	return nil
+}
+
+// releaseDeletion requires the caller to hold the key's storage gate. It is
+// called after a physical deletion failed, when the bytes may or may not still
+// exist. The claim is retired and the incarnation advances, so an upload must
+// re-verify or recreate the bytes, protection rechecks them, and an unprotected
+// guard stays a candidate that the next sweep claims again.
+func (table *GuardTable) releaseDeletion(deletion Deletion) {
+	table.mu.Lock()
+	defer table.mu.Unlock()
+
+	guard, found := table.guards[deletion.Key]
+	if !found || guard.state != Deleting || !deletionMatchesGuard(deletion, guard) {
+		return
+	}
+	guard.state = Candidate
+	guard.generation++
+	guard.incarnation++
+	guard.deletionEpoch = 0
 }
 
 // ValidateDeletion checks the current metadata only. A successful result is not

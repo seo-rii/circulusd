@@ -1,8 +1,10 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -237,6 +239,207 @@ func TestDeduplicatedUploadCannotRegisterBytesDeletedAfterItsRead(t *testing.T) 
 	if _, err := second.Protect(ctx, tenant, reuploaded, "dedup-reupload"); err != nil {
 		t.Fatalf("successfully reuploaded bytes cannot be protected: %v", err)
 	}
+}
+
+func TestFailedPhysicalDeletionReleasesClaim(t *testing.T) {
+	t.Parallel()
+	// removed=true models a delete whose durability step fails after the
+	// object is already gone, so the physical outcome is unknown.
+	for _, removed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("removed=%t", removed), func(t *testing.T) {
+			t.Parallel()
+			content, objects := newTestContentStore(t)
+			content.objects = &failingDeletionStore{Store: objects, remove: removed, failures: 1}
+			ctx := context.Background()
+			tenant := blobTenant(t, "F")
+			now := time.Unix(1_900_000_000, 0)
+			data := []byte("deletion fails")
+			reference, err := content.Upload(ctx, tenant, data, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := content.guards.Sweep(1, true, nil, now); err != nil {
+				t.Fatal(err)
+			}
+			claims, err := content.guards.Sweep(2, true, nil, now)
+			if err != nil || len(claims) != 1 {
+				t.Fatalf("Sweep() = %v, %v", claims, err)
+			}
+			if err := content.Delete(ctx, claims[0]); !errors.Is(err, errInjectedDeletion) {
+				t.Fatalf("Delete() = %v, want injected failure", err)
+			}
+			if snapshot := content.guards.Snapshot(claims[0].Key); snapshot.State != Candidate || snapshot.Incarnation != 2 {
+				t.Fatalf("guard after failed deletion = %+v, want released candidate with a new incarnation", snapshot)
+			}
+			if err := content.Delete(ctx, claims[0]); !errors.Is(err, ErrStaleDeletion) {
+				t.Fatalf("Delete(released claim) = %v, want stale claim", err)
+			}
+			// Protection rechecks the bytes, so a deletion with an unknown
+			// outcome is never reported as protected.
+			permit, err := content.Protect(ctx, tenant, reference, "before-reupload")
+			if removed {
+				if !errors.Is(err, objectstore.ErrNotFound) {
+					t.Fatalf("Protect(removed bytes) = %+v, %v, want not found", permit, err)
+				}
+			} else if err != nil || permit.ObjectIncarnation != 2 {
+				t.Fatalf("Protect(kept bytes) = %+v, %v", permit, err)
+			}
+			reuploaded, err := content.Upload(ctx, tenant, data, now.Add(time.Hour))
+			if err != nil {
+				t.Fatalf("re-upload after failed deletion = %v", err)
+			}
+			if _, err := content.Protect(ctx, tenant, reuploaded, "after-reupload"); err != nil {
+				t.Fatalf("Protect(re-uploaded) = %v", err)
+			}
+			if got, err := content.Read(ctx, tenant, reuploaded); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("Read(re-uploaded) = %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestReleasedDeletionIsClaimedAgainBySweep(t *testing.T) {
+	t.Parallel()
+	content, objects := newTestContentStore(t)
+	content.objects = &failingDeletionStore{Store: objects, failures: 1}
+	ctx := context.Background()
+	tenant := blobTenant(t, "S")
+	now := time.Unix(1_900_000_000, 0)
+	data := []byte("deleted on retry")
+	reference, err := content.Upload(ctx, tenant, data, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := content.guards.Sweep(1, true, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := content.guards.Sweep(2, true, nil, now)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("Sweep() = %v, %v", claims, err)
+	}
+	if err := content.Delete(ctx, claims[0]); !errors.Is(err, errInjectedDeletion) {
+		t.Fatalf("Delete() = %v, want injected failure", err)
+	}
+	retry, err := content.guards.Sweep(3, true, nil, now)
+	if err != nil || len(retry) != 1 || retry[0].GuardGeneration <= claims[0].GuardGeneration {
+		t.Fatalf("Sweep(after failure) = %v, %v, want a newer claim than %v", retry, err, claims)
+	}
+	if err := content.Delete(ctx, retry[0]); err != nil {
+		t.Fatalf("Delete(retry) = %v", err)
+	}
+	if _, err := content.Read(ctx, tenant, reference); !errors.Is(err, objectstore.ErrNotFound) {
+		t.Fatalf("Read(after retried deletion) = %v, want not found", err)
+	}
+	if _, err := content.Upload(ctx, tenant, data, now.Add(time.Hour)); err != nil {
+		t.Fatalf("Upload(after retried deletion) = %v", err)
+	}
+}
+
+func TestProtectRacingFailedDeletionKeepsProtectedBytes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Unix(1_900_000_000, 0)
+	data := []byte("racing protection")
+	for iteration := range 100 {
+		content, objects := newTestContentStore(t)
+		content.objects = &failingDeletionStore{Store: objects, remove: iteration%2 == 1, failures: 1}
+		tenant := blobTenant(t, "P")
+		reference, err := content.Upload(ctx, tenant, data, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := content.guards.Sweep(1, true, nil, now); err != nil {
+			t.Fatal(err)
+		}
+		claims, err := content.guards.Sweep(2, true, nil, now)
+		if err != nil || len(claims) != 1 {
+			t.Fatalf("iteration %d Sweep() = %v, %v", iteration, claims, err)
+		}
+
+		ready := make(chan struct{})
+		var wait sync.WaitGroup
+		var deleteErr, protectErr, uploadErr error
+		var permit Permit
+		wait.Add(3)
+		go func() {
+			defer wait.Done()
+			<-ready
+			deleteErr = content.Delete(ctx, claims[0])
+		}()
+		go func() {
+			defer wait.Done()
+			<-ready
+			permit, protectErr = content.Protect(ctx, tenant, reference, "racing-permit")
+		}()
+		go func() {
+			defer wait.Done()
+			<-ready
+			_, uploadErr = content.Upload(ctx, tenant, data, now.Add(time.Hour))
+		}()
+		close(ready)
+		wait.Wait()
+
+		if !errors.Is(deleteErr, errInjectedDeletion) {
+			t.Fatalf("iteration %d Delete() = %v, want injected failure", iteration, deleteErr)
+		}
+		if uploadErr != nil && !errors.Is(uploadErr, ErrObjectDeleting) {
+			t.Fatalf("iteration %d Upload() = %v", iteration, uploadErr)
+		}
+		if protectErr != nil {
+			if !errors.Is(protectErr, ErrObjectDeleting) && !errors.Is(protectErr, objectstore.ErrNotFound) {
+				t.Fatalf("iteration %d Protect() = %v", iteration, protectErr)
+			}
+		} else {
+			// A granted permit must name the current incarnation and its bytes,
+			// and the failed claim must not be able to remove them later.
+			snapshot := content.guards.Snapshot(claims[0].Key)
+			if snapshot.State != Live || snapshot.PendingPermits != 1 || snapshot.Incarnation != permit.ObjectIncarnation {
+				t.Fatalf("iteration %d permit %+v with guard %+v", iteration, permit, snapshot)
+			}
+			if err := content.Delete(ctx, claims[0]); !errors.Is(err, ErrStaleDeletion) {
+				t.Fatalf("iteration %d Delete(after protection) = %v, want stale claim", iteration, err)
+			}
+			if got, err := content.Read(ctx, tenant, reference); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("iteration %d protected bytes = %q, %v", iteration, got, err)
+			}
+		}
+		if _, err := content.Upload(ctx, tenant, data, now.Add(2*time.Hour)); err != nil {
+			t.Fatalf("iteration %d Upload(after failed deletion) = %v", iteration, err)
+		}
+		if _, err := content.Protect(ctx, tenant, reference, "recovered-permit"); err != nil {
+			t.Fatalf("iteration %d Protect(after re-upload) = %v", iteration, err)
+		}
+	}
+}
+
+var errInjectedDeletion = errors.New("injected deletion failure")
+
+// failingDeletionStore fails the first failures conditional deletes. With
+// remove set it removes the object before failing, like a delete whose
+// durability step fails after the object is gone.
+type failingDeletionStore struct {
+	objectstore.Store
+	remove   bool
+	mu       sync.Mutex
+	failures int
+}
+
+func (store *failingDeletionStore) DeleteIfMatch(ctx context.Context, bucket objectstore.Bucket, key string, expected objectstore.ETag) error {
+	store.mu.Lock()
+	fail := store.failures > 0
+	if fail {
+		store.failures--
+	}
+	store.mu.Unlock()
+	if !fail {
+		return store.Store.DeleteIfMatch(ctx, bucket, key, expected)
+	}
+	if store.remove {
+		if err := store.Store.DeleteIfMatch(ctx, bucket, key, expected); err != nil {
+			return err
+		}
+	}
+	return errInjectedDeletion
 }
 
 type pausedReadStore struct {
