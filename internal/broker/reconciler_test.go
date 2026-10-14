@@ -282,6 +282,98 @@ func TestEffectReconcilerRejectsTerminalThatDiffersFromRecovery(t *testing.T) {
 	}
 }
 
+// Recovery may enact a durable transition of its own. The reconciler must
+// return that decision with its permit or receipt, never settle a terminal
+// observation on top of it, and replay it without a second transition.
+func TestEffectReconcilerReturnsEnactedRecoveryTransitions(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_010_800, 0).UTC()
+	tests := []struct {
+		name          string
+		state         EffectState
+		policy        ReplayPolicy
+		abort         bool
+		ledger        LedgerStatus
+		userConfirmed bool
+		want          RecoveryAction
+		check         func(*testing.T, RecoveryDecision, *fakeStore)
+	}{
+		{name: "retry dispatch", state: EffectDispatched, policy: ReplayIdempotencyKey, ledger: LedgerAbsent, want: RecoveryReplay,
+			check: func(t *testing.T, decision RecoveryDecision, store *fakeStore) {
+				if decision.PreparationPermit == nil || decision.DispatchPermit == nil || decision.DispatchPermit.DispatchAttempt != 2 {
+					t.Fatalf("decision = %#v, want a durable second-attempt dispatch permit", decision)
+				}
+				if store.prepareRetryTransitions != 1 || store.markDispatchTransitions != 1 {
+					t.Fatalf("retry transitions = %d prepare, %d dispatch; want one each", store.prepareRetryTransitions, store.markDispatchTransitions)
+				}
+			}},
+		{name: "confirmed retry dispatch", state: EffectBlocked, policy: ReplayConfirm, userConfirmed: true, want: RecoveryReplay,
+			check: func(t *testing.T, decision RecoveryDecision, store *fakeStore) {
+				if decision.PreparationPermit == nil || decision.DispatchPermit == nil || decision.DispatchPermit.DispatchAttempt != 2 {
+					t.Fatalf("decision = %#v, want a durable second-attempt dispatch permit", decision)
+				}
+				if store.prepareRetryTransitions != 1 || store.markDispatchTransitions != 1 {
+					t.Fatalf("retry transitions = %d prepare, %d dispatch; want one each", store.prepareRetryTransitions, store.markDispatchTransitions)
+				}
+			}},
+		{name: "block uncertain", state: EffectDispatched, policy: ReplayConfirm, ledger: LedgerUnknown, want: RecoveryNeedsConfirmation,
+			check: func(t *testing.T, decision RecoveryDecision, store *fakeStore) {
+				if decision.BlockReceipt == nil || decision.BlockReceipt.State != EffectBlocked || store.blockTransitions != 1 {
+					t.Fatalf("decision = %#v, block transitions = %d; want one durable block", decision, store.blockTransitions)
+				}
+			}},
+		{name: "settle interrupted", state: EffectDispatched, policy: ReplayNever, ledger: LedgerUnknown, want: RecoverySettleInterrupted,
+			check: func(t *testing.T, decision RecoveryDecision, store *fakeStore) {
+				if decision.SettlementReceipt == nil || decision.SettlementReceipt.RecoveryKind != RecoverySettlementInterrupted || store.recoverySettlementTransitions != 1 {
+					t.Fatalf("decision = %#v, recovery settlements = %d; want one interrupted settlement", decision, store.recoverySettlementTransitions)
+				}
+			}},
+		{name: "settle aborted prepared", state: EffectPrepared, policy: ReplayIdempotencyKey, abort: true, want: RecoverySettleInterrupted,
+			check: func(t *testing.T, decision RecoveryDecision, store *fakeStore) {
+				if decision.SettlementReceipt == nil || decision.SettlementReceipt.RecoveryKind != RecoverySettlementInterrupted || store.recoverySettlementTransitions != 1 {
+					t.Fatalf("decision = %#v, recovery settlements = %d; want one interrupted settlement", decision, store.recoverySettlementTransitions)
+				}
+			}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			snapshot := baseSnapshot(now)
+			snapshot.AbortRequested = test.abort
+			effect := baseEffect(test.state)
+			effect.ReplayPolicy = test.policy
+			snapshot.ActiveEffect = effect
+			store := newFakeStore(snapshot)
+			ledger := &fakeLedger{record: routedRecord(test.ledger)}
+			reconciler := mustEffectReconciler(t, mustCoordinator(t, store, ledger))
+			request := baseEffectReconcileRequest(now, "recover-"+test.name, "settle-"+test.name)
+			request.Recovery.UserConfirmed = test.userConfirmed
+
+			decision, err := reconciler.Reconcile(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Reconcile() error = %v", err)
+			}
+			if decision.Action != test.want {
+				t.Fatalf("action = %q, want %q", decision.Action, test.want)
+			}
+			test.check(t, decision, store)
+			if len(store.settlements) != 0 || store.markExternalTransitions != 0 {
+				t.Fatalf("reconciler settled a terminal over %q: settlements = %d, external transitions = %d", decision.Action, len(store.settlements), store.markExternalTransitions)
+			}
+
+			eventSequence := store.eventSequence
+			replayed, err := reconciler.Reconcile(context.Background(), request)
+			if err != nil {
+				t.Fatalf("replayed Reconcile() error = %v", err)
+			}
+			if replayed.Action != decision.Action || store.eventSequence != eventSequence || len(store.settlements) != 0 {
+				t.Fatalf("replay = %q (event sequence %d, settlements %d); want %q without a new transition",
+					replayed.Action, store.eventSequence, len(store.settlements), decision.Action)
+			}
+		})
+	}
+}
+
 func baseEffectReconcileRequest(now time.Time, recoveryOperationKey, settlementOperationKey string) EffectReconcileRequest {
 	return EffectReconcileRequest{
 		Recovery:               baseRecoveryRequest(now, recoveryOperationKey),

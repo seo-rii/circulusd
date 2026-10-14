@@ -23,7 +23,10 @@ type EffectReconcileRequest struct {
 }
 
 // EffectReconciler joins an existing recovery decision to its settlement-only
-// Session transition. It owns no provider and cannot start or retry one.
+// Session transition. It owns no provider and never calls one. The recovery
+// it runs is not read-only: RecoverEffect may durably prepare and mark a retry
+// dispatch, block an uncertain effect, or settle an interrupted or failed
+// effect before the reconciler sees the decision.
 type EffectReconciler struct {
 	coordinator *Coordinator
 }
@@ -38,7 +41,9 @@ func NewEffectReconciler(coordinator *Coordinator) (*EffectReconciler, error) {
 // Reconcile asks the Coordinator for one recovery decision. A settle-only
 // decision must exactly match the subordinate terminal observation before it
 // can be settled. RecoveryNone is allowed through SettleEffect only to recover
-// the original durable receipt for an exact replay.
+// the original durable receipt for an exact replay. Every other decision is
+// returned unchanged, including any permit or receipt RecoverEffect already
+// persisted; a returned DispatchPermit is the caller's to start.
 func (reconciler *EffectReconciler) Reconcile(ctx context.Context, request EffectReconcileRequest) (RecoveryDecision, error) {
 	if ctx == nil {
 		return RecoveryDecision{}, ErrInvalidRequest
