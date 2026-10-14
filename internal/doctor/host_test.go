@@ -131,6 +131,57 @@ func TestHostProbesFailOrReportUnavailableWithoutOverclaiming(t *testing.T) {
 	}
 }
 
+func TestScratchQuotaProbeUsesTheTopMostMountAtTheDataDirectory(t *testing.T) {
+	t.Parallel()
+
+	quotaMount := "30 23 8:1 / /var/lib/circulusd rw,relatime - ext4 /dev/sda1 rw,prjquota"
+	tmpfsOverMount := "31 30 0:40 / /var/lib/circulusd rw,relatime - tmpfs tmpfs rw"
+	tests := []struct {
+		name      string
+		mountInfo string
+		want      conformance.Status
+	}{
+		{name: "quota filesystem on top", mountInfo: tmpfsOverMount + "\n" + quotaMount, want: conformance.Pass},
+		{name: "tmpfs mounted over quota filesystem", mountInfo: quotaMount + "\n" + tmpfsOverMount, want: conformance.Unavailable},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			probes, err := HostProbes(HostRequirements{
+				DataDirectory:     "/var/lib/circulusd",
+				MinimumFreeBytes:  1,
+				MinimumFreeInodes: 1,
+			}, HostSources{
+				OperatingSystem: "linux",
+				Architecture:    "amd64",
+				ReadFile: func(path string, _ int64) ([]byte, error) {
+					if path != "/proc/self/mountinfo" {
+						return nil, fs.ErrNotExist
+					}
+					return []byte(test.mountInfo), nil
+				},
+				Stat:          func(string) error { return fs.ErrNotExist },
+				StatFS:        func(string) (FileSystemStats, error) { return FileSystemStats{}, fs.ErrNotExist },
+				LookPath:      func(string) (string, error) { return "", fs.ErrNotExist },
+				OpenReadWrite: func(string) error { return fs.ErrNotExist },
+			})
+			if err != nil {
+				t.Fatalf("HostProbes() error = %v", err)
+			}
+			for _, probe := range probes {
+				if probe.Component != "host.scratch-quota" {
+					continue
+				}
+				if result := probe.Run(t.Context()); result.Status != test.want {
+					t.Fatalf("scratch quota result = %+v, want %s", result, test.want)
+				}
+				return
+			}
+			t.Fatal("host.scratch-quota probe is missing")
+		})
+	}
+}
+
 func TestHostProbesRejectInvalidOrIncompleteSources(t *testing.T) {
 	t.Parallel()
 
