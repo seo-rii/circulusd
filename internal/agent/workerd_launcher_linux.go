@@ -63,6 +63,9 @@ const (
 // ambient agentd environment is never inherited. ObservationSink and
 // ObservationInterval are set together or not at all; a sink requires the
 // cgroup boundary because every observation carries a complete cgroup sample.
+// HistoryCapacity bounds the shards with a pending launch, a tracked process
+// group, or an unreleased cgroup allocation, and separately the retired
+// generations remembered for idle shards.
 type WorkerdLauncherConfig struct {
 	ExecutablePath string
 	// Executable optionally supplies an already-opened verified executable
@@ -104,7 +107,9 @@ type CPUMax struct {
 }
 
 // WorkerdEnsureRequest is the immutable identity of one shard generation in
-// one agent boot. Reusing the same tuple with different arguments is rejected.
+// one agent boot. Reusing the same tuple with different arguments is rejected
+// while that generation is pending or running, and a generation that was ever
+// published is never started again.
 type WorkerdEnsureRequest struct {
 	AgentInstanceID identity.ID
 	ShardID         string
@@ -306,6 +311,12 @@ type WorkerdProcessLauncher struct {
 	closeOperation       *workerdCloseOperation
 	cgroupsClosed        bool
 	terminalCloseErr     error
+
+	// retiredFloor is the highest generation evicted from retiredGenerations.
+	// A shard with no live history and no remembered retired generation must
+	// start above it, because the launcher cannot tell a new shard from one
+	// whose retirement it no longer remembers.
+	retiredFloor ShardGeneration
 }
 
 // WorkerdShardHandle is returned only after the configured readiness probe
@@ -589,12 +600,16 @@ func (launcher *WorkerdProcessLauncher) Ensure(ctx context.Context, request Work
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdAgentInstanceMismatch
 		}
-		if _, known := launcher.latestGenerations[shardKey]; !known && len(launcher.latestGenerations) >= launcher.historyCapacity {
+		_, known := launcher.latestGenerations[shardKey]
+		if !known && len(launcher.latestGenerations) >= launcher.historyCapacity {
 			launcher.mu.Unlock()
 			return nil, ErrWorkerdHistoryCapacity
 		}
-		if retired := launcher.retiredGenerations[shardKey]; retired >= request.ShardGeneration ||
-			launcher.latestGenerations[shardKey] > request.ShardGeneration {
+		retired, remembered := launcher.retiredGenerations[shardKey]
+		if !known && !remembered {
+			retired = launcher.retiredFloor
+		}
+		if retired >= request.ShardGeneration || launcher.latestGenerations[shardKey] > request.ShardGeneration {
 			launcher.mu.Unlock()
 			return nil, ErrStaleWorkerdGeneration
 		}
@@ -760,6 +775,7 @@ func (launcher *WorkerdProcessLauncher) runLaunch(pending *workerdPendingLaunch)
 				}
 			}
 			delete(launcher.pending, pending.key)
+			launcher.forgetIdleWorkerdShardLocked(pending.key.shardKey())
 			pending.handle = resultHandle
 			pending.err = resultErr
 			close(pending.done)
@@ -1081,8 +1097,60 @@ func (instance *workerdInstance) closeProcessIdentity() error {
 
 func (launcher *WorkerdProcessLauncher) forgetWorkerdCgroupAllocation(lease *workerdCgroupLease) {
 	launcher.mu.Lock()
+	allocation, found := launcher.allocations[lease]
 	delete(launcher.allocations, lease)
+	if found {
+		launcher.forgetIdleWorkerdShardLocked(allocation.key.shardKey())
+	}
 	launcher.mu.Unlock()
+}
+
+// forgetIdleWorkerdShardLocked drops a shard's live generation and
+// launch-identity history once nothing can still act for it: no pending
+// launch, no tracked process group, and no cgroup allocation. Its retired
+// generation stays remembered. Outside Close, every published generation is
+// retired before its group is marked gone, so stale handles, observers, and
+// fences never meet a restart of a published generation. Remembered
+// retirements are bounded by evicting the lowest idle one into retiredFloor.
+// Callers hold mu.
+func (launcher *WorkerdProcessLauncher) forgetIdleWorkerdShardLocked(shardKey workerdShardKey) {
+	for key := range launcher.pending {
+		if key.shardKey() == shardKey {
+			return
+		}
+	}
+	for instance := range launcher.instances {
+		if instance.key.shardKey() == shardKey {
+			return
+		}
+	}
+	for _, allocation := range launcher.allocations {
+		if allocation.key.shardKey() == shardKey {
+			return
+		}
+	}
+	delete(launcher.latestGenerations, shardKey)
+	for key := range launcher.launchIdentities {
+		if key.shardKey() == shardKey {
+			delete(launcher.launchIdentities, key)
+		}
+	}
+	for len(launcher.retiredGenerations) > launcher.historyCapacity {
+		var evicted workerdShardKey
+		evictedGeneration := ShardGeneration(0)
+		for key, generation := range launcher.retiredGenerations {
+			if _, live := launcher.latestGenerations[key]; !live && (evictedGeneration == 0 || generation < evictedGeneration) {
+				evicted, evictedGeneration = key, generation
+			}
+		}
+		if evictedGeneration == 0 {
+			return
+		}
+		delete(launcher.retiredGenerations, evicted)
+		if evictedGeneration > launcher.retiredFloor {
+			launcher.retiredFloor = evictedGeneration
+		}
+	}
 }
 
 func (launcher *WorkerdProcessLauncher) rememberWorkerdTerminalCloseError(err error) {
@@ -1134,6 +1202,7 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 				if launcher.current[shardKey] == instance {
 					delete(launcher.current, shardKey)
 				}
+				launcher.forgetIdleWorkerdShardLocked(shardKey)
 				if cleanupErr != nil {
 					launcher.terminalCloseErr = errors.Join(launcher.terminalCloseErr, cleanupErr)
 				}
@@ -1216,6 +1285,7 @@ func (launcher *WorkerdProcessLauncher) beginWorkerdStop(instance *workerdInstan
 			if launcher.current[shardKey] == instance {
 				delete(launcher.current, shardKey)
 			}
+			launcher.forgetIdleWorkerdShardLocked(shardKey)
 			instance.mu.Unlock()
 			launcher.mu.Unlock()
 			closeErr := instance.closeProcessIdentity()
