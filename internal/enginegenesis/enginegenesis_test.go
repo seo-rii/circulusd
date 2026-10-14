@@ -355,4 +355,77 @@ func TestNativeGenesisClientRejectsRedirectAndCredentialDisclosure(t *testing.T)
 	}
 }
 
+// A peer that does not share the root key rejects the request MAC with 401.
+// That is a keying failure, not an unavailable source, and must stay distinct
+// through the client and the provider.
+func TestNativeGenesisRequestAuthenticationRejectionIsDistinct(t *testing.T) {
+	source, sealed := qualifiedSource(t)
+	handler, err := NewServer(ServerConfig{KeyID: "engine-genesis-1", RootKey: bytes.Repeat([]byte{0x9d}, 32), Source: sealed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Endpoint: server.URL, KeyID: "engine-genesis-1", RootKey: bytes.Repeat([]byte{0x9e}, 32), Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	request, _ := actualPiFixture(t)
+	if _, err := client.RequestGenesis(context.Background(), request); !errors.Is(err, ErrUnauthenticatedRequest) {
+		t.Fatalf("client error = %v, want ErrUnauthenticatedRequest", err)
+	}
+	binding := dependencycontract.Verify[Transport](t, source.ProductionProofs, client, []dependency.AtomicGroup{dependency.AtomicEngineGenesis})
+	provider, err := NewProvider(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.CreateGenesis(context.Background(), request); !errors.Is(err, ErrUnauthenticatedRequest) || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("provider error = %v, want ErrUnauthenticatedRequest", err)
+	}
+	if source.calls.Load() != 0 {
+		t.Fatal("unauthenticated request reached source")
+	}
+}
+
+type failingTransport struct {
+	*dependencycontract.ProductionProofs
+	err error
+}
+
+func (transport *failingTransport) RequestGenesis(context.Context, stateappadmission.GenesisRequest) (*v1.AgentCheckpoint, error) {
+	return nil, transport.err
+}
+
+func TestGenesisProviderKeepsAuthenticationFailuresDistinct(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "response MAC", err: ErrUnauthenticatedResponse, want: ErrUnauthenticatedResponse},
+		{name: "request MAC", err: ErrUnauthenticatedRequest, want: ErrUnauthenticatedRequest},
+		{name: "invalid response", err: ErrInvalidResponse, want: ErrUnavailable},
+		{name: "transport detail", err: errors.New("secret-transport-detail"), want: ErrUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			groups := []dependency.AtomicGroup{dependency.AtomicEngineGenesis}
+			proofs := dependencycontract.NewProductionProofs(t, groups)
+			transport := &failingTransport{ProductionProofs: proofs, err: test.err}
+			provider, err := NewProvider(dependencycontract.Verify[Transport](t, proofs, transport, groups))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _ := actualPiFixture(t)
+			_, err = provider.CreateGenesis(context.Background(), request)
+			if !errors.Is(err, test.want) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("CreateGenesis() error = %v, want %v", err, test.want)
+			}
+			if test.want != ErrUnavailable && errors.Is(err, ErrUnavailable) {
+				t.Fatalf("authentication failure %v is also reported as unavailable", err)
+			}
+		})
+	}
+}
+
 func sha256Bytes(value []byte) []byte { sum := sha256.Sum256(value); return sum[:] }
