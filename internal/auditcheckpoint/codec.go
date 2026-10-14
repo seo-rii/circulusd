@@ -7,10 +7,10 @@ import (
 	"encoding/hex"
 	"regexp"
 
-	"filippo.io/edwards25519"
 	"github.com/hancomac/circulusd/internal/authstate"
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/dependency"
+	"github.com/hancomac/circulusd/internal/ed25519key"
 	"github.com/hancomac/circulusd/internal/identity"
 )
 
@@ -54,7 +54,7 @@ func signingPayload(claims Claims) ([]byte, [32]byte, error) {
 }
 
 func Verify(checkpoint Checkpoint, publicKey ed25519.PublicKey) error {
-	if !validPublicKey(publicKey) || len(checkpoint.Signature) != ed25519.SignatureSize {
+	if !ed25519key.IsCanonicalPrimeOrder(publicKey) || len(checkpoint.Signature) != ed25519.SignatureSize {
 		return ErrInvalidCheckpoint
 	}
 	_, digest, err := signingPayload(checkpoint.Claims)
@@ -183,26 +183,6 @@ func validDigest(text string) bool {
 	}
 	decoded, err := hex.DecodeString(text[7:])
 	return err == nil && len(decoded) == 32 && hex.EncodeToString(decoded) == text[7:]
-}
-
-func validPublicKey(key ed25519.PublicKey) bool {
-	if len(key) != ed25519.PublicKeySize {
-		return false
-	}
-	point, err := new(edwards25519.Point).SetBytes(key)
-	if err != nil || !bytes.Equal(point.Bytes(), key) || point.Equal(edwards25519.NewIdentityPoint()) == 1 {
-		return false
-	}
-	// Reject torsion components as the production trust-root verifier does.
-	var eight [32]byte
-	eight[0] = 8
-	scalar, err := new(edwards25519.Scalar).SetCanonicalBytes(eight[:])
-	if err != nil {
-		return false
-	}
-	prime := new(edwards25519.Point).MultByCofactor(point)
-	restored := new(edwards25519.Point).ScalarMult(new(edwards25519.Scalar).Invert(scalar), prime)
-	return restored.Equal(point) == 1
 }
 
 func checkpointOptions() canonical.Options {
