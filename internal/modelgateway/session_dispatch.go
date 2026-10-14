@@ -182,9 +182,16 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	}
 	command, commandOpened := claimed.Open()
 	observation, observationOpened := claimed.Observation()
+	// Durable NativeLedger snapshots preserve the exact deadline instant in
+	// UTC, without process-local monotonic clock bits, while broker wire
+	// permits decode it in the local zone. Compare canonical copies of both
+	// complete permits, retaining every other immutable dispatch fact.
 	startBinding := start.Dispatch
 	startBinding.Opaque = ""
-	if !commandOpened || !observationOpened || command.Dispatch != startBinding ||
+	startBinding.Deadline = startBinding.Deadline.UTC().Round(0)
+	commandBinding := command.Dispatch
+	commandBinding.Deadline = commandBinding.Deadline.UTC().Round(0)
+	if !commandOpened || !observationOpened || commandBinding != startBinding ||
 		command.CommandDigest != start.CommandDigest || len(command.Payload) == 0 ||
 		sessionDispatchCommandDigest(command.Payload) != start.CommandDigest {
 		return ErrDispatchNotDurable

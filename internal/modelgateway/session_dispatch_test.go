@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/broker"
+	"github.com/hancomac/circulusd/internal/celldbridge"
 	"github.com/hancomac/circulusd/internal/dependency"
 	dependencycontract "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/effectledger"
@@ -69,6 +71,67 @@ func TestReferenceSessionDispatchUsesFreshBrokerClaimWithoutSecondDispatchAuthor
 	if result.State != StateCompleted || result.Outcome != OutcomeCompleted || result.ProviderRequestID != "provider-request-1" ||
 		result.Response == nil || result.Response.Text != "done" || result.Response.Usage != (Usage{InputTokens: 11, OutputTokens: 17}) {
 		t.Fatalf("terminal result = %#v", result)
+	}
+}
+
+func TestNativeSessionDispatchAcceptsWireDecodedDeadline(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		deadline func(time.Time) time.Time
+	}{
+		// The state-broker wire decodes deadlines with time.UnixMilli, in the
+		// process-local zone, while NativeLedger snapshots hold them in UTC.
+		{name: "wire local zone", deadline: func(at time.Time) time.Time { return time.UnixMilli(at.UnixMilli()) }},
+		{name: "fixed offset zone", deadline: func(at time.Time) time.Time { return at.In(time.FixedZone("UTC+9", 9*60*60)) }},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			test := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{completedSessionProviderEvent()}}, nil, true)
+			test.dispatch.Deadline = testCase.deadline(test.dispatch.Deadline)
+			groups := []dependency.AtomicGroup{celldbridge.AtomicNativeStorage, dependency.AtomicCommandReceipt,
+				dependency.AtomicEffectLifecycle, effectledger.AtomicProviderObservationLedger}
+			slices.Sort(groups)
+			proofs := dependencycontract.NewProductionProofs(t, groups)
+			source := &nativeModelFixture{ProductionProofs: proofs, objects: make(map[string]celldbridge.Snapshot)}
+			transport := dependencycontract.Verify[celldbridge.NativeTransport](t, proofs, source, groups)
+			storage, err := celldbridge.New(celldbridge.Config{Transport: transport, MaximumAttempts: 8,
+				Bounds: celldbridge.Bounds{MaxStateBytes: 131072, MaxReceiptResponseBytes: 1024, MaxCapabilityClaims: 1,
+					MaxCapabilityClaimBytes: 1024, MaxReceiptLookups: 1, MaxReceiptWrites: 1, MaxTransactionBytes: 262144}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := effectledger.NewNativeLedger(effectledger.NativeConfig{
+				Storage: dependencycontract.Verify(t, proofs, storage, groups), Service: broker.ServiceModel,
+				RouteDigest: test.dispatch.ProviderRouteDigest, Limits: requiredSessionDispatchLedgerLimits(test.gateway.bounds),
+				MaximumStateBytes: 131072,
+			})
+			if err != nil {
+				t.Fatalf("NewNativeLedger() error = %v", err)
+			}
+			test.starter, err = NewReferenceSessionDispatchStarter(test.gateway, ledger, test.dispatch.ProviderRouteDigest)
+			if err != nil {
+				t.Fatalf("NewReferenceSessionDispatchStarter() error = %v", err)
+			}
+			digest, err := test.starter.Prepare(context.Background(), test.dispatch, test.transition)
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			consumer, _ := test.consumer(t, digest)
+			execution, err := consumer.StartExactAttempt(context.Background(), test.startRequest(digest))
+			if err != nil || execution.Outcome != broker.DispatchStartOutcomeStarted {
+				t.Fatalf("StartExactAttempt() = %#v, %v, want started", execution, err)
+			}
+			if _, calls := test.provider.snapshot(); calls != 1 {
+				t.Fatalf("provider calls = %d, want one", calls)
+			}
+			facts, err := ledger.Inspect(context.Background(), sessionLookup(test.dispatch))
+			if err != nil || facts.State != effectledger.StateTerminal || facts.Terminal.Status != effectledger.TerminalCommitted ||
+				!facts.Command.Dispatch.Deadline.Equal(test.dispatch.Deadline) {
+				t.Fatalf("native terminal facts = %#v, %v", facts, err)
+			}
+		})
 	}
 }
 
