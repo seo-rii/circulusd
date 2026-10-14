@@ -65,29 +65,83 @@ func (expression *boundedSchemaRegexp) MatchString(value string) bool {
 }
 
 func (validator *configurationSchemaValidator) compileRegexp(pattern string) (jsonschema.Regexp, error) {
-	// regexp2 also implements .NET group extensions. Those constructs are not
-	// valid ECMAScript patterns, even when its ECMAScript matching flag is set.
+	// regexp2 also implements .NET group extensions and accepts escapes and
+	// braces that Ajv's Unicode-mode (u flag) ECMAScript parser rejects. Check
+	// that syntax here before regexp2 compiles the pattern.
+	groups := countCapturingGroups(pattern)
 	inClass := false
+	// classAtoms records the current class's atoms: 'd' for a class escape such
+	// as \d, '-' for an unescaped dash and 0 for anything else.
+	var classAtoms []byte
 	for index := 0; index < len(pattern); index++ {
 		if pattern[index] == '\\' {
-			index++
-			if index < len(pattern) && strings.ContainsRune("AGZz", rune(pattern[index])) {
-				return nil, fmt.Errorf("unsupported non-ECMAScript anchor escape")
+			length, classEscape, err := checkUnicodeModeEscape(pattern[index+1:], inClass, groups)
+			if err != nil {
+				return nil, err
+			}
+			index += length
+			if inClass {
+				if classEscape {
+					classAtoms = append(classAtoms, 'd')
+				} else {
+					classAtoms = append(classAtoms, 0)
+				}
 			}
 			continue
 		}
-		if pattern[index] == '[' {
+		if inClass {
+			switch pattern[index] {
+			case ']':
+				for atom := 0; atom+2 < len(classAtoms); atom++ {
+					if classAtoms[atom+1] == '-' {
+						if classAtoms[atom] == 'd' || classAtoms[atom+2] == 'd' {
+							return nil, fmt.Errorf("ECMAScript Unicode mode forbids class escapes in ranges")
+						}
+						atom += 2
+					}
+				}
+				inClass = false
+			case '-':
+				classAtoms = append(classAtoms, '-')
+			case '^':
+				if len(classAtoms) > 0 || pattern[index-1] != '[' {
+					classAtoms = append(classAtoms, 0)
+				}
+			default:
+				if pattern[index] < utf8.RuneSelf || utf8.RuneStart(pattern[index]) {
+					classAtoms = append(classAtoms, 0)
+				}
+			}
+			continue
+		}
+		switch pattern[index] {
+		case '[':
 			inClass = true
+			classAtoms = classAtoms[:0]
 			continue
-		}
-		if pattern[index] == ']' {
-			if !inClass {
-				return nil, fmt.Errorf("unmatched ECMAScript character-class close")
+		case ']':
+			return nil, fmt.Errorf("unmatched ECMAScript character-class close")
+		case '{':
+			// Unicode mode has no literal braces: { must start {n}, {n,} or {n,m}.
+			cursor, digits := index+1, 0
+			for ; cursor < len(pattern) && pattern[cursor] >= '0' && pattern[cursor] <= '9'; cursor++ {
+				digits++
 			}
-			inClass = false
+			if digits > 0 && cursor < len(pattern) && pattern[cursor] == ',' {
+				cursor++
+				for cursor < len(pattern) && pattern[cursor] >= '0' && pattern[cursor] <= '9' {
+					cursor++
+				}
+			}
+			if digits == 0 || cursor >= len(pattern) || pattern[cursor] != '}' {
+				return nil, fmt.Errorf("ECMAScript Unicode mode requires braces to form a quantifier")
+			}
+			index = cursor
 			continue
+		case '}':
+			return nil, fmt.Errorf("ECMAScript Unicode mode requires braces to form a quantifier")
 		}
-		if inClass || pattern[index] != '(' || index+2 >= len(pattern) || pattern[index+1] != '?' {
+		if pattern[index] != '(' || index+2 >= len(pattern) || pattern[index+1] != '?' {
 			continue
 		}
 		switch pattern[index+2] {
@@ -126,6 +180,89 @@ func (validator *configurationSchemaValidator) compileRegexp(pattern string) (js
 	}
 	expression.MatchTimeout = 100 * time.Millisecond
 	return &boundedSchemaRegexp{regexp: expression, owner: validator}, nil
+}
+
+// checkUnicodeModeEscape allows only the escapes that ECMAScript accepts in
+// Unicode mode. escape starts after the backslash. It returns how many bytes
+// of escape the escape uses and whether it is a class escape (\d, \p{...}).
+// Property names and \k group names are left to regexp2, which rejects the
+// same names as ECMAScript.
+func checkUnicodeModeEscape(escape string, inClass bool, groups int) (int, bool, error) {
+	if escape != "" {
+		character := escape[0]
+		switch {
+		case strings.IndexByte(`^$\.*+?()[]{}|/`, character) >= 0, character == '-' && inClass:
+			return 1, false, nil
+		case strings.IndexByte("dDwWsS", character) >= 0:
+			return 1, true, nil
+		case character == 'p' || character == 'P':
+			if end := strings.IndexByte(escape, '}'); len(escape) > 1 && escape[1] == '{' && end > 2 {
+				return end + 1, true, nil
+			}
+		case strings.IndexByte("fnrtvb", character) >= 0, character == 'B' && !inClass:
+			return 1, false, nil
+		case character == 'c':
+			if len(escape) > 1 && (escape[1]|0x20) >= 'a' && (escape[1]|0x20) <= 'z' {
+				return 2, false, nil
+			}
+		case character == '0':
+			if len(escape) == 1 || escape[1] < '0' || escape[1] > '9' {
+				return 1, false, nil
+			}
+		case character >= '1' && character <= '9' && !inClass:
+			length := 1
+			for length < len(escape) && escape[length] >= '0' && escape[length] <= '9' {
+				length++
+			}
+			if reference, err := strconv.Atoi(escape[:length]); err == nil && reference <= groups {
+				return length, false, nil
+			}
+		case character == 'k' && !inClass:
+			if len(escape) > 1 && escape[1] == '<' {
+				return 1, false, nil
+			}
+		case character == 'x':
+			if len(escape) >= 3 {
+				if _, err := strconv.ParseUint(escape[1:3], 16, 8); err == nil {
+					return 3, false, nil
+				}
+			}
+		case character == 'u':
+			if len(escape) >= 5 {
+				if _, err := strconv.ParseUint(escape[1:5], 16, 16); err == nil {
+					return 5, false, nil
+				}
+			}
+			if end := strings.IndexByte(escape, '}'); len(escape) > 1 && escape[1] == '{' && end > 2 {
+				if value, err := strconv.ParseUint(escape[2:end], 16, 32); err == nil && value <= utf8.MaxRune {
+					return end + 1, false, nil
+				}
+			}
+		}
+	}
+	return 0, false, fmt.Errorf("unsupported escape in ECMAScript Unicode mode")
+}
+
+// countCapturingGroups counts numbered and named capturing groups, which
+// decimal backreferences may name in any position.
+func countCapturingGroups(pattern string) int {
+	groups, inClass := 0, false
+	for index := 0; index < len(pattern); index++ {
+		switch {
+		case pattern[index] == '\\':
+			index++
+		case inClass:
+			inClass = pattern[index] != ']'
+		case pattern[index] == '[':
+			inClass = true
+		case pattern[index] == '(':
+			rest := pattern[index+1:]
+			if !strings.HasPrefix(rest, "?") || (strings.HasPrefix(rest, "?<") && !strings.HasPrefix(rest, "?<=") && !strings.HasPrefix(rest, "?<!")) {
+				groups++
+			}
+		}
+	}
+	return groups
 }
 
 // encoding/json replaces escaped lone surrogates with U+FFFD. The TS JSON
