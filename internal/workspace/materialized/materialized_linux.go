@@ -624,7 +624,7 @@ func (state *scanState) scanDirectory(ctx context.Context, directoryFD int, pref
 				return fmt.Errorf("read symlink %q: %w", entryPath, err)
 			}
 			if targetBytes == len(targetBuffer) {
-				return fmt.Errorf("%w: symlink %q target exceeds %d bytes", manifest.ErrInvalidEntry, entryPath, manifest.MaxPathBytes)
+				return fmt.Errorf("%w: symlink %q target exceeds %d bytes", manifest.ErrInvalidSymlink, entryPath, manifest.MaxPathBytes)
 			}
 			var after unix.Stat_t
 			if err := unix.Fstatat(directoryFD, name, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil {

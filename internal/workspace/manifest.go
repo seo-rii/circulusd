@@ -23,8 +23,10 @@ var (
 	ErrPathCollision    = wiremanifest.ErrPathCollision
 	ErrInvalidEntry     = wiremanifest.ErrInvalidEntry
 	ErrInvalidHierarchy = wiremanifest.ErrInvalidTree
-	ErrInvalidSymlink   = wiremanifest.ErrInvalidEntry
+	// ErrInvalidSymlink also matches ErrInvalidEntry.
+	ErrInvalidSymlink   = wiremanifest.ErrInvalidSymlink
 	ErrManifestTooLarge = errors.New("workspace: manifest exceeds configured quota")
+	ErrInvalidLimits    = errors.New("workspace: invalid manifest limits")
 )
 
 type EntryType = wiremanifest.EntryType
@@ -70,7 +72,7 @@ func (manifest Manifest) MetadataBytes() int { return manifest.metadataBytes }
 // sandbox materialization, and post-execution scans.
 func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 	if limits.MaxEntries < 0 || limits.MaxMetadataBytes < 0 {
-		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrManifestTooLarge)
+		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrInvalidLimits)
 	}
 	if limits.MaxEntries == 0 {
 		limits.MaxEntries = defaultMaximumEntries
@@ -88,8 +90,10 @@ func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 	}
 	encoded, err := canonicalManifest.MarshalCanonical()
 	if err != nil {
+		// The encoder's own size and item caps can fail before the configured
+		// metadata quota, so report the limit that was actually hit.
 		if errors.Is(err, canonical.ErrLimitExceeded) {
-			return Manifest{}, fmt.Errorf("%w: metadata limit %d bytes", ErrManifestTooLarge, limits.MaxMetadataBytes)
+			return Manifest{}, fmt.Errorf("%w: %w", ErrManifestTooLarge, err)
 		}
 		return Manifest{}, fmt.Errorf("encode workspace manifest: %w", err)
 	}

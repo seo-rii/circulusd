@@ -12,12 +12,13 @@ import (
 	wiremanifest "github.com/hancomac/circulusd/internal/workspace/manifest"
 )
 
-// buildManifestByComposition is the previous BuildManifest body. It
-// canonicalized the input three times (Canonicalize, MarshalCanonical and
-// RootDigest) and is kept as the oracle for the single-pass build.
+// buildManifestByComposition is the previous BuildManifest body, with the
+// current limit errors. It canonicalized the input three times (Canonicalize,
+// MarshalCanonical and RootDigest) and is kept as the oracle for the
+// single-pass build.
 func buildManifestByComposition(input []Entry, limits Limits) (Manifest, error) {
 	if limits.MaxEntries < 0 || limits.MaxMetadataBytes < 0 {
-		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrManifestTooLarge)
+		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrInvalidLimits)
 	}
 	if limits.MaxEntries == 0 {
 		limits.MaxEntries = defaultMaximumEntries
@@ -35,7 +36,7 @@ func buildManifestByComposition(input []Entry, limits Limits) (Manifest, error) 
 	encoded, err := wiremanifest.MarshalCanonical(entries)
 	if err != nil {
 		if errors.Is(err, canonical.ErrLimitExceeded) {
-			return Manifest{}, fmt.Errorf("%w: metadata limit %d bytes", ErrManifestTooLarge, limits.MaxMetadataBytes)
+			return Manifest{}, fmt.Errorf("%w: %w", ErrManifestTooLarge, err)
 		}
 		return Manifest{}, fmt.Errorf("encode workspace manifest: %w", err)
 	}

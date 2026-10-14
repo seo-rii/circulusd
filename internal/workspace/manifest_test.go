@@ -2,9 +2,12 @@ package workspace
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/hancomac/circulusd/internal/canonical"
 )
 
 const (
@@ -143,6 +146,66 @@ func TestBuildManifestEnforcesEntryAndMetadataQuotas(t *testing.T) {
 	}
 	if _, err := BuildManifest(entries, Limits{MaxEntries: 2, MaxMetadataBytes: 8}); !errors.Is(err, ErrManifestTooLarge) {
 		t.Fatalf("metadata quota error = %v, want ErrManifestTooLarge", err)
+	}
+}
+
+func TestBuildManifestSymlinkErrorsAreDistinctEntryErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		entries []Entry
+		symlink bool
+	}{
+		{name: "file missing digest", entries: []Entry{{Path: "x", Type: EntryFile}}},
+		{name: "file target", entries: []Entry{{Path: "x", Type: EntryFile, ContentDigest: emptyDigest, SymlinkTarget: "y"}}},
+		{name: "unknown type", entries: []Entry{{Path: "x", Type: EntryType("fifo")}}},
+		{name: "special mode", entries: []Entry{{Path: "x", Type: EntryFile, Mode: 0o100644, ContentDigest: emptyDigest}}},
+		{name: "symlink file metadata", entries: []Entry{{Path: "x", Type: EntrySymlink, Size: 1, SymlinkTarget: "y"}}, symlink: true},
+		{name: "symlink missing target", entries: []Entry{{Path: "x", Type: EntrySymlink}}, symlink: true},
+		{name: "symlink control character", entries: []Entry{{Path: "x", Type: EntrySymlink, SymlinkTarget: "a\x01"}}, symlink: true},
+		{name: "lexically escaping symlink", entries: []Entry{{Path: "dir", Type: EntryDirectory}, {Path: "dir/x", Type: EntrySymlink, SymlinkTarget: "../../etc"}}, symlink: true},
+		{name: "escape through traversal", entries: []Entry{
+			{Path: "dir", Type: EntryDirectory},
+			{Path: "dir/up", Type: EntrySymlink, SymlinkTarget: ".."},
+			{Path: "x", Type: EntrySymlink, SymlinkTarget: "dir/up/.."},
+		}, symlink: true},
+		{name: "symlink loop", entries: []Entry{{Path: "a", Type: EntrySymlink, SymlinkTarget: "b/c"}, {Path: "b", Type: EntrySymlink, SymlinkTarget: "a/c"}}, symlink: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := BuildManifest(test.entries, Limits{})
+			if !errors.Is(err, ErrInvalidEntry) {
+				t.Fatalf("BuildManifest() error = %v, want ErrInvalidEntry", err)
+			}
+			if errors.Is(err, ErrInvalidSymlink) != test.symlink {
+				t.Fatalf("BuildManifest() error = %v; errors.Is(ErrInvalidSymlink) = %t, want %t", err, !test.symlink, test.symlink)
+			}
+		})
+	}
+}
+
+func TestBuildManifestLimitErrorsNameTheLimitThatFailed(t *testing.T) {
+	t.Parallel()
+	for _, limits := range []Limits{{MaxEntries: -1}, {MaxMetadataBytes: -1}} {
+		if _, err := BuildManifest(nil, limits); !errors.Is(err, ErrInvalidLimits) || errors.Is(err, ErrManifestTooLarge) {
+			t.Fatalf("BuildManifest(%#v) error = %v, want ErrInvalidLimits only", limits, err)
+		}
+	}
+
+	// The configured metadata quota is above the canonical encoder's 16 MiB
+	// cap, so the encoder fails first. The error must name that cap, not
+	// claim the configured quota was exceeded.
+	target := strings.Repeat("abcdefg/", 511) + "abcdefg"
+	entries := make([]Entry, 0, 4200)
+	for index := range 4200 {
+		entries = append(entries, Entry{Path: fmt.Sprintf("link-%04d", index), Type: EntrySymlink, SymlinkTarget: target})
+	}
+	_, err := BuildManifest(entries, Limits{MaxMetadataBytes: 32 << 20})
+	if !errors.Is(err, ErrManifestTooLarge) || !errors.Is(err, canonical.ErrLimitExceeded) {
+		t.Fatalf("BuildManifest() error = %v, want ErrManifestTooLarge from the canonical encoding limit", err)
+	}
+	if message := err.Error(); !strings.Contains(message, "16777216") || strings.Contains(message, "33554432") {
+		t.Fatalf("BuildManifest() error = %q, want the 16777216-byte encoding cap and not the configured quota", message)
 	}
 }
 
