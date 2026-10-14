@@ -934,6 +934,52 @@ func TestWorkerdCgroupPreparePoisonsControllerWhenCreatedChildCannotBeOpened(t *
 	}
 }
 
+func TestWorkerdCgroupPrepareRemovesLeafAfterTransientOpenFailure(t *testing.T) {
+	for name, errno := range map[string]unix.Errno{
+		"process descriptor limit": unix.EMFILE,
+		"system descriptor limit":  unix.ENFILE,
+		"kernel memory":            unix.ENOMEM,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, backend, controller := newWorkerdCgroupFixture(t)
+			backend.openErr = errno
+			lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "transient-open", 1)
+			if lease != nil || err == nil || errors.Is(err, errWorkerdCgroupPoisoned) {
+				t.Fatalf("prepare(transient open failure) = %#v, %v, want nil and an unpoisoned error", lease, err)
+			}
+			if children := backend.childCount(); children != 0 {
+				t.Fatalf("children after transient open failure = %d, want the new leaf removed", children)
+			}
+			backend.openErr = nil
+			retry, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "transient-open", 1)
+			if err != nil {
+				t.Fatalf("prepare(retry) error = %v", err)
+			}
+			if err := retry.destroy(context.Background()); err != nil {
+				t.Fatalf("destroy(retry) error = %v", err)
+			}
+			if err := controller.close(); err != nil {
+				t.Fatalf("close() error = %v", err)
+			}
+			if descriptors := backend.openFileDescriptors(); descriptors != 0 {
+				t.Fatalf("open descriptors after close = %d, want 0", descriptors)
+			}
+		})
+	}
+	t.Run("failed removal still poisons", func(t *testing.T) {
+		_, backend, controller := newWorkerdCgroupFixture(t)
+		backend.openErr = unix.EMFILE
+		backend.removeFailures = 1
+		lease, err := controller.prepare(context.Background(), workerdTestAgentInstanceID(0), "transient-open", 1)
+		if lease != nil || !errors.Is(err, errWorkerdCgroupPoisoned) {
+			t.Fatalf("prepare(transient open, failed removal) = %#v, %v, want nil and poisoned error", lease, err)
+		}
+		if err := controller.close(); !errors.Is(err, errWorkerdCgroupPoisoned) {
+			t.Fatalf("close(poisoned) error = %v, want poisoned error", err)
+		}
+	})
+}
+
 func TestWorkerdCgroupPoisonRevokesBorrowFromExistingLease(t *testing.T) {
 	config := validWorkerdCgroupConfig()
 	config.MaximumShards = 2
