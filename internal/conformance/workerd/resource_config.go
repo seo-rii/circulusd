@@ -1,8 +1,6 @@
 package workerd
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/hancomac/circulusd/internal/strictjson"
 )
 
 const (
@@ -85,79 +85,11 @@ func parseResourceQualificationConfig(reader io.Reader) (resourceQualificationCo
 		return resourceQualificationConfig{}, fmt.Errorf("%w: document exceeds %d bytes", errInvalidResourceQualificationConfig, maximumResourceQualificationConfigBytes)
 	}
 
-	type container struct {
-		kind         json.Delim
-		keys         map[string]struct{}
-		expectingKey bool
-	}
-	tokenDecoder := json.NewDecoder(bytes.NewReader(encoded))
-	tokenDecoder.UseNumber()
-	containers := make([]container, 0, 8)
-	completeValue := func() {
-		if len(containers) == 0 {
-			return
-		}
-		current := &containers[len(containers)-1]
-		if current.kind == '{' && !current.expectingKey {
-			current.expectingKey = true
-		}
-	}
-	for {
-		token, tokenErr := tokenDecoder.Token()
-		if tokenErr == io.EOF {
-			break
-		}
-		if tokenErr != nil {
-			return resourceQualificationConfig{}, fmt.Errorf("%w: decode document: %v", errInvalidResourceQualificationConfig, tokenErr)
-		}
-		if delimiter, ok := token.(json.Delim); ok {
-			switch delimiter {
-			case '{':
-				containers = append(containers, container{kind: delimiter, keys: make(map[string]struct{}), expectingKey: true})
-			case '[':
-				containers = append(containers, container{kind: delimiter})
-			case '}', ']':
-				if len(containers) == 0 || containers[len(containers)-1].kind+2 != delimiter {
-					return resourceQualificationConfig{}, fmt.Errorf("%w: mismatched JSON container", errInvalidResourceQualificationConfig)
-				}
-				containers = containers[:len(containers)-1]
-				completeValue()
-			}
-			continue
-		}
-		if len(containers) > 0 {
-			current := &containers[len(containers)-1]
-			if current.kind == '{' && current.expectingKey {
-				key, ok := token.(string)
-				if !ok {
-					return resourceQualificationConfig{}, fmt.Errorf("%w: JSON object key is not a string", errInvalidResourceQualificationConfig)
-				}
-				if _, duplicate := current.keys[key]; duplicate {
-					return resourceQualificationConfig{}, fmt.Errorf("%w: duplicate JSON member %q", errInvalidResourceQualificationConfig, key)
-				}
-				current.keys[key] = struct{}{}
-				current.expectingKey = false
-				continue
-			}
-		}
-		completeValue()
-	}
-	if len(containers) != 0 {
-		return resourceQualificationConfig{}, fmt.Errorf("%w: incomplete JSON container", errInvalidResourceQualificationConfig)
-	}
-
+	// strictjson rejects duplicate, unknown and case-folded members as well as
+	// trailing values; encoding/json alone would match keys case-insensitively.
 	var document resourceQualificationDocument
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&document); err != nil {
+	if err := strictjson.Decode(encoded, &document); err != nil {
 		return resourceQualificationConfig{}, fmt.Errorf("%w: decode document: %v", errInvalidResourceQualificationConfig, err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return resourceQualificationConfig{}, fmt.Errorf("%w: trailing JSON value", errInvalidResourceQualificationConfig)
-		}
-		return resourceQualificationConfig{}, fmt.Errorf("%w: decode document trailer: %v", errInvalidResourceQualificationConfig, err)
 	}
 
 	if document.SchemaVersion != 1 {

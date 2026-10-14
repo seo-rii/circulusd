@@ -248,7 +248,9 @@ func TestObservationsRejectActualIsolationRegressions(t *testing.T) {
 
 func TestConfigAndEvidenceRejectAmbiguitySymlinksAndClobber(t *testing.T) {
 	encoded, _ := json.Marshal(validTestConfig())
-	for _, raw := range [][]byte{append([]byte(`{"schemaVersion":1,`), encoded[1:]...), append(encoded, []byte(` {}`)...), bytesReplace(encoded, `"schemaVersion":1`, `"schemaVersion":1,"passed":true`), bytesReplace(encoded, `"hostUid":400001`, `"hostUid":0`), bytesReplace(encoded, `"stepMillis":10000`, `"stepMillis":9999`), bytesReplace(encoded, `"sandboxRoot":"/q/s"`, `"sandboxRoot":"/q"`)} {
+	for _, raw := range [][]byte{append([]byte(`{"schemaVersion":1,`), encoded[1:]...), append(encoded, []byte(` {}`)...), bytesReplace(encoded, `"schemaVersion":1`, `"schemaVersion":1,"passed":true`), bytesReplace(encoded, `"hostUid":400001`, `"hostUid":0`), bytesReplace(encoded, `"stepMillis":10000`, `"stepMillis":9999`), bytesReplace(encoded, `"sandboxRoot":"/q/s"`, `"sandboxRoot":"/q"`),
+		// Case-folded aliases of exact members.
+		append([]byte(`{"SchemaVersion":1,`), encoded[1:]...), bytesReplace(encoded, `"hostUid":400001`, `"HostUID":400001`)} {
 		if _, err := parseQualificationConfig(raw); err == nil {
 			t.Fatalf("accepted invalid config: %s", raw)
 		}
