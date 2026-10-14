@@ -178,9 +178,8 @@ func nativeStateOperation[T any](ctx context.Context, repository *NativeReposito
 	if err := repository.source.DurabilityBarrier(ctx, commit); err != nil {
 		return zero, nativeRepositoryError(ctx, err)
 	}
-	if err := ctx.Err(); err != nil {
-		return zero, err
-	}
+	// The commit is durable past the barrier. A context that ended meanwhile
+	// must not report the persisted result as failed.
 	return result, nil
 }
 

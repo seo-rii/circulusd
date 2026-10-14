@@ -368,7 +368,11 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	} else if !validMCPError(rpc.Error) {
 		return ProviderStartResult{}, ErrProtocolMismatch
 	}
-	row, err := nativeStateOperation(ctx, provider.factory.repository, func(state *nativeRepositoryState) (nativeWireInvocation, error) {
+	// The response is an observed external fact. Persist it with the bounded
+	// cleanup context so a caller cancelled after it arrived cannot drop it.
+	persistCtx, cancelPersist := provider.factory.validator.cleanupContext(ctx)
+	defer cancelPersist()
+	row, err := nativeStateOperation(persistCtx, provider.factory.repository, func(state *nativeRepositoryState) (nativeWireInvocation, error) {
 		row, found := state.WireInvocations[key]
 		if !found || row.Start != command.Start || !row.StartClaimed || row.TerminalStatus != "" {
 			return nativeWireInvocation{}, ErrConcurrentTransition
@@ -440,17 +444,19 @@ func (*nativeHTTPCall) String() string   { return "native-mcp-http-call<redacted
 func (*nativeHTTPCall) GoString() string { return "native-mcp-http-call<redacted>" }
 
 func (call *nativeHTTPCall) Next(ctx context.Context) (ProviderEvent, error) {
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	// The durable result is already in hand and needs no I/O, so deliver it
+	// before honouring cancellation.
+	if !call.closed && len(call.output) != 0 {
+		output := call.output
+		call.output = nil
+		return ProviderEvent{Kind: ProviderCompleted, Output: output}, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return ProviderEvent{}, err
 	}
-	call.mu.Lock()
-	defer call.mu.Unlock()
-	if call.closed || len(call.output) == 0 {
-		return ProviderEvent{}, io.EOF
-	}
-	output := call.output
-	call.output = nil
-	return ProviderEvent{Kind: ProviderCompleted, Output: output}, nil
+	return ProviderEvent{}, io.EOF
 }
 func (call *nativeHTTPCall) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

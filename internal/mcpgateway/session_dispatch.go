@@ -501,11 +501,13 @@ func (starter *SessionDispatchStarter) consumeProviderCall(
 	var chunkCount uint32
 	var streamBytes uint64
 	for {
-		if err := ctx.Err(); err != nil {
-			return errors.Join(err, starter.recordUnknown(ctx, observation, "provider stream was interrupted"))
-		}
+		// Next honours ctx itself; checking ctx first would discard a
+		// terminal result the provider already holds.
 		event, err := call.Next(ctx)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return errors.Join(ctxErr, starter.recordUnknown(ctx, observation, "provider stream was interrupted"))
+			}
 			if errors.Is(err, io.EOF) {
 				return starter.recordUnknown(ctx, observation, "provider stream ended before completion")
 			}

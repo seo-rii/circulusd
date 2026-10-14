@@ -24,6 +24,7 @@ type nativeRepositoryFixtureSource struct {
 	skipCallback bool
 	wrongObject  bool
 	failCommit   bool
+	afterBarrier func()
 }
 
 type nativeRepositoryFixtureTransaction struct{ state []byte }
@@ -68,6 +69,9 @@ func (source *nativeRepositoryFixtureSource) DurabilityBarrier(_ context.Context
 	source.mu.Lock()
 	defer source.mu.Unlock()
 	source.barriers = append(source.barriers, commit)
+	if source.afterBarrier != nil {
+		source.afterBarrier()
+	}
 	return source.barrierError
 }
 func (source *nativeRepositoryFixtureSource) ProbeProduction(ctx context.Context, challenge dependency.ProbeChallenge) (dependency.ProbeResponse, error) {
@@ -160,6 +164,30 @@ func TestNativeRepositoryNoResultsBeforeBarrierOrActualCallback(t *testing.T) {
 				t.Fatalf("unconfirmed result escaped: %v", err)
 			}
 		})
+	}
+}
+
+func TestNativeRepositoryReturnsDurableResultWhenContextEndsAfterBarrier(t *testing.T) {
+	repository, source := nativeRepositoryFixture(t)
+	fixture := newGatewayFixture(t, ReplayNever)
+	effect := admitFixtureEffect(t, fixture)
+	if err := repository.SetCurrentAuthority(context.Background(), effect.Scope); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source.afterBarrier = cancel
+	stored, err := repository.Admit(ctx, effect)
+	source.afterBarrier = nil
+	if ctx.Err() == nil {
+		t.Fatal("fixture did not end the context after the durable barrier")
+	}
+	if err != nil || !stored.Durable || !sameEffect(stored.Effect, effect) {
+		t.Fatalf("durable commit was reported as failed: %v", err)
+	}
+	loaded, err := repository.Load(context.Background(), effect.Scope.InvocationID)
+	if err != nil || !sameEffect(loaded.Effect, effect) {
+		t.Fatalf("durable commit was not retained: %v", err)
 	}
 }
 
