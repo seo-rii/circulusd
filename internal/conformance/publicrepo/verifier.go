@@ -49,7 +49,7 @@ func RequiredChecks() []Check {
 		{
 			ID:          "atomic-idempotency",
 			Reference:   "SPEC §36 / §53.16",
-			Description: "a repeated (subject, key) with the same request digest returns the same durable turn; a different request digest conflicts",
+			Description: "a repeated (subject, key) with the same request digest returns the same durable turn as originally created (queued), even after the turn progressed; a different request digest conflicts",
 		},
 		{
 			ID:          "atomic-event-sequence",
@@ -232,6 +232,25 @@ func checkIdempotency(ctx context.Context, subject *Subject) (CheckOutcome, erro
 		return CheckOutcome{Passed: false, Detail: fmt.Sprintf(
 			"duplicate key returned turn %q dedup=%t, want the committed turn %q dedup=true",
 			repeat.ID, dedup, first.ID)}, nil
+	}
+
+	// A retry after the turn has progressed must still replay the original
+	// creation result. The Service accepts only a queued turn from CreateTurn,
+	// so returning the current status would turn a valid retry into a failure.
+	if _, err := subject.appendAccepted(ctx, subject.authority(first.ID, subject.PlacementGeneration), 0); err != nil {
+		return CheckOutcome{}, fmt.Errorf("append accepted: %w", err)
+	}
+	progressed, dedup, err := subject.Repository.CreateTurn(ctx, platformapi.CreateTurnCommand{
+		TenantID: subject.TenantID, SubjectID: subject.SubjectID, SessionID: subject.SessionID,
+		KeyDigest: keyDigest, RequestDigest: digestA, ProposedTurn: proposedB, Authorization: permit,
+	})
+	if err != nil {
+		return CheckOutcome{}, fmt.Errorf("duplicate CreateTurn after progress: %w", err)
+	}
+	if !dedup || progressed != first {
+		return CheckOutcome{Passed: false, Detail: fmt.Sprintf(
+			"duplicate key after progress returned turn %q status %q dedup=%t, want the created turn %q status %q dedup=true",
+			progressed.ID, progressed.Status, dedup, first.ID, first.Status)}, nil
 	}
 
 	// The same key with a different request digest must conflict, not fork.

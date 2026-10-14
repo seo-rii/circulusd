@@ -166,8 +166,10 @@ func applyCreateTurn(state sessionRecord, cmd command) (celld.ApplyResult, error
 		if receipt.requestDigest != cmd.requestDigest {
 			return celld.ApplyResult{}, ErrIdempotencyConflict
 		}
-		turn := state.turns[receipt.turnID]
-		return finish(state, createResponse(receipt.turnID, true, turn.status))
+		// Replay the original creation result, as the MemoryStore reference
+		// does. A turn is always created queued; its current status belongs to
+		// the event journal, not to the creation receipt.
+		return finish(state, createResponse(receipt.turnID, true, string(sessionevent.TurnQueued)))
 	}
 	if _, collision := state.turns[cmd.proposedTurnID]; collision {
 		return celld.ApplyResult{}, ErrIdempotencyConflict
