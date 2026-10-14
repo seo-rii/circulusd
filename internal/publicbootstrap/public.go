@@ -182,8 +182,20 @@ func (graph *Graph) ServeHTTP(response http.ResponseWriter, request *http.Reques
 	}
 	defer controller.SetWriteDeadline(time.Time{})
 	if request.Body != nil {
-		stopBody := context.AfterFunc(ctx, func() { _ = request.Body.Close() })
-		defer stopBody()
+		// An HTTP/1.1 Body.Close waits for an in-progress Read and may read
+		// the unread body itself, so expire the read deadline first. Wait for
+		// the close before the deferred deadline reset can undo it.
+		bodyClosed := make(chan struct{})
+		stopBody := context.AfterFunc(ctx, func() {
+			defer close(bodyClosed)
+			_ = controller.SetReadDeadline(time.Now())
+			_ = request.Body.Close()
+		})
+		defer func() {
+			if !stopBody() {
+				<-bodyClosed
+			}
+		}()
 	}
 	// Close may race registration of the cancellation callback.
 	if graph.ctx.Err() != nil {
