@@ -115,20 +115,22 @@ func run(ctx context.Context, endpoints []Endpoint, timeout time.Duration, query
 	probeContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Failure reasons name the canonical endpoint (platformd, agentd or
+	// executord) but never its socket path or the underlying error.
 	artifacts := make([]conformance.ArtifactReference, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		response, err := query(probeContext, endpoint)
 		if err != nil {
-			return queryFailure(ctx, probeContext, err)
+			return queryFailure(ctx, probeContext, err, endpoint.Name)
 		}
 		if ctx.Err() != nil {
 			return result(conformance.NotRun, "daemon protocol probe canceled", nil)
 		}
 		if probeContext.Err() != nil {
-			return result(conformance.Unavailable, "daemon protocol probe timed out", nil)
+			return result(conformance.Unavailable, "daemon protocol probe timed out: "+endpoint.Name, nil)
 		}
 		if !validCapabilitiesResponse(endpoint, response) {
-			return result(conformance.Fail, "daemon protocol evidence is invalid", nil)
+			return result(conformance.Fail, "daemon protocol evidence is invalid: "+endpoint.Name, nil)
 		}
 		artifacts = append(artifacts, conformance.ArtifactReference{
 			Name:   "uds-" + endpoint.Name + "-protocol-descriptor",
@@ -138,21 +140,21 @@ func run(ctx context.Context, endpoints []Endpoint, timeout time.Duration, query
 	return result(conformance.Pass, "", artifacts)
 }
 
-func queryFailure(parent, bounded context.Context, err error) conformance.Result {
+func queryFailure(parent, bounded context.Context, err error, endpointName string) conformance.Result {
 	if parent.Err() != nil {
 		return result(conformance.NotRun, "daemon protocol probe canceled", nil)
 	}
 	if bounded.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
-		return result(conformance.Unavailable, "daemon protocol probe timed out", nil)
+		return result(conformance.Unavailable, "daemon protocol probe timed out: "+endpointName, nil)
 	}
 	if code := connect.CodeOf(err); code != connect.CodeUnknown && code != connect.CodeUnavailable {
-		return result(conformance.Fail, "daemon protocol verification failed", nil)
+		return result(conformance.Fail, "daemon protocol verification failed: "+endpointName, nil)
 	}
 	if connect.CodeOf(err) == connect.CodeUnavailable || errors.Is(err, os.ErrNotExist) ||
 		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
-		return result(conformance.Unavailable, "daemon protocol endpoint is unavailable", nil)
+		return result(conformance.Unavailable, "daemon protocol endpoint is unavailable: "+endpointName, nil)
 	}
-	return result(conformance.Fail, "daemon protocol verification failed", nil)
+	return result(conformance.Fail, "daemon protocol verification failed: "+endpointName, nil)
 }
 
 func result(status conformance.Status, reason string, artifacts []conformance.ArtifactReference) conformance.Result {

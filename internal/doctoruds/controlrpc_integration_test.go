@@ -88,7 +88,7 @@ func TestDefaultProbeHidesWrongRoleAndPeerAuthorityDetails(t *testing.T) {
 				t.Fatalf("BuildProbe() error = %v", err)
 			}
 			result := probe.Run(context.Background())
-			if result.Status != conformance.Fail || result.Reason != "daemon protocol verification failed" {
+			if result.Status != conformance.Fail || result.Reason != "daemon protocol verification failed: platformd" {
 				t.Fatalf("result = %+v, want generic FAIL", result)
 			}
 			assertNoSensitiveReason(t, result.Reason)

@@ -177,7 +177,7 @@ func TestInjectedProbeFailsClosedOnInvalidProtocolEvidence(t *testing.T) {
 				t.Fatalf("BuildProbe() error = %v", err)
 			}
 			result := probe.Run(context.Background())
-			if result.Status != conformance.Fail || result.Reason != "daemon protocol evidence is invalid" {
+			if result.Status != conformance.Fail || result.Reason != "daemon protocol evidence is invalid: platformd" {
 				t.Fatalf("result = %+v, want generic FAIL", result)
 			}
 			assertNoSensitiveReason(t, result.Reason)
@@ -202,8 +202,9 @@ func TestInjectedProbeRequiresRoleCapabilityFromAgentdAndExecutord(t *testing.T)
 			if err != nil {
 				t.Fatalf("BuildProbe() error = %v", err)
 			}
-			if result := probe.Run(context.Background()); result.Status != conformance.Fail {
-				t.Fatalf("result = %+v, want FAIL", result)
+			if result := probe.Run(context.Background()); result.Status != conformance.Fail ||
+				result.Reason != "daemon protocol evidence is invalid: "+daemon {
+				t.Fatalf("result = %+v, want FAIL naming %s", result, daemon)
 			}
 		})
 	}
@@ -231,7 +232,7 @@ func TestInjectedProbeClassifiesCancellationTimeoutAndQueryFailureWithoutDetails
 			query: func(context.Context, Endpoint) (*v1.GetCapabilitiesResponse, error) {
 				return nil, context.Canceled
 			},
-			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed",
+			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed: platformd",
 		},
 		{
 			name: "probe timeout", ctx: context.Background, timeout: 5 * time.Millisecond,
@@ -239,28 +240,28 @@ func TestInjectedProbeClassifiesCancellationTimeoutAndQueryFailureWithoutDetails
 				<-ctx.Done()
 				return nil, ctx.Err()
 			},
-			wantStatus: conformance.Unavailable, wantReason: "daemon protocol probe timed out",
+			wantStatus: conformance.Unavailable, wantReason: "daemon protocol probe timed out: platformd",
 		},
 		{
 			name: "missing endpoint", ctx: context.Background, timeout: time.Second,
 			query: func(context.Context, Endpoint) (*v1.GetCapabilitiesResponse, error) {
 				return nil, os.ErrNotExist
 			},
-			wantStatus: conformance.Unavailable, wantReason: "daemon protocol endpoint is unavailable",
+			wantStatus: conformance.Unavailable, wantReason: "daemon protocol endpoint is unavailable: platformd",
 		},
 		{
 			name: "local authority contradiction", ctx: context.Background, timeout: time.Second,
 			query: func(context.Context, Endpoint) (*v1.GetCapabilitiesResponse, error) {
 				return nil, errors.New("secret socket path and peer details")
 			},
-			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed",
+			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed: platformd",
 		},
 		{
 			name: "authenticated protocol mismatch", ctx: context.Background, timeout: time.Second,
 			query: func(context.Context, Endpoint) (*v1.GetCapabilitiesResponse, error) {
 				return nil, connect.NewError(connect.CodeDataLoss, errors.New("secret peer transcript"))
 			},
-			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed",
+			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed: platformd",
 		},
 	}
 
@@ -278,6 +279,62 @@ func TestInjectedProbeClassifiesCancellationTimeoutAndQueryFailureWithoutDetails
 			if result.Evidence.Class != conformance.EvidenceClassExternal || result.Evidence.ArtifactReferences == nil {
 				t.Fatalf("failure evidence = %+v, want normalized external evidence", result.Evidence)
 			}
+		})
+	}
+}
+
+func TestInjectedProbeReasonNamesTheFailingEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		failing    string
+		failure    func(Endpoint) (*v1.GetCapabilitiesResponse, error)
+		wantStatus conformance.Status
+		wantReason string
+	}{
+		{
+			name: "unreachable", failing: Executord,
+			failure: func(Endpoint) (*v1.GetCapabilitiesResponse, error) {
+				return nil, os.ErrNotExist
+			},
+			wantStatus: conformance.Unavailable, wantReason: "daemon protocol endpoint is unavailable: executord",
+		},
+		{
+			name: "authority contradiction", failing: Platformd,
+			failure: func(Endpoint) (*v1.GetCapabilitiesResponse, error) {
+				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("secret peer transcript"))
+			},
+			wantStatus: conformance.Fail, wantReason: "daemon protocol verification failed: platformd",
+		},
+		{
+			name: "invalid evidence", failing: Agentd,
+			failure: func(endpoint Endpoint) (*v1.GetCapabilitiesResponse, error) {
+				response := testCapabilitiesResponse(endpoint.Name)
+				response.ProtocolVersion.Minor = 1
+				return response, nil
+			},
+			wantStatus: conformance.Fail, wantReason: "daemon protocol evidence is invalid: agentd",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			probe, err := BuildProbe(Config{
+				Endpoints: testEndpoints(),
+				Timeout:   time.Second,
+				Query: func(_ context.Context, endpoint Endpoint) (*v1.GetCapabilitiesResponse, error) {
+					if endpoint.Name == test.failing {
+						return test.failure(endpoint)
+					}
+					return testCapabilitiesResponse(endpoint.Name), nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("BuildProbe() error = %v", err)
+			}
+			result := probe.Run(context.Background())
+			if result.Status != test.wantStatus || result.Reason != test.wantReason {
+				t.Fatalf("result = %+v, want %s/%q", result, test.wantStatus, test.wantReason)
+			}
+			assertNoSensitiveReason(t, result.Reason)
 		})
 	}
 }
