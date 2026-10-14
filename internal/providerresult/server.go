@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/celld"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
 	"github.com/hancomac/circulusd/internal/stateappbroker"
@@ -179,7 +181,23 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := server.source.ResolveResult(ctx, request)
 	if err != nil || ctx.Err() != nil {
-		server.writeResponse(w, requestID, requestDigest, canonical.Map{"ok": false, "error": canonical.Map{"code": "INTERNAL_ERROR", "message": "The operation could not be completed."}})
+		// Only fixed failure classes get a specific code; every other failure,
+		// including expiry, stays INTERNAL_ERROR so no diagnostic text escapes.
+		code, message := "INTERNAL_ERROR", "The operation could not be completed."
+		switch {
+		case ctx.Err() != nil:
+		case errors.Is(err, ErrRecordUnavailable):
+			code, message = "NOT_FOUND", "The requested resource was not found."
+		case errors.Is(err, ErrRecordConflict), errors.Is(err, broker.ErrFenceMismatch):
+			code, message = "CONFLICT", "The operation conflicts with current state."
+		case errors.Is(err, broker.ErrInvalidEffectState), errors.Is(err, ErrUnsupportedService):
+			code, message = "FAILED_PRECONDITION", "A required precondition was not satisfied."
+		case errors.Is(err, broker.ErrInvalidRequest), errors.Is(err, stateappclient.ErrInvalidRequest):
+			code, message = "INVALID_ARGUMENT", "The RPC request is invalid."
+		case errors.Is(err, celld.ErrStorageContract):
+			code, message = "STORAGE_CONTRACT", "The durable storage contract is unavailable."
+		}
+		server.writeResponse(w, requestID, requestDigest, canonical.Map{"ok": false, "error": canonical.Map{"code": code, "message": message}})
 		return
 	}
 	if result.Request != request || len(result.CanonicalCBOR) < 1 || len(result.CanonicalCBOR) > stateappclient.MaximumProviderResultBytes {
