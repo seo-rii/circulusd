@@ -318,6 +318,34 @@ func TestStarterInvalidProviderResponseFallsBackToUnknown(t *testing.T) {
 	}
 }
 
+func TestStarterRecordsClaimedCommandRejectedBeforeProviderAsFailed(t *testing.T) {
+	dispatch := fakeDispatch(t, 30)
+	command := mustFakeCommand(t, dispatch, []byte("payload"))
+	// The subordinate ledger accepts any digest; the adapter rejects one that
+	// is not its canonical command digest after the one-time claim.
+	command.CommandDigest = fakeDigest(99)
+	store := effectledger.NewReferenceStore()
+	ledger := fakeLedger(t, store, dispatch)
+	if err := ledger.Prepare(context.Background(), command); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	provider := &recordingProvider{}
+	starter, err := fakeeffect.NewStarter(ledger, provider)
+	if err != nil {
+		t.Fatalf("NewStarter() error = %v", err)
+	}
+	if err := starter.Start(context.Background(), mintFakeClaim(t, command)); !errors.Is(err, effectledger.ErrBindingMismatch) {
+		t.Fatalf("Start() error = %v, want ErrBindingMismatch", err)
+	}
+	if provider.calls.Load() != 0 {
+		t.Fatalf("rejected command reached provider %d times", provider.calls.Load())
+	}
+	record, err := ledger.Lookup(context.Background(), fakeLookup(dispatch))
+	if err != nil || record.Status != broker.LedgerFailed {
+		t.Fatalf("Lookup() = %#v, %v, want failed (definitely not sent)", record, err)
+	}
+}
+
 func TestStarterAcceptsAuthoritativeTerminalBeforeProviderAcceptance(t *testing.T) {
 	tests := []struct {
 		name       string

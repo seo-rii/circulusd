@@ -249,6 +249,60 @@ func TestSessionDispatchRejectsZeroAndForeignClaimsBeforeProviderIO(t *testing.T
 	}
 }
 
+func TestSessionDispatchRecordsClaimedCommandRejectedBeforeProviderIOAsFailed(t *testing.T) {
+	tests := []struct {
+		name    string
+		command func(*testing.T, gatewayFixture, CallRequest) ([]byte, broker.Digest)
+	}{
+		{name: "undecodable command", command: func(*testing.T, gatewayFixture, CallRequest) ([]byte, broker.Digest) {
+			return []byte("not an MCP command"), broker.Digest(digestWithByte(84))
+		}},
+		{name: "command digest mismatch", command: func(t *testing.T, fixture gatewayFixture, call CallRequest) ([]byte, broker.Digest) {
+			input, _, err := canonicalizeCall(call, testBounds())
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, _, err := encodeSessionDispatchPayload(fixture.scope.RuntimeRevision, call.ServerID, call.ToolName, input, testBounds())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return payload, broker.Digest(digestWithByte(85))
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayFixture(t, ReplayNever)
+			route := broker.Digest(digestWithByte(byte(86 + index)))
+			ledger := newSessionLedger(t, effectledger.NewReferenceStore(), route)
+			starter := mustSessionStarter(t, fixture.gateway, ledger, route)
+			call := sessionCall(fixture)
+			dispatch := sessionDispatch(t, fixture, call, route)
+			// The subordinate ledger accepts the command, but the starter rejects
+			// it after the one-time claim and before any provider I/O.
+			payload, commandDigest := test.command(t, fixture, call)
+			if err := ledger.Prepare(context.Background(), effectledger.Command{
+				Dispatch: dispatch, CommandDigest: commandDigest, Payload: payload,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			consumer := mustSessionConsumer(t, newSessionClaimer(t, dispatch, commandDigest), starter)
+			_, err := consumer.StartExactAttempt(context.Background(), broker.DispatchStartRequest{
+				Dispatch: dispatch, CommandDigest: commandDigest,
+			})
+			if !errors.Is(err, broker.ErrDispatchStartUnknown) {
+				t.Fatalf("StartExactAttempt() error = %v, want unknown", err)
+			}
+			if fixture.provider.negotiationCount() != 0 || fixture.provider.startCount() != 0 || len(fixture.authorizer.calls) != 0 {
+				t.Fatal("rejected command reached authorization/provider I/O")
+			}
+			record, err := ledger.Lookup(context.Background(), sessionLookup(dispatch))
+			if err != nil || record.Status != broker.LedgerFailed {
+				t.Fatalf("Lookup() = %#v, %v, want failed (definitely not sent)", record, err)
+			}
+		})
+	}
+}
+
 func TestSessionProviderProofBindsEveryNonSecretDispatchField(t *testing.T) {
 	fixture := newGatewayFixture(t, ReplayNever)
 	route := broker.Digest(digestWithByte(83))
