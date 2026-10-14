@@ -54,6 +54,16 @@ var declaredKinds = []Kind{
 	PolicyRevision,
 }
 
+// maximumIDBytes is the length of the longest valid identity. Longer input is
+// rejected before any of it is formatted into an error.
+var maximumIDBytes = func() int {
+	longest := 0
+	for _, kind := range declaredKinds {
+		longest = max(longest, len(kind))
+	}
+	return longest + len("_") + idEncoding.EncodedLen(entropyBytes)
+}()
+
 type ID struct {
 	kind  Kind
 	value string
@@ -128,6 +138,9 @@ func (id *ID) UnmarshalText(text []byte) error {
 }
 
 func parseID(value string) (ID, error) {
+	if len(value) > maximumIDBytes {
+		return ID{}, fmt.Errorf("identity of %d bytes has an invalid shape", len(value))
+	}
 	prefix, encoded, found := strings.Cut(value, "_")
 	if !found || prefix == "" || len(encoded) != 26 {
 		return ID{}, fmt.Errorf("identity %q has an invalid shape", value)
