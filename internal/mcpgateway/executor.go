@@ -81,7 +81,7 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 	if negotiationErr != nil {
 		failed, applyErr := gateway.Apply(current, Event{
 			ExpectedRevision: current.Revision, Kind: EventDispatchFailed, Failure: FailureDefinitelyNotSent,
-			Reason: boundedFailureReason(negotiationCallErr, "provider negotiation failed before tool dispatch", gateway.bounds.MaxFailureBytes),
+			Reason: "provider negotiation failed before tool dispatch",
 		})
 		if applyErr != nil {
 			return current, applyErr
@@ -163,9 +163,9 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 		if errors.As(startErr, &classified) && classified.Classification() == DispatchDefinitelyNotSent && !validProviderID {
 			class = FailureDefinitelyNotSent
 		}
-		reason := boundedFailureReason(startErr, "provider dispatch outcome is unknown", gateway.bounds.MaxFailureBytes)
 		failed, applyErr := gateway.Apply(current, Event{
-			ExpectedRevision: current.Revision, Kind: EventDispatchFailed, Failure: class, Reason: reason,
+			ExpectedRevision: current.Revision, Kind: EventDispatchFailed, Failure: class,
+			Reason: "provider dispatch outcome is unknown",
 		})
 		if applyErr != nil {
 			return current, applyErr
@@ -200,9 +200,9 @@ func (gateway *Gateway) Execute(ctx context.Context, authority OpaqueAuthority, 
 				}
 				return cancelled, ctx.Err()
 			}
-			reason := boundedFailureReason(nextErr, "provider stream ended before completion", gateway.bounds.MaxFailureBytes)
 			failed, applyErr := gateway.Apply(current, Event{
-				ExpectedRevision: current.Revision, Kind: EventDispatchFailed, Failure: FailureUnknown, Reason: reason,
+				ExpectedRevision: current.Revision, Kind: EventDispatchFailed, Failure: FailureUnknown,
+				Reason: "provider stream ended before completion",
 			})
 			if applyErr != nil {
 				return current, applyErr
@@ -1254,14 +1254,6 @@ func (gateway *Gateway) closeProviderCall(ctx context.Context, call ProviderCall
 		defer cancelCleanup()
 		_ = call.Close(cleanupContext)
 	}
-}
-
-func boundedFailureReason(err error, fallback string, maximum uint64) string {
-	// Provider errors are not a trusted public-error channel and may contain
-	// endpoint credentials or request payload fragments.
-	_ = err
-	_ = maximum
-	return fallback
 }
 
 func cloneLedgerRecord(record LedgerRecord) LedgerRecord {

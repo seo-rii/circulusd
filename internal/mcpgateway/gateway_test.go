@@ -319,6 +319,44 @@ func TestGatewayRequiresFullConfiguredEventEnvelope(t *testing.T) {
 	}
 }
 
+func TestGatewayFailureBoundHoldsEveryBuiltInReason(t *testing.T) {
+	// Failure reasons are fixed text; this is the longest one an effect event
+	// can carry, so a smaller MaxFailureBytes would wedge that transition.
+	const longestReason = "provider negotiation failed before tool dispatch"
+	fixture := newGatewayFixture(t, ReplayNever)
+	gatewayWithFailureBytes := func(maximum uint64) (*Gateway, error) {
+		bounds := testBounds()
+		bounds.MaxFailureBytes = maximum
+		return NewGateway(Configuration{
+			Bounds: bounds, Servers: []ServerRegistration{fixture.server}, Tools: []ToolRegistration{fixture.tool},
+			AllowReferenceMemory: true,
+		}, Dependencies{
+			Authority: fixture.authority, Authorizer: fixture.authorizer, Credentials: fixture.credentials,
+			Repository: fixture.repository, Audit: &auditStub{}, Providers: map[string]Provider{"stdio": fixture.provider},
+		})
+	}
+	if _, err := gatewayWithFailureBytes(uint64(len(longestReason)) - 1); !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("undersized failure bound error=%v, want %v", err, ErrInvalidConfiguration)
+	}
+	gateway, err := gatewayWithFailureBytes(uint64(len(longestReason)))
+	if err != nil {
+		t.Fatalf("exact failure bound rejected: %v", err)
+	}
+	fixture.gateway = gateway
+	effect := admitFixtureEffect(t, fixture)
+	fixture.provider.negotiate = func(context.Context, NegotiationCommand) (StartNegotiationReceipt, error) {
+		return StartNegotiationReceipt{}, errors.New("provider refused negotiation with private detail")
+	}
+	result, err := gateway.Execute(context.Background(), OpaqueAuthority("renewed"), effect, discardSink())
+	if err != nil || result.State != StateRetryPending || result.FailureReason != longestReason {
+		t.Fatalf("negotiation failure state=%s reason=%q err=%v", result.State, result.FailureReason, err)
+	}
+	stored, err := fixture.repository.Load(context.Background(), effect.Scope.InvocationID)
+	if err != nil || !sameEffect(stored.Effect, result) {
+		t.Fatalf("negotiation failure was not durable: stored=%+v err=%v", stored, err)
+	}
+}
+
 func TestCanonicalAdmissionIsDurablyIdempotent(t *testing.T) {
 	fixture := newGatewayFixture(t, ReplayIdempotencyKey)
 	effectID := mustID(t, identity.Effect)
