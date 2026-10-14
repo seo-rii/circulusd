@@ -759,3 +759,15 @@ func cloneRawClaims(claims []RawCapabilityClaims) []RawCapabilityClaims {
 	}
 	return cloned
 }
+
+func TestNewHostRejectsClaimBytesAPermitCannotSeal(t *testing.T) {
+	config := Config{Storage: newMemoryStorage("claim-limit", nil), Aggregate: &counterAggregate{}, Sealer: mustPermitCodec(t)}
+	config.Limits.MaxCapabilityClaimBytes = permitMaximumPayloadBytes
+	mustHost(t, config)
+	// A larger claim would commit durably and then fail Seal on every
+	// response and receipt replay.
+	config.Limits.MaxCapabilityClaimBytes = permitMaximumPayloadBytes + 1
+	if _, err := NewHost(config); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("NewHost() error = %v, want %v", err, ErrInvalidConfig)
+	}
+}
