@@ -732,6 +732,48 @@ func TestAdapterCancellationAndTransportErrorsExposeNoSuccess(t *testing.T) {
 	}
 }
 
+// A native transport reports a definite, not-committed rejection with these
+// sentinels; mapping them to ErrUnavailable would make callers retry forever.
+func TestAdapterPreservesDefiniteNativeRejections(t *testing.T) {
+	for _, phase := range []string{"snapshot", "receipt", "commit", "barrier"} {
+		for _, definite := range []error{ErrInvalidRequest, celld.ErrIdempotencyConflict} {
+			t.Run(phase+"/"+definite.Error(), func(t *testing.T) {
+				n, _, s := newAdapter(t)
+				rejection := fmt.Errorf("%w: %w", definite, adapterDiagnostic)
+				switch phase {
+				case "snapshot":
+					n.snapshotError = rejection
+				case "receipt":
+					n.receiptError = rejection
+				case "commit":
+					n.commitError = rejection
+				case "barrier":
+					n.barrierError = rejection
+				}
+				calls := 0
+				token, err := s.Transaction(context.Background(), "definite", func(tx celld.Transaction) error {
+					calls++
+					if _, _, err := tx.LookupReceipt("c"); err != nil {
+						return err
+					}
+					return tx.WriteReceipt("c", adapterReceipt("c"))
+				})
+				if phase == "barrier" {
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = s.DurabilityBarrier(context.Background(), token)
+				} else if token != (celld.CommitToken{}) {
+					t.Fatal("partial token escaped")
+				}
+				if err != definite || calls > 1 || n.commits.Load() > 1 {
+					t.Fatalf("definite rejection became %v after %d callbacks and %d commits", err, calls, n.commits.Load())
+				}
+			})
+		}
+	}
+}
+
 func TestAdapterMandatoryQualificationImmutableBoundsAndIdentifiers(t *testing.T) {
 	_, config, s := newAdapter(t)
 	for _, mode := range []string{"unverified", "state", "response", "claims", "claim-bytes", "lookups", "writes", "total", "attempts", "group"} {

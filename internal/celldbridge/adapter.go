@@ -470,7 +470,10 @@ func nativeError(ctx context.Context, err error) error {
 	if contextErr := ctx.Err(); contextErr != nil {
 		return contextErr
 	}
-	for _, safe := range []error{context.Canceled, context.DeadlineExceeded, ErrSnapshotConflict, ErrInvalidResponse, ErrUnauthenticatedResponse, ErrClosed, dependency.ErrUnverifiedDependency} {
+	// ErrInvalidRequest and ErrIdempotencyConflict are definite, not committed
+	// rejections; reporting them as unavailable would invite endless retries.
+	for _, safe := range []error{context.Canceled, context.DeadlineExceeded, ErrSnapshotConflict, ErrInvalidRequest, celld.ErrIdempotencyConflict,
+		ErrInvalidResponse, ErrUnauthenticatedResponse, ErrClosed, dependency.ErrUnverifiedDependency} {
 		if errors.Is(err, safe) {
 			return safe
 		}
