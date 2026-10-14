@@ -25,6 +25,8 @@ func (artifacts AuthenticatedStateArtifactDigests) StateAppApplicationDigest() s
 // and derives both expected state identities from that same immutable snapshot.
 // The current schema has no artifact-purpose field, so each role must have
 // exactly one artifact applicable to the requested release architecture.
+// A celld artifact with gzip extraction provenance yields its extracted
+// executable digest; every other artifact yields its archive digest.
 func (store *TrustStore) DeriveProductionStateArtifactDigests(
 	manifest Manifest,
 	architecture string,
@@ -59,6 +61,12 @@ func (store *TrustStore) DeriveProductionStateArtifactDigests(
 			}
 			digest := "sha256:" + artifact.SHA256
 			if component.Name == "celld" {
+				// celld's build digest is the hash of its running executable.
+				// A packaged artifact therefore contributes its signed
+				// extracted-executable digest, never the archive digest.
+				if artifact.ExtractionRecipe == ExtractionRecipeGzipSingleFileV1 {
+					digest = "sha256:" + artifact.ExtractedExecutableSHA256
+				}
 				celldDigests = append(celldDigests, digest)
 			} else {
 				stateAppDigests = append(stateAppDigests, digest)

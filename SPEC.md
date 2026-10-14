@@ -5054,7 +5054,10 @@ artifact가 각각 정확히 하나일 때만 성공한다. 현 manifest schema�
 내 artifact의 runtime identity purpose를 구분하는 field가 없으므로, 둘 이상의
 applicable artifact 중 첫 항목, 정렬 결과, 파일 이름 규칙으로 하나를 추측하지
 않는다. release manifest의 lowercase 64-hex `sha256` 값에는 `sha256:` prefix를
-정확히 한 번 붙이고 재hash하지 않는다. 이 결과는 설치 또는 runtime artifact bytes를
+정확히 한 번 붙이고 재hash하지 않는다. celld build digest는 실행 중인 executable의
+hash이므로, celld artifact가 `gzip-single-file-v1` extraction provenance를 가지면 archive
+`sha256` 대신 함께 서명된 `extractedExecutableSha256`에 같은 규칙을 적용한다.
+이 결과는 설치 또는 runtime artifact bytes를
 직접 hash한 attestation이 아니라 signed manifest에서 인증한 expected digest pair이며,
 그 자체만으로 readiness가 아니다. production requirements constructor는 이 opaque
 pair 전체와 instance/domain/epoch/age/필수 atomic-group policy를 함께 받아 immutable
