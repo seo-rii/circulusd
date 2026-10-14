@@ -22,9 +22,10 @@ type StateReader interface {
 // crash barrier come from celld; live subscription delivery (durable fan-out and
 // ephemeral events) is served in process, exactly as the MemoryStore reference.
 //
-// A single mutex serializes durable append (host Execute plus its live publish)
-// against opening a stream (committed read plus subscribe), so no durable event
-// is lost or duplicated across the replay-to-live handoff.
+// A per-session lock serializes durable append (host Execute plus its live
+// publish) against opening a stream (committed read plus subscribe), so no
+// durable event is lost or duplicated across the replay-to-live handoff. One
+// session's durability barrier never blocks another session.
 //
 // The reference constructor reports CrashDurable:false: over the reference
 // celld.Storage this proves the atomic contract behaviorally but is not durable.
@@ -36,9 +37,17 @@ type Repository struct {
 	newCommandID func() (string, error)
 	crashDurable bool
 
-	mu          sync.Mutex
-	subscribers map[string]map[uint64]chan platformapi.Event
-	nextSubID   uint64
+	// mu guards the maps below and every subscriber channel send or close.
+	// It is never held across a host call.
+	mu           sync.Mutex
+	sessionLocks map[string]*sessionLock
+	subscribers  map[string]map[uint64]chan platformapi.Event
+	nextSubID    uint64
+}
+
+type sessionLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 var _ platformapi.Repository = (*Repository)(nil)
@@ -60,6 +69,7 @@ func NewReferenceRepository(host *celld.Host, reader StateReader) (*Repository, 
 			return value.String(), nil
 		},
 		crashDurable: false,
+		sessionLocks: make(map[string]*sessionLock),
 		subscribers:  make(map[string]map[uint64]chan platformapi.Event),
 	}, nil
 }
@@ -170,15 +180,17 @@ func (repo *Repository) AppendDurableEvent(
 	if err != nil {
 		return platformapi.Event{}, false, platformapi.ErrInvalidRequest
 	}
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
+	defer repo.lockSession(command.Authority.Scope.SessionID)()
 	appendObserved := false
 	defer func() {
 		if !appendObserved {
 			// Execute can fail after a durable commit. No live reader may
 			// remain behind that commit while a later receipt replay skips
-			// publication. Disconnect under the same lock as open/subscribe
-			// so every reader recovers from its last durable cursor.
+			// publication. Disconnect under the same session lock as
+			// open/subscribe so every reader recovers from its last durable
+			// cursor.
+			repo.mu.Lock()
+			defer repo.mu.Unlock()
 			for _, channel := range repo.subscribers[command.Authority.Scope.SessionID] {
 				close(channel)
 			}
@@ -189,7 +201,11 @@ func (repo *Repository) AppendDurableEvent(
 		ObjectID: command.Authority.Scope.SessionID, CommandID: command.CommandID, Command: encoded,
 	})
 	if err != nil {
-		return platformapi.Event{}, false, mapAppendError(err)
+		mapped := mapAppendError(err)
+		// A definite rejection comes from the aggregate inside a rolled-back
+		// transaction, so nothing was committed and readers stay current.
+		appendObserved = mapped != platformapi.ErrRepositoryFailure
+		return platformapi.Event{}, false, mapped
 	}
 	sequence, turnID, eventType, payload, err := DecodeAppendResponse(result.Response)
 	if err != nil {
@@ -200,7 +216,9 @@ func (repo *Repository) AppendDurableEvent(
 		Payload: payload, Durable: true,
 	}
 	if !result.Replayed {
+		repo.mu.Lock()
 		repo.publishLocked(command.Authority.Scope.SessionID, event)
+		repo.mu.Unlock()
 	}
 	appendObserved = true
 	return event, result.Replayed, nil
@@ -217,8 +235,7 @@ func (repo *Repository) PublishEphemeralEvent(
 	if event.Durable || event.Sequence != 0 || event.TurnID != authority.Scope.TurnID || event.Payload == "" {
 		return platformapi.ErrInvalidRequest
 	}
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
+	defer repo.lockSession(authority.Scope.SessionID)()
 	record, found, err := repo.readRecord(authority.Scope.SessionID)
 	if err != nil {
 		return platformapi.ErrRepositoryFailure
@@ -237,6 +254,8 @@ func (repo *Repository) PublishEphemeralEvent(
 	if _, ok := record.turns[authority.Scope.TurnID]; !ok {
 		return platformapi.ErrTurnNotFound
 	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
 	repo.publishLocked(authority.Scope.SessionID, event)
 	return nil
 }
@@ -272,8 +291,7 @@ func (repo *Repository) OpenEventStream(
 	if err := ctx.Err(); err != nil {
 		return platformapi.EventStream{}, err
 	}
-	repo.mu.Lock()
-	defer repo.mu.Unlock()
+	defer repo.lockSession(query.SessionID)()
 	record, found, err := repo.readRecord(query.SessionID)
 	if err != nil {
 		return platformapi.EventStream{}, platformapi.ErrRepositoryFailure
@@ -296,9 +314,34 @@ func (repo *Repository) OpenEventStream(
 		Replay: replay, CaughtUp: lastReplayed == replay.Snapshot.LastDurableSequence,
 	}
 	if stream.CaughtUp {
+		repo.mu.Lock()
 		stream.Subscription = repo.subscribeLocked(query.SessionID)
+		repo.mu.Unlock()
 	}
 	return stream, nil
+}
+
+// lockSession acquires the session's append/open lock and returns its release.
+// Entries are reference counted so idle sessions leave no lock behind.
+func (repo *Repository) lockSession(sessionID string) (unlock func()) {
+	repo.mu.Lock()
+	lock := repo.sessionLocks[sessionID]
+	if lock == nil {
+		lock = &sessionLock{}
+		repo.sessionLocks[sessionID] = lock
+	}
+	lock.refs++
+	repo.mu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		repo.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(repo.sessionLocks, sessionID)
+		}
+		repo.mu.Unlock()
+	}
 }
 
 func (repo *Repository) readRecord(sessionID string) (sessionRecord, bool, error) {
