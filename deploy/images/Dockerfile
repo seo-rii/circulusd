@@ -16,7 +16,7 @@
 # This image has NOT been built or run in this workspace (no container runtime
 # was available); treat it as unverified reference scaffolding.
 
-ARG GO_VERSION=1.25.3
+ARG GO_VERSION=1.26.9
 # busybox provides a shell so the entrypoint can clear a stale control socket
 # after an ungraceful restart (the daemons fail-closed on a pre-existing socket
 # and only unlink on graceful shutdown) and so the socket-dir init step has
