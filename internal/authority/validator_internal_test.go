@@ -6,6 +6,46 @@ import (
 	"testing"
 )
 
+func TestEffectBindingAllowsOnlyOwnedServices(t *testing.T) {
+	t.Parallel()
+
+	services := []EffectService{
+		EffectServiceModel,
+		EffectServiceWorkspace,
+		EffectServiceExecutor,
+		EffectServiceMCP,
+		EffectServiceArtifact,
+		EffectServiceExternalTool,
+		EffectService("unknown"),
+	}
+	owned := map[ServiceBinding][]EffectService{
+		BindingModel:             {EffectServiceModel},
+		BindingWorkspace:         {EffectServiceWorkspace},
+		BindingExecutor:          {EffectServiceExecutor, EffectServiceExternalTool},
+		BindingMCP:               {EffectServiceMCP, EffectServiceExternalTool},
+		BindingArtifacts:         {EffectServiceArtifact},
+		BindingState:             nil,
+		BindingEvents:            nil,
+		ServiceBinding("secret"): nil,
+		ServiceBinding(""):       nil,
+	}
+	for binding, allowed := range owned {
+		for _, service := range services {
+			want := false
+			for _, candidate := range allowed {
+				want = want || candidate == service
+			}
+			err := validateEffectBinding(binding, service)
+			if want && err != nil {
+				t.Errorf("validateEffectBinding(%q, %q) error = %v, want nil", binding, service, err)
+			}
+			if !want && !errors.Is(err, ErrServiceBindingMismatch) {
+				t.Errorf("validateEffectBinding(%q, %q) error = %v, want ErrServiceBindingMismatch", binding, service, err)
+			}
+		}
+	}
+}
+
 func TestSettlementEffectIdentityIsAuthenticatedByMAC(t *testing.T) {
 	t.Parallel()
 

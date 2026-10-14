@@ -542,11 +542,26 @@ func validateEffect(
 	return nil
 }
 
+// effectServicesByBinding lists the effect services each stable broker binding
+// may settle. Either tool broker may own a generic external tool call. State
+// and events own no effect service, and an unlisted binding settles nothing.
+var effectServicesByBinding = map[ServiceBinding][]EffectService{
+	BindingModel:     {EffectServiceModel},
+	BindingWorkspace: {EffectServiceWorkspace},
+	BindingExecutor:  {EffectServiceExecutor, EffectServiceExternalTool},
+	BindingMCP:       {EffectServiceMCP, EffectServiceExternalTool},
+	BindingArtifacts: {EffectServiceArtifact},
+	BindingState:     nil,
+	BindingEvents:    nil,
+}
+
 func validateEffectBinding(binding ServiceBinding, service EffectService) error {
-	if binding == BindingWorkspace && service != EffectServiceWorkspace {
-		return ErrServiceBindingMismatch
+	for _, allowed := range effectServicesByBinding[binding] {
+		if allowed == service {
+			return nil
+		}
 	}
-	return nil
+	return ErrServiceBindingMismatch
 }
 
 func validDigest(value string) bool {

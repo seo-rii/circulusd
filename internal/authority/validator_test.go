@@ -392,6 +392,33 @@ func TestWorkspaceSettlementRejectsForeignEffectService(t *testing.T) {
 	}
 }
 
+func TestEventsBindingCannotSettleExecutorEffect(t *testing.T) {
+	t.Parallel()
+
+	validator, reader, _, scope := newFixture(t)
+	effect := settlementEffect("effect-executor", "invocation-executor")
+	effect.Service = authority.EffectServiceExecutor
+	effect.Operation = "executor.run"
+	reader.Update(func(snapshot *authority.Snapshot) { snapshot.ActiveEffect = effect })
+	request := settlementRequest(scope, effect)
+
+	if _, err := validator.IssueSettlementAuthority(
+		context.Background(),
+		authority.BindingEvents,
+		request,
+	); !errors.Is(err, authority.ErrServiceBindingMismatch) {
+		t.Fatalf("IssueSettlementAuthority(events binding, executor effect) error = %v, want ErrServiceBindingMismatch", err)
+	}
+
+	handle, err := validator.IssueSettlementAuthority(context.Background(), authority.BindingExecutor, request)
+	if err != nil {
+		t.Fatalf("IssueSettlementAuthority(executor binding) error = %v", err)
+	}
+	if err := validator.ValidateSettlement(context.Background(), handle, authority.BindingExecutor, request); err != nil {
+		t.Fatalf("ValidateSettlement(executor binding) error = %v", err)
+	}
+}
+
 func TestSettlementAuthorityBindsFullEffectIdentityAcrossFreshSnapshot(t *testing.T) {
 	t.Parallel()
 
