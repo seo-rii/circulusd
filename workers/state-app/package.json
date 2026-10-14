@@ -13,7 +13,9 @@
   "scripts": {
     "check": "tsc -p tsconfig.json",
     "check:worker-types": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --check",
+    "check:rpc-digests": "node scripts/update-rpc-digests.mjs --check",
     "generate:rpc-digests": "node scripts/generate-rpc-digests.mjs",
+    "update:rpc-digests": "node scripts/update-rpc-digests.mjs",
     "types:worker": "wrangler types worker-configuration.d.ts --config wrangler.jsonc",
     "test": "vitest run",
     "test:unit": "vitest run"
