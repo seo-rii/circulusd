@@ -139,6 +139,8 @@ const DISPATCH_START_HOST_CONTRACT = HOST_RPC_CONTRACTS["session.execute"];
 const ZERO_DIGEST = `sha256:${"0".repeat(64)}` as const;
 const textEncoder = new TextEncoder();
 
+// Byte-identical to rpc.ts and Go stateappclient's safeHostErrorMessages: the Go
+// client rejects any other code and message pair as an invalid response.
 const SAFE_HOST_ERROR_MESSAGES = Object.freeze({
   INVALID_ARGUMENT: "The RPC request is invalid.",
   NOT_FOUND: "The requested resource was not found.",
@@ -149,7 +151,7 @@ const SAFE_HOST_ERROR_MESSAGES = Object.freeze({
   FAILED_PRECONDITION: "A required precondition was not satisfied.",
   STALE_GENERATION: "The supplied generation is stale.",
   STALE_DISPATCH_ATTEMPT: "The supplied dispatch attempt is stale.",
-  DISPATCH_ALREADY_STARTED: "The dispatch attempt has already started.",
+  DISPATCH_ALREADY_STARTED: "The dispatch attempt already has a start claim.",
   DIGEST_MISMATCH: "A supplied digest does not match its value.",
   NEEDS_CONFIRMATION: "The operation requires confirmation.",
   ABORTED: "The operation was aborted.",

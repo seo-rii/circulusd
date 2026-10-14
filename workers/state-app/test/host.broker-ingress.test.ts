@@ -1,10 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { decodeCanonicalCbor, digestStructuredValue, encodeCanonicalCbor, type NormalizedValue } from "@circulusd/protocol-types";
+import { PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_NAME, decodeCanonicalCbor, digestStructuredValue, encodeCanonicalCbor, parseNormalizedValue, type NormalizedValue } from "@circulusd/protocol-types";
 
 import worker from "../src/host/worker.ts";
-import { HOST_RPC_CONTRACTS, HOST_RPC_FALLBACK_REQUEST_ID } from "../src/host/rpc.ts";
+import { HOST_RPC_CONTRACTS, HOST_RPC_FALLBACK_REQUEST_ID, invokeHostRpc } from "../src/host/rpc.ts";
 import { sessionCellName } from "../src/host/names.ts";
 import { SessionCell } from "../src/host/cells.ts";
 import type { HostRpcOperation } from "../src/host/rpc.ts";
@@ -232,6 +232,45 @@ describe("signed typed Session broker ingress", () => {
     const thrown = await send(environment(async () => { throw new Error("secret-provider-token"); }));
     expect(thrown.response.status).toBe(502);
     expect(Buffer.from(thrown.encoded).includes(Buffer.from("secret-provider-token"))).toBe(false);
+  });
+
+  it("relays every Host failure with the exact code and message pair the Go client accepts", async () => {
+    // Mirrors internal/stateappclient/client.go safeHostErrorMessages.
+    const canonical: Record<string, string> = {
+      INVALID_ARGUMENT: "The RPC request is invalid.",
+      NOT_FOUND: "The requested resource was not found.",
+      ALREADY_EXISTS: "The requested resource already exists.",
+      CONFLICT: "The operation conflicts with current state.",
+      IDEMPOTENCY_CONFLICT: "The idempotency key conflicts with an earlier request.",
+      PERMISSION_DENIED: "The operation is not permitted.",
+      FAILED_PRECONDITION: "A required precondition was not satisfied.",
+      STALE_GENERATION: "The supplied generation is stale.",
+      STALE_DISPATCH_ATTEMPT: "The supplied dispatch attempt is stale.",
+      DIGEST_MISMATCH: "A supplied digest does not match its value.",
+      NEEDS_CONFIRMATION: "The operation requires confirmation.",
+      DISPATCH_ALREADY_STARTED: "The dispatch attempt already has a start claim.",
+      ABORTED: "The operation was aborted.",
+      LEASE_EXPIRED: "The supplied lease has expired.",
+      RESOURCE_EXHAUSTED: "The RPC response exceeds its operation limit.",
+      STORAGE_CONTRACT: "The durable storage contract is unavailable.",
+      CELL_ID_MISMATCH: "The request was routed to the wrong durable cell.",
+      NOT_INITIALIZED: "The durable aggregate is not initialized.",
+      INITIALIZATION_CONFLICT: "The initialization conflicts with stored state.",
+      STRUCTURED_CLONE_FAILED: "The value cannot cross the durable storage boundary.",
+      CORRUPT_STATE: "The durable aggregate state is invalid.",
+      INVALID_AGGREGATE_OUTPUT: "The aggregate produced an invalid result.",
+      INTERNAL_ERROR: "The operation could not be completed.",
+    };
+    for (const [code, message] of Object.entries(canonical)) {
+      const host = await invokeHostRpc("session.execute", {
+        protocol: PROTOCOL_NAME, major: PROTOCOL_MAJOR, minor: PROTOCOL_MINOR,
+        schemaDigest: HOST_RPC_CONTRACTS["session.execute"].schemaDigest, requestId: "request-error-pair", payload: null,
+      }, parseNormalizedValue, () => { throw Object.assign(new Error("secret-provider-token"), { code }); });
+      expect(host.payload).toEqual({ ok: false, error: { code, message } });
+      const relayed = await send(environment(async () => ({ ...envelope(null), payload: { ok: false, error: { code, message: "secret-provider-token" } } })));
+      expect(relayed.response.status).toBe(200);
+      expect(relayed.result?.payload).toEqual({ ok: false, error: { code, message } });
+    }
   });
 
   it("uses the real SessionCell for scoped reads and exactly one durable fresh dispatch start", async () => {
