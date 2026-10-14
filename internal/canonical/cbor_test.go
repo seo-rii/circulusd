@@ -68,6 +68,73 @@ func TestTypeScriptGoldenVectors(t *testing.T) {
 	}
 }
 
+// The digests below were computed by the TypeScript digestStructuredValue in
+// packages/protocol-types, which frames the payload under a depth limit of 72.
+// Every value the default decoder accepts (depth 64) must also be digestable,
+// and both languages must agree on the deepest payload they hash.
+func TestStructuredDigestMatchesTypeScriptDepthBudget(t *testing.T) {
+	t.Parallel()
+
+	nestedMaps := func(levels int) Value {
+		var value Value = Map{}
+		for range levels {
+			value = Map{"next": value}
+		}
+		return value
+	}
+	nestedArrays := func(levels int) Value {
+		var value Value = int64(0)
+		for range levels {
+			value = Array{value}
+		}
+		return value
+	}
+	for _, vector := range []struct {
+		name   string
+		build  func(int) Value
+		levels int
+		digest string
+	}{
+		{"maps-63", nestedMaps, 63, "sha256:ada22c61310c73374c3b196887015a804b3e094ff9c80d266a242244f9a926d3"},
+		{"maps-64", nestedMaps, 64, "sha256:d35c538b9beded472c599bbe1866aa1bae598a38d6d512acb6c85eaef88e4468"},
+		{"maps-71", nestedMaps, 71, "sha256:71b21cf47e0b4c756e6938c6bb5ab1b9f46a33ca8ced5cd2e7606a81119427f5"},
+		{"maps-72", nestedMaps, 72, ""},
+		{"arrays-63", nestedArrays, 63, "sha256:9e0806dee8b025e8ee84789d24d3483b4a91cbbd6d65668182868180c624108a"},
+		{"arrays-64", nestedArrays, 64, "sha256:fc882f15f492cbb7028470152617ca1b795c51c445f017be5c1dafbce15e9009"},
+		{"arrays-71", nestedArrays, 71, "sha256:972e40c527cbc959690668d71b6593b2b428ecc8d9065ee5dc7906491eebec5c"},
+		{"arrays-72", nestedArrays, 72, ""},
+	} {
+		t.Run(vector.name, func(t *testing.T) {
+			t.Parallel()
+			payload := vector.build(vector.levels)
+			digest, err := StructuredDigest("circulusd.depth-budget", 1, payload)
+			if vector.digest == "" {
+				if !errors.Is(err, ErrLimitExceeded) {
+					t.Fatalf("StructuredDigest() = %q, %v, want ErrLimitExceeded", digest, err)
+				}
+				return
+			}
+			if err != nil || digest != vector.digest {
+				t.Fatalf("StructuredDigest() = %q, %v, want %q", digest, err, vector.digest)
+			}
+			if vector.levels > defaultMaxDepth {
+				return
+			}
+			encoded, err := Encode(payload, DefaultOptions())
+			if err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+			decoded, err := Decode(encoded, DefaultOptions())
+			if err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+			if digest, err := StructuredDigest("circulusd.depth-budget", 1, decoded); err != nil || digest != vector.digest {
+				t.Fatalf("StructuredDigest(decoded) = %q, %v, want %q", digest, err, vector.digest)
+			}
+		})
+	}
+}
+
 func TestEncodeNormalizesTextAndSortsMapKeys(t *testing.T) {
 	t.Parallel()
 

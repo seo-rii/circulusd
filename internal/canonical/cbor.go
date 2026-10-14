@@ -18,6 +18,11 @@ const (
 	defaultMaxBytes = 16 << 20
 	defaultMaxItems = 1_000_000
 	maxSafeInteger  = uint64(9_007_199_254_740_991)
+
+	// structuredDigestMaxDepth leaves room for the digest frame above
+	// defaultMaxDepth, so every value accepted under the default limits can be
+	// digested. It matches TypeScript digestStructuredValue.
+	structuredDigestMaxDepth = 72
 )
 
 var (
@@ -97,9 +102,11 @@ func StructuredDigest(domain string, schemaVersion uint64, payload Value) (strin
 	if schemaVersion == 0 || schemaVersion > maxSafeInteger {
 		return "", fmt.Errorf("%w: schema version is outside the shared integer range", ErrInvalidValue)
 	}
+	options := DefaultOptions()
+	options.MaxDepth = structuredDigestMaxDepth
 	encoded, err := Encode(
 		Array{"circulusd.hash", int64(1), domain, int64(schemaVersion), payload},
-		DefaultOptions(),
+		options,
 	)
 	if err != nil {
 		return "", err
