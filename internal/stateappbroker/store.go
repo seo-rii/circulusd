@@ -364,6 +364,14 @@ func (store *Store) SettleRecovery(ctx context.Context, command broker.SettleRec
 	if err != nil || errorValue == nil {
 		return broker.SettlementReceipt{}, broker.ErrInvalidRequest
 	}
+	// The state app stores a non-empty interrupted reason as the settlement's
+	// bounded identifier and rejects any other reason, so fail before sending.
+	if command.Kind == broker.RecoverySettlementInterrupted && command.Error.Reason != "" {
+		var d decoder
+		if d.identifier(command.Error.Reason); d.err != nil {
+			return broker.SettlementReceipt{}, broker.ErrInvalidRequest
+		}
+	}
 	body["kind"], body["error"] = string(command.Kind), errorValue
 	value, err := store.call(ctx, "settle-recovery", body)
 	if err != nil {
