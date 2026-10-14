@@ -220,11 +220,14 @@ func newWorkerdCgroupController(config workerdCgroupConfig) (*workerdCgroupContr
 }
 
 func newWorkerdCgroupControllerWithBackend(config workerdCgroupConfig, backend workerdCgroupBackend) (*workerdCgroupController, error) {
+	// The kernel stores memory.max rounded down to a whole page and prepare
+	// requires an exact readback, so the limit must be a page multiple.
 	if config.RootPath == "" || len(config.RootPath) > maximumWorkerdCgroupPathBytes || strings.IndexByte(config.RootPath, 0) >= 0 ||
 		!filepath.IsAbs(config.RootPath) || filepath.Clean(config.RootPath) != config.RootPath || config.RootPath == string(filepath.Separator) ||
 		config.MaximumShards < 1 || config.MaximumShards > maximumWorkerdCgroupShards ||
 		config.DrainTimeout <= 0 || config.DrainTimeout > maximumWorkerdCgroupDrainTimeout ||
-		config.MemoryMaxBytes < 1 || config.MemoryMaxBytes > maximumWorkerdCgroupMemoryBytes || config.SwapMaxBytes != 0 ||
+		config.MemoryMaxBytes < 1 || config.MemoryMaxBytes%uint64(os.Getpagesize()) != 0 ||
+		config.MemoryMaxBytes > maximumWorkerdCgroupMemoryBytes || config.SwapMaxBytes != 0 ||
 		config.CPUMax.QuotaMicros < minimumWorkerdCgroupCPUQuota || config.CPUMax.QuotaMicros > maximumWorkerdCgroupCPUQuota ||
 		config.CPUMax.PeriodMicros < minimumWorkerdCgroupCPUPeriod || config.CPUMax.PeriodMicros > maximumWorkerdCgroupCPUPeriod ||
 		config.PIDsMax < 1 || config.PIDsMax > maximumWorkerdCgroupPIDs {
