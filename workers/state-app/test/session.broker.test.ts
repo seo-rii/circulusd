@@ -5,7 +5,7 @@ import { HOST_RPC_CONTRACTS, type HostRpcOperation, type HostRpcResponse } from 
 import { SESSION_HISTORY_ROW_PREFIX } from "../src/host/session-history-store.ts";
 import type { TransactionalStoragePort, TransactionPort } from "../src/host/contracts.ts";
 import {
-  effectRequestDigest, migrateSessionState, turnInputDigest, type SessionBrokerAcquire,
+  effectRequestDigest, migrateSessionState, sessionReferencedBlobDigests, turnInputDigest, type SessionBrokerAcquire,
   type SessionBrokerCommit, type SessionBrokerDispatchPermit, type SessionBrokerDispatchStartClaim,
   type SessionBrokerEngineGrant, type SessionBrokerOperationReceipt, type SessionBrokerPreparationPermit,
   type SessionBrokerPublicError, type SessionBrokerRequest, type SessionBrokerSettlementReceipt,
@@ -491,7 +491,7 @@ describe("Session broker authoritative transaction", () => {
     const previous = await f.state();
     const legacy = { ...previous, schemaVersion: 6 };
     const migrated = await migrateSessionState(legacy);
-    expect(migrated).toEqual({ state: { ...legacy, schemaVersion: 7 }, migrated: true });
+    expect(migrated).toEqual({ state: { ...legacy, schemaVersion: 7 }, migrated: true, referencedBlobs: sessionReferencedBlobDigests(previous) });
     const first = await f.acquire("original");
     await f.commit(first.grant, { kind: "checkpoint", checkpoint: await f.checkpoint(await f.read()) }, "original-commit");
     for (let index = 0; index < 17; index += 1) {
