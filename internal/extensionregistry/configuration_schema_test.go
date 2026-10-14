@@ -82,6 +82,48 @@ func TestNativeSchemaUsesECMAScriptUnicodeRegexSemantics(t *testing.T) {
 	}
 }
 
+// Ajv compiles "pattern" with new RegExp(pattern, "u"). Each expectation below
+// was checked against Node 24.1. The rejected patterns are ones regexp2 accepted
+// before this check.
+func TestSchemaPatternsUseECMAScriptUnicodeModeSyntax(t *testing.T) {
+	t.Parallel()
+	compile := func(pattern string) error {
+		raw, err := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string", "pattern": pattern}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = compileConfigurationSchema(raw)
+		return err
+	}
+	for _, pattern := range []string{
+		// Identity escapes outside SyntaxCharacter and "/" are errors.
+		`\R`, `\a`, `\e`, `\Q`, `\E`, `\K`, `\h`, `\H`, `\V`, `\N`, `\X`, `\i`, `\g`, `\-`, `\_`, `\"`, `\ `, `\#`,
+		`\c`, `\c1`, `\c_`, `\00`, `\01`, `\8`, `\x4`, `\xGG`, `\x{41}`, `\u004`,
+		// Backreferences must name an existing group.
+		`\1`, `(a)\2`, `(a)\10`,
+		// Class escapes are restricted inside a class and cannot bound a range.
+		`[\R]`, `[\a]`, `[\e]`, `[\B]`, `[\1]`, `[\8]`, `[\k]`, `[\c1]`, `[\c_]`, `[\_]`, `[\ ]`, `[\00]`, `[\01]`, `[\q{a}]`,
+		`[\d-z]`, `[a-\d]`, `[\s-\S]`, `[\d-\d]`, `[\W-a]`, `[a-\s]`, `[\p{L}-z]`,
+		// Braces are only quantifiers.
+		`x{,3}`, `x{3`, `x{ }`, `a{,}`, `a{`, `a}`, `x{1,2`, `{`, `}`,
+	} {
+		if err := compile(pattern); err == nil {
+			t.Errorf("pattern %q compiled, but ECMAScript Unicode mode rejects it", pattern)
+		}
+	}
+	for _, pattern := range []string{
+		`\/`, `\.`, `\^\$\\\*\+\?\(\)\[\]\{\}\|`, `\d\D\w\W\s\S\b\B`, `\f\n\r\t\v`, `\cz`, `\0`, `\x41`, `\u0041`, `\u{1F600}`, `\uD83D\uDE00`,
+		`(a)\1`, `\1(a)`, `(a)|\1`, `(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\10`, `(?<a>x)\k<a>`, `\k<a>(?<a>x)`,
+		`\p{L}`, `\P{L}`, `\p{Lu}`, `\p{Script=Latin}`, `\p{gc=Lu}`, `[\p{L}-]`, `[-\p{L}]`,
+		`[\-]`, `[\b-\n]`, `[a\-z]`, `[\/]`, `[\0]`, `[\cz]`, `[\w-]`, `[-\w]`, `[^\d]`, `[a-b-c]`, `[\x41-\x5a]`, `[\u{1F600}-\u{1F64F}]`, `[{}]`,
+		`a{0}`, `a{01}`, `a{1,1}`, `a{2,}`, `a{1,2}?`, `(?:a){2}`, `(?<=ab)c`, `(?<!a+)b`,
+	} {
+		if err := compile(pattern); err != nil {
+			t.Errorf("pattern %q rejected, but ECMAScript Unicode mode accepts it: %v", pattern, err)
+		}
+	}
+}
+
 func TestSchemaRegexFailureCannotBecomeSuccessThroughNegationOrOneOf(t *testing.T) {
 	t.Parallel()
 	for _, constraint := range []string{
