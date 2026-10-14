@@ -1,3 +1,17 @@
+// Package auth implements local password accounts and personal access tokens
+// (PATs) for the public API.
+//
+// Passwords are stored as Argon2id PHC strings. Authenticator checks a
+// username and password and applies the lockout policy of ApplyLoginAttempt.
+// For an unknown username it verifies a dummy hash with the same Argon2id
+// parameters, so both paths cost the same hashing work. PATService issues,
+// authenticates and revokes PATs. A token is "pat_" followed by 32 random
+// bytes in unpadded base64url, and only its SHA-256 digest is stored.
+//
+// Persistence is behind AccountStore and PATStore. A store must commit each
+// state change atomically with its audit event, and updates are
+// compare-and-swap on the record version. Package authstate implements both
+// stores.
 package auth
 
 import (

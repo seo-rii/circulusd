@@ -1,3 +1,19 @@
+// Package controlrpc is the private Connect transport for the daemon control
+// sockets. A Server serves ControlService (Handshake and GetCapabilities from
+// api/proto/circulus/v1alpha) on one Unix socket. On agentd and executord
+// sockets it can also serve the reference-only ReferenceWorkloadService, but
+// no command enables it.
+//
+// The server authenticates each connection by its SO_PEERCRED UID and allows
+// that UID only the protocol roles configured for it. Handshake requires the
+// peer to support protocol version 1.0, the same descriptor digest and a
+// 32-byte client nonce. It returns a nonce proof and an HMAC-signed session
+// token, bound to the peer UID and role, that expires after five minutes.
+// Messages are limited to 1 MiB.
+//
+// platformd, platformd-dev, and the agentd and executord shells (package
+// daemonshell) run servers. platformctl capabilities and platformctl doctor
+// (package doctoruds) are clients.
 package controlrpc
 
 import (

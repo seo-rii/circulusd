@@ -1,3 +1,7 @@
+// platformd-dev is the development diagnostic daemon. It serves a fixed
+// GET /v1/status document on a loopback HTTP address and a private control
+// socket. It has no state, execution or public API, and reports those
+// capabilities as unavailable (NOT_WIRED).
 package main
 
 import (

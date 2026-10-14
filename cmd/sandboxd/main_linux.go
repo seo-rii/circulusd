@@ -1,5 +1,11 @@
 //go:build linux
 
+// sandboxd is the process supervisor that runs inside a sandbox. It reads a
+// 32-byte one-time launch nonce from file descriptor 3, which must be a pipe,
+// loads the sealed command manifest, and serves the sandbox process protocol
+// (package sandboxrpc) on a private Unix socket. Its process runner uses
+// os/exec and relies on the surrounding NsJail, Docker or Firecracker sandbox
+// for isolation.
 package main
 
 import (

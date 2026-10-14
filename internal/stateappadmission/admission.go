@@ -1,3 +1,10 @@
+// Package stateappadmission admits public Session turns through the
+// state-app. A Planner asks the native Session authority for an admission
+// plan (command ID, expected event sequence and turn lease) and has a
+// GenesisProvider create the genesis checkpoint. A TurnAdmitter then submits
+// the turn with that plan through the state-app ingress client. Both require
+// verified production dependencies (package dependency), and a replayed
+// admission is returned as deduplicated.
 package stateappadmission
 
 import (

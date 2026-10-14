@@ -1,3 +1,9 @@
+// platformd is the production platform daemon. It runs the production state
+// bootstrap (package statebootstrap) from the platform configuration and the
+// signed release manifest, but the production graph is not composed yet, so
+// it does not serve the public API. It serves only the private control
+// socket, which reports every capability except control.protocol as
+// unavailable (NOT_WIRED).
 package main
 
 import (

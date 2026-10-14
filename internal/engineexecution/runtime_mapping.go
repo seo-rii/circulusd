@@ -1,3 +1,17 @@
+// Package engineexecution verifies the signed execution runtime mapping,
+// which binds a Pi artifact digest to one runtime revision digest. It is the
+// Go counterpart of workers/pi-runtime/src/execution-runtime-mapping.ts, and
+// both sides are checked against
+// packages/protocol-types/fixtures/pi-execution-runtime-mapping-v1alpha1.json.
+//
+// The signed document is canonical CBOR (package canonical). Its Ed25519
+// signature covers the ASCII text of the claims' structured digest in the
+// RuntimeMappingDomain domain. VerifySignedRuntimeMapping requires that
+// digest to equal one pinned by the caller and the signing key to be one of
+// the independently provisioned trust roots. A verified mapping does not by
+// itself grant production authority.
+//
+// No production code imports this package yet.
 package engineexecution
 
 import (

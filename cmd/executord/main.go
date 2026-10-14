@@ -1,3 +1,8 @@
+// executord is a diagnostic-only shell for the executord role. It serves only
+// the private control socket (package daemonshell; default
+// /run/pi-platform/executord.sock) and reports execution.docker,
+// execution.environments, execution.firecracker and execution.nsjail as
+// unavailable (NOT_WIRED). It constructs no execution provider.
 package main
 
 import (

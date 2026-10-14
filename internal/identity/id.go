@@ -1,3 +1,8 @@
+// Package identity generates and parses typed opaque identifiers such as
+// session, turn and tenant IDs. An ID has the form <kind>_<suffix>, where
+// kind is one of the declared Kind values and suffix is 16 random bytes in
+// unpadded, uppercase RFC 4648 base32 (26 characters). Parse accepts only a
+// declared kind and the canonical encoding of exactly 16 bytes.
 package identity
 
 import (
