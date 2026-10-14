@@ -32,6 +32,11 @@ export interface AppOptions {
   readonly maxSessions?: number;
   /** Called after a session is deleted or evicted so executors can drop per-session state (the python sandbox). */
   readonly onSessionDeleted?: (sessionId: string) => Promise<void>;
+  /**
+   * Host header values served besides localhost, 127.0.0.1 and [::1] on the
+   * listening port, matched exactly and case-insensitively (e.g. "devbox.lan:8090").
+   */
+  readonly allowedHosts?: readonly string[];
 }
 
 export interface App {
@@ -89,6 +94,7 @@ export function createApp(options: AppOptions): App {
     historyInjection: options.historyInjection,
   });
   const frontendRoot = options.frontendDirectory === null ? null : resolve(options.frontendDirectory);
+  const allowedHosts = new Set((options.allowedHosts ?? []).map((host) => host.toLowerCase()));
   // Open SSE streams per session (each entry closes one), so a deleted or
   // evicted session's streams are ended (the browser then learns the session
   // is gone instead of waiting on a stream nothing will ever write to again).
@@ -139,6 +145,22 @@ export function createApp(options: AppOptions): App {
     const url = new URL(request.url ?? "/", "http://localhost");
     const method = request.method ?? "GET";
     const path = url.pathname;
+
+    // DNS rebinding: a page whose own name resolves to this machine sends
+    // that name as Host. Serve only requests addressed to loopback on this
+    // port or to an explicitly allowed host.
+    const host = request.headers.host?.toLowerCase() ?? "";
+    const loopback = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::(\d{1,5}))?$/.exec(host);
+    if (!allowedHosts.has(host) && (loopback === null || Number(loopback[1] ?? "80") !== request.socket.localPort)) {
+      throw new HttpError(403, "HOST_NOT_ALLOWED", `Host ${JSON.stringify(host)} is not an allowed host for this backend`);
+    }
+    // A cross-site page can send a POST without a CORS preflight. Browsers
+    // name its origin, and only the frontend this backend serves may change state.
+    const origin = request.headers.origin?.toLowerCase();
+    if (method !== "GET" && method !== "HEAD" && origin !== undefined &&
+      origin !== `http://${host}` && origin !== `https://${host}`) {
+      throw new HttpError(403, "ORIGIN_NOT_ALLOWED", "cross-origin requests may not change state");
+    }
 
     if (path === "/v1/capabilities" || path === "/v1/status") {
       if (method !== "GET") throw new HttpError(405, "METHOD_NOT_ALLOWED", `${method} is not allowed`);
@@ -542,6 +564,14 @@ function extractPrompt(body: unknown): string | null {
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
+  // Form and text/plain bodies are what a cross-site page can send without a
+  // CORS preflight, so a body is parsed only when it is declared as JSON.
+  const declaresBody = request.headers["transfer-encoding"] !== undefined ||
+    (request.headers["content-length"] ?? "0") !== "0";
+  const mediaType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
+  if (declaresBody && mediaType !== "application/json") {
+    throw new HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "request body must be application/json");
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   try {
