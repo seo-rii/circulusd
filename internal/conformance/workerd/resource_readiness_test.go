@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,39 @@ func TestResourceReadinessProbeRejectsAServedButInvalidResponse(t *testing.T) {
 			}
 			if elapsed := time.Since(start); elapsed > 2*time.Second {
 				t.Fatalf("WaitReady retried a terminal failure for %v", elapsed)
+			}
+		})
+	}
+}
+
+// The readiness body is evidence from the process under qualification. A
+// member that only matches through encoding/json's case folding, a repeated
+// member or an unknown member must not be read as a valid response.
+func TestResourceReadinessProbeRejectsAmbiguousJSONMembers(t *testing.T) {
+	// Each value replaces the valid body's "loaderAbi":1 member.
+	for name, replacement := range map[string]string{
+		"duplicate member":   `"loaderAbi":1,"loaderAbi":1`,
+		"case-folded member": `"LoaderABI":1`,
+		"case-folded alias":  `"loaderAbi":1,"LOADERABI":1`,
+		"unknown member":     `"loaderAbi":1,"ready":true`,
+	} {
+		replacement := replacement
+		t.Run(name, func(t *testing.T) {
+			socket := readinessSocketPath(t)
+			fixture := readinessProbeFixture(socket)
+			valid := readinessHandler(fixture, nil)
+			serveReadiness(t, socket, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				recorder := httptest.NewRecorder()
+				valid.ServeHTTP(recorder, request)
+				writer.Header().Set("content-type", "application/json")
+				_, _ = writer.Write([]byte(strings.Replace(recorder.Body.String(), `"loaderAbi":1`, replacement, 1)))
+			}))
+
+			probe := newResourceReadinessProbe(fixture)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := probe.WaitReady(ctx, agent.WorkerdProcessInfo{}); err == nil {
+				t.Fatal("WaitReady() = nil, want rejection")
 			}
 		})
 	}

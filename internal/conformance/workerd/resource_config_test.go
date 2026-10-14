@@ -57,6 +57,8 @@ func TestParseResourceQualificationConfigRejectsAmbiguousOrUnboundedDocuments(t 
 	}{
 		{name: "duplicate field", input: strings.Replace(valid, `"schemaVersion":1`, `"schemaVersion":1,"schemaVersion":1`, 1)},
 		{name: "unknown nested field", input: strings.Replace(valid, `"limits":{`, `"limits":{"cpuMax":"max",`, 1)},
+		{name: "case-folded duplicate field", input: strings.Replace(valid, `"schemaVersion":1`, `"schemaVersion":1,"SchemaVersion":1`, 1)},
+		{name: "case-folded nested field", input: strings.Replace(valid, `"pidsMax":128`, `"PidsMax":128`, 1)},
 		{name: "unsupported schema", input: strings.Replace(valid, `"schemaVersion":1`, `"schemaVersion":2`, 1)},
 		{name: "relative manifest", input: strings.Replace(valid, `"/usr/lib/pi-platform/release-manifest.json"`, `"release-manifest.json"`, 1)},
 		{name: "unclean trust roots", input: strings.Replace(valid, `"/etc/pi-platform/release-trust-roots.json"`, `"/etc/pi-platform/../release-trust-roots.json"`, 1)},

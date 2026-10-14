@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hancomac/circulusd/internal/agent"
+	"github.com/hancomac/circulusd/internal/strictjson"
 )
 
 // resourceReadinessResponse is the bounded SessionHost readiness envelope the
@@ -128,8 +128,10 @@ func (probe *resourceReadinessProbe) attempt(ctx context.Context, client *http.C
 	if response.StatusCode != http.StatusOK {
 		return true, fmt.Errorf("workerd resource qualification: readiness status %d", response.StatusCode)
 	}
+	// The body is evidence from the process under qualification: only its
+	// exact members are accepted, never encoding/json's case-folded aliases.
 	var payload resourceReadinessResponse
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := strictjson.Decode(body, &payload); err != nil {
 		return true, fmt.Errorf("decode readiness body: %w", err)
 	}
 	if err := probe.verify(payload, nonce); err != nil {

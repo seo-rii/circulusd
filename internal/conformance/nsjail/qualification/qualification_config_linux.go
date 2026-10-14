@@ -3,10 +3,8 @@
 package qualification
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +17,7 @@ import (
 	"github.com/hancomac/circulusd/internal/conformance/nsjail/fixture"
 	executorns "github.com/hancomac/circulusd/internal/executor/nsjail"
 	"github.com/hancomac/circulusd/internal/release"
+	"github.com/hancomac/circulusd/internal/strictjson"
 	"golang.org/x/sys/unix"
 )
 
@@ -83,64 +82,13 @@ func canonicalPath(s string) bool {
 	return s != "" && s != "/" && len(s) <= 4096 && !strings.ContainsAny(s, "\x00\r\n") && filepath.IsAbs(s) && filepath.Clean(s) == s
 }
 
-// Reject duplicates at all depths as well as unknown fields and trailing JSON.
+// Reject duplicate, unknown and case-folded members at all depths, and
+// trailing JSON. encoding/json alone would match keys case-insensitively.
 func strictQualificationJSON(raw []byte, target any) error {
 	if len(raw) == 0 || len(raw) > maximumQualificationDocument {
 		return errors.New("qualification document exceeds bounds")
 	}
-	scan := json.NewDecoder(bytes.NewReader(raw))
-	scan.UseNumber()
-	var walk func(int) error
-	walk = func(depth int) error {
-		if depth > 32 {
-			return errors.New("JSON nesting exceeds bound")
-		}
-		token, err := scan.Token()
-		if err != nil {
-			return err
-		}
-		d, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch d {
-		case '{':
-			seen := map[string]bool{}
-			for scan.More() {
-				key, err := scan.Token()
-				if err != nil {
-					return err
-				}
-				s, ok := key.(string)
-				if !ok || seen[s] {
-					return errors.New("duplicate or malformed JSON member")
-				}
-				seen[s] = true
-				if err := walk(depth + 1); err != nil {
-					return err
-				}
-			}
-		case '[':
-			for scan.More() {
-				if err := walk(depth + 1); err != nil {
-					return err
-				}
-			}
-		default:
-			return errors.New("unexpected JSON delimiter")
-		}
-		_, err = scan.Token()
-		return err
-	}
-	if err := walk(0); err != nil {
-		return err
-	}
-	if _, err := scan.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("trailing JSON value")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
+	return strictjson.Decode(raw, target)
 }
 
 func readQualificationFile(path string, max int64, executable bool) ([]byte, error) {

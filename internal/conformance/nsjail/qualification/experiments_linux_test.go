@@ -120,7 +120,9 @@ func TestEnforcementNeedsPressureNotJustAppliedLimits(t *testing.T) {
 func TestExperimentRawRecordRejectsMissingNullOrPrematureFields(t *testing.T) {
 	run := testHost().RunID
 	raw, _ := json.Marshal(testExperiments(run)[0].Ready)
-	for _, bad := range [][]byte{bytes.Replace(raw, []byte(`"errno":0`), []byte(`"errno":null`), 1), bytes.Replace(raw, []byte(`,"errno":0`), nil, 1), bytes.Replace(raw, []byte(`"attempts":0`), []byte(`"attempts":1`), 1), bytes.Replace(raw, []byte(`"runId":"`+run+`"`), []byte(`"runId":"other"`), 1), append(raw, raw...)} {
+	for _, bad := range [][]byte{bytes.Replace(raw, []byte(`"errno":0`), []byte(`"errno":null`), 1), bytes.Replace(raw, []byte(`,"errno":0`), nil, 1), bytes.Replace(raw, []byte(`"attempts":0`), []byte(`"attempts":1`), 1), bytes.Replace(raw, []byte(`"runId":"`+run+`"`), []byte(`"runId":"other"`), 1), append(raw, raw...),
+		// encoding/json folds case, so these alias an exact member.
+		bytes.Replace(raw, []byte(`"attempts":0`), []byte(`"attempts":0,"Attempts":0`), 1), bytes.Replace(raw, []byte(`"workUnits":0`), []byte(`"workUnits":0,"WORKUNITS":0`), 1)} {
 		var o fixture.ExperimentRecord
 		if err := decodeExperimentRecord(bad, run, "seccomp", "ready", &o); err == nil {
 			t.Fatalf("accepted ambiguous raw observation %s", bad)
