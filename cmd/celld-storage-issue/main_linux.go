@@ -241,7 +241,7 @@ func verifyRunningProcess(m issuance.Measurement, size uint64) error {
 	}
 	defer f.Close()
 	var before, after unix.Stat_t
-	if unix.Fstat(int(f.Fd()), &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Uid != uint32(os.Getuid()) || before.Mode&0077 != 0 || before.Nlink != 1 || before.Size < 1 || uint64(before.Size) != size || size > 1<<30 {
+	if unix.Fstat(int(f.Fd()), &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Uid != uint32(os.Geteuid()) || before.Mode&0077 != 0 || before.Nlink != 1 || before.Size < 1 || uint64(before.Size) != size || size > 1<<30 {
 		return issuance.ErrInvalidConfiguration
 	}
 	h := sha256.New()
@@ -294,7 +294,7 @@ func privateOpen(path string) (*os.File, unix.Stat_t, error) {
 		return nil, stat, issuance.ErrInvalidConfiguration
 	}
 	file := os.NewFile(uintptr(fd), "private-input")
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Getuid()) || stat.Mode&0077 != 0 || stat.Nlink != 1 {
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0077 != 0 || stat.Nlink != 1 {
 		_ = file.Close()
 		return nil, stat, issuance.ErrInvalidConfiguration
 	}
@@ -353,7 +353,7 @@ func retain(path string, payload []byte) error {
 	}
 	defer unix.Close(dir)
 	var st unix.Stat_t
-	if unix.Fstat(dir, &st) != nil || st.Uid != uint32(os.Getuid()) || st.Mode&0077 != 0 {
+	if unix.Fstat(dir, &st) != nil || st.Uid != uint32(os.Geteuid()) || st.Mode&0077 != 0 {
 		return issuance.ErrInvalidConfiguration
 	}
 	var nonce [16]byte

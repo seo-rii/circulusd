@@ -288,7 +288,11 @@ func observe(ctx context.Context, options objectstore.S3StoreOptions, cleanupTim
 	key := ".doctor/raw-cas-" + hex.EncodeToString(nonce[:])
 	initial := []byte(fmt.Sprintf("circulusd-raw-cas-initial:%x", nonce))
 	updated := []byte(fmt.Sprintf("circulusd-raw-cas-updated:%x", nonce))
-	owned := map[string]bool{string(initial): true, string(updated): true}
+	// A store that ignores a precondition keeps the rejected write, so those
+	// payloads must also be recognizable for cleanup.
+	stale := []byte(fmt.Sprintf("circulusd-raw-cas-stale:%x", nonce))
+	duplicate := []byte(fmt.Sprintf("circulusd-raw-cas-duplicate:%x", nonce))
+	owned := map[string]bool{string(initial): true, string(updated): true, string(stale): true, string(duplicate): true}
 	for contender := range 32 {
 		owned[fmt.Sprintf("circulusd-raw-cas-winner-%02d:%x", contender, nonce)] = true
 	}
@@ -341,9 +345,9 @@ func observe(ctx context.Context, options objectstore.S3StoreOptions, cleanupTim
 	if err != nil || updatedETag == initialETag {
 		return facts, errObservation
 	}
-	_, err = client.put(ctx, key, initialETag, []byte("stale-update"))
+	_, err = client.put(ctx, key, initialETag, stale)
 	facts.StaleUpdateStatus = nativeStatus(err)
-	_, err = client.put(ctx, key, "", []byte("duplicate-create"))
+	_, err = client.put(ctx, key, "", duplicate)
 	facts.DuplicateCreateStatus = nativeStatus(err)
 	facts.StaleDeleteStatus = nativeStatus(client.delete(ctx, key, initialETag))
 	if facts.StaleUpdateStatus != 412 || facts.DuplicateCreateStatus != 412 || facts.StaleDeleteStatus != 412 {
@@ -419,7 +423,7 @@ func readPrivateJSON(path string, value any) error {
 	file := os.NewFile(uintptr(descriptor), "native-cas-input")
 	defer file.Close()
 	var stat unix.Stat_t
-	if unix.Fstat(descriptor, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0077 != 0 || stat.Size < 1 || stat.Size > 65536 {
+	if unix.Fstat(descriptor, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0077 != 0 || stat.Nlink != 1 || stat.Size < 1 || stat.Size > 65536 {
 		return errObservation
 	}
 	encoded, err := io.ReadAll(io.LimitReader(file, 65537))
