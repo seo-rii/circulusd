@@ -20,7 +20,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const defaultRequestTimeout = 30 * time.Second
+const (
+	defaultRequestTimeout = 30 * time.Second
+	// sessionRefreshMargin renews a cached session well before the server's
+	// sessionLifetime ends. Start never retries, so it must not send a token
+	// that the server may already treat as expired.
+	sessionRefreshMargin = time.Minute
+)
 
 type ClientConfig struct {
 	SocketPath         string
@@ -36,10 +42,12 @@ type Client struct {
 	transport      *http.Transport
 	rpc            v1connect.ControlServiceClient
 	closed         atomic.Bool
+	now            func() time.Time
 
-	handshakeMu       sync.Mutex
-	handshakeSession  string
-	handshakeInFlight chan struct{}
+	handshakeMu        sync.Mutex
+	handshakeSession   string
+	handshakeRefreshAt time.Time
+	handshakeInFlight  chan struct{}
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -73,6 +81,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		socketIdentity: identity,
 		peer:           peer,
 		serverPeer:     serverPeer,
+		now:            time.Now,
 	}
 	client.transport = &http.Transport{
 		DisableCompression:  true,
@@ -177,9 +186,12 @@ func (client *Client) ensureHandshake(ctx context.Context) (string, error) {
 		}
 		client.handshakeMu.Lock()
 		if client.handshakeSession != "" {
-			session := client.handshakeSession
-			client.handshakeMu.Unlock()
-			return session, nil
+			if client.now().Before(client.handshakeRefreshAt) {
+				session := client.handshakeSession
+				client.handshakeMu.Unlock()
+				return session, nil
+			}
+			client.handshakeSession = ""
 		}
 		if client.handshakeInFlight != nil {
 			finished := client.handshakeInFlight
@@ -195,10 +207,13 @@ func (client *Client) ensureHandshake(ctx context.Context) (string, error) {
 		client.handshakeInFlight = finished
 		client.handshakeMu.Unlock()
 
+		// The server stamps its expiry no earlier than this local start time.
+		started := client.now()
 		session, err := client.performHandshake(ctx)
 		client.handshakeMu.Lock()
 		if err == nil && !client.closed.Load() {
 			client.handshakeSession = session
+			client.handshakeRefreshAt = started.Add(sessionLifetime - sessionRefreshMargin)
 		}
 		client.handshakeInFlight = nil
 		close(finished)

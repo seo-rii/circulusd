@@ -148,7 +148,9 @@ func TestReferenceWorkloadExpiredHandshakeIsNeverRetried(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The client still considers the session fresh, so only the server rejects it.
 	fixture.client.handshakeSession = expired
+	fixture.client.handshakeRefreshAt = time.Now().Add(time.Hour)
 	if _, err := fixture.rpc.Start(context.Background(), &v1.ReferenceWorkloadClaim{}, []byte("opaque reference payload")); connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expired session: %v", err)
 	}
@@ -157,6 +159,29 @@ func TestReferenceWorkloadExpiredHandshakeIsNeverRetried(t *testing.T) {
 	}
 	if fixture.client.handshakeSession != expired {
 		t.Fatal("failed operation replaced its handshake")
+	}
+}
+
+func TestReferenceWorkloadRenewsSessionBeforeServerLifetimeEnds(t *testing.T) {
+	fixture := newReferenceTransportFixture(t)
+	clock := time.Now()
+	fixture.client.now = func() time.Time { return clock }
+	if _, err := fixture.rpc.Start(context.Background(), &v1.ReferenceWorkloadClaim{}, []byte("first payload")); err != nil {
+		t.Fatal(err)
+	}
+	// The server signs an absolute expiry sessionLifetime after issue. Model the
+	// cached token reaching that expiry while the client clock advances as much.
+	expired, err := fixture.server.handler.issueSession(uint32(os.Getuid()), v1.ProtocolPeer_PROTOCOL_PEER_PLATFORMD, time.Now().Add(-sessionLifetime))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.handshakeSession = expired
+	clock = clock.Add(sessionLifetime)
+	if _, err := fixture.rpc.Start(context.Background(), &v1.ReferenceWorkloadClaim{}, []byte("later payload")); err != nil {
+		t.Fatalf("start after session lifetime: %v", err)
+	}
+	if fixture.handshakes.Load() != 2 || fixture.requests.Load() != 2 || fixture.calls.Load() != 2 {
+		t.Fatalf("handshakes=%d requests=%d receiver=%d", fixture.handshakes.Load(), fixture.requests.Load(), fixture.calls.Load())
 	}
 }
 
