@@ -149,6 +149,10 @@ type workerdCgroupRootInspection struct {
 	Controllers      string
 	SubtreeControl   string
 	ChildDirectories int
+	// KillInterface and SwapMaxInterface record whether the root exposes
+	// cgroup.kill and memory.swap.max. Every shard leaf needs both.
+	KillInterface    bool
+	SwapMaxInterface bool
 }
 
 type workerdCgroupBackend interface {
@@ -295,6 +299,12 @@ func newWorkerdCgroupControllerWithBackend(config workerdCgroupConfig, backend w
 		} else if missingController {
 			rootErr = fmt.Errorf("%w: required controller is unavailable", errWorkerdCgroupUnavailable)
 		}
+	}
+	// prepare writes memory.swap.max on every leaf and destroy kills through
+	// cgroup.kill. cgroup.kill also implies Linux 5.14 or newer, and with it
+	// the CLONE_INTO_CGROUP (5.7) that attaches each workerd at clone time.
+	if rootErr == nil && (!inspection.KillInterface || !inspection.SwapMaxInterface) {
+		rootErr = fmt.Errorf("%w: delegated root lacks cgroup.kill or memory.swap.max", errWorkerdCgroupUnavailable)
 	}
 	if rootErr != nil {
 		_ = backend.closeFD(inspection.DirectoryFD)
@@ -1275,6 +1285,19 @@ func (backend linuxWorkerdCgroupBackend) inspectRoot(rootPath string) (workerdCg
 		_ = unix.Close(currentFD)
 		return workerdCgroupRootInspection{}, err
 	}
+	var interfacePresent [2]bool
+	for index, name := range []string{"cgroup.kill", "memory.swap.max"} {
+		var interfaceStat unix.Stat_t
+		statErr := unix.Fstatat(currentFD, name, &interfaceStat, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(statErr, unix.ENOENT) {
+			continue
+		}
+		if statErr != nil {
+			_ = unix.Close(currentFD)
+			return workerdCgroupRootInspection{}, statErr
+		}
+		interfacePresent[index] = interfaceStat.Mode&unix.S_IFMT == unix.S_IFREG
+	}
 	directoryFD, err := unix.Openat2(currentFD, ".", &unix.OpenHow{
 		Flags: uint64(unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC), Resolve: workerdCgroupSecureResolve,
 	})
@@ -1332,6 +1355,8 @@ func (backend linuxWorkerdCgroupBackend) inspectRoot(rootPath string) (workerdCg
 		Controllers:      controllers,
 		SubtreeControl:   subtreeControl,
 		ChildDirectories: childDirectories,
+		KillInterface:    interfacePresent[0],
+		SwapMaxInterface: interfacePresent[1],
 	}, nil
 }
 
