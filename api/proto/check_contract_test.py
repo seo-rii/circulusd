@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from api.proto import check_contract
 
@@ -114,6 +116,12 @@ class JSONSchemaRegistryTest(unittest.TestCase):
 
     def test_registry_includes_doctor_report(self) -> None:
         self.assertIn("doctor-report.schema.json", check_contract.SCHEMA_FILES)
+
+    def test_missing_jsonschema_module_fails_the_contract_check(self) -> None:
+        # A None entry makes `import jsonschema` raise ImportError.
+        with mock.patch.dict(sys.modules, {"jsonschema": None}):
+            with self.assertRaisesRegex(check_contract.ContractError, "jsonschema"):
+                check_contract.validate_json_schemas()
 
 
 @unittest.skipIf(jsonschema is None, "jsonschema is not installed")

@@ -772,8 +772,11 @@ def validate_json_schemas() -> None:
 
     try:
         import jsonschema
-    except ImportError:
-        jsonschema = None
+    except ImportError as error:
+        raise ContractError(
+            "the jsonschema Python module is required to validate the JSON Schemas; "
+            "install it (python3 -m pip install jsonschema) and rerun"
+        ) from error
 
     schemas = {}
     for name in SCHEMA_FILES:
@@ -785,8 +788,7 @@ def validate_json_schemas() -> None:
             raise ContractError(f"{name}: expected JSON Schema draft 2020-12")
         if not str(schema.get("$id", "")).endswith(f"/v1alpha/{name}"):
             raise ContractError(f"{name}: versioned canonical $id is required")
-        if jsonschema is not None:
-            jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
 
         nodes: list[tuple[str, object]] = [("$", schema)]
         while nodes:
@@ -823,194 +825,193 @@ def validate_json_schemas() -> None:
             "release-manifest.schema.json status must match the Go release contract"
         )
 
-    if jsonschema is not None:
-        digest = "sha256:" + ("0" * 64)
-        examples = {
-            "public-error.schema.json": {
-                "apiVersion": "v1alpha",
-                "code": "stale_generation",
-                "reason": "STALE_PLACEMENT_GENERATION",
-                "message": "the caller no longer owns this placement",
-                "retryable": False,
-                "requestId": "req_example",
-            },
-            "capabilities-response.schema.json": {
-                "apiVersion": "v1alpha",
-                "protocol": {
-                    "major": 1,
-                    "minor": 0,
-                    "descriptorDigest": digest,
-                    "maximumFrameSize": 1048576,
-                },
-                "agentIsolation": [],
-                "executionBackends": {
-                    "nsjail": {
-                        "status": {"availability": "available"},
-                        "hostKernelShared": True,
-                        "features": ["process-streaming"],
-                    },
-                    "docker": {
-                        "status": {
-                            "availability": "unavailable",
-                            "reason": "Docker is not installed",
-                        },
-                        "hostKernelShared": True,
-                        "features": [],
-                    },
-                    "firecracker": {
-                        "status": {
-                            "availability": "unavailable",
-                            "reason": "KVM is not available",
-                        },
-                        "hostKernelShared": False,
-                        "features": [],
-                    },
-                },
-                "executionEnvironments": [],
-                "resourceProfiles": [],
-                "extensions": [],
-                "models": [],
-                "mcpServers": [],
-            },
-            "development-status.schema.json": {
-                "apiVersion": "v1alpha",
-                "profile": "development-reference",
-                "mode": "diagnostic-only",
-                "productionEligible": False,
-                "admissionEnabled": False,
-                "state": {
-                    "availability": "unavailable",
-                    "reason": "NOT_WIRED",
-                    "implementation": "none",
-                    "durability": "none",
-                },
-                "execution": {
-                    "availability": "unavailable",
-                    "reason": "NOT_WIRED",
-                    "provider": "none",
-                    "isolationConformance": "NOT_RUN",
-                },
-            },
-            "doctor-report.schema.json": {
-                "schemaVersion": 1,
-                "apiVersion": "v1alpha",
-                "probeRunId": "doctor-run-example",
-                "profile": "lightweight",
-                "configDigest": digest,
-                "releaseDigest": digest,
-                "hostId": "host-example",
-                "runnerBinaryDigest": digest,
-                "targetInstanceId": "single-node-example",
-                "productionProfile": True,
-                "requiredComponents": [
-                    "host.kernel",
-                    "state.kill-durability",
-                ],
-                "startedAt": "2026-08-27T01:02:03Z",
-                "finishedAt": "2026-08-27T01:02:04Z",
-                "observedAt": "2026-08-27T01:02:04Z",
-                "profileQualified": True,
-                "productionEligible": True,
-                "results": [
-                    {
-                        "component": "host.kernel",
-                        "status": "PASS",
-                        "evidence": {
-                            "evidenceClass": "host-observation",
-                            "kernel": "6.12.4-reference",
-                            "architecture": "x86_64",
-                            "artifactReferences": [],
-                        },
-                    },
-                    {
-                        "component": "state.kill-durability",
-                        "status": "PASS",
-                        "evidence": {
-                            "evidenceClass": "external",
-                            "binaryDigest": digest,
-                            "version": "0.3.0",
-                            "artifactReferences": [
-                                {
-                                    "name": "state-app.wasm",
-                                    "digest": digest,
-                                }
-                            ],
-                        },
-                    },
-                ],
-            },
-            "rpc-envelope.schema.json": {
-                "apiVersion": "v1alpha",
-                "kind": "request",
-                "requestId": "req_example",
-                "protocolVersion": {"major": 1, "minor": 0},
+    digest = "sha256:" + ("0" * 64)
+    examples = {
+        "public-error.schema.json": {
+            "apiVersion": "v1alpha",
+            "code": "stale_generation",
+            "reason": "STALE_PLACEMENT_GENERATION",
+            "message": "the caller no longer owns this placement",
+            "retryable": False,
+            "requestId": "req_example",
+        },
+        "capabilities-response.schema.json": {
+            "apiVersion": "v1alpha",
+            "protocol": {
+                "major": 1,
+                "minor": 0,
                 "descriptorDigest": digest,
-                "requestDigest": digest,
-                "deadlineUnixMs": 1000,
-                "payload": {},
+                "maximumFrameSize": 1048576,
             },
-        }
-        for name, example in examples.items():
-            try:
-                jsonschema.Draft202012Validator(schemas[name]).validate(example)
-            except jsonschema.ValidationError as error:
-                raise ContractError(f"{name}: valid example rejected: {error.message}") from error
+            "agentIsolation": [],
+            "executionBackends": {
+                "nsjail": {
+                    "status": {"availability": "available"},
+                    "hostKernelShared": True,
+                    "features": ["process-streaming"],
+                },
+                "docker": {
+                    "status": {
+                        "availability": "unavailable",
+                        "reason": "Docker is not installed",
+                    },
+                    "hostKernelShared": True,
+                    "features": [],
+                },
+                "firecracker": {
+                    "status": {
+                        "availability": "unavailable",
+                        "reason": "KVM is not available",
+                    },
+                    "hostKernelShared": False,
+                    "features": [],
+                },
+            },
+            "executionEnvironments": [],
+            "resourceProfiles": [],
+            "extensions": [],
+            "models": [],
+            "mcpServers": [],
+        },
+        "development-status.schema.json": {
+            "apiVersion": "v1alpha",
+            "profile": "development-reference",
+            "mode": "diagnostic-only",
+            "productionEligible": False,
+            "admissionEnabled": False,
+            "state": {
+                "availability": "unavailable",
+                "reason": "NOT_WIRED",
+                "implementation": "none",
+                "durability": "none",
+            },
+            "execution": {
+                "availability": "unavailable",
+                "reason": "NOT_WIRED",
+                "provider": "none",
+                "isolationConformance": "NOT_RUN",
+            },
+        },
+        "doctor-report.schema.json": {
+            "schemaVersion": 1,
+            "apiVersion": "v1alpha",
+            "probeRunId": "doctor-run-example",
+            "profile": "lightweight",
+            "configDigest": digest,
+            "releaseDigest": digest,
+            "hostId": "host-example",
+            "runnerBinaryDigest": digest,
+            "targetInstanceId": "single-node-example",
+            "productionProfile": True,
+            "requiredComponents": [
+                "host.kernel",
+                "state.kill-durability",
+            ],
+            "startedAt": "2026-08-27T01:02:03Z",
+            "finishedAt": "2026-08-27T01:02:04Z",
+            "observedAt": "2026-08-27T01:02:04Z",
+            "profileQualified": True,
+            "productionEligible": True,
+            "results": [
+                {
+                    "component": "host.kernel",
+                    "status": "PASS",
+                    "evidence": {
+                        "evidenceClass": "host-observation",
+                        "kernel": "6.12.4-reference",
+                        "architecture": "x86_64",
+                        "artifactReferences": [],
+                    },
+                },
+                {
+                    "component": "state.kill-durability",
+                    "status": "PASS",
+                    "evidence": {
+                        "evidenceClass": "external",
+                        "binaryDigest": digest,
+                        "version": "0.3.0",
+                        "artifactReferences": [
+                            {
+                                "name": "state-app.wasm",
+                                "digest": digest,
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        "rpc-envelope.schema.json": {
+            "apiVersion": "v1alpha",
+            "kind": "request",
+            "requestId": "req_example",
+            "protocolVersion": {"major": 1, "minor": 0},
+            "descriptorDigest": digest,
+            "requestDigest": digest,
+            "deadlineUnixMs": 1000,
+            "payload": {},
+        },
+    }
+    for name, example in examples.items():
+        try:
+            jsonschema.Draft202012Validator(schemas[name]).validate(example)
+        except jsonschema.ValidationError as error:
+            raise ContractError(f"{name}: valid example rejected: {error.message}") from error
 
-        unsafe_error = dict(examples["public-error.schema.json"])
-        unsafe_error["capability"] = "raw-secret"
-        if jsonschema.Draft202012Validator(
-            schemas["public-error.schema.json"]
-        ).is_valid(unsafe_error):
-            raise ContractError("public-error.schema.json accepted an unknown sensitive field")
+    unsafe_error = dict(examples["public-error.schema.json"])
+    unsafe_error["capability"] = "raw-secret"
+    if jsonschema.Draft202012Validator(
+        schemas["public-error.schema.json"]
+    ).is_valid(unsafe_error):
+        raise ContractError("public-error.schema.json accepted an unknown sensitive field")
 
-        development_validator = jsonschema.Draft202012Validator(
-            schemas["development-status.schema.json"]
-        )
-        dishonest_statuses = []
-        for field in ("productionEligible", "admissionEnabled"):
-            status = json.loads(json.dumps(examples["development-status.schema.json"]))
-            status[field] = True
-            dishonest_statuses.append(status)
-        wired_state = json.loads(
-            json.dumps(examples["development-status.schema.json"])
-        )
-        wired_state["state"]["implementation"] = "memory"
-        dishonest_statuses.append(wired_state)
-        for status in dishonest_statuses:
-            if development_validator.is_valid(status):
-                raise ContractError(
-                    "development-status.schema.json accepted a production or wired claim"
-                )
+    development_validator = jsonschema.Draft202012Validator(
+        schemas["development-status.schema.json"]
+    )
+    dishonest_statuses = []
+    for field in ("productionEligible", "admissionEnabled"):
+        status = json.loads(json.dumps(examples["development-status.schema.json"]))
+        status[field] = True
+        dishonest_statuses.append(status)
+    wired_state = json.loads(
+        json.dumps(examples["development-status.schema.json"])
+    )
+    wired_state["state"]["implementation"] = "memory"
+    dishonest_statuses.append(wired_state)
+    for status in dishonest_statuses:
+        if development_validator.is_valid(status):
+            raise ContractError(
+                "development-status.schema.json accepted a production or wired claim"
+            )
 
-        doctor_example = examples["doctor-report.schema.json"]
-        doctor_validator = jsonschema.Draft202012Validator(
-            schemas["doctor-report.schema.json"],
-            format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
-        )
-        dishonest_reports = []
-        missing_identity = json.loads(json.dumps(doctor_example))
-        del missing_identity["runnerBinaryDigest"]
-        dishonest_reports.append(missing_identity)
-        reference_pass = json.loads(json.dumps(doctor_example))
-        reference_pass["results"][1]["evidence"]["evidenceClass"] = (
-            "reference-only"
-        )
-        reference_pass["results"][1]["evidence"]["mock"] = True
-        dishonest_reports.append(reference_pass)
-        forged_eligibility = json.loads(json.dumps(doctor_example))
-        forged_eligibility["productionProfile"] = False
-        dishonest_reports.append(forged_eligibility)
-        unknown_evidence = json.loads(json.dumps(doctor_example))
-        unknown_evidence["results"][0]["evidence"]["capturedSecret"] = True
-        dishonest_reports.append(unknown_evidence)
-        for report in dishonest_reports:
-            if doctor_validator.is_valid(report):
-                raise ContractError(
-                    "doctor-report.schema.json accepted ambiguous or dishonest evidence"
-                )
+    doctor_example = examples["doctor-report.schema.json"]
+    doctor_validator = jsonschema.Draft202012Validator(
+        schemas["doctor-report.schema.json"],
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+    )
+    dishonest_reports = []
+    missing_identity = json.loads(json.dumps(doctor_example))
+    del missing_identity["runnerBinaryDigest"]
+    dishonest_reports.append(missing_identity)
+    reference_pass = json.loads(json.dumps(doctor_example))
+    reference_pass["results"][1]["evidence"]["evidenceClass"] = (
+        "reference-only"
+    )
+    reference_pass["results"][1]["evidence"]["mock"] = True
+    dishonest_reports.append(reference_pass)
+    forged_eligibility = json.loads(json.dumps(doctor_example))
+    forged_eligibility["productionProfile"] = False
+    dishonest_reports.append(forged_eligibility)
+    unknown_evidence = json.loads(json.dumps(doctor_example))
+    unknown_evidence["results"][0]["evidence"]["capturedSecret"] = True
+    dishonest_reports.append(unknown_evidence)
+    for report in dishonest_reports:
+        if doctor_validator.is_valid(report):
+            raise ContractError(
+                "doctor-report.schema.json accepted ambiguous or dishonest evidence"
+            )
 
     release_manifest = REPOSITORY_ROOT / "deploy" / "airgap" / "release-manifest.json"
-    if jsonschema is not None and release_manifest.is_file():
+    if release_manifest.is_file():
         release_schema = schemas["release-manifest.schema.json"]
         release_instance = json.loads(release_manifest.read_text())
         validator = jsonschema.Draft202012Validator(
