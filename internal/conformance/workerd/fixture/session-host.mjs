@@ -105,10 +105,11 @@ export const extensionOrder = {
 
 export const stableBrokerBinding = {
   async test(_controller, env) {
-    const left = env.LOADER.get("stable-broker/sha256-b2dbe9f525690a98ae24251abec662564de84901e1a5fb5067c3dbc94536fe61/identity-a", () =>
+    // Content-addressed by sha256(pi-worker.mjs); `pnpm generate:workerd-fixture` re-pins it.
+    const left = env.LOADER.get("stable-broker/sha256-8cec762d231dfdc4004f7f57fab90d41114c8dc3f2d9a54cead36d25901c7eb1/identity-a", () =>
       definition("identity-a", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
     );
-    const right = env.LOADER.get("stable-broker/sha256-b2dbe9f525690a98ae24251abec662564de84901e1a5fb5067c3dbc94536fe61/identity-b", () =>
+    const right = env.LOADER.get("stable-broker/sha256-8cec762d231dfdc4004f7f57fab90d41114c8dc3f2d9a54cead36d25901c7eb1/identity-b", () =>
       definition("identity-b", { cpuMs: 1000, subRequests: 12 }, { MODEL: env.MODEL, MCP: env.MCP })
     );
     const [leftResult, rightResult] = await Promise.all([

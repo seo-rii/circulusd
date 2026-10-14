@@ -1256,7 +1256,7 @@ async function validateEngineStepResult(value) {
 }
 
 // workers/pi-runtime/src/codec.ts
-var textDecoder2 = new TextDecoder("utf-8", { fatal: true });
+var textDecoder2 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 var CanonicalCborReader = class {
   #bytes;
   #maxDepth;
@@ -16131,10 +16131,95 @@ function decodePiJson(value) {
   return walkPiJson(value, "$", 0, { mode: "decode", seen: /* @__PURE__ */ new WeakSet(), items: 0 });
 }
 
+// workers/pi-runtime/src/pi-tool-details-codec.ts
+var PI_AGENT_CORE_TOOL_DETAILS_ENCODING = "pi-tool-details-json-v1";
+var maximumValueBytes = 4 << 20;
+function ownDataField(value, field) {
+  if (value === null || typeof value !== "object") return void 0;
+  const descriptor = Object.getOwnPropertyDescriptor(value, field);
+  return descriptor !== void 0 && "value" in descriptor ? descriptor.value : void 0;
+}
+function hasRawDetailsNumber(details) {
+  let source;
+  try {
+    source = validatePiJson(details);
+  } catch {
+    return false;
+  }
+  const pending = [source];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "number" && !Number.isSafeInteger(value)) return true;
+    if (value !== null && typeof value === "object") {
+      for (const entry of Object.values(value)) pending.push(entry);
+    }
+  }
+  return false;
+}
+function detailsFields(message, encode) {
+  if (message.detailsEncoding !== void 0) {
+    if (message.detailsEncoding !== PI_AGENT_CORE_TOOL_DETAILS_ENCODING || message.details === void 0) {
+      throw new PiRuntimeError("INVALID_CONTEXT", "Pi tool details encoding is unsupported or missing details");
+    }
+    return { ...message, details: encode ? encodePiJson(message.details) : decodePiJson(message.details) };
+  }
+  if (encode && message.details !== void 0 && hasRawDetailsNumber(message.details)) {
+    return { ...message, detailsEncoding: PI_AGENT_CORE_TOOL_DETAILS_ENCODING, details: encodePiJson(message.details) };
+  }
+  return message;
+}
+function encodePiAgentCoreToolResult(value) {
+  const result = exactRecord2(
+    value,
+    ["version", "toolCallId", "toolName", "content", "isError", "timestamp"],
+    ["details"],
+    "piTool.result",
+    "INVALID_CONTEXT"
+  );
+  if (result.version !== 1) throw new PiRuntimeError("INVALID_CONTEXT", "Pi tool result version is unsupported");
+  return boundedProtocolValue({
+    ...result,
+    ...result.details === void 0 ? {} : {
+      detailsEncoding: PI_AGENT_CORE_TOOL_DETAILS_ENCODING,
+      details: encodePiJson(result.details)
+    }
+  }, maximumValueBytes, "piTool.encodedResult", "INVALID_CONTEXT");
+}
+function decodePiAgentCoreToolResultMessage(value) {
+  const message = exactRecord2(
+    value,
+    ["role", "toolCallId", "toolName", "content", "isError", "timestamp"],
+    ["details", "detailsEncoding"],
+    "piTool.message",
+    "INVALID_CONTEXT"
+  );
+  return detailsFields(message, false);
+}
+function encodePiAgentCoreToolResultMessage(value) {
+  const message = exactRecord2(
+    value,
+    ["role", "toolCallId", "toolName", "content", "isError", "timestamp"],
+    ["details", "detailsEncoding"],
+    "piTool.message",
+    "INVALID_CONTEXT"
+  );
+  return detailsFields(message, true);
+}
+function normalizePiAgentCoreToolSettlement(value, request) {
+  const payload = request?.payload;
+  const call = ownDataField(payload, "toolCall");
+  const outcome = ownDataField(value, "outcome");
+  const result = ownDataField(outcome, "result");
+  if (request?.service !== "external-tool" || request.operation !== "call" || ownDataField(payload, "protocol") !== "pi-agent-core" || ownDataField(payload, "version") !== 1 || ownDataField(value, "requestDigest") !== request.requestDigest || ownDataField(outcome, "kind") !== "success" || ownDataField(result, "version") !== 1 || ownDataField(result, "detailsEncoding") !== void 0 || ownDataField(call, "type") !== "toolCall" || typeof ownDataField(call, "id") !== "string" || typeof ownDataField(call, "name") !== "string" || ownDataField(result, "toolCallId") !== ownDataField(call, "id") || ownDataField(result, "toolName") !== ownDataField(call, "name") || !hasRawDetailsNumber(ownDataField(result, "details"))) return value;
+  const settlement = exactRecord2(value, ["requestDigest", "outcome"], [], "piTool.engineSettlement", "INVALID_CONTEXT");
+  const success = exactRecord2(settlement.outcome, ["kind", "result"], [], "piTool.outcome", "INVALID_CONTEXT");
+  return { ...settlement, outcome: { ...success, result: encodePiAgentCoreToolResult(success.result) } };
+}
+
 // workers/pi-runtime/src/pi-cost-codec.ts
 var PI_AGENT_CORE_MODEL_PROTOCOL_VERSION = 2;
 var PI_AGENT_CORE_COST_ENCODING = "pi-cost-decimal-v1";
-var maximumValueBytes = 4 << 20;
+var maximumValueBytes2 = 4 << 20;
 var costFields = ["input", "output", "cacheRead", "cacheWrite", "total"];
 var PiToolArgumentsEncodingError = class extends PiRuntimeError {
   constructor(cause) {
@@ -16226,10 +16311,10 @@ function encodePiAgentCoreAssistantMessage(value) {
     ...message,
     content: assistantContent(message.content, true),
     usage: { ...usage, cost: { encoding: PI_AGENT_CORE_COST_ENCODING, ...encodedCost } }
-  }, maximumValueBytes, "piModel.encodedMessage", "INVALID_CONTEXT");
+  }, maximumValueBytes2, "piModel.encodedMessage", "INVALID_CONTEXT");
 }
 function decodePiAgentCoreAssistantMessage(value) {
-  const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.message", "INVALID_CONTEXT");
+  const normalized = boundedProtocolValue(value, maximumValueBytes2, "piModel.message", "INVALID_CONTEXT");
   const { message, usage, cost } = assistantRecords(normalized);
   let decode;
   if (cost.encoding === void 0) {
@@ -16281,23 +16366,23 @@ function decodePiAgentCoreModelSettlement(value) {
 function encodePiAgentCoreModelContext(value) {
   return boundedProtocolValue({
     ...value,
-    messages: value.messages.map((message) => message.role === "assistant" ? encodePiAgentCoreAssistantMessage(message) : message),
+    messages: value.messages.map((message) => message.role === "assistant" ? encodePiAgentCoreAssistantMessage(message) : message.role === "toolResult" ? encodePiAgentCoreToolResultMessage(message) : message),
     ...value.tools === void 0 ? {} : { tools: contextTools(value.tools, true) }
-  }, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
+  }, maximumValueBytes2, "piModel.context", "INVALID_CONTEXT");
 }
 function decodePiAgentCoreModelContext(value) {
-  const normalized = boundedProtocolValue(value, maximumValueBytes, "piModel.context", "INVALID_CONTEXT");
+  const normalized = boundedProtocolValue(value, maximumValueBytes2, "piModel.context", "INVALID_CONTEXT");
   const context = exactRecord2(normalized, ["messages"], ["systemPrompt", "tools"], "piModel.context", "INVALID_CONTEXT");
   if (!Array.isArray(context.messages)) {
     throw new PiRuntimeError("INVALID_CONTEXT", "Pi model context messages must be an array");
   }
   return {
     ...context,
-    messages: context.messages.map((message) => message !== null && typeof message === "object" && message.role === "assistant" ? decodePiAgentCoreAssistantMessage(message) : message),
+    messages: context.messages.map((message) => message !== null && typeof message === "object" && message.role === "assistant" ? decodePiAgentCoreAssistantMessage(message) : message !== null && typeof message === "object" && message.role === "toolResult" ? decodePiAgentCoreToolResultMessage(message) : message),
     ...context.tools === void 0 ? {} : { tools: contextTools(context.tools, false) }
   };
 }
-function ownDataField(value, field) {
+function ownDataField2(value, field) {
   if (value === null || typeof value !== "object") return void 0;
   const descriptor = Object.getOwnPropertyDescriptor(value, field);
   return descriptor !== void 0 && "value" in descriptor ? descriptor.value : void 0;
@@ -16305,14 +16390,14 @@ function ownDataField(value, field) {
 function hasRawToolArgumentNumber(message) {
   let content;
   try {
-    content = validatePiJson(ownDataField(message, "content"));
+    content = validatePiJson(ownDataField2(message, "content"));
   } catch {
     return false;
   }
   if (!Array.isArray(content)) return false;
   for (const block of content) {
-    if (ownDataField(block, "type") !== "toolCall") continue;
-    const pending = [ownDataField(block, "arguments")];
+    if (ownDataField2(block, "type") !== "toolCall") continue;
+    const pending = [ownDataField2(block, "arguments")];
     while (pending.length > 0) {
       const value = pending.pop();
       if (typeof value === "number" && !Number.isSafeInteger(value)) return true;
@@ -16324,12 +16409,14 @@ function hasRawToolArgumentNumber(message) {
   return false;
 }
 function normalizePiAgentCoreSettlement(value, request) {
+  const toolSettlement = normalizePiAgentCoreToolSettlement(value, request);
+  if (toolSettlement !== value) return toolSettlement;
   const payload = request?.payload;
   if (request?.service !== "model" || request.operation !== "complete" || payload === null || typeof payload !== "object" || Array.isArray(payload) || payload instanceof Uint8Array || payload.protocol !== "pi-agent-core" || payload.version !== 1 && payload.version !== PI_AGENT_CORE_MODEL_PROTOCOL_VERSION) return value;
-  const message = ownDataField(ownDataField(ownDataField(value, "outcome"), "result"), "message");
-  const cost = ownDataField(ownDataField(message, "usage"), "cost");
+  const message = ownDataField2(ownDataField2(ownDataField2(value, "outcome"), "result"), "message");
+  const cost = ownDataField2(ownDataField2(message, "usage"), "cost");
   const rawCost = costFields.some((field) => {
-    const number = ownDataField(cost, field);
+    const number = ownDataField2(cost, field);
     return typeof number === "number" && !Number.isSafeInteger(number);
   });
   if (!rawCost && !hasRawToolArgumentNumber(message)) return value;
@@ -17106,7 +17193,7 @@ function createPiAgentCoreFactory(configuration) {
             const resultRecord = exactRecord2(
               entry.settlement.result,
               ["version", "toolCallId", "toolName", "content", "isError", "timestamp"],
-              ["details"],
+              ["details", "detailsEncoding"],
               `piAgentCore.toolSettlements[${index3}].result`,
               "CORE_OUTPUT_INVALID"
             );
@@ -17187,6 +17274,7 @@ function createPiAgentCoreFactory(configuration) {
               toolName: resultRecord.toolName,
               content,
               ...resultRecord.details === void 0 ? {} : { details: normalizeProtocolValue(resultRecord.details) },
+              ...resultRecord.detailsEncoding === void 0 ? {} : { detailsEncoding: resultRecord.detailsEncoding },
               isError: resultRecord.isError,
               timestamp: timestamp3
             }));
