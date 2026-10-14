@@ -28,6 +28,10 @@ const MAX_PATH_BYTES = 256;
 const MAX_SOURCE_IMPORTS = 256;
 const MAX_AST_NODES = 10_000;
 const MAX_AST_DEPTH = 256;
+// Names that evaluate to the global object in at least one supported runtime.
+const GLOBAL_OBJECT_NAMES: ReadonlySet<string> = new Set(["globalThis", "self", "global", "window"]);
+// Members of the global object that are, or return, the global object itself.
+const GLOBAL_OBJECT_MEMBERS: ReadonlySet<string> = new Set([...GLOBAL_OBJECT_NAMES, "valueOf"]);
 
 const COMPATIBILITY = [
   "worker",
@@ -684,6 +688,37 @@ function snapshotFiles(value: ExtensionBundleFiles): readonly SnapshotFile[] {
   });
 }
 
+// A global object name may only be declared, read through a static member, or tested with
+// typeof. Any other use could reach a forbidden member through a computed key or an alias.
+// Locals that share these names are held to the same rule because the scan has no scopes.
+function isStaticGlobalObjectUse(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
+    return !GLOBAL_OBJECT_MEMBERS.has(parent.name.text);
+  }
+  if (ts.isElementAccessExpression(parent) && parent.expression === node) {
+    const key = parent.argumentExpression;
+    return (
+      (ts.isStringLiteral(key) || ts.isNoSubstitutionTemplateLiteral(key)) &&
+      !GLOBAL_OBJECT_MEMBERS.has(key.text)
+    );
+  }
+  if (
+    ts.isTypeOfExpression(parent) ||
+    ts.isTypeQueryNode(parent) ||
+    ts.isTypeReferenceNode(parent) ||
+    ts.isQualifiedName(parent)
+  ) {
+    return true;
+  }
+  if (ts.isShorthandPropertyAssignment(parent)) {
+    return false;
+  }
+  // Declaration, member, label and import or export names do not read the global object.
+  const named = parent as { name?: ts.Node; propertyName?: ts.Node; label?: ts.Node };
+  return named.name === node || named.propertyName === node || named.label === node;
+}
+
 function prepareExtension(value: unknown, bundleFiles: ExtensionBundleFiles): PreparedExtension {
   const manifest = normalizeManifest(value);
   const files = snapshotFiles(bundleFiles);
@@ -880,6 +915,32 @@ function prepareExtension(value: unknown, bundleFiles: ExtensionBundleFiles): Pr
         fail(
           `$files[${JSON.stringify(path)}]`,
           `${node.argumentExpression.text} is forbidden`,
+        );
+      }
+      // The name checks above only see static names. A function's `constructor` is Function,
+      // and a computed key or alias of the global object can rebuild a forbidden name.
+      if (ts.isIdentifier(node) && node.text === "constructor") {
+        fail(`$files[${JSON.stringify(path)}]`, "constructor access is forbidden");
+      }
+      if (
+        (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+        node.text === "constructor" &&
+        // Comparisons, such as prototype-pollution guards, cannot produce a function.
+        !ts.isCaseClause(node.parent) &&
+        !(
+          ts.isBinaryExpression(node.parent) &&
+          (node.parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+            node.parent.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken ||
+            node.parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsToken ||
+            node.parent.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsToken)
+        )
+      ) {
+        fail(`$files[${JSON.stringify(path)}]`, "constructor access is forbidden");
+      }
+      if (ts.isIdentifier(node) && GLOBAL_OBJECT_NAMES.has(node.text) && !isStaticGlobalObjectUse(node)) {
+        fail(
+          `$files[${JSON.stringify(path)}]`,
+          `global object ${node.text} may only be used for static member access`,
         );
       }
       if (ts.isImportDeclaration(node)) {

@@ -317,6 +317,52 @@ describe("extension manifest compiler", () => {
     await expect(compileExtensionManifest(manifest(), bundleFiles)).rejects.toThrow(reason);
   });
 
+  it.each([
+    ["function constructor access", '(function () {}).constructor("return 1")();', /constructor/],
+    ["optional constructor access", "const run = () => 1; run?.constructor;", /constructor/],
+    ["literal constructor key", 'const run = () => 1; run["constructor"];', /constructor/],
+    ["template constructor key", "const run = () => 1; run[`constructor`];", /constructor/],
+    ["destructured constructor", "const { constructor: Ctor } = async () => {};", /constructor/],
+    ["constructor lookup call", 'Reflect.get(() => 1, "constructor");', /constructor/],
+    ["computed global key", 'const name = "x"; globalThis[name];', /global object/],
+    ["computed self key", 'const name = "x"; self[name];', /global object/],
+    ["aliased global", "const root = globalThis; root.x;", /global object/],
+    ["global argument", 'Reflect.get(globalThis, "x");', /global object/],
+    ["global spread", "const copy = { ...globalThis };", /global object/],
+    ["global destructuring", "const { x } = globalThis;", /global object/],
+    ["global shorthand", "const holder = { globalThis };", /global object/],
+    ["nested global alias", 'const name = "x"; globalThis.self[name];', /global object/],
+    ["literal global alias", 'globalThis["window"].x;', /global object/],
+    ["global valueOf", 'const name = "x"; self.valueOf()[name];', /global object/],
+    ["parenthesized global", 'const name = "x"; (globalThis)[name];', /global object/],
+  ])("rejects a code-generation route through %s", async (_name, source, reason) => {
+    await expect(
+      computeExtensionContentDigest(manifest(), files({ "dist/index.mjs": source })),
+    ).rejects.toThrow(reason);
+  });
+
+  it("keeps constructors, comparisons and static global access allowed", async () => {
+    const bundleFiles = files({
+      "dist/index.mjs": [
+        'import { render } from "./render.mjs";',
+        "class Box { constructor(value) { this.value = value; } }",
+        'const safeKey = (key) => key !== "__proto__" && key !== "constructor";',
+        'const label = (key) => { switch (key) { case "constructor": return 1; default: return 0; } };',
+        'const hasFetch = typeof globalThis.fetch === "function" && typeof self !== "undefined";',
+        'const log = globalThis.console?.log ?? globalThis["console"].log;',
+        "const flags = /x/g.global;",
+        "const { window: view, self: owner } = { window: 1, self: 2 };",
+        "function bind(self) { return self.value; }",
+        "export { Box, safeKey, label, hasFetch, log, flags, view, owner, bind, render };",
+        "",
+      ].join("\n"),
+    });
+    const raw = await signedManifest(manifest(), bundleFiles);
+    await expect(compileExtensionManifest(raw, bundleFiles)).resolves.toMatchObject({
+      contentDigest: (raw.metadata as Record<string, unknown>).digest,
+    });
+  });
+
   it("rejects native addons even when they are unreachable", async () => {
     await expect(
       compileExtensionManifest(manifest(), files({ "unused/binding.node": new Uint8Array([1]) })),
