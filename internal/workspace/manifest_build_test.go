@@ -59,14 +59,14 @@ func TestBuildManifestMatchesComposedCanonicalization(t *testing.T) {
 	cases := []buildCase{
 		{name: "empty"},
 		{name: "nfc and modes", entries: []Entry{
-			{Path: "src/é.txt", Type: EntryFile, Mode: 0o600, Size: 5, ContentDigest: textDigest},
+			{Path: "src/e\u0301.txt", Type: EntryFile, Mode: 0o600, Size: 5, ContentDigest: textDigest},
 			{Path: "src", Type: EntryDirectory, Mode: 0o700},
 			{Path: "run", Type: EntryFile, Mode: 0o711, ContentDigest: emptyDigest},
-			{Path: "latest", Type: EntrySymlink, Mode: 0o700, SymlinkTarget: "src/é.txt"},
+			{Path: "latest", Type: EntrySymlink, Mode: 0o700, SymlinkTarget: "src/\u00e9.txt"},
 		}},
 		{name: "path collision", entries: []Entry{
-			{Path: "é", Type: EntryFile, ContentDigest: emptyDigest},
-			{Path: "é", Type: EntryFile, ContentDigest: emptyDigest},
+			{Path: "\u00e9", Type: EntryFile, ContentDigest: emptyDigest},
+			{Path: "e\u0301", Type: EntryFile, ContentDigest: emptyDigest},
 		}},
 		{name: "missing parent", entries: []Entry{{Path: "a/b", Type: EntryFile, ContentDigest: emptyDigest}}},
 		{name: "escaping symlink", entries: []Entry{{Path: "up", Type: EntrySymlink, SymlinkTarget: "../outside"}}},
@@ -112,7 +112,7 @@ func TestBuildManifestMatchesComposedCanonicalization(t *testing.T) {
 func randomManifestEntries(random *rand.Rand) []Entry {
 	directories := []string{""}
 	var entries []Entry
-	names := []string{"a", "b", "é", "é", "src", "lib", "x.txt"}
+	names := []string{"a", "b", "e\u0301", "\u00e9", "src", "lib", "x.txt"}
 	for range 1 + random.Intn(24) {
 		parent := directories[random.Intn(len(directories))]
 		name := names[random.Intn(len(names))] + fmt.Sprint(random.Intn(4))
