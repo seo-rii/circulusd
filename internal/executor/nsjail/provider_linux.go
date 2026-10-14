@@ -152,6 +152,9 @@ type ensureCall struct {
 	done   chan struct{}
 	record *sandboxRecord
 	err    error
+	// leaderCanceled reports that the launching caller's own context ended
+	// before the launch finished.
+	leaderCanceled bool
 }
 
 type lifecycleAttempt struct {
@@ -330,6 +333,14 @@ func (provider *Provider) EnsureSandbox(
 			provider.mu.Unlock()
 			select {
 			case <-done:
+				if call.leaderCanceled {
+					// The leader's own cancellation is not this caller's
+					// failure; a waiter whose context is live retries.
+					if err := ctx.Err(); err != nil {
+						return executor.EnsureResult{}, err
+					}
+					continue
+				}
 				if call.err != nil {
 					return executor.EnsureResult{}, call.err
 				}
@@ -361,6 +372,7 @@ func (provider *Provider) EnsureSandbox(
 			provider.mu.Lock()
 			call.record = published
 			call.err = creationErr
+			call.leaderCanceled = creationErr != nil && ctx.Err() != nil
 			delete(provider.inflight, cacheKey)
 			close(call.done)
 			provider.mu.Unlock()
