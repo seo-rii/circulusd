@@ -258,6 +258,21 @@ func TestParseWorkerdProcStatHandlesSpacesAndParentheses(t *testing.T) {
 	}
 }
 
+func TestParseWorkerdProcStatAcceptsFieldsAppendedByNewerKernels(t *testing.T) {
+	valid := strings.TrimSuffix(validWorkerdProcStat(42, "workerd", 987_654), "\n")
+	for name, value := range map[string]string{
+		"one appended field":    valid + " 1\n",
+		"three appended fields": valid + " 0 -7 18446744073709551615\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			token, err := parseWorkerdProcStat(value, 42)
+			if err != nil || token != (workerdProcessToken{PID: 42, StartTicks: 987_654}) {
+				t.Fatalf("parseWorkerdProcStat(%q) = %+v, %v", value, token, err)
+			}
+		})
+	}
+}
+
 func TestParseWorkerdProcStatRejectsMalformedOrOversizedInput(t *testing.T) {
 	valid := validWorkerdProcStat(42, "workerd", 987_654)
 	startToken := "987654"
@@ -275,9 +290,10 @@ func TestParseWorkerdProcStatRejectsMalformedOrOversizedInput(t *testing.T) {
 		"overflow start":      strings.Replace(valid, startToken, "18446744073709551616", 1),
 		"double spacing":      strings.Replace(valid, ") S ", ") S  ", 1),
 		"trailing whitespace": strings.TrimSuffix(valid, "\n") + " \n",
-		"trailing field":      strings.TrimSuffix(valid, "\n") + " 1\n",
 		"trailing newline":    valid + "\n",
 		"trailing text":       strings.TrimSuffix(valid, "\n") + " text\n",
+		"leading-zero append": strings.TrimSuffix(valid, "\n") + " 01\n",
+		"one field short":     strings.TrimSuffix(valid, " 0\n") + "\n",
 		"oversized":           strings.Repeat("1", maximumWorkerdProcStatBytes+1),
 	}
 	for name, value := range tests {

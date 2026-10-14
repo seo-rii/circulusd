@@ -271,13 +271,18 @@ func parseWorkerdProcStat(value string, expectedPID int) (workerdProcessToken, e
 		return workerdProcessToken{}, fmt.Errorf("%w: malformed stat state", errWorkerdProcessContract)
 	}
 	fields := strings.Split(remainder[2:], " ")
-	if len(fields) != workerdProcStatNumericFieldCount {
+	if len(fields) < workerdProcStatNumericFieldCount {
 		return workerdProcessToken{}, fmt.Errorf("%w: unexpected stat field count", errWorkerdProcessContract)
 	}
 	for index, field := range fields {
 		signed := false
 		switch index {
 		case 0, 1, 2, 3, 4, 12, 13, 14, 15, 16, 17, 20, 34, 35, 40, 48:
+			signed = true
+		}
+		// Newer kernels append fields of unknown type; each must still be a
+		// canonical decimal integer of either sign.
+		if index >= workerdProcStatNumericFieldCount && strings.HasPrefix(field, "-") {
 			signed = true
 		}
 		if signed {
