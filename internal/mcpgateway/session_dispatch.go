@@ -175,16 +175,23 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	if !opened || !observed || !claimOpened {
 		return ErrDispatchNotDurable
 	}
+	// The claim is consumed from here on. A rejection before provider I/O is
+	// recorded as definitely not sent, so the attempt does not stay in flight;
+	// the rejection is still returned to the dispatch consumer.
+	rejectBeforeStart := func(cause error) error {
+		return errors.Join(cause, starter.recordTerminal(ctx, observation, effectledger.TerminalFailed,
+			"MCP dispatch rejected before provider start"))
+	}
 	payload, err := decodeSessionDispatchPayload(command.Payload, starter.gateway.bounds)
 	if err != nil {
-		return err
+		return rejectBeforeStart(err)
 	}
 	if err := starter.validateClaimedCommand(start, command, payload); err != nil {
-		return err
+		return rejectBeforeStart(err)
 	}
 	sessionPermit, sessionOpened := deriveSessionProviderPermit(claim)
 	if !sessionOpened {
-		return ErrDispatchNotDurable
+		return rejectBeforeStart(ErrDispatchNotDurable)
 	}
 	if starter.nativeSource != nil {
 		sessionPermit.source = starter.nativeSource

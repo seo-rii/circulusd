@@ -141,13 +141,21 @@ func (starter *Starter) Start(ctx context.Context, claim broker.ClaimedDispatchS
 	}
 	command, opened := claimed.Open()
 	observation, observed := claimed.Observation()
-	if !opened || !observed || command.Dispatch.Service != starter.ledger.Service() ||
-		command.Dispatch.ProviderRouteDigest != starter.ledger.RouteDigest() {
+	if !opened || !observed {
 		return effectledger.ErrBindingMismatch
 	}
 	canonicalCommand, err := NewCommand(command.Dispatch, command.Payload)
-	if err != nil || canonicalCommand.CommandDigest != command.CommandDigest {
-		return effectledger.ErrBindingMismatch
+	if command.Dispatch.Service != starter.ledger.Service() ||
+		command.Dispatch.ProviderRouteDigest != starter.ledger.RouteDigest() ||
+		err != nil || canonicalCommand.CommandDigest != command.CommandDigest {
+		// The claim is consumed but the provider was never called: record the
+		// attempt as definitely not sent rather than leaving it in flight.
+		factContext, cancelFacts := context.WithTimeout(context.WithoutCancel(ctx), maximumFactWriteDuration)
+		defer cancelFacts()
+		_, recordErr := starter.ledger.RecordTerminal(factContext, observation, effectledger.Terminal{
+			Status: effectledger.TerminalFailed, Result: []byte("command rejected before provider start"),
+		})
+		return errors.Join(effectledger.ErrBindingMismatch, recordErr)
 	}
 
 	response, providerErr := starter.provider.Start(ctx, Request{

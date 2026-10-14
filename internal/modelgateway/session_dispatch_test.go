@@ -3,6 +3,7 @@ package modelgateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"slices"
@@ -343,6 +344,56 @@ func TestReferenceSessionDispatchRecordsPreAcceptanceFailureAndUnknown(t *testin
 			}
 			if _, calls := test.provider.snapshot(); calls != 1 {
 				t.Fatalf("provider calls = %d, want one without internal retry", calls)
+			}
+		})
+	}
+}
+
+func TestReferenceSessionDispatchRecordsClaimedCommandRejectedBeforeProviderIOAsFailed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		payload func(*testing.T, Effect) []byte
+	}{
+		{name: "undecodable command", payload: func(*testing.T, Effect) []byte { return []byte("not a model command") }},
+		{name: "command that is not dispatching", payload: func(t *testing.T, effect Effect) []byte {
+			encoded, err := json.Marshal(sessionDispatchPayload{
+				Version: sessionDispatchCommandVersion, Scope: effect.Scope, RequestDigest: effect.RequestDigest,
+				Request: effect.Request, ProviderID: effect.ProviderID, QuotaPermit: effect.QuotaPermit,
+				ContextTokens: effect.ContextTokens, RequestedOutputTokens: effect.RequestedOutputTokens,
+				MaxContextTokens: effect.MaxContextTokens, MaxTotalTokens: effect.MaxTotalTokens,
+				MaxPreDispatchRetries: effect.MaxPreDispatchRetries, DurableRequestRetrieval: effect.DurableRequestRetrieval,
+				State: StateAdmitted, Revision: effect.Revision, Attempt: effect.Attempt,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return encoded
+		}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			test := newSessionDispatchTest(t, &scriptedSessionProviderStream{events: []ProviderEvent{completedSessionProviderEvent()}}, nil, true)
+			// The subordinate ledger accepts the command, but the starter rejects
+			// it after the one-time claim and before any provider I/O.
+			payload := testCase.payload(t, test.transition.Effect)
+			digest := sessionDispatchCommandDigest(payload)
+			if err := test.ledger.Prepare(context.Background(), effectledger.Command{
+				Dispatch: test.dispatch, CommandDigest: digest, Payload: payload,
+			}); err != nil {
+				t.Fatalf("ledger Prepare() error = %v", err)
+			}
+			consumer, _ := test.consumer(t, digest)
+			if _, err := consumer.StartExactAttempt(context.Background(), test.startRequest(digest)); !errors.Is(err, broker.ErrDispatchStartUnknown) {
+				t.Fatalf("StartExactAttempt() error = %v, want ErrDispatchStartUnknown", err)
+			}
+			if _, calls := test.provider.snapshot(); calls != 0 {
+				t.Fatalf("rejected command reached provider %d times", calls)
+			}
+			record, err := test.ledger.Lookup(context.Background(), sessionLookup(test.dispatch))
+			if err != nil || record.Status != broker.LedgerFailed {
+				t.Fatalf("Lookup() = %#v, %v, want failed (definitely not sent)", record, err)
 			}
 		})
 	}

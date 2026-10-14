@@ -182,6 +182,9 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	}
 	command, commandOpened := claimed.Open()
 	observation, observationOpened := claimed.Observation()
+	if !commandOpened || !observationOpened {
+		return ErrDispatchNotDurable
+	}
 	// Durable NativeLedger snapshots preserve the exact deadline instant in
 	// UTC, without process-local monotonic clock bits, while broker wire
 	// permits decode it in the local zone. Compare canonical copies of both
@@ -191,15 +194,15 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	startBinding.Deadline = startBinding.Deadline.UTC().Round(0)
 	commandBinding := command.Dispatch
 	commandBinding.Deadline = commandBinding.Deadline.UTC().Round(0)
-	if !commandOpened || !observationOpened || commandBinding != startBinding ||
+	if commandBinding != startBinding ||
 		command.CommandDigest != start.CommandDigest || len(command.Payload) == 0 ||
 		sessionDispatchCommandDigest(command.Payload) != start.CommandDigest {
-		return ErrDispatchNotDurable
+		return starter.recordPreStartFailure(ctx, observation, ErrDispatchNotDurable)
 	}
 
 	var payload sessionDispatchPayload
 	if err := decodeCanonicalJSON(command.Payload, &payload); err != nil || payload.Version != sessionDispatchCommandVersion {
-		return fmt.Errorf("%w: decode Session model command", ErrInvalidRequest)
+		return starter.recordPreStartFailure(ctx, observation, fmt.Errorf("%w: decode Session model command", ErrInvalidRequest))
 	}
 	effect := Effect{
 		Scope: payload.Scope, RequestDigest: payload.RequestDigest,
@@ -221,10 +224,10 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	}
 	effect, providerCommand, err := starter.gateway.validateDispatchTransition(transition)
 	if err != nil {
-		return err
+		return starter.recordPreStartFailure(ctx, observation, err)
 	}
 	if err := starter.validateSessionBinding(command.Dispatch, effect); err != nil {
-		return err
+		return starter.recordPreStartFailure(ctx, observation, err)
 	}
 
 	proofHash := sha256.New()
@@ -235,7 +238,7 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 	var proof OpaqueDispatchPermit
 	copy(proof[:], proofHash.Sum(nil))
 	if proof == (OpaqueDispatchPermit{}) {
-		return ErrDispatchNotDurable
+		return starter.recordPreStartFailure(ctx, observation, ErrDispatchNotDurable)
 	}
 	permit := DispatchPermit{
 		Proof: proof, Durable: true, Scope: effect.Scope, EffectID: effect.Scope.EffectID,
@@ -353,6 +356,22 @@ func (starter *SessionDispatchStarter) Start(ctx context.Context, claim broker.C
 		return errors.Join(fmt.Errorf("%w: provider start has no durable acceptance", ErrProviderUnavailable), executionErr)
 	}
 	return nil
+}
+
+// recordPreStartFailure records that a claimed command was rejected before any
+// provider I/O, so the attempt is definitely not sent instead of staying in
+// flight. The rejection is still returned to the dispatch consumer.
+func (starter *SessionDispatchStarter) recordPreStartFailure(
+	ctx context.Context,
+	observation effectledger.Observation,
+	cause error,
+) error {
+	factContext, cancelFacts := context.WithTimeout(context.WithoutCancel(ctx), sessionDispatchFactTimeout)
+	defer cancelFacts()
+	_, err := starter.ledger.RecordTerminal(factContext, observation, effectledger.Terminal{
+		Status: effectledger.TerminalFailed, Result: []byte("model dispatch rejected before provider start"),
+	})
+	return errors.Join(cause, err)
 }
 
 // SessionDispatchResult is the bounded provider observation retained by the
