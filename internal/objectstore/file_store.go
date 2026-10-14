@@ -24,7 +24,13 @@ const (
 	defaultMaximumObjectBytes = int64(64 << 20)
 	maximumKeyBytes           = 1024
 	lockDirectory             = ".locks"
+	temporaryPrefix           = ".circulusd-object-"
 )
+
+// errKeyPathConflict rejects a key whose object path would have to be both a
+// file and a directory, for example "a" when "a/b" is stored or the reverse.
+// The file layout cannot hold both, so the later key fails as a key error.
+var errKeyPathConflict = fmt.Errorf("%w: key and a stored key are path prefixes of each other", ErrInvalidKey)
 
 // FileStore is the durable single-node object store. All filesystem access is
 // performed through an *os.Root opened once at construction, so every path is
@@ -136,6 +142,8 @@ func (store *FileStore) PutIfAbsent(ctx context.Context, bucket Bucket, key stri
 		switch {
 		case err == nil && information.Mode().IsRegular():
 			return ErrPreconditionFailed
+		case err == nil && information.IsDir():
+			return errKeyPathConflict
 		case err == nil:
 			return ErrUnsafePath
 		case !errors.Is(err, os.ErrNotExist):
@@ -218,7 +226,8 @@ func (store *FileStore) objectRelPath(bucket Bucket, key string) (string, error)
 		return "", ErrInvalidKey
 	}
 	for _, component := range strings.Split(key, "/") {
-		if component == "" || component == "." || component == ".." || len([]byte(component)) > 255 {
+		if component == "" || component == "." || component == ".." || len([]byte(component)) > 255 ||
+			strings.HasPrefix(component, temporaryPrefix) {
 			return "", ErrInvalidKey
 		}
 		for _, character := range component {
@@ -310,6 +319,9 @@ func (store *FileStore) ensureParentDirectories(relativeParent string) error {
 		if err != nil {
 			return fmt.Errorf("inspect object parent: %w", err)
 		}
+		if information.Mode().IsRegular() {
+			return errKeyPathConflict
+		}
 		if !information.IsDir() || information.Mode()&os.ModeSymlink != 0 {
 			return ErrUnsafePath
 		}
@@ -328,6 +340,10 @@ func (store *FileStore) readExisting(objectPath string) ([]byte, ETag, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("inspect object: %w", err)
 	}
+	if information.IsDir() {
+		// The directory holds longer keys; no object is stored at this key.
+		return nil, "", ErrNotFound
+	}
 	if !information.Mode().IsRegular() || information.Mode()&os.ModeSymlink != 0 {
 		return nil, "", ErrUnsafePath
 	}
@@ -335,6 +351,10 @@ func (store *FileStore) readExisting(objectPath string) ([]byte, ETag, error) {
 		return nil, "", ErrObjectTooLarge
 	}
 	file, err := store.root.Open(objectPath)
+	if errors.Is(err, os.ErrNotExist) {
+		// Reads take no key lock, so a concurrent delete can win the race.
+		return nil, "", ErrNotFound
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("open object: %w", err)
 	}
@@ -358,8 +378,8 @@ func (store *FileStore) readExisting(objectPath string) ([]byte, ETag, error) {
 }
 
 // validateExistingParents walks the object's parent chain for a read, requiring
-// each component to be a real directory. A missing component yields ErrNotFound; a
-// symlink component yields ErrUnsafePath.
+// each component to be a real directory. A missing component or a stored object
+// in the chain yields ErrNotFound; a symlink component yields ErrUnsafePath.
 func (store *FileStore) validateExistingParents(relativeParent string) error {
 	current := ""
 	for _, component := range strings.Split(relativeParent, "/") {
@@ -372,7 +392,7 @@ func (store *FileStore) validateExistingParents(relativeParent string) error {
 			current = current + "/" + component
 		}
 		information, err := store.root.Lstat(current)
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) || (err == nil && information.Mode().IsRegular()) {
 			return ErrNotFound
 		}
 		if err != nil {
@@ -435,7 +455,7 @@ func (store *FileStore) createTemporary(relativeParent string) (*os.File, string
 		if _, err := rand.Read(randomBytes[:]); err != nil {
 			return nil, "", fmt.Errorf("generate object temporary name: %w", err)
 		}
-		name := ".circulusd-object-" + hex.EncodeToString(randomBytes[:])
+		name := temporaryPrefix + hex.EncodeToString(randomBytes[:])
 		relativePath := path.Join(relativeParent, name)
 		file, err := store.root.OpenFile(relativePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if err == nil {
