@@ -30,6 +30,12 @@ const (
 	hardMaxFailureBytes           = 4096
 	hardMaxEvents                 = 1 << 20
 	hardMaxRetries                = 16
+
+	// Failure and audit reasons are fixed built-in text: provider errors are
+	// not a trusted public-error channel and may contain endpoint credentials
+	// or request payload fragments. MaxFailureBytes must hold the longest one,
+	// "provider negotiation failed before tool dispatch".
+	minimumFailureBytes = 48
 )
 
 var (
@@ -278,7 +284,7 @@ func validateBounds(bounds Bounds) error {
 		bounds.MaxChunkBytes == 0 || bounds.MaxChunkBytes > hardMaxChunkBytes ||
 		bounds.MaxChunks == 0 || bounds.MaxChunks > hardMaxChunks ||
 		bounds.MaxOutputBytes == 0 || bounds.MaxOutputBytes > hardMaxOutputBytes ||
-		bounds.MaxFailureBytes == 0 || bounds.MaxFailureBytes > hardMaxFailureBytes ||
+		bounds.MaxFailureBytes < minimumFailureBytes || bounds.MaxFailureBytes > hardMaxFailureBytes ||
 		bounds.MaxEvents < 8 || bounds.MaxEvents > hardMaxEvents ||
 		bounds.MaxChunkBytes > bounds.MaxOutputBytes || bounds.MaxChunks > bounds.MaxEvents ||
 		bounds.CancelTimeout <= 0 || bounds.CancelTimeout > 30_000_000_000 {

@@ -473,13 +473,11 @@ func (starter *SessionDispatchStarter) startProviderOnce(
 	if startErr != nil || isNilInterface(result.Call) || !validProviderID {
 		var classified *ProviderDispatchError
 		if errors.As(startErr, &classified) && classified.Classification() == DispatchDefinitelyNotSent && !validProviderID {
-			terminalErr := starter.recordTerminal(ctx, observation, effectledger.TerminalFailed,
-				boundedFailureReason(startErr, "provider rejected dispatch", starter.gateway.bounds.MaxFailureBytes))
+			terminalErr := starter.recordTerminal(ctx, observation, effectledger.TerminalFailed, "provider rejected dispatch")
 			starter.gateway.closeProviderCall(ctx, result.Call)
 			return terminalErr
 		}
-		unknownErr := starter.recordUnknown(ctx, observation,
-			boundedFailureReason(startErr, "provider dispatch outcome is unknown", starter.gateway.bounds.MaxFailureBytes))
+		unknownErr := starter.recordUnknown(ctx, observation, "provider dispatch outcome is unknown")
 		starter.gateway.closeProviderCall(ctx, result.Call)
 		if validProviderID {
 			return unknownErr
@@ -509,8 +507,7 @@ func (starter *SessionDispatchStarter) consumeProviderCall(
 			if errors.Is(err, io.EOF) {
 				return starter.recordUnknown(ctx, observation, "provider stream ended before completion")
 			}
-			return starter.recordUnknown(ctx, observation,
-				boundedFailureReason(err, "provider stream failed", starter.gateway.bounds.MaxFailureBytes))
+			return starter.recordUnknown(ctx, observation, "provider stream failed")
 		}
 		switch event.Kind {
 		case ProviderOutputChunk:
@@ -551,8 +548,7 @@ func (starter *SessionDispatchStarter) recordPreStartFailure(
 	observation effectledger.Observation,
 	cause error,
 ) error {
-	reason := boundedFailureReason(cause, "MCP dispatch rejected before provider start", starter.gateway.bounds.MaxFailureBytes)
-	if err := starter.recordTerminal(ctx, observation, effectledger.TerminalFailed, reason); err != nil {
+	if err := starter.recordTerminal(ctx, observation, effectledger.TerminalFailed, "MCP dispatch rejected before provider start"); err != nil {
 		return errors.Join(cause, err)
 	}
 	return nil
