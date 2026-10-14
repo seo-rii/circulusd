@@ -177,7 +177,9 @@ func (table *GuardTable) Protect(key Key, permitID string) (Permit, error) {
 		if existing.permit.Key != key {
 			return Permit{}, fmt.Errorf("protect %s: %w", key.Digest, ErrPermitReused)
 		}
-		if existing.state == permitAbandoned {
+		// Only a pending permit still pins its object. A finalized or abandoned
+		// one must not be reported as protection the guard no longer holds.
+		if existing.state != permitPending {
 			return Permit{}, fmt.Errorf("protect %s: %w", key.Digest, ErrStalePermit)
 		}
 		guard := table.guards[key]
