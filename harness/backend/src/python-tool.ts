@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,7 +56,6 @@ export const PYTHON_TIMEOUT_MS = positiveInteger(process.env.CIRCULUSD_TEST_PYTH
 export const PYTHON_OUTPUT_LIMIT = 16 * 1024;
 export const PYTHON_CODE_LIMIT_BYTES = 64 * 1024;
 export const PYTHON_STDIN_LIMIT_BYTES = 256 * 1024;
-export const PYTHON_WORKSPACE_ROOT = join(tmpdir(), "circulusd-test", "workspaces");
 
 const PROBE_SCRIPT = "import sys; print(sys.version.split()[0]); print(sys.executable)";
 
@@ -92,9 +92,26 @@ export function resolvePythonInterpreter(): PythonInterpreter | null {
   return resolved;
 }
 
+let workspaceRoot: string | undefined;
+
+/**
+ * Host-mode workspaces live under one directory per process, created on first
+ * use by mkdtemp: owner-only and unpredictable, so other local users cannot
+ * pre-create, redirect or read it the way they could a fixed shared /tmp path.
+ */
+export function pythonWorkspaceRoot(): string {
+  if (workspaceRoot === undefined) {
+    const root = mkdtempSync(join(tmpdir(), "circulusd-test-workspaces-"));
+    // Sessions do not outlive the process, so neither do their workspaces.
+    process.once("exit", () => rmSync(root, { recursive: true, force: true }));
+    workspaceRoot = root;
+  }
+  return workspaceRoot;
+}
+
 export function sessionWorkspace(sessionId: string): string {
   const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 96) || "session";
-  return join(PYTHON_WORKSPACE_ROOT, safe);
+  return join(pythonWorkspaceRoot(), safe);
 }
 
 /** Runs one script with the host interpreter (no sandbox). */
@@ -265,7 +282,7 @@ export class HostPythonExecutor implements PythonExecutor {
       isolation: "none: the host interpreter runs as the backend user with a scrubbed environment and a per-session temp directory",
       interpreter: this.#interpreter.executable,
       version: this.#interpreter.version,
-      workspaces: PYTHON_WORKSPACE_ROOT,
+      workspaces: pythonWorkspaceRoot(),
     };
   }
 
