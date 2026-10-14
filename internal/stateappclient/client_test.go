@@ -936,6 +936,13 @@ func TestReadSessionEventsValidatesSignedErrorEnvelopeAndStatus(t *testing.T) {
 			}},
 		},
 		{
+			name:   "digest mismatch outside turn admission",
+			status: http.StatusBadRequest,
+			payload: canonical.Map{"ok": false, "error": canonical.Map{
+				"code": "DIGEST_MISMATCH", "message": "A supplied digest does not match its value.",
+			}},
+		},
+		{
 			name:    "success with failure status",
 			status:  http.StatusBadGateway,
 			payload: canonical.Map{"ok": true, "result": canonical.Map{}},

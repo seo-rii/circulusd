@@ -962,7 +962,9 @@ func (client *Client) invokeAuthenticatedIngress(
 	case http.StatusOK:
 		validStatus = true
 	case http.StatusBadRequest:
-		validStatus = code == "INVALID_ARGUMENT"
+		// Turn admission also answers a recomputed input/request digest
+		// mismatch with a signed 400.
+		validStatus = code == "INVALID_ARGUMENT" || (code == "DIGEST_MISMATCH" && contract.path == admissionIngressPath)
 	case http.StatusInternalServerError:
 		validStatus = code == "INTERNAL_ERROR"
 	case http.StatusBadGateway:

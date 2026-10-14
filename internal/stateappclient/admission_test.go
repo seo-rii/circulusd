@@ -42,7 +42,7 @@ func admissionFixture(t *testing.T) (goldenFixture, AdmitSessionTurnRequest) {
 }
 
 func TestAdmitSessionTurnGoldenAndAuthenticatedResponseValidation(t *testing.T) {
-	for _, mode := range []string{"golden", "replay", "wrong fresh turn", "invalid outcome", "tampered MAC"} {
+	for _, mode := range []string{"golden", "replay", "wrong fresh turn", "invalid outcome", "tampered MAC", "digest mismatch", "undeclared 400 code"} {
 		t.Run(mode, func(t *testing.T) {
 			fixture, input := admissionFixture(t)
 			root, _ := hex.DecodeString(fixture.RootKeyHex)
@@ -58,7 +58,14 @@ func TestAdmitSessionTurnGoldenAndAuthenticatedResponseValidation(t *testing.T) 
 					t.Fatal(err)
 				}
 				result := value.(canonical.Map)["payload"].(canonical.Map)["result"].(canonical.Map)
+				status := http.StatusOK
 				switch mode {
+				case "digest mismatch", "undeclared 400 code":
+					// The admit-turn ingress recomputes the input and request
+					// digests and answers a mismatch with a signed 400.
+					code := map[string]string{"digest mismatch": "DIGEST_MISMATCH", "undeclared 400 code": "CONFLICT"}[mode]
+					value.(canonical.Map)["payload"] = canonical.Map{"ok": false, "error": canonical.Map{"code": code, "message": safeHostErrorMessages[code]}}
+					status = http.StatusBadRequest
 				case "replay":
 					result["replayed"] = true
 					result["outcome"].(canonical.Map)["turnId"] = validID("turn", 2)
@@ -71,14 +78,14 @@ func TestAdmitSessionTurnGoldenAndAuthenticatedResponseValidation(t *testing.T) 
 				if err != nil {
 					t.Fatal(err)
 				}
-				signature := responseMACFor(root, fixture.KeyID, fixture.Request.RequestID, body, 200, fixture.ContentType, admissionResponseMACDomain, responseBody)
+				signature := responseMACFor(root, fixture.KeyID, fixture.Request.RequestID, body, status, fixture.ContentType, admissionResponseMACDomain, responseBody)
 				if mode == "golden" && signature != fixture.ResponseMACHex {
 					t.Error("response MAC differs from TS golden")
 				}
 				if mode == "tampered MAC" {
 					signature = strings.Repeat("0", 64)
 				}
-				writeWireResponse(writer, wireResponse{status: 200, contentType: fixture.ContentType, keyID: fixture.KeyID, signature: signature, body: responseBody})
+				writeWireResponse(writer, wireResponse{status: status, contentType: fixture.ContentType, keyID: fixture.KeyID, signature: signature, body: responseBody})
 			}))
 			client, err := newWithSources(Config{Endpoint: endpoint, KeyID: "read-1", RootKey: bytes.Repeat([]byte{0x31}, 32), AdmissionKeyID: fixture.KeyID, AdmissionRootKey: root, Timeout: time.Second}, clientSources{
 				clock: func() time.Time { return time.UnixMilli(fixture.Request.SentAtUnixMS) }, newRequestID: func() (string, error) { return fixture.Request.RequestID, nil },
@@ -100,6 +107,11 @@ func TestAdmitSessionTurnGoldenAndAuthenticatedResponseValidation(t *testing.T) 
 			case "tampered MAC":
 				if !errors.Is(err, ErrUnauthenticatedResponse) {
 					t.Fatalf("err=%v", err)
+				}
+			case "digest mismatch":
+				var remote *RemoteError
+				if !errors.As(err, &remote) || remote.Code != "DIGEST_MISMATCH" || remote.Status != http.StatusBadRequest || !errors.Is(err, ErrRemote) {
+					t.Fatalf("err=%#v, want DIGEST_MISMATCH RemoteError", err)
 				}
 			default:
 				if !errors.Is(err, ErrInvalidResponse) {
