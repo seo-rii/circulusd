@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,12 +16,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/hancomac/circulusd/internal/conformance"
 	"github.com/hancomac/circulusd/internal/objectstore"
+	"github.com/hancomac/circulusd/internal/strictjson"
 	"golang.org/x/sys/unix"
 )
 
@@ -198,77 +197,6 @@ func openPrivateReport(path string) (*os.File, error) {
 	return os.NewFile(uintptr(descriptor), "qualification-report"), nil
 }
 
-// Bound nesting and reject duplicate object fields before typed decoding. A
-// configuration or credential document has one interpretation for both people
-// and the parser, including Unicode escapes and the case-folded aliases that
-// encoding/json would otherwise allow to overwrite the same typed field.
-func uniqueJSONDocument(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	tokens := 0
-	var read func(int) error
-	read = func(depth int) error {
-		tokens++
-		if depth > 16 || tokens > 1024 {
-			return errors.New("JSON input exceeds structure limits")
-		}
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		if delimiter, ok := token.(json.Delim); ok {
-			switch delimiter {
-			case '{':
-				var seen []string
-				for decoder.More() {
-					key, err := decoder.Token()
-					if err != nil {
-						return err
-					}
-					name, ok := key.(string)
-					if !ok {
-						return errors.New("duplicate JSON field")
-					}
-					for _, previous := range seen {
-						if strings.EqualFold(name, previous) {
-							return errors.New("duplicate JSON field")
-						}
-					}
-					seen = append(seen, name)
-					tokens++
-					if err := read(depth + 1); err != nil {
-						return err
-					}
-				}
-				end, err := decoder.Token()
-				if err != nil || end != json.Delim('}') {
-					return errors.New("invalid JSON object")
-				}
-			case '[':
-				for decoder.More() {
-					if err := read(depth + 1); err != nil {
-						return err
-					}
-				}
-				end, err := decoder.Token()
-				if err != nil || end != json.Delim(']') {
-					return errors.New("invalid JSON array")
-				}
-			default:
-				return errors.New("invalid JSON delimiter")
-			}
-		}
-		return nil
-	}
-	if err := read(0); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return errors.New("multiple JSON values")
-	}
-	return nil
-}
-
 func readJSONFile(path string, value any, private bool) error {
 	descriptor, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
@@ -290,15 +218,9 @@ func readJSONFile(path string, value any, private bool) error {
 	if err != nil || len(data) > 65536 {
 		return errors.New("invalid input file")
 	}
-	if uniqueJSONDocument(data) != nil {
-		return errors.New("invalid JSON input")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(value); err != nil {
-		return errors.New("invalid JSON input")
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
+	// One exact interpretation: no duplicate members, case-folded aliases,
+	// unknown members or trailing values.
+	if strictjson.Decode(data, value) != nil {
 		return errors.New("invalid JSON input")
 	}
 	return nil
