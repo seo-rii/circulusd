@@ -136,7 +136,9 @@ func (c *Codec) HydrateSettlement(ctx context.Context, requestDigest string, sto
 		outcome = canonical.Map{"kind": "success", "result": result}
 	case "error":
 		code, codeOK := identifier(m["code"])
-		message, messageOK := identifier(m["message"])
+		// The state app bounds the message like an AgentError message, not
+		// like an identifier.
+		message, messageOK := boundedString(m["message"], 4096)
 		retry, retryOK := m["retryable"].(bool)
 		if len(m) != 4 || !codeOK || !messageOK || !retryOK {
 			return nil, ErrInvalidSettlement
