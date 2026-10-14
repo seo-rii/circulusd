@@ -20,6 +20,19 @@ if (!Number.isInteger(port) || port < 0 || port > 65_535) {
   console.error(`CIRCULUSD_TEST_PORT must be an integer in 0..65535, got ${process.env.CIRCULUSD_TEST_PORT}`);
   process.exit(2);
 }
+// Against DNS rebinding the backend serves only requests addressed to
+// localhost, 127.0.0.1 or [::1] on its port, to a concrete bind address, and
+// to these extra Host values (e.g. devbox.lan:8090, or a proxy's host).
+const allowedHosts = (process.env.CIRCULUSD_TEST_ALLOWED_HOSTS ?? "").split(",").map((entry) => entry.trim()).filter((entry) => entry !== "");
+for (const entry of allowedHosts) {
+  if (!/^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:\d{1,5})?$/.test(entry)) {
+    console.error(`CIRCULUSD_TEST_ALLOWED_HOSTS entries must be Host header values such as devbox.lan:8090, got ${entry}`);
+    process.exit(2);
+  }
+}
+if (!["127.0.0.1", "::1", "localhost", "0.0.0.0", "::", ""].includes(host)) {
+  allowedHosts.push(`${host.includes(":") ? `[${host}]` : host}:${port}`);
+}
 const historyInjection = (process.env.CIRCULUSD_TEST_HISTORY ?? "1") !== "0";
 const sandboxMode = process.env.CIRCULUSD_TEST_SANDBOX ?? "circulusd";
 if (!["circulusd", "host", "off"].includes(sandboxMode)) {
@@ -100,6 +113,7 @@ const app = createApp({
   frontendDirectory,
   historyInjection,
   log,
+  allowedHosts,
   ...(maxChatSessions === undefined ? {} : { maxSessions: maxChatSessions }),
   ...(pythonExecutor === null ? {} : { onSessionDeleted: (sessionId: string) => pythonExecutor.closeSession(sessionId) }),
 });
@@ -142,6 +156,7 @@ if (python === null) {
 for (const note of pythonNotes) console.log(`  python: ${note}`);
 console.log(`  runtime revision: ${app.runtimeRevisionDigest}`);
 console.log(`  history injection: ${historyInjection ? "on" : "off"}`);
+console.log(`  allowed hosts: localhost, 127.0.0.1, [::1] on port ${address.port}${allowedHosts.map((entry) => `, ${entry}`).join("")}`);
 console.log(`  sessions kept in memory: ${maxChatSessions ?? DEFAULT_SESSION_LIMIT} (longest idle evicted beyond that)`);
 console.log(`  frontend: ${frontendDirectory}`);
 

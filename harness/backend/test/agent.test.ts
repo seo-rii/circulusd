@@ -611,7 +611,7 @@ test("HTTP API: deleting or evicting a session ends its event streams and runs t
   const { port } = await app.listen("127.0.0.1", 0);
   const base = `http://127.0.0.1:${port}`;
   const createSession = async (): Promise<string> =>
-    ((await (await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" })).json()) as { sessionId: string }).sessionId;
+    ((await (await fetch(`${base}/v1/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { sessionId: string }).sessionId;
   try {
     const first = await createSession();
     const firstSession = app.store.get(first)!;

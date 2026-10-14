@@ -91,7 +91,7 @@ for (const removal of ["delete", "evict"] as const) {
     const { port } = await app.listen("127.0.0.1", 0);
     const base = `http://127.0.0.1:${port}`;
     try {
-      const created = await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" });
+      const created = await fetch(`${base}/v1/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
       const { sessionId } = await created.json() as { sessionId: string };
       const oldSession = app.store.get(sessionId)!;
       const upload = await pendingUpload(app, base, sessionId);
@@ -99,7 +99,7 @@ for (const removal of ["delete", "evict"] as const) {
       if (removal === "delete") {
         assert.equal((await fetch(`${base}/v1/sessions/${sessionId}`, { method: "DELETE" })).status, 204);
       } else {
-        assert.equal((await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" })).status, 201);
+        assert.equal((await fetch(`${base}/v1/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 201);
       }
       assert.deepEqual(fixture.cleaned, [sessionId]);
       assert.equal(app.store.get(sessionId), undefined);
@@ -124,7 +124,7 @@ test("a retained session accepts a valid chunked upload and delivers the tool re
   const { port } = await app.listen("127.0.0.1", 0);
   const base = `http://127.0.0.1:${port}`;
   try {
-    const created = await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" });
+    const created = await fetch(`${base}/v1/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const { sessionId } = await created.json() as { sessionId: string };
     const session = app.store.get(sessionId)!;
     const upload = await pendingUpload(app, base, sessionId);
@@ -149,12 +149,12 @@ test("DELETE after an accepted turn starts still cancels model work before its t
   const { port } = await app.listen("127.0.0.1", 0);
   const base = `http://127.0.0.1:${port}`;
   try {
-    const created = await fetch(`${base}/v1/sessions`, { method: "POST", body: "{}" });
+    const created = await fetch(`${base}/v1/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const { sessionId } = await created.json() as { sessionId: string };
     const session = app.store.get(sessionId)!;
     const terminal = terminalEvent(session);
     const accepted = await fetch(`${base}/v1/sessions/${sessionId}/turns`, {
-      method: "POST", body: JSON.stringify({ prompt: "echo cancellation control" }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: "echo cancellation control" }),
     });
     assert.equal(accepted.status, 202);
     await fixture.started;
