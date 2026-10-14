@@ -153,6 +153,35 @@ func TestSchemaRegexFailureCannotBecomeSuccessThroughNegationOrOneOf(t *testing.
 	}
 }
 
+// Each validation has its own regex budget. Concurrent validations of one
+// schema must not queue behind each other's budget: sixteen validations that
+// each run into the 100 ms regex timeout take at least 1.6 s one at a time,
+// and about one timeout when they run side by side.
+func TestConcurrentSchemaValidationsDoNotWaitForEachOthersRegexBudget(t *testing.T) {
+	t.Parallel()
+	schema, err := compileConfigurationSchema([]byte(`{"type":"object","properties":{"value":{"pattern":"^(a+)+$"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathological := map[string]any{"value": strings.Repeat("a", 4_000) + "!"}
+	started := time.Now()
+	var pending sync.WaitGroup
+	for range 16 {
+		pending.Go(func() {
+			if err := schema.Validate(pathological); err == nil || err.Error() != "configuration schema regex execution exceeded its budget" {
+				t.Errorf("Validate() error = %v, want the regex budget failure", err)
+			}
+		})
+	}
+	pending.Wait()
+	if elapsed := time.Since(started); elapsed >= 1600*time.Millisecond {
+		t.Fatalf("16 concurrent validations took %v; they ran one at a time", elapsed)
+	}
+	if err := schema.Validate(map[string]any{"value": "aaa"}); err != nil {
+		t.Fatalf("Validate(after concurrent budget failures) error = %v", err)
+	}
+}
+
 func TestRuntimeValidatesCompleteConfigurationAgainstImmutableSignedSchema(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)

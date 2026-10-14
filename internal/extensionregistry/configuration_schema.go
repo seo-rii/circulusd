@@ -20,33 +20,45 @@ const extensionConfigurationDialect = "https://json-schema.org/draft/2020-12/sch
 
 type schemaRegexBudgetFailure struct{}
 
-// The shared regex callbacks need one deadline for the whole validation. The
-// mutex keeps each call's budget separate, including concurrent compilations.
+// The regex callbacks of a compiled schema share one deadline for the whole
+// validation, so a compiled copy serves one validation at a time. Concurrent
+// validations take separate copies from a pool instead of waiting for each
+// other's regex budget.
 type configurationSchemaValidator struct {
+	document any // the checked schema resource; never mutated after compilation
+	copies   sync.Pool
+}
+
+type compiledConfigurationSchema struct {
 	schema   *jsonschema.Schema
-	mu       sync.Mutex
 	deadline time.Time
 }
 
 func (validator *configurationSchemaValidator) Validate(value any) (err error) {
-	validator.mu.Lock()
-	defer validator.mu.Unlock()
-	validator.deadline = time.Now().Add(time.Second)
+	compiled, _ := validator.copies.Get().(*compiledConfigurationSchema)
+	if compiled == nil {
+		// The document already compiled once at install time.
+		if compiled, err = compileConfigurationSchemaCopy(validator.document); err != nil {
+			return fmt.Errorf("configuration schema could not be compiled")
+		}
+	}
+	compiled.deadline = time.Now().Add(time.Second)
 	defer func() {
-		validator.deadline = time.Time{}
+		compiled.deadline = time.Time{}
 		if failure := recover(); failure != nil {
 			if _, expected := failure.(schemaRegexBudgetFailure); !expected {
 				panic(failure)
 			}
 			err = fmt.Errorf("configuration schema regex execution exceeded its budget")
 		}
+		validator.copies.Put(compiled)
 	}()
-	return validator.schema.Validate(value)
+	return compiled.schema.Validate(value)
 }
 
 type boundedSchemaRegexp struct {
 	regexp *regexp2.Regexp
-	owner  *configurationSchemaValidator
+	owner  *compiledConfigurationSchema
 }
 
 func (expression *boundedSchemaRegexp) String() string { return expression.regexp.String() }
@@ -64,7 +76,7 @@ func (expression *boundedSchemaRegexp) MatchString(value string) bool {
 	return matched
 }
 
-func (validator *configurationSchemaValidator) compileRegexp(pattern string) (jsonschema.Regexp, error) {
+func (compiled *compiledConfigurationSchema) compileRegexp(pattern string) (jsonschema.Regexp, error) {
 	// regexp2 also implements .NET group extensions and accepts escapes and
 	// braces that Ajv's Unicode-mode (u flag) ECMAScript parser rejects. Check
 	// that syntax here before regexp2 compiles the pattern.
@@ -179,7 +191,7 @@ func (validator *configurationSchemaValidator) compileRegexp(pattern string) (js
 		return nil, err
 	}
 	expression.MatchTimeout = 100 * time.Millisecond
-	return &boundedSchemaRegexp{regexp: expression, owner: validator}, nil
+	return &boundedSchemaRegexp{regexp: expression, owner: compiled}, nil
 }
 
 // checkUnicodeModeEscape allows only the escapes that ECMAScript accepts in
@@ -392,17 +404,33 @@ func compileConfigurationSchema(raw []byte) (*configurationSchemaValidator, erro
 	if err := check(value); err != nil {
 		return nil, err
 	}
-	compiler := jsonschema.NewCompiler()
-	validator := &configurationSchemaValidator{}
-	compiler.DefaultDraft(jsonschema.Draft2020)
-	compiler.UseLoader(offlineExtensionSchemaLoader{})
-	compiler.UseRegexpEngine(validator.compileRegexp)
-	const local = "https://circulusd.invalid/extension-configuration.schema.json"
-	if err := compiler.AddResource(local, value); err != nil {
+	compiled, err := compileConfigurationSchemaCopy(value)
+	if err != nil {
 		return nil, err
 	}
-	validator.schema, err = compiler.Compile(local)
-	return validator, err
+	validator := &configurationSchemaValidator{document: value}
+	validator.copies.Put(compiled)
+	return validator, nil
+}
+
+// compileConfigurationSchemaCopy compiles a checked schema document into a
+// copy whose regex callbacks use only that copy's deadline.
+func compileConfigurationSchemaCopy(document any) (*compiledConfigurationSchema, error) {
+	compiled := &compiledConfigurationSchema{}
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(offlineExtensionSchemaLoader{})
+	compiler.UseRegexpEngine(compiled.compileRegexp)
+	const local = "https://circulusd.invalid/extension-configuration.schema.json"
+	if err := compiler.AddResource(local, document); err != nil {
+		return nil, err
+	}
+	schema, err := compiler.Compile(local)
+	if err != nil {
+		return nil, err
+	}
+	compiled.schema = schema
+	return compiled, nil
 }
 
 func extensionJSONInstance(value canonical.Value) any {
