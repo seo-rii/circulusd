@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -332,5 +333,18 @@ test("sandbox executor sends one fenced RPC for each original or repaired body a
     controller.abort();
     await sandbox.close();
     for (const sessionId of sessions) await host.closeSession(sessionId);
+  }
+});
+
+test("host python workspaces live in a private per-process directory", async () => {
+  const root = dirname(sessionWorkspace("private_root_probe"));
+  assert.equal(dirname(root), tmpdir());
+  assert.match(basename(root), /^circulusd-test-workspaces-/);
+  assert.equal(dirname(sessionWorkspace("another_session")), root);
+  const info = await stat(root);
+  assert.ok(info.isDirectory());
+  if (process.platform !== "win32") {
+    assert.equal(info.mode & 0o777, 0o700);
+    assert.equal(info.uid, process.getuid?.());
   }
 });
