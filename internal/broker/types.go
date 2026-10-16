@@ -169,11 +169,13 @@ type EngineStepPermit struct {
 	ExpectedEventSequence uint64
 	CheckpointDigest      Digest
 	Budget                EngineStepBudget
-	Deadline              time.Time
-	Durable               bool
-	Checkpoint            *v1.AgentCheckpoint
-	UnconsumedSettlement  *v1.EffectRecord
-	ResumeSettlement      []byte
+	// Deadline can shorten Budget.MaximumWallClock. Execution must enforce it
+	// independently; replay preserves the original budget and deadline.
+	Deadline             time.Time
+	Durable              bool
+	Checkpoint           *v1.AgentCheckpoint
+	UnconsumedSettlement *v1.EffectRecord
+	ResumeSettlement     []byte
 }
 
 type BoundaryKind string
@@ -561,6 +563,9 @@ type AcquireStepCommand struct {
 	Now          time.Time
 	Budget       EngineStepBudget
 	OperationKey string
+	// AbsoluteDeadline bounds the immutable budget by current admission and
+	// lease expiry. It must be after Now and no later than Now + MaximumWallClock.
+	AbsoluteDeadline time.Time
 }
 
 type CommitStepCommand struct {

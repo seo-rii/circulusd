@@ -61,15 +61,17 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if budget.MaximumWallClock > snapshot.EngineStepLimits.MaximumWallClock {
 		budget.MaximumWallClock = snapshot.EngineStepLimits.MaximumWallClock
 	}
-	if remaining := request.Authority.ExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
-	if remaining := snapshot.LeaseExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
+	// Budget is part of the durable operation identity. Clamp its absolute
+	// deadline separately so an exact retry cannot change the retained budget.
 	deadline := request.Now.Add(budget.MaximumWallClock)
+	if request.Authority.ExpiresAt.Before(deadline) {
+		deadline = request.Authority.ExpiresAt
+	}
+	if snapshot.LeaseExpiresAt.Before(deadline) {
+		deadline = snapshot.LeaseExpiresAt
+	}
 	permit, err := coordinator.store.AcquireEngineStep(ctx, AcquireStepCommand{
-		Snapshot: snapshot, Now: request.Now, Budget: budget, OperationKey: request.OperationKey,
+		Snapshot: snapshot, Now: request.Now, Budget: budget, AbsoluteDeadline: deadline, OperationKey: request.OperationKey,
 	})
 	if err != nil {
 		return EngineStepPermit{}, fmt.Errorf("acquire durable engine step: %w", err)
@@ -77,7 +79,9 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if !permit.Durable {
 		return EngineStepPermit{}, ErrDurabilityBarrier
 	}
-	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !permit.Deadline.Equal(deadline) {
+	// Exact retries return the original grant, whose deadline does not move
+	// with request.Now. It must still be live and within this admission's bound.
+	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !request.Now.Before(permit.Deadline) || permit.Deadline.After(deadline) {
 		return EngineStepPermit{}, fmt.Errorf("%w: invalid engine-step receipt", ErrFenceMismatch)
 	}
 	if !proto.Equal(permit.Checkpoint, snapshot.Checkpoint) || !proto.Equal(permit.UnconsumedSettlement, snapshot.UnconsumedSettlement) || !bytes.Equal(permit.ResumeSettlement, snapshot.ResumeSettlement) {

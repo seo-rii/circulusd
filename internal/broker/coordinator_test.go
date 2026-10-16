@@ -75,8 +75,8 @@ func TestAcquireEngineStepClampsBudgetAndRequiresCurrentAdmission(t *testing.T) 
 	if err != nil {
 		t.Fatalf("AcquireEngineStep(authority clamp) error = %v", err)
 	}
-	if short.Budget.MaximumWallClock != 30*time.Second {
-		t.Fatalf("authority-clamped wall clock = %s, want 30s", short.Budget.MaximumWallClock)
+	if short.Budget.MaximumWallClock != time.Minute || !short.Deadline.Equal(shortAuthority.ExpiresAt) {
+		t.Fatalf("authority-clamped grant budget = %s, deadline = %s", short.Budget.MaximumWallClock, short.Deadline)
 	}
 
 	tests := []struct {
@@ -1153,7 +1153,7 @@ func (store *fakeStore) AcquireEngineStep(ctx context.Context, command AcquireSt
 		Opaque: opaque(1), TenantID: command.Snapshot.TenantID, WorkspaceID: command.Snapshot.WorkspaceID, UserID: command.Snapshot.UserID,
 		OperationKey: command.OperationKey, SessionID: command.Snapshot.SessionID, TurnID: command.Snapshot.TurnID,
 		Generations: command.Snapshot.Generations, ExpectedEventSequence: command.Snapshot.EventSequence,
-		CheckpointDigest: command.Snapshot.CheckpointDigest, Budget: command.Budget, Deadline: command.Now.Add(command.Budget.MaximumWallClock), Durable: !store.forceNonDurable,
+		CheckpointDigest: command.Snapshot.CheckpointDigest, Budget: command.Budget, Deadline: command.AbsoluteDeadline, Durable: !store.forceNonDurable,
 		Checkpoint: command.Snapshot.Checkpoint, UnconsumedSettlement: command.Snapshot.UnconsumedSettlement,
 	}
 	store.applyReceiptRouteCorruption(&permit.TenantID, &permit.WorkspaceID)
