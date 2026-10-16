@@ -77,7 +77,9 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if !permit.Durable {
 		return EngineStepPermit{}, ErrDurabilityBarrier
 	}
-	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !permit.Deadline.Equal(deadline) {
+	// Exact retries return the original grant, whose deadline does not move
+	// with request.Now. It must still be live and within this admission's bound.
+	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !request.Now.Before(permit.Deadline) || permit.Deadline.After(deadline) {
 		return EngineStepPermit{}, fmt.Errorf("%w: invalid engine-step receipt", ErrFenceMismatch)
 	}
 	if !proto.Equal(permit.Checkpoint, snapshot.Checkpoint) || !proto.Equal(permit.UnconsumedSettlement, snapshot.UnconsumedSettlement) || !bytes.Equal(permit.ResumeSettlement, snapshot.ResumeSettlement) {
