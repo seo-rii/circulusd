@@ -178,18 +178,32 @@ export function agentHeaders(ready: SandboxReady): Record<string, string> {
 
 export async function waitForApi(ready: SandboxReady, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let lastError = "";
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://${ready.host}:${ready.port}/v1/ready`, { headers: agentHeaders(ready) });
-      if (response.ok) return;
-      lastError = `HTTP ${response.status}`;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+  try {
+    while (Date.now() < deadline && !controller.signal.aborted) {
+      try {
+        const response = await fetch(`http://${ready.host}:${ready.port}/v1/ready`, {
+          headers: agentHeaders(ready),
+          signal: controller.signal,
+        });
+        // Only the status is needed; do not retain an unread response stream.
+        void response.body?.cancel().catch(() => undefined);
+        if (response.ok) return;
+        lastError = `HTTP ${response.status}`;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || controller.signal.aborted) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(250, remaining)));
     }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+    throw new Error(`sandbox agent API at ${ready.host}:${ready.port} is unreachable: ${lastError}`);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
   }
-  throw new Error(`sandbox agent API at ${ready.host}:${ready.port} is unreachable: ${lastError}`);
 }
 
 async function closeChild(child: ChildProcess, exited: Promise<number | null>, hasExited: () => boolean): Promise<void> {
