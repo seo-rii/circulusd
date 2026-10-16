@@ -1083,6 +1083,8 @@ func redactedError(err error) error {
 		return connect.NewError(connect.CodeFailedPrecondition, errors.New("process state does not permit this operation"))
 	case errors.Is(err, sandboxd.ErrOutputBackpressure):
 		return connect.NewError(connect.CodeResourceExhausted, errors.New("process output backpressure limit was exceeded"))
+	case errors.Is(err, sandboxd.ErrAttachmentLimit):
+		return connect.NewError(connect.CodeResourceExhausted, errors.New("process attachment capacity exhausted"))
 	case errors.Is(err, sandboxd.ErrReplayUnavailable):
 		return connect.NewError(connect.CodeOutOfRange, errors.New("requested process replay is unavailable"))
 	default:
