@@ -19,6 +19,7 @@ describe("extension configuration decimal multipleOf", () => {
     ["anyOf", { anyOf: [{ properties: { value: { type: "number", multipleOf: 0.1 } } }, { properties: { value: { type: "string" } } }], unevaluatedProperties: false }, { value: 0.3 }, { value: 0.35 }],
     ["oneOf", { properties: { value: { oneOf: [{ multipleOf: 0.1 }, { multipleOf: 0.2 }] } } }, { value: 0.3 }, { value: 0.4 }],
     ["not", { properties: { value: { type: "number", not: { multipleOf: 0.1 } } } }, { value: 0.35 }, { value: 0.3 }],
+    // oxlint-disable-next-line unicorn/no-thenable -- JSON Schema conditional keyword.
     ["conditional", { properties: { value: { type: "number", if: { multipleOf: 0.1 }, then: { minimum: 0.3 }, else: false } } }, { value: 0.3 }, { value: 0.35 }],
     ["contains", { properties: { readings: { type: "array", contains: { type: "number", multipleOf: 0.1 }, minContains: 1, maxContains: 1 } } }, { readings: [0.3, 0.35] }, { readings: [0.2, 0.3] }],
     ["unevaluatedItems", { properties: { readings: { type: "array", prefixItems: [{ type: "number", multipleOf: 0.1 }], unevaluatedItems: false } } }, { readings: [0.3] }, { readings: [0.3, 0.2] }],
