@@ -19,6 +19,13 @@ func TestNativeHTTPProviderAuditsDeniedServerRequestsBeforeReply(t *testing.T) {
 			var replies atomic.Int32
 			var inspectAudit func()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					if r.Header.Get("MCP-Session-Id") != "audit-session" || r.Header.Get("MCP-Protocol-Version") != streamableHTTPProtocol {
+						t.Error("session cleanup lost the audited session/protocol")
+					}
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				body, _ := io.ReadAll(r.Body)
 				rpc, err := decodeMCPMessage(body)
 				if err != nil {
