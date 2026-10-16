@@ -67,3 +67,49 @@ func TestAcquireEngineStepReplayStillValidatesReceipt(t *testing.T) {
 		})
 	}
 }
+
+func TestAcquireEngineStepReplaysClampedDeadlineWithoutChangingBudget(t *testing.T) {
+	t.Parallel()
+	for _, bound := range []string{"lease", "admission"} {
+		t.Run(bound, func(t *testing.T) {
+			now := time.Unix(1_800_000_000, 0).UTC()
+			deadline := now.Add(500 * time.Millisecond)
+			snapshot, authority := baseSnapshot(now), baseAuthority(now)
+			if bound == "lease" {
+				snapshot.LeaseExpiresAt = deadline
+			} else {
+				authority.ExpiresAt = deadline
+			}
+			store := newFakeStore(snapshot)
+			request := EngineStepRequest{Authority: authority, Now: now, OperationKey: "clamped-step",
+				Budget: EngineStepBudget{MaximumEvents: 1, MaximumEphemeralBytes: 4096, MaximumWallClock: time.Second}}
+			original, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), request)
+			if err != nil || original.Budget != request.Budget || !original.Deadline.Equal(deadline) {
+				t.Fatalf("clamped grant = %#v, error = %v", original, err)
+			}
+			request.Now = now.Add(time.Millisecond)
+			replayed, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), request)
+			if err != nil || replayed.Opaque != original.Opaque || replayed.Budget != original.Budget || !replayed.Deadline.Equal(original.Deadline) || len(store.stepPermits) != 1 {
+				t.Fatalf("clamped replay = %#v, error = %v", replayed, err)
+			}
+
+			// A receipt inside the wall-clock budget still cannot exceed the
+			// earlier admission or lease bound.
+			forged := original
+			forged.Deadline = deadline.Add(time.Millisecond)
+			store.stepPermits[request.OperationKey] = forged
+			if _, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), request); !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("receipt beyond %s accepted: %v", bound, err)
+			}
+			store.stepPermits[request.OperationKey] = original
+
+			// Renewing admission/lease cannot revive an expired retained grant.
+			request.Authority.ExpiresAt = now.Add(time.Minute)
+			store.snapshot.LeaseExpiresAt = now.Add(time.Minute)
+			request.Now = deadline
+			if _, err := mustCoordinator(t, store, nil).AcquireEngineStep(context.Background(), request); !errors.Is(err, ErrFenceMismatch) {
+				t.Fatalf("expired original grant revived after renewal: %v", err)
+			}
+		})
+	}
+}

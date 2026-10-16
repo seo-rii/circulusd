@@ -61,15 +61,17 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if budget.MaximumWallClock > snapshot.EngineStepLimits.MaximumWallClock {
 		budget.MaximumWallClock = snapshot.EngineStepLimits.MaximumWallClock
 	}
-	if remaining := request.Authority.ExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
-	if remaining := snapshot.LeaseExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
+	// Budget is part of the durable operation identity. Clamp its absolute
+	// deadline separately so an exact retry cannot change the retained budget.
 	deadline := request.Now.Add(budget.MaximumWallClock)
+	if request.Authority.ExpiresAt.Before(deadline) {
+		deadline = request.Authority.ExpiresAt
+	}
+	if snapshot.LeaseExpiresAt.Before(deadline) {
+		deadline = snapshot.LeaseExpiresAt
+	}
 	permit, err := coordinator.store.AcquireEngineStep(ctx, AcquireStepCommand{
-		Snapshot: snapshot, Now: request.Now, Budget: budget, OperationKey: request.OperationKey,
+		Snapshot: snapshot, Now: request.Now, Budget: budget, AbsoluteDeadline: deadline, OperationKey: request.OperationKey,
 	})
 	if err != nil {
 		return EngineStepPermit{}, fmt.Errorf("acquire durable engine step: %w", err)
