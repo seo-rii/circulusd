@@ -166,6 +166,43 @@ func validMCPSessionID(id string) bool {
 	return true
 }
 
+// terminateSession releases a completed invocation's remote session. A server
+// may decline client-driven termination (405), or another retained handle may
+// already have deleted the same session (404). Neither changes its durable result.
+func (transport *StreamableHTTPTransport) terminateSession(ctx context.Context, targetRef, session string) error {
+	if transport == nil || ctx == nil || session == "" || !validMCPSessionID(session) {
+		return ErrInvalidRequest
+	}
+	target, found := transport.targets[targetRef]
+	if !found {
+		return ErrInvalidRequest
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.config.RequestTimeout)
+	defer cancel()
+	select {
+	case transport.slots <- struct{}{}:
+		defer func() { <-transport.slots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target.String(), nil)
+	if err != nil {
+		return ErrInvalidRequest
+	}
+	req.Close = true
+	req.Header.Set("MCP-Session-Id", session)
+	req.Header.Set("MCP-Protocol-Version", transport.config.ProtocolVersion)
+	response, err := transport.client.Do(req)
+	if err != nil {
+		return ErrProviderUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 200 && response.StatusCode < 300 || response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed {
+		return nil
+	}
+	return ErrProviderUnavailable
+}
+
 func (transport *StreamableHTTPTransport) Exchange(ctx context.Context, request MCPWireRequest) (MCPWireResponse, error) {
 	if transport == nil || ctx == nil {
 		return MCPWireResponse{}, ErrInvalidRequest
