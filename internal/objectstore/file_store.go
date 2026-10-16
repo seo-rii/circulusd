@@ -32,6 +32,11 @@ const (
 // This confines operations to the original root even if the root path is later
 // renamed or replaced by a symlink, and it refuses any component symlink that
 // would escape the root — neither guarantee holds for a captured path string.
+// Conditional mutations share 256 stable lock files across all instances using
+// this root. A hash collision only serializes unrelated keys; lock inodes are
+// never removed while another process may still hold them. Stop all instances
+// using the former per-key lock scheme before upgrading a shared store. Legacy
+// lock files are preserved and may be removed only while the store is offline.
 type FileStore struct {
 	root               *os.Root
 	maximumObjectBytes int64
@@ -235,7 +240,7 @@ func (store *FileStore) withKeyLock(ctx context.Context, bucket Bucket, key stri
 		return err
 	}
 	lockDigest := sha256.Sum256([]byte(string(bucket) + "\x00" + key))
-	lockPath := lockDirectory + "/" + hex.EncodeToString(lockDigest[:]) + ".lock"
+	lockPath := lockDirectory + "/stripe-" + hex.EncodeToString(lockDigest[:1]) + ".lock"
 	file, err := store.root.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open object lock: %w", err)
