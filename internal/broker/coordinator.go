@@ -662,10 +662,14 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 				}
 				return RecoveryDecision{}, fmt.Errorf("prepare confirmed retry: %w", err)
 			}
-			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
+			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || (preparation.EventSequence != snapshot.EventSequence && preparation.EventSequence-1 != snapshot.EventSequence) || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
+			// A replayed reservation has already advanced the reread snapshot.
+			// Dispatch must compare the original source event, not that new event.
+			dispatchSnapshot := snapshot
+			dispatchSnapshot.EventSequence = preparation.EventSequence - 1
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: dispatchSnapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch confirmed retry: %w", err)
 			}
@@ -789,10 +793,14 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 				}
 				return RecoveryDecision{}, fmt.Errorf("prepare effect retry: %w", err)
 			}
-			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
+			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || (preparation.EventSequence != snapshot.EventSequence && preparation.EventSequence-1 != snapshot.EventSequence) || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
+			// A replayed reservation has already advanced the reread snapshot.
+			// Dispatch must compare the original source event, not that new event.
+			dispatchSnapshot := snapshot
+			dispatchSnapshot.EventSequence = preparation.EventSequence - 1
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: dispatchSnapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch effect retry: %w", err)
 			}
