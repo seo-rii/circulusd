@@ -62,6 +62,13 @@ func TestAttachmentWatcherPreservesBackpressureResult(t *testing.T) {
 			}
 			for range attachment.Events {
 			}
+			// Completion retains the queued-replay capacity until its owner
+			// closes or cancels the attachment, including after backpressure.
+			if liveWatcher {
+				cancel()
+			} else {
+				attachment.Close()
+			}
 			// Run the actual watcher body to completion before reading Done.
 			// This deterministically detects a watcher stealing the public error
 			// without relying on a sleep or racing the caller against it.
