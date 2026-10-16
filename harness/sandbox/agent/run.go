@@ -312,9 +312,11 @@ func (e *executor) execute(ctx context.Context, plan spawnPlan) (*runResult, err
 	e.keyed++
 	handle, err := e.client.spawn(ctx, spawnRequest)
 	if err != nil {
-		// A spawn that timed out may still have started the process; only a
-		// definite refusal (ledger full, nothing listening) is safe to retry.
-		if connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
+		// A timeout or lost response does not prove the process was refused.
+		// Unavailable also covers EOF after a successful Spawn, so conservatively
+		// suppress replay even when the connection may have failed before dispatch.
+		// A definite ledger-full refusal remains safe for the pool to retry.
+		if connect.CodeOf(err) == connect.CodeUnavailable || connect.CodeOf(err) == connect.CodeDeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
 			return nil, &spawnedError{err}
 		}
 		return nil, err
