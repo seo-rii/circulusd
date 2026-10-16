@@ -40,6 +40,12 @@ const PATCHABLE_HOOKS = [
 const REQUEST_PATCH_FIELDS = ["operation", "replayPolicy", "payload"] as const;
 const RESULT_PATCH_FIELDS = ["result"] as const;
 
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof BoundaryFault) throw signal.reason;
+  throw new BoundaryFault("TURN_ABORTED", "turn was aborted", { cause: signal.reason });
+}
+
 export class HookDispatcher {
   readonly #identity: EngineIdentity;
   readonly #maxOutputBytes: number;
@@ -313,13 +319,15 @@ export class HookDispatcher {
 
   async #runVoidHook(
     hook: "beforeTurn" | "afterTurn",
-    event: Record<string, unknown>,
+    event: Record<string, unknown> & { readonly signal: AbortSignal },
   ): Promise<void> {
     for (const extension of this.#active) {
+      throwIfAborted(event.signal);
       const callback = extension.instance[hook];
       if (callback === undefined) continue;
       try {
         const result = await callback.call(extension.instance, frozenSignalContext(event) as never);
+        throwIfAborted(event.signal);
         if (result !== undefined) {
           throw new BoundaryFault(
             "EXTENSION_OUTPUT_INVALID",
@@ -327,6 +335,7 @@ export class HookDispatcher {
           );
         }
       } catch (error) {
+        throwIfAborted(event.signal);
         if (error instanceof BoundaryFault) throw error;
         throw new BoundaryFault(
           "EXTENSION_HOOK_FAILED",
@@ -345,6 +354,7 @@ export class HookDispatcher {
   ): Promise<EffectRequestDraft> {
     let request = frozenProtocolClone(initial);
     for (const extension of this.#active) {
+      throwIfAborted(signal);
       const callback = extension.instance[hook];
       if (callback === undefined) continue;
       let output: unknown;
@@ -359,12 +369,14 @@ export class HookDispatcher {
           }) as never,
         );
       } catch (error) {
+        throwIfAborted(signal);
         throw new BoundaryFault(
           "EXTENSION_HOOK_FAILED",
           `extension ${extension.manifest.id} failed in ${hook}`,
           { cause: error },
         );
       }
+      throwIfAborted(signal);
       if (output === undefined) continue;
       const patch = exactRecord(
         output,
@@ -426,6 +438,7 @@ export class HookDispatcher {
   ): Promise<NormalizedValue> {
     let result = frozenProtocolClone(initial);
     for (const extension of this.#active) {
+      throwIfAborted(signal);
       const callback = extension.instance[hook];
       if (callback === undefined) continue;
       let output: unknown;
@@ -441,12 +454,14 @@ export class HookDispatcher {
           }) as never,
         );
       } catch (error) {
+        throwIfAborted(signal);
         throw new BoundaryFault(
           "EXTENSION_HOOK_FAILED",
           `extension ${extension.manifest.id} failed in ${hook}`,
           { cause: error },
         );
       }
+      throwIfAborted(signal);
       if (output === undefined) continue;
       const patch = exactRecord(
         output,
