@@ -519,6 +519,9 @@ type DurableStore interface {
 	LookupOperation(context.Context, OperationLookup) (OperationReceipt, error)
 	ReadTurn(context.Context, identity.ID) (TurnSnapshot, error)
 	AcquireEngineStep(context.Context, AcquireStepCommand) (EngineStepPermit, error)
+	// CommitEngineStep checks for an exact retained operation (including the
+	// request digest, permit proof, and boundary) before applying snapshot and
+	// deadline checks. Without that receipt, stale snapshots must never mutate.
 	CommitEngineStep(context.Context, CommitStepCommand) (EngineStepReceipt, error)
 	MarkDispatched(context.Context, MarkDispatchedCommand) (DispatchPermit, error)
 	ClaimDispatchStart(context.Context, ClaimDispatchStartCommand) (DispatchStartClaim, error)

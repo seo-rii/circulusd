@@ -94,7 +94,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if err := ctx.Err(); err != nil {
 		return EngineStepReceipt{}, err
 	}
-	if !request.Permit.Durable || request.Permit.Opaque == "" || request.Permit.TenantID.Kind() != identity.Tenant || request.Permit.WorkspaceID.Kind() != identity.Workspace || request.Permit.UserID.Kind() != identity.Subject || request.Permit.Deadline.IsZero() || request.Now.IsZero() || !request.Now.Before(request.Permit.Deadline) || request.OperationKey == "" || request.RequestDigest == (Digest{}) {
+	if !request.Permit.Durable || request.Permit.Opaque == "" || request.Permit.TenantID.Kind() != identity.Tenant || request.Permit.WorkspaceID.Kind() != identity.Workspace || request.Permit.UserID.Kind() != identity.Subject || request.Permit.Deadline.IsZero() || request.Now.IsZero() || request.OperationKey == "" || request.RequestDigest == (Digest{}) {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
 	if request.Boundary.CheckpointDigest == (Digest{}) {
@@ -103,6 +103,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if request.Boundary.Message != nil && (request.Boundary.Kind != "" || request.Boundary.Effect != nil) {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
+	isTerminalBoundary := false
 	if request.Boundary.Message != nil {
 		if request.Boundary.Message.Checkpoint == nil || request.Boundary.Message.Boundary == nil {
 			return EngineStepReceipt{}, ErrInvalidRequest
@@ -120,10 +121,12 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 			if boundary.TurnComplete == nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = true
 		case *v1.EngineStepBoundary_TurnError:
 			if boundary.TurnError == nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = true
 		default:
 			return EngineStepReceipt{}, ErrInvalidRequest
 		}
@@ -142,6 +145,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 			if request.Boundary.Effect != nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = request.Boundary.Kind != BoundaryCheckpoint
 		default:
 			return EngineStepReceipt{}, ErrInvalidRequest
 		}
@@ -153,11 +157,27 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if snapshot.TenantID.Kind() != identity.Tenant || snapshot.WorkspaceID.Kind() != identity.Workspace {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
-	if snapshot.SessionID != request.Permit.SessionID || snapshot.TurnID != request.Permit.TurnID || snapshot.Generations != request.Permit.Generations {
-		return EngineStepReceipt{}, ErrStaleGeneration
-	}
 	if snapshot.TenantID != request.Permit.TenantID || snapshot.WorkspaceID != request.Permit.WorkspaceID || snapshot.UserID != request.Permit.UserID {
 		return EngineStepReceipt{}, ErrFenceMismatch
+	}
+	if snapshot.SessionID != request.Permit.SessionID || snapshot.Generations.Authorization != request.Permit.Generations.Authorization {
+		return EngineStepReceipt{}, ErrStaleGeneration
+	}
+	if snapshot.TurnID != request.Permit.TurnID || snapshot.Generations != request.Permit.Generations {
+		if !isTerminalBoundary {
+			return EngineStepReceipt{}, ErrStaleGeneration
+		}
+		// A terminal commit may have completed before its reply was lost, even
+		// promoting the next turn. Let the owner replay the exact retained
+		// receipt. This old CAS cannot authorize a fresh commit, so replay is
+		// also safe after the grant deadline; current authorization still holds.
+		snapshot = TurnSnapshot{
+			TenantID: request.Permit.TenantID, WorkspaceID: request.Permit.WorkspaceID, UserID: request.Permit.UserID,
+			SessionID: request.Permit.SessionID, TurnID: request.Permit.TurnID, Generations: request.Permit.Generations,
+			EventSequence: request.Permit.ExpectedEventSequence, CheckpointDigest: request.Permit.CheckpointDigest,
+		}
+	} else if !request.Now.Before(request.Permit.Deadline) {
+		return EngineStepReceipt{}, ErrInvalidRequest
 	}
 	receipt, err := coordinator.store.CommitEngineStep(ctx, CommitStepCommand{
 		Snapshot: snapshot, Permit: request.Permit, Now: request.Now, OperationKey: request.OperationKey,
