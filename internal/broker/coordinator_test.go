@@ -1270,6 +1270,14 @@ func (store *fakeStore) MarkDispatched(ctx context.Context, command MarkDispatch
 	if store.retryPreparedAttempt != 0 && store.retryPreparedAttempt != command.PreparationPermit.DispatchAttempt {
 		return DispatchPermit{}, ErrInvalidEffectState
 	}
+	// Retry dispatch compares the snapshot from before the reservation, while
+	// the authoritative state must still be exactly at the reservation event.
+	if store.retryPreparedAttempt != 0 && (command.PreparationPermit.EventSequence == 0 ||
+		command.Snapshot.EventSequence != command.PreparationPermit.EventSequence-1 ||
+		store.snapshot.EventSequence != command.PreparationPermit.EventSequence ||
+		command.Snapshot.CheckpointDigest != store.snapshot.CheckpointDigest || command.Snapshot.Generations != store.snapshot.Generations) {
+		return DispatchPermit{}, ErrStaleGeneration
+	}
 	store.eventSequence++
 	store.snapshot.ActiveEffect.State = EffectDispatched
 	store.snapshot.ActiveEffect.DispatchAttempt++
