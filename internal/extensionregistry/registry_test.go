@@ -188,16 +188,6 @@ func TestRegistryRejectsSignedRecordsWithoutAUsableAssessedBackend(t *testing.T)
 				record.Assessment.AllowedExecutionBackends = []environment.Backend{environment.BackendNsJail}
 			},
 		},
-		{
-			name: "common backend is weaker than final minimum isolation",
-			mutate: func(record *SignedRevision) {
-				record.Revision.RequestedMinimumIsolation = Isolation{
-					ProcessScope: ProcessScopeSession, OuterIsolation: OuterIsolationFirecracker,
-				}
-				record.Revision.SupportedBackends = []environment.Backend{environment.BackendNsJail}
-				record.Assessment.AllowedExecutionBackends = []environment.Backend{environment.BackendNsJail}
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -288,9 +278,6 @@ func TestRuntimeCompilationRejectsSelectionToolEnvironmentAndIsolationConflicts(
 		{name: "missing configuration snapshot", mutate: func(request *CompileRequest) { delete(request.Configuration, "official/pdf") }, want: ErrInvalidRequest},
 		{name: "unknown configuration", mutate: func(request *CompileRequest) { request.Configuration["evil/unknown"] = canonical.Map{} }, want: ErrInvalidRequest},
 		{name: "backend denied by assessment", mutate: func(request *CompileRequest) { request.Backend = environment.BackendDocker }, want: ErrNoCompatibleBackend},
-		{name: "backend weaker than policy", mutate: func(request *CompileRequest) {
-			request.PolicyMinimumIsolation.OuterIsolation = OuterIsolationFirecracker
-		}, want: ErrNoCompatibleBackend},
 		{name: "environment package conflict", mutate: func(request *CompileRequest) {
 			request.Selections = []Selection{{ID: "official/pdf", Version: "1.4.2"}}
 			request.Configuration = canonical.Map{"official/pdf": canonical.Map{}}

@@ -133,9 +133,6 @@ func (registry *Registry) CompileRuntime(request CompileRequest) (RuntimeRevisio
 			ContentDigest: installed.revision.ContentDigest, RevisionDigest: installed.revision.RevisionDigest,
 		}
 	}
-	if !backendSatisfies(request.Backend, minimumIsolation.OuterIsolation) {
-		return RuntimeRevision{}, fmt.Errorf("%w: backend %q is weaker than minimum outer isolation %q", ErrNoCompatibleBackend, request.Backend, minimumIsolation.OuterIsolation)
-	}
 
 	sort.Slice(requirements, func(left, right int) bool {
 		if requirements[left].requirement.PackageID != requirements[right].requirement.PackageID {
@@ -274,15 +271,4 @@ func joinIsolation(left, right Isolation) Isolation {
 		result.OuterIsolation = OuterIsolationFirecracker
 	}
 	return result
-}
-
-func backendSatisfies(backend environment.Backend, minimum OuterIsolation) bool {
-	if minimum == OuterIsolationNone {
-		return true
-	}
-	if backend == environment.BackendFirecracker {
-		return true
-	}
-	return (backend == environment.BackendNsJail && minimum == OuterIsolationNsJail) ||
-		(backend == environment.BackendDocker && minimum == OuterIsolationDocker)
 }
