@@ -349,7 +349,7 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 		return ProviderStartResult{}, failure
 	}
 	if !claimed.Fresh {
-		return nativeRetainedCall(claimed.Row)
+		return provider.retainedCall(claimed.Row)
 	}
 	if provider.factory.repository.now().UnixNano() >= claimed.Row.Start.LeaseExpiresAtUnixNano {
 		return ProviderStartResult{}, ErrDispatchNotDurable
@@ -402,7 +402,7 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	if err != nil {
 		return ProviderStartResult{ProviderRequestID: id}, err
 	}
-	return nativeRetainedCall(row)
+	return provider.retainedCall(row)
 }
 
 func nativeRetainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
@@ -419,9 +419,10 @@ func nativeRetainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
 }
 
 type nativeHTTPCall struct {
-	mu     sync.Mutex
-	output []byte
-	closed bool
+	mu           sync.Mutex
+	output       []byte
+	closed       bool
+	closeSession func(context.Context) error
 }
 
 func (*nativeHTTPCall) String() string   { return "native-mcp-http-call<redacted>" }
@@ -448,7 +449,31 @@ func (call *nativeHTTPCall) Close(ctx context.Context) error {
 	defer call.mu.Unlock()
 	call.closed = true
 	call.output = nil
+	if call.closeSession != nil {
+		if err := call.closeSession(ctx); err != nil {
+			// Keep the cleanup operation retryable without exposing another
+			// completion or changing the already durable provider result.
+			return err
+		}
+		call.closeSession = nil
+	}
 	return nil
+}
+
+func (provider *nativeHTTPProvider) retainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
+	result, err := nativeRetainedCall(row)
+	if err != nil {
+		return result, err
+	}
+	if row.ConnectionRef != "" {
+		// Bind cleanup separately from reconstructing the immutable result.
+		// Capture only connection identity, not the retained response bytes.
+		target, session := row.Server.TargetRef, row.ConnectionRef
+		result.Call.(*nativeHTTPCall).closeSession = func(ctx context.Context) error {
+			return provider.transport.terminateSession(ctx, target, session)
+		}
+	}
+	return result, nil
 }
 
 func nativeWireLedger(row nativeWireInvocation, scope ValidatedAuthority, digest Digest) LedgerRecord {
