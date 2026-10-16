@@ -93,6 +93,8 @@ export interface SessionHostLimits {
   // Bounds a conservative canonical binary-size estimate for both turn input
   // and AgentEvent snapshots before any structured clone is allocated.
   readonly maximumEventBytes: number;
+  // A stalled ephemeral consumer must not prevent the next durable commit.
+  readonly maximumEphemeralDeliveryMs: number;
   // Externalized payloads have their own protocol-bounded budget. Hydrating a
   // large input must not implicitly enlarge the outbound AgentEvent budget.
   readonly maximumCheckpointPayloadBytes: number;
@@ -208,6 +210,7 @@ const DEFAULT_LIMITS: SessionHostLimits = {
   maximumBundleBytes: 32 << 20,
   maximumAuthorityBytes: 64 << 10,
   maximumEventBytes: 1 << 20,
+  maximumEphemeralDeliveryMs: 1_000,
   maximumCheckpointPayloadBytes: 4 << 20,
 };
 
@@ -511,6 +514,9 @@ export class SessionHost {
       limits.maximumAuthorityBytes <= 0 ||
       !Number.isSafeInteger(limits.maximumEventBytes) ||
       limits.maximumEventBytes <= 0 ||
+      !Number.isSafeInteger(limits.maximumEphemeralDeliveryMs) ||
+      limits.maximumEphemeralDeliveryMs <= 0 ||
+      limits.maximumEphemeralDeliveryMs > 2_147_483_647 ||
       !Number.isSafeInteger(limits.maximumCheckpointPayloadBytes) ||
       limits.maximumCheckpointPayloadBytes <= 0 ||
       limits.maximumCheckpointPayloadBytes > (4 << 20)
@@ -1127,6 +1133,7 @@ export class SessionHost {
     let iterator: AsyncIterator<AgentEvent> | undefined;
     let iteratorClosed = false;
     let eventsObserved = 0;
+    let ephemeralSinkAvailable = true;
     try {
       iterator = events[Symbol.asyncIterator]();
       while (true) {
@@ -1204,7 +1211,26 @@ export class SessionHost {
           });
         }
         if (cloned.type === "assistant_delta") {
-          await options.emit(cloned as EphemeralAgentEvent);
+          if (ephemeralSinkAvailable) {
+            const expired = Promise.withResolvers<false>();
+            const timer = setTimeout(
+              () => expired.resolve(false),
+              this.#limits.maximumEphemeralDeliveryMs,
+            );
+            try {
+              ephemeralSinkAvailable = await Promise.race([
+                Promise.resolve().then(() => options.emit(cloned as EphemeralAgentEvent)).then(
+                  () => true,
+                  () => false,
+                ),
+                expired.promise,
+              ]);
+            } finally {
+              clearTimeout(timer);
+            }
+            // Stop using a stalled or failed sink so later deltas do not queue
+            // behind an unresolved delivery. Durable commits remain awaited.
+          }
           continue;
         }
         try {
