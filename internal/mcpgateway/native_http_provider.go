@@ -14,6 +14,7 @@ import (
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
+	"github.com/hancomac/circulusd/internal/pijson"
 )
 
 // Wire state is authoritative only inside the exact native transaction. A
@@ -269,7 +270,13 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	if _, ok := input.(canonical.Map); !ok {
 		return ProviderStartResult{}, ErrInvalidRequest
 	}
-	if !nativeJSONValue(input) {
+	// Canonical arguments retain Pi number wrappers for hashing and storage.
+	// Restore numbers only at the external JSON boundary.
+	input, err = pijson.DecodeValue(input, canonical.DefaultOptions())
+	if err != nil {
+		return ProviderStartResult{}, ErrInvalidRequest
+	}
+	if _, ok := input.(canonical.Map); !ok {
 		return ProviderStartResult{}, ErrInvalidRequest
 	}
 	digest, err := digestCanonicalCall(command.Server.ServerID, command.ToolName, command.InputCanonical)
@@ -392,29 +399,6 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 		return ProviderStartResult{ProviderRequestID: id}, err
 	}
 	return nativeRetainedCall(row)
-}
-
-func nativeJSONValue(value canonical.Value) bool {
-	switch value := value.(type) {
-	case nil, bool, string, int64, uint64:
-		return true
-	case canonical.Array:
-		for _, child := range value {
-			if !nativeJSONValue(child) {
-				return false
-			}
-		}
-		return true
-	case canonical.Map:
-		for _, child := range value {
-			if !nativeJSONValue(child) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
 }
 
 func nativeRetainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
