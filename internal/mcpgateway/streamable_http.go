@@ -167,6 +167,11 @@ func validMCPSessionID(id string) bool {
 }
 
 func (transport *StreamableHTTPTransport) Exchange(ctx context.Context, request MCPWireRequest) (MCPWireResponse, error) {
+	return transport.exchangeWithServerRequests(ctx, request, nil)
+}
+
+func (transport *StreamableHTTPTransport) exchangeWithServerRequests(ctx context.Context, request MCPWireRequest,
+	serverRequest func(context.Context, mcpRPCMessage) ([]byte, error)) (MCPWireResponse, error) {
 	if transport == nil || ctx == nil {
 		return MCPWireResponse{}, ErrInvalidRequest
 	}
@@ -289,8 +294,24 @@ func (transport *StreamableHTTPTransport) Exchange(ctx context.Context, request 
 				return MCPWireResponse{}, err
 			}
 			if message.Method != "" {
-				if len(message.ID) != 0 || !strings.HasPrefix(message.Method, "notifications/") {
+				if len(message.Result) != 0 || len(message.Error) != 0 || !validBoundedText(message.Method, 512) {
 					return MCPWireResponse{}, ErrProtocolMismatch
+				}
+				if len(message.ID) == 0 {
+					if !strings.HasPrefix(message.Method, "notifications/") {
+						return MCPWireResponse{}, ErrProtocolMismatch
+					}
+				} else {
+					if serverRequest == nil || !validMCPServerRequestID(message.ID) {
+						return MCPWireResponse{}, ErrProtocolMismatch
+					}
+					reply, err := serverRequest(ctx, message)
+					if err != nil {
+						return MCPWireResponse{}, err
+					}
+					if err := transport.sendServerResponse(ctx, target, session, reply); err != nil {
+						return MCPWireResponse{}, err
+					}
 				}
 			} else {
 				if validMCPResponse(data, id) != nil {
@@ -312,6 +333,58 @@ func (transport *StreamableHTTPTransport) Exchange(ctx context.Context, request 
 		}
 	}
 	return MCPWireResponse{}, ErrProtocolMismatch
+}
+
+func validMCPServerRequestID(raw json.RawMessage) bool {
+	if len(raw) == 0 || len(raw) > 512 {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var id any
+	if decoder.Decode(&id) != nil {
+		return false
+	}
+	switch id.(type) {
+	case string, json.Number:
+		return true
+	default:
+		return false
+	}
+}
+
+// The admitted SSE exchange already holds its slot. Send at most one response
+// at a time per stream, with its own deadline, so a one-slot transport cannot
+// deadlock waiting for itself and server requests cannot create unbounded work.
+func (transport *StreamableHTTPTransport) sendServerResponse(ctx context.Context, target *url.URL, session string, reply []byte) error {
+	if len(reply) > transport.config.MaximumRequestBytes {
+		return ErrProtocolMismatch
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.config.RequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(reply))
+	if err != nil {
+		return ErrInvalidRequest
+	}
+	req.GetBody = nil
+	req.Close = true
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", transport.config.ProtocolVersion)
+	if session != "" {
+		req.Header.Set("MCP-Session-Id", session)
+	}
+	response, err := transport.client.Do(req)
+	if err != nil {
+		return ErrProviderUnavailable
+	}
+	defer response.Body.Close()
+	// Client responses are acknowledged with an empty HTTP 202.
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1))
+	if err != nil || response.StatusCode != http.StatusAccepted || len(body) != 0 {
+		return ErrProtocolMismatch
+	}
+	return nil
 }
 
 func validMCPResponse(data []byte, id string) error {

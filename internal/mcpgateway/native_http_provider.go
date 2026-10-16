@@ -220,7 +220,9 @@ func (provider *nativeHTTPProvider) Negotiate(ctx context.Context, command Negot
 	}
 	id := nativeWireRequestID("initialize", provider.factory.policyDigest, key)
 	message, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "initialize", "params": map[string]any{"protocolVersion": streamableHTTPProtocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "circulusd", "version": "1"}}})
-	response, err := provider.transport.Exchange(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, MessageJSON: message})
+	response, err := provider.transport.exchangeWithServerRequests(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, MessageJSON: message}, func(requestCtx context.Context, request mcpRPCMessage) ([]byte, error) {
+		return provider.serverResponse(requestCtx, claimed.Row, request)
+	})
 	if err != nil {
 		return StartNegotiationReceipt{}, err
 	}
@@ -352,7 +354,9 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	if provider.factory.repository.now().UnixNano() >= claimed.Row.Start.LeaseExpiresAtUnixNano {
 		return ProviderStartResult{}, ErrDispatchNotDurable
 	}
-	response, err := provider.transport.Exchange(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, ConnectionRef: claimed.Row.ConnectionRef, MessageJSON: message})
+	response, err := provider.transport.exchangeWithServerRequests(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, ConnectionRef: claimed.Row.ConnectionRef, MessageJSON: message}, func(requestCtx context.Context, request mcpRPCMessage) ([]byte, error) {
+		return provider.serverResponse(requestCtx, claimed.Row, request)
+	})
 	if err != nil {
 		return ProviderStartResult{}, ErrProviderUnavailable
 	}
