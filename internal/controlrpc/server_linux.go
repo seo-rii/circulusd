@@ -35,6 +35,7 @@ const (
 	sessionRandomBytes         = 16
 	sessionPayloadBytes        = 1 + 4 + 4 + 8 + sessionRandomBytes
 	controlHTTPIOTimeout       = 5 * time.Second
+	controlShutdownTimeout     = 5 * time.Second
 	maximumRequestDeadline     = 5 * time.Minute
 )
 
@@ -70,6 +71,8 @@ type Server struct {
 	close      sync.Once
 	closeError error
 	closed     atomic.Bool
+
+	shutdownTimeout time.Duration
 }
 
 type controlHandler struct {
@@ -229,6 +232,7 @@ func ListenServer(config ServerConfig) (*Server, error) {
 		listener:   listener,
 		handler:    handler,
 	}
+	server.shutdownTimeout = controlShutdownTimeout
 	server.httpServer = &http.Server{
 		Handler:                      routeHandler,
 		ReadTimeout:                  controlHTTPIOTimeout,
@@ -295,7 +299,14 @@ func (server *Server) Close() error {
 	}
 	server.close.Do(func() {
 		server.closed.Store(true)
-		httpError := server.httpServer.Close()
+		// Stop accepting and let in-flight responses finish, then force-close
+		// whatever is still running once the bound expires.
+		shutdownContext, cancel := context.WithTimeout(context.Background(), server.shutdownTimeout)
+		httpError := server.httpServer.Shutdown(shutdownContext)
+		cancel()
+		if errors.Is(httpError, context.DeadlineExceeded) {
+			httpError = server.httpServer.Close()
+		}
 		listenerError := server.listener.Close()
 		if httpError != nil && !errors.Is(httpError, net.ErrClosed) {
 			server.closeError = httpError

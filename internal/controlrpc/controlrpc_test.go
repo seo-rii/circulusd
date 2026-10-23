@@ -1029,6 +1029,126 @@ func TestServerClosePreservesFirstCleanupError(t *testing.T) {
 	}
 }
 
+func TestServerCloseLetsInFlightResponseFinish(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	socketPath := testSocketPath(t)
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  socketPath,
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+		CapabilityProvider: func(context.Context) ([]*v1.CapabilityStatus, error) {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			return []*v1.CapabilityStatus{{
+				Name:         "in.flight",
+				Availability: v1.CapabilityAvailability_CAPABILITY_AVAILABILITY_AVAILABLE,
+			}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	serveError := make(chan error, 1)
+	go func() { serveError <- server.Serve(context.Background()) }()
+	client, err := NewClient(ClientConfig{SocketPath: socketPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	responseError := make(chan error, 1)
+	go func() {
+		_, err := client.GetCapabilities(ctx)
+		responseError <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("capability provider was not reached")
+	}
+
+	closeError := make(chan error, 1)
+	go func() { closeError <- server.Close() }()
+	// Closing the listener unlinks the socket; only then release the response.
+	for {
+		if _, err := os.Lstat(socketPath); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("Close() did not stop accepting connections")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	close(release)
+	if err := <-responseError; err != nil {
+		t.Fatalf("in-flight GetCapabilities() error = %v, want its response", err)
+	}
+	if err := <-closeError; err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := <-serveError; err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+}
+
+func TestServerCloseBoundsGracefulShutdown(t *testing.T) {
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	socketPath := testSocketPath(t)
+	server, err := ListenServer(ServerConfig{
+		SocketPath:  socketPath,
+		AllowedUIDs: []uint32{uint32(os.Getuid())},
+		CapabilityProvider: func(ctx context.Context) ([]*v1.CapabilityStatus, error) {
+			enteredOnce.Do(func() { close(entered) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("ListenServer() error = %v", err)
+	}
+	server.shutdownTimeout = 20 * time.Millisecond
+	serveError := make(chan error, 1)
+	go func() { serveError <- server.Serve(context.Background()) }()
+	client, err := NewClient(ClientConfig{SocketPath: socketPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	responseError := make(chan error, 1)
+	go func() {
+		_, err := client.GetCapabilities(ctx)
+		responseError <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("capability provider was not reached")
+	}
+
+	closeError := make(chan error, 1)
+	go func() { closeError <- server.Close() }()
+	select {
+	case err := <-closeError:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close() did not force-close a stuck request after the shutdown bound")
+	}
+	if err := <-responseError; err == nil {
+		t.Fatal("force-closed request reported success")
+	}
+	if err := <-serveError; err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+}
+
 func TestServerServeReturnsCleanupErrorOnContextCancellation(t *testing.T) {
 	server, err := ListenServer(ServerConfig{
 		SocketPath:  testSocketPath(t),
