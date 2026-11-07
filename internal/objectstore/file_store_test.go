@@ -52,7 +52,17 @@ func TestFileStoreConditionalWriteAndReadAfterWrite(t *testing.T) {
 
 func TestFileStoreConcurrentCASHasExactlyOneWinner(t *testing.T) {
 	t.Parallel()
-	store := newTestFileStore(t)
+	root := t.TempDir()
+	store, err := NewFileStore(root, FileStoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	other, err := NewFileStore(root, FileStoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
 	ctx := context.Background()
 	initial, err := store.PutIfAbsent(ctx, BucketCelldState, "ownership/object-1", []byte("owner-0"))
 	if err != nil {
@@ -63,10 +73,14 @@ func TestFileStoreConcurrentCASHasExactlyOneWinner(t *testing.T) {
 	var wait sync.WaitGroup
 	results := make(chan error, contenders)
 	for contender := range contenders {
+		writer := store
+		if contender%2 != 0 {
+			writer = other
+		}
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			_, err := store.CompareAndSwap(ctx, BucketCelldState, "ownership/object-1", initial, []byte(fmt.Sprintf("owner-%d", contender+1)))
+			_, err := writer.CompareAndSwap(ctx, BucketCelldState, "ownership/object-1", initial, []byte(fmt.Sprintf("owner-%d", contender+1)))
 			results <- err
 		}()
 	}
@@ -86,6 +100,41 @@ func TestFileStoreConcurrentCASHasExactlyOneWinner(t *testing.T) {
 	}
 	if winners != 1 || losers != contenders-1 {
 		t.Fatalf("CAS results = %d winners/%d losers, want 1/%d", winners, losers, contenders-1)
+	}
+}
+
+func TestFileStoreBoundsLockFilesAcrossKeyChurnAndRestart(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+	for generation := range 2 {
+		store, err := NewFileStore(root, FileStoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for index := range 512 {
+			key := fmt.Sprintf("ephemeral-%d-%d", generation, index)
+			etag, err := store.PutIfAbsent(ctx, BucketWorkspaceBlobs, key, []byte("x"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DeleteIfMatch(ctx, BucketWorkspaceBlobs, key, etag); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DeleteIfMatch(ctx, BucketWorkspaceBlobs, "absent-"+key, ETagFor(nil)); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("absent delete: %v", err)
+			}
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		objects, err := os.ReadDir(filepath.Join(root, string(BucketWorkspaceBlobs)))
+		if err != nil || len(objects) != 0 {
+			t.Fatalf("objects after deletion = %d, error = %v", len(objects), err)
+		}
+		locks, err := os.ReadDir(filepath.Join(root, lockDirectory))
+		if err != nil || len(locks) > 256 {
+			t.Fatalf("retained locks after generation %d = %d, error = %v; want at most 256", generation, len(locks), err)
+		}
 	}
 }
 

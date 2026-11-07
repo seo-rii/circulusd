@@ -24,6 +24,13 @@ import (
 func nativeHTTPTestServer(t *testing.T, call http.HandlerFunc, observers ...func()) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if r.Header.Get("MCP-Session-Id") != "private-native-fixture-session" || r.Header.Get("MCP-Protocol-Version") != streamableHTTPProtocol {
+				t.Error("fixture session termination mismatch")
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		for _, observe := range observers {
 			observe()
 		}

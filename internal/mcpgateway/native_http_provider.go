@@ -14,6 +14,7 @@ import (
 	"github.com/hancomac/circulusd/internal/canonical"
 	"github.com/hancomac/circulusd/internal/dependency"
 	"github.com/hancomac/circulusd/internal/identity"
+	"github.com/hancomac/circulusd/internal/pijson"
 )
 
 // Wire state is authoritative only inside the exact native transaction. A
@@ -219,7 +220,9 @@ func (provider *nativeHTTPProvider) Negotiate(ctx context.Context, command Negot
 	}
 	id := nativeWireRequestID("initialize", provider.factory.policyDigest, key)
 	message, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "initialize", "params": map[string]any{"protocolVersion": streamableHTTPProtocol, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "circulusd", "version": "1"}}})
-	response, err := provider.transport.Exchange(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, MessageJSON: message})
+	response, err := provider.transport.exchangeWithServerRequests(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, MessageJSON: message}, func(requestCtx context.Context, request mcpRPCMessage) ([]byte, error) {
+		return provider.serverResponse(requestCtx, claimed.Row, request)
+	})
 	if err != nil {
 		return StartNegotiationReceipt{}, err
 	}
@@ -269,7 +272,13 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	if _, ok := input.(canonical.Map); !ok {
 		return ProviderStartResult{}, ErrInvalidRequest
 	}
-	if !nativeJSONValue(input) {
+	// Canonical arguments retain Pi number wrappers for hashing and storage.
+	// Restore numbers only at the external JSON boundary.
+	input, err = pijson.DecodeValue(input, canonical.DefaultOptions())
+	if err != nil {
+		return ProviderStartResult{}, ErrInvalidRequest
+	}
+	if _, ok := input.(canonical.Map); !ok {
 		return ProviderStartResult{}, ErrInvalidRequest
 	}
 	digest, err := digestCanonicalCall(command.Server.ServerID, command.ToolName, command.InputCanonical)
@@ -340,12 +349,14 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 		return ProviderStartResult{}, failure
 	}
 	if !claimed.Fresh {
-		return nativeRetainedCall(claimed.Row)
+		return provider.retainedCall(claimed.Row)
 	}
 	if provider.factory.repository.now().UnixNano() >= claimed.Row.Start.LeaseExpiresAtUnixNano {
 		return ProviderStartResult{}, ErrDispatchNotDurable
 	}
-	response, err := provider.transport.Exchange(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, ConnectionRef: claimed.Row.ConnectionRef, MessageJSON: message})
+	response, err := provider.transport.exchangeWithServerRequests(ctx, MCPWireRequest{TargetRef: command.Server.TargetRef, ConnectionRef: claimed.Row.ConnectionRef, MessageJSON: message}, func(requestCtx context.Context, request mcpRPCMessage) ([]byte, error) {
+		return provider.serverResponse(requestCtx, claimed.Row, request)
+	})
 	if err != nil {
 		return ProviderStartResult{}, ErrProviderUnavailable
 	}
@@ -391,30 +402,7 @@ func (provider *nativeHTTPProvider) Start(ctx context.Context, command ProviderC
 	if err != nil {
 		return ProviderStartResult{ProviderRequestID: id}, err
 	}
-	return nativeRetainedCall(row)
-}
-
-func nativeJSONValue(value canonical.Value) bool {
-	switch value := value.(type) {
-	case nil, bool, string, int64, uint64:
-		return true
-	case canonical.Array:
-		for _, child := range value {
-			if !nativeJSONValue(child) {
-				return false
-			}
-		}
-		return true
-	case canonical.Map:
-		for _, child := range value {
-			if !nativeJSONValue(child) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
+	return provider.retainedCall(row)
 }
 
 func nativeRetainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
@@ -431,9 +419,10 @@ func nativeRetainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
 }
 
 type nativeHTTPCall struct {
-	mu     sync.Mutex
-	output []byte
-	closed bool
+	mu           sync.Mutex
+	output       []byte
+	closed       bool
+	closeSession func(context.Context) error
 }
 
 func (*nativeHTTPCall) String() string   { return "native-mcp-http-call<redacted>" }
@@ -460,7 +449,31 @@ func (call *nativeHTTPCall) Close(ctx context.Context) error {
 	defer call.mu.Unlock()
 	call.closed = true
 	call.output = nil
+	if call.closeSession != nil {
+		if err := call.closeSession(ctx); err != nil {
+			// Keep the cleanup operation retryable without exposing another
+			// completion or changing the already durable provider result.
+			return err
+		}
+		call.closeSession = nil
+	}
 	return nil
+}
+
+func (provider *nativeHTTPProvider) retainedCall(row nativeWireInvocation) (ProviderStartResult, error) {
+	result, err := nativeRetainedCall(row)
+	if err != nil {
+		return result, err
+	}
+	if row.ConnectionRef != "" {
+		// Bind cleanup separately from reconstructing the immutable result.
+		// Capture only connection identity, not the retained response bytes.
+		target, session := row.Server.TargetRef, row.ConnectionRef
+		result.Call.(*nativeHTTPCall).closeSession = func(ctx context.Context) error {
+			return provider.transport.terminateSession(ctx, target, session)
+		}
+	}
+	return result, nil
 }
 
 func nativeWireLedger(row nativeWireInvocation, scope ValidatedAuthority, digest Digest) LedgerRecord {

@@ -29,11 +29,13 @@ const maximumSharedInteger = uint64(9_007_199_254_740_991)
 // configuration. The first single-node profile always selects NsJail with no
 // fallback. Capability availability does not attest kernel qualification.
 type Policy struct {
-	TenantID                identity.ID
-	Architecture            environment.Architecture
-	Mode                    executor.DeploymentMode
-	AllowedBackends         []executor.Backend
-	HostCapabilities        []executor.Capability
+	TenantID         identity.ID
+	Architecture     environment.Architecture
+	Mode             executor.DeploymentMode
+	AllowedBackends  []executor.Backend
+	HostCapabilities []executor.Capability
+	// MinimumIsolation applies to the Agent process. Native tool backends are
+	// selected separately by AllowedBackends and the signed registry records.
 	MinimumIsolation        extensionregistry.Isolation
 	AuthorizationGeneration uint64
 	PolicyGeneration        uint64
@@ -189,14 +191,10 @@ func (planner *Planner) Plan(ctx context.Context, request Request) (Plan, error)
 }
 
 func (planner *Planner) selection(artifacts []executor.Backend) executor.BackendSelection {
-	minimum := executor.IsolationSharedKernel
-	if planner.policy.MinimumIsolation.OuterIsolation == extensionregistry.OuterIsolationFirecracker {
-		minimum = executor.IsolationMicroVM
-	}
 	return executor.BackendSelection{Mode: planner.policy.Mode, ToolOrSession: executor.BackendNsJail,
 		ServerAllowed: planner.policy.AllowedBackends, RegistryAllowed: []executor.Backend{executor.BackendNsJail},
 		ExtensionSupported: []executor.Backend{executor.BackendNsJail}, EnvironmentArtifacts: artifacts,
-		HostCapabilities: planner.policy.HostCapabilities, MinimumIsolation: minimum,
+		HostCapabilities: planner.policy.HostCapabilities, MinimumIsolation: executor.IsolationSharedKernel,
 		Fallback: executor.BackendFallbackPolicy{Mode: executor.FallbackDisabled}}
 }
 

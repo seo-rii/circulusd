@@ -37,6 +37,7 @@ type Supervisor struct {
 	replayLimitEvents int
 	subscriberBuffer  int
 	readChunkBytes    int
+	attachmentSlots   chan struct{}
 
 	nextRecordID uint64
 	processes    map[uint64]*processRecord
@@ -95,6 +96,7 @@ type eventSubscriber struct {
 	done     chan error
 	closed   chan struct{}
 	finished bool
+	released bool
 }
 
 // NewSupervisor validates and snapshots trusted launch configuration.
@@ -118,6 +120,12 @@ func NewSupervisor(config Config) (*Supervisor, error) {
 	if config.ReplayLimitBytes <= 0 || config.ReplayLimitEvents <= 0 ||
 		config.SubscriberBuffer <= 0 || config.ReadChunkBytes <= 0 {
 		return nil, fmt.Errorf("%w: stream limits must be positive", ErrInvalidConfig)
+	}
+	if config.MaximumAttachments < 0 {
+		return nil, fmt.Errorf("%w: maximum attachments must not be negative", ErrInvalidConfig)
+	}
+	if config.MaximumAttachments == 0 {
+		config.MaximumAttachments = 64
 	}
 
 	commands := make(map[string]string, len(config.Commands))
@@ -145,6 +153,7 @@ func NewSupervisor(config Config) (*Supervisor, error) {
 		replayLimitEvents: config.ReplayLimitEvents,
 		subscriberBuffer:  config.SubscriberBuffer,
 		readChunkBytes:    config.ReadChunkBytes,
+		attachmentSlots:   make(chan struct{}, config.MaximumAttachments),
 		processes:         make(map[uint64]*processRecord),
 		requests:          make(map[string]spawnIdentity),
 		processIDs:        make(map[string]spawnIdentity),
@@ -486,6 +495,14 @@ func (supervisor *Supervisor) Attach(
 		record.mu.Unlock()
 		return nil, ErrReplayUnavailable
 	}
+	// Reserve before copying replay. A terminal stream still owns its queued
+	// bytes, so completion alone must not release this global capacity slot.
+	select {
+	case supervisor.attachmentSlots <- struct{}{}:
+	default:
+		record.mu.Unlock()
+		return nil, ErrAttachmentLimit
+	}
 	replay := make([]ProcessEvent, 0, len(record.replay))
 	for _, event := range record.replay {
 		if event.Sequence > afterSequence {
@@ -513,9 +530,7 @@ func (supervisor *Supervisor) Attach(
 		Events: subscriber.events,
 		Done:   subscriber.done,
 		close: func() {
-			record.mu.Lock()
-			supervisor.finishSubscriber(record, subscriber, nil)
-			record.mu.Unlock()
+			supervisor.closeAttachment(record, subscriber, nil)
 		},
 	}
 	if ctx.Done() != nil {
@@ -527,13 +542,27 @@ func (supervisor *Supervisor) Attach(
 func (supervisor *Supervisor) watchAttachment(ctx context.Context, record *processRecord, subscriber *eventSubscriber) {
 	select {
 	case <-ctx.Done():
-		record.mu.Lock()
-		supervisor.finishSubscriber(record, subscriber, ctx.Err())
-		record.mu.Unlock()
+		supervisor.closeAttachment(record, subscriber, ctx.Err())
 	case <-subscriber.closed:
-		// The public done channel carries the caller's one terminal error.
-		// Internal observers use a separate broadcast without consuming it.
+		// Close releases the queued data and capacity, independently of when
+		// the process finishes or the caller reads the terminal error.
 	}
+}
+
+func (supervisor *Supervisor) closeAttachment(record *processRecord, subscriber *eventSubscriber, err error) {
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if subscriber.released {
+		return
+	}
+	supervisor.finishSubscriber(record, subscriber, err)
+	// Empty the closed queue before reusing its slot. Merely closing the
+	// channel leaves copied payloads retained by callers holding Attachment.
+	for range subscriber.events {
+	}
+	subscriber.released = true
+	close(subscriber.closed)
+	<-supervisor.attachmentSlots
 }
 
 // WriteStdin serializes writes so each call remains contiguous. A failed or
@@ -838,5 +867,4 @@ func (supervisor *Supervisor) finishSubscriber(
 		subscriber.done <- err
 	}
 	close(subscriber.done)
-	close(subscriber.closed)
 }

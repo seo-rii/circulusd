@@ -61,6 +61,10 @@ class PullDrivenAgentIterator implements AsyncIterableIterator<AgentEvent> {
   #pull: ReturnType<typeof Promise.withResolvers<IteratorResult<AgentEvent>>> | null = null;
   #resumeProducer: (() => void) | null = null;
   #producer: Promise<void> | null = null;
+  #pendingTerminal:
+    | { readonly kind: "event"; readonly event: AgentEvent }
+    | { readonly kind: "error"; readonly error: unknown }
+    | null = null;
   #closed = false;
   #finished = false;
 
@@ -87,9 +91,16 @@ class PullDrivenAgentIterator implements AsyncIterableIterator<AgentEvent> {
   }
 
   next(): Promise<IteratorResult<AgentEvent>> {
-    if (this.#closed || this.#finished) {
+    if (this.#closed) {
       return Promise.resolve({ done: true, value: undefined });
     }
+    const terminal = this.#pendingTerminal;
+    this.#pendingTerminal = null;
+    if (terminal?.kind === "event") {
+      return Promise.resolve({ done: false, value: terminal.event });
+    }
+    if (terminal?.kind === "error") return Promise.reject(terminal.error);
+    if (this.#finished) return Promise.resolve({ done: true, value: undefined });
     if (this.#pull !== null) {
       return Promise.reject(
         new PiRuntimeError("STEP_IN_PROGRESS", "concurrent AsyncIterator.next calls are forbidden"),
@@ -114,6 +125,7 @@ class PullDrivenAgentIterator implements AsyncIterableIterator<AgentEvent> {
     const completedAtDurableBoundary = this.#finished;
     this.#closed = true;
     this.#finished = true;
+    this.#pendingTerminal = null;
     const pull = this.#pull;
     this.#pull = null;
     pull?.resolve({ done: true, value: undefined });
@@ -241,16 +253,21 @@ class PullDrivenAgentIterator implements AsyncIterableIterator<AgentEvent> {
       }
     } catch (error) {
       if (this.#closed) return;
-      this.#finished = true;
       await this.#bestEffortAbort();
+      if (this.#closed) return;
+      this.#finished = true;
       const pull = this.#pull;
       this.#pull = null;
-      pull?.reject(error);
+      if (pull === null) this.#pendingTerminal = { kind: "error", error };
+      else pull.reject(error);
+      const resume = this.#resumeProducer;
+      this.#resumeProducer = null;
+      resume?.();
     }
   }
 
   async #publishAndAwaitPull(event: AgentEvent): Promise<void> {
-    if (this.#closed) {
+    if (this.#closed || this.#finished) {
       throw new PiRuntimeError("ENGINE_POISONED", "AgentEvent iteration was closed");
     }
     const pull = this.#pull;
@@ -266,23 +283,23 @@ class PullDrivenAgentIterator implements AsyncIterableIterator<AgentEvent> {
     this.#resumeProducer = () => resumed.resolve();
     pull.resolve({ done: false, value: cloned });
     await resumed.promise;
-    if (this.#closed) {
+    if (this.#closed || this.#finished) {
       throw new PiRuntimeError("ENGINE_POISONED", "AgentEvent iteration was closed");
     }
   }
 
   #finishWithEvent(event: AgentEvent): void {
     const pull = this.#pull;
-    if (pull === null) {
-      throw new PiRuntimeError(
-        "STEP_IN_PROGRESS",
-        "AgentEngine attempted to finish without an AsyncIterator pull",
-      );
-    }
     const cloned = structuredClone(event);
     this.#pull = null;
     this.#finished = true;
-    pull.resolve({ done: false, value: cloned });
+    // A timeout or abort can finish step() while the consumer is still handling
+    // its last delta. Retain that durable boundary until the consumer pulls it.
+    if (pull === null) this.#pendingTerminal = { kind: "event", event: cloned };
+    else pull.resolve({ done: false, value: cloned });
+    const resume = this.#resumeProducer;
+    this.#resumeProducer = null;
+    resume?.();
   }
 
   async #bestEffortAbort(): Promise<void> {

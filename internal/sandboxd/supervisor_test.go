@@ -549,13 +549,14 @@ func newFakeSupervisor(t *testing.T, overrides sandboxd.Config) (*sandboxd.Super
 			SandboxID:  "sandbox-test",
 			Generation: 7,
 		},
-		WorkspaceRoot:     "/trusted/workspace",
-		Commands:          map[string]string{"tool": "/trusted/bin/tool"},
-		Runner:            runner,
-		ReplayLimitBytes:  4096,
-		ReplayLimitEvents: 128,
-		SubscriberBuffer:  16,
-		ReadChunkBytes:    64,
+		MaximumAttachments: overrides.MaximumAttachments,
+		WorkspaceRoot:      "/trusted/workspace",
+		Commands:           map[string]string{"tool": "/trusted/bin/tool"},
+		Runner:             runner,
+		ReplayLimitBytes:   4096,
+		ReplayLimitEvents:  128,
+		SubscriberBuffer:   16,
+		ReadChunkBytes:     64,
 	}
 	if overrides.ReplayLimitBytes != 0 {
 		config.ReplayLimitBytes = overrides.ReplayLimitBytes

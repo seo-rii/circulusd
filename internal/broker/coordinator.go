@@ -61,15 +61,17 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if budget.MaximumWallClock > snapshot.EngineStepLimits.MaximumWallClock {
 		budget.MaximumWallClock = snapshot.EngineStepLimits.MaximumWallClock
 	}
-	if remaining := request.Authority.ExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
-	if remaining := snapshot.LeaseExpiresAt.Sub(request.Now); budget.MaximumWallClock > remaining {
-		budget.MaximumWallClock = remaining
-	}
+	// Budget is part of the durable operation identity. Clamp its absolute
+	// deadline separately so an exact retry cannot change the retained budget.
 	deadline := request.Now.Add(budget.MaximumWallClock)
+	if request.Authority.ExpiresAt.Before(deadline) {
+		deadline = request.Authority.ExpiresAt
+	}
+	if snapshot.LeaseExpiresAt.Before(deadline) {
+		deadline = snapshot.LeaseExpiresAt
+	}
 	permit, err := coordinator.store.AcquireEngineStep(ctx, AcquireStepCommand{
-		Snapshot: snapshot, Now: request.Now, Budget: budget, OperationKey: request.OperationKey,
+		Snapshot: snapshot, Now: request.Now, Budget: budget, AbsoluteDeadline: deadline, OperationKey: request.OperationKey,
 	})
 	if err != nil {
 		return EngineStepPermit{}, fmt.Errorf("acquire durable engine step: %w", err)
@@ -77,7 +79,9 @@ func (coordinator *Coordinator) AcquireEngineStep(ctx context.Context, request E
 	if !permit.Durable {
 		return EngineStepPermit{}, ErrDurabilityBarrier
 	}
-	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !permit.Deadline.Equal(deadline) {
+	// Exact retries return the original grant, whose deadline does not move
+	// with request.Now. It must still be live and within this admission's bound.
+	if permit.Opaque == "" || permit.TenantID != snapshot.TenantID || permit.WorkspaceID != snapshot.WorkspaceID || permit.UserID != snapshot.UserID || permit.OperationKey != request.OperationKey || permit.SessionID != snapshot.SessionID || permit.TurnID != snapshot.TurnID || permit.Generations != snapshot.Generations || permit.ExpectedEventSequence != snapshot.EventSequence || permit.CheckpointDigest != snapshot.CheckpointDigest || permit.Budget != budget || !request.Now.Before(permit.Deadline) || permit.Deadline.After(deadline) {
 		return EngineStepPermit{}, fmt.Errorf("%w: invalid engine-step receipt", ErrFenceMismatch)
 	}
 	if !proto.Equal(permit.Checkpoint, snapshot.Checkpoint) || !proto.Equal(permit.UnconsumedSettlement, snapshot.UnconsumedSettlement) || !bytes.Equal(permit.ResumeSettlement, snapshot.ResumeSettlement) {
@@ -90,7 +94,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if err := ctx.Err(); err != nil {
 		return EngineStepReceipt{}, err
 	}
-	if !request.Permit.Durable || request.Permit.Opaque == "" || request.Permit.TenantID.Kind() != identity.Tenant || request.Permit.WorkspaceID.Kind() != identity.Workspace || request.Permit.UserID.Kind() != identity.Subject || request.Permit.Deadline.IsZero() || request.Now.IsZero() || !request.Now.Before(request.Permit.Deadline) || request.OperationKey == "" || request.RequestDigest == (Digest{}) {
+	if !request.Permit.Durable || request.Permit.Opaque == "" || request.Permit.TenantID.Kind() != identity.Tenant || request.Permit.WorkspaceID.Kind() != identity.Workspace || request.Permit.UserID.Kind() != identity.Subject || request.Permit.Deadline.IsZero() || request.Now.IsZero() || request.OperationKey == "" || request.RequestDigest == (Digest{}) {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
 	if request.Boundary.CheckpointDigest == (Digest{}) {
@@ -99,6 +103,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if request.Boundary.Message != nil && (request.Boundary.Kind != "" || request.Boundary.Effect != nil) {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
+	isTerminalBoundary := false
 	if request.Boundary.Message != nil {
 		if request.Boundary.Message.Checkpoint == nil || request.Boundary.Message.Boundary == nil {
 			return EngineStepReceipt{}, ErrInvalidRequest
@@ -116,10 +121,12 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 			if boundary.TurnComplete == nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = true
 		case *v1.EngineStepBoundary_TurnError:
 			if boundary.TurnError == nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = true
 		default:
 			return EngineStepReceipt{}, ErrInvalidRequest
 		}
@@ -138,6 +145,7 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 			if request.Boundary.Effect != nil {
 				return EngineStepReceipt{}, ErrInvalidRequest
 			}
+			isTerminalBoundary = request.Boundary.Kind != BoundaryCheckpoint
 		default:
 			return EngineStepReceipt{}, ErrInvalidRequest
 		}
@@ -149,11 +157,27 @@ func (coordinator *Coordinator) CommitEngineStep(ctx context.Context, request En
 	if snapshot.TenantID.Kind() != identity.Tenant || snapshot.WorkspaceID.Kind() != identity.Workspace {
 		return EngineStepReceipt{}, ErrInvalidRequest
 	}
-	if snapshot.SessionID != request.Permit.SessionID || snapshot.TurnID != request.Permit.TurnID || snapshot.Generations != request.Permit.Generations {
-		return EngineStepReceipt{}, ErrStaleGeneration
-	}
 	if snapshot.TenantID != request.Permit.TenantID || snapshot.WorkspaceID != request.Permit.WorkspaceID || snapshot.UserID != request.Permit.UserID {
 		return EngineStepReceipt{}, ErrFenceMismatch
+	}
+	if snapshot.SessionID != request.Permit.SessionID || snapshot.Generations.Authorization != request.Permit.Generations.Authorization {
+		return EngineStepReceipt{}, ErrStaleGeneration
+	}
+	if snapshot.TurnID != request.Permit.TurnID || snapshot.Generations != request.Permit.Generations {
+		if !isTerminalBoundary {
+			return EngineStepReceipt{}, ErrStaleGeneration
+		}
+		// A terminal commit may have completed before its reply was lost, even
+		// promoting the next turn. Let the owner replay the exact retained
+		// receipt. This old CAS cannot authorize a fresh commit, so replay is
+		// also safe after the grant deadline; current authorization still holds.
+		snapshot = TurnSnapshot{
+			TenantID: request.Permit.TenantID, WorkspaceID: request.Permit.WorkspaceID, UserID: request.Permit.UserID,
+			SessionID: request.Permit.SessionID, TurnID: request.Permit.TurnID, Generations: request.Permit.Generations,
+			EventSequence: request.Permit.ExpectedEventSequence, CheckpointDigest: request.Permit.CheckpointDigest,
+		}
+	} else if !request.Now.Before(request.Permit.Deadline) {
+		return EngineStepReceipt{}, ErrInvalidRequest
 	}
 	receipt, err := coordinator.store.CommitEngineStep(ctx, CommitStepCommand{
 		Snapshot: snapshot, Permit: request.Permit, Now: request.Now, OperationKey: request.OperationKey,
@@ -638,10 +662,14 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 				}
 				return RecoveryDecision{}, fmt.Errorf("prepare confirmed retry: %w", err)
 			}
-			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
+			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || (preparation.EventSequence != snapshot.EventSequence && preparation.EventSequence-1 != snapshot.EventSequence) || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
+			// A replayed reservation has already advanced the reread snapshot.
+			// Dispatch must compare the original source event, not that new event.
+			dispatchSnapshot := snapshot
+			dispatchSnapshot.EventSequence = preparation.EventSequence - 1
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: dispatchSnapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch confirmed retry: %w", err)
 			}
@@ -765,10 +793,14 @@ func (coordinator *Coordinator) RecoverEffect(ctx context.Context, request Recov
 				}
 				return RecoveryDecision{}, fmt.Errorf("prepare effect retry: %w", err)
 			}
-			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
+			if preparation.EffectKey != key || preparation.Opaque == "" || !preparation.Durable || preparation.EventSequence == 0 || (preparation.EventSequence != snapshot.EventSequence && preparation.EventSequence-1 != snapshot.EventSequence) || preparation.TenantID != snapshot.TenantID || preparation.WorkspaceID != snapshot.WorkspaceID || preparation.UserID != snapshot.UserID || preparation.Service != effect.Service || preparation.Operation != effect.Operation || preparation.ParentOperationID != effect.ParentOperationID || preparation.ParentOperation != effect.ParentOperation || preparation.Ordinal != effect.Ordinal || preparation.ReplayPolicy != effect.ReplayPolicy || preparation.DispatchAttempt != effect.DispatchAttempt+1 || preparation.Generations != snapshot.Generations || !preparation.Deadline.Equal(request.Deadline) {
 				return RecoveryDecision{}, fmt.Errorf("%w: invalid retry preparation", ErrFenceMismatch)
 			}
-			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: snapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
+			// A replayed reservation has already advanced the reread snapshot.
+			// Dispatch must compare the original source event, not that new event.
+			dispatchSnapshot := snapshot
+			dispatchSnapshot.EventSequence = preparation.EventSequence - 1
+			permit, err := coordinator.store.MarkDispatched(ctx, MarkDispatchedCommand{Snapshot: dispatchSnapshot, Key: key, Service: effect.Service, Operation: effect.Operation, OperationKey: request.OperationKey, OperationDigest: request.OperationDigest, PreparationPermit: preparation, ProviderRequestID: request.ProviderRequestID, ProviderRouteDigest: request.ProviderRouteDigest, Now: request.Now, Deadline: request.Deadline})
 			if err != nil {
 				return RecoveryDecision{}, fmt.Errorf("dispatch effect retry: %w", err)
 			}

@@ -27,6 +27,7 @@ var (
 	ErrReplayUnavailable  = errors.New("requested process event replay is unavailable")
 	ErrInvalidCursor      = errors.New("invalid process event cursor")
 	ErrOutputBackpressure = errors.New("process event subscriber exceeded its buffer")
+	ErrAttachmentLimit    = errors.New("sandbox process attachment capacity exhausted")
 	ErrInvalidSignal      = errors.New("invalid process signal")
 	ErrInvalidGeneration  = errors.New("generation must increase monotonically")
 )
@@ -123,6 +124,10 @@ type Config struct {
 	ReplayLimitEvents int
 	SubscriberBuffer  int
 	ReadChunkBytes    int
+
+	// MaximumAttachments bounds outstanding attachments across all processes,
+	// including completed replay streams until Close. Zero selects 64.
+	MaximumAttachments int
 }
 
 // ProcessSignal always targets the runner's process group abstraction.
@@ -217,6 +222,8 @@ type SpawnResult struct {
 
 // Attachment is a bounded event stream. A slow client is disconnected with
 // ErrOutputBackpressure on Done and can reconnect using its last sequence.
+// Call Close even after Events ends to release the attachment's capacity.
+// Close discards any unread events; retained process history can be replayed.
 type Attachment struct {
 	Events <-chan ProcessEvent
 	Done   <-chan error

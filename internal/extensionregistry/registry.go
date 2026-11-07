@@ -107,11 +107,12 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 		if minimum != record.Assessment.MinimumIsolation {
 			return nil, fmt.Errorf("%w at index %d: trust class %q requires at least %#v", ErrInvalidRecord, index, record.Assessment.TrustClass, baseline)
 		}
-		finalMinimum := joinIsolation(record.Revision.RequestedMinimumIsolation, record.Assessment.MinimumIsolation)
+		// Agent process isolation is joined into the compiled runtime. It does
+		// not restrict the independently assessed native tool backend set.
 		hasUsableBackend := false
 		for _, supported := range record.Revision.SupportedBackends {
 			for _, allowed := range record.Assessment.AllowedExecutionBackends {
-				if supported == allowed && backendSatisfies(supported, finalMinimum.OuterIsolation) {
+				if supported == allowed {
 					hasUsableBackend = true
 					break
 				}
@@ -121,7 +122,7 @@ func New(roots TrustRoots, records []SignedRevision, resolver EnvironmentResolve
 			}
 		}
 		if !hasUsableBackend {
-			return nil, fmt.Errorf("%w at index %d: no mutually permitted backend satisfies the final minimum isolation", ErrInvalidRecord, index)
+			return nil, fmt.Errorf("%w at index %d: no mutually permitted native execution backend", ErrInvalidRecord, index)
 		}
 
 		coordinate := record.Revision.ID + "\x00" + record.Revision.Version

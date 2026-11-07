@@ -160,15 +160,26 @@ func (store *Store) AcquireEngineStep(ctx context.Context, command broker.Acquir
 	if err != nil {
 		return broker.EngineStepPermit{}, err
 	}
-	now, err := millis(command.Now)
-	if err != nil {
+	if _, err := millis(command.Now); err != nil {
 		return broker.EngineStepPermit{}, err
 	}
 	budget, err := budgetValue(command.Budget)
 	if err != nil || command.Budget.MaximumEvents != 1 || command.Budget.MaximumEphemeralBytes > store.limits.MaximumEphemeralBytes || command.Budget.MaximumWallClock > store.limits.MaximumWallClock {
 		return broker.EngineStepPermit{}, broker.ErrInvalidRequest
 	}
-	body["nowUnixMs"], body["budget"] = now, budget
+	if !command.Now.Before(command.AbsoluteDeadline) || command.AbsoluteDeadline.After(command.Now.Add(command.Budget.MaximumWallClock)) || command.AbsoluteDeadline.After(command.Snapshot.LeaseExpiresAt) {
+		return broker.EngineStepPermit{}, broker.ErrInvalidRequest
+	}
+	// The owner derives deadline = nowUnixMs + budget and permits a past
+	// nowUnixMs. Encode the budget-window anchor, not issuance time, so its
+	// existing wire contract enforces our shorter absolute deadline without
+	// changing budget (which, unlike nowUnixMs, is part of replay identity).
+	// Trusted transaction time still governs owner authority, lease and expiry.
+	anchor, err := millis(command.AbsoluteDeadline.Add(-command.Budget.MaximumWallClock))
+	if err != nil {
+		return broker.EngineStepPermit{}, err
+	}
+	body["nowUnixMs"], body["budget"] = anchor, budget
 	value, err := store.call(ctx, "acquire-step", body)
 	if err != nil {
 		return broker.EngineStepPermit{}, err

@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/pijson"
 )
 
 const maximumSessionPiResultBytes = 1 << 20
@@ -94,7 +95,7 @@ func ValidateSessionPiResult(encodedLedgerResult, normalizedCBOR []byte) ([]byte
 			return nil, ErrInvalidRequest
 		}
 		number, parseErr := strconv.ParseFloat(decimal, 64)
-		encoded, encodeErr := piNumberDecimal(number)
+		encoded, encodeErr := pijson.NumberDecimal(number)
 		if parseErr != nil || encodeErr != nil || math.Signbit(number) || encoded != decimal {
 			return nil, ErrInvalidRequest
 		}

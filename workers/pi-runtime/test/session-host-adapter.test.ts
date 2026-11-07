@@ -18,7 +18,7 @@ import { genesis, identity, successSettlement } from "./helpers.ts";
 
 const authorityBytes = () => new Uint8Array([31, 41, 59]);
 
-function makeHost(): SessionHost {
+function makeHost(maximumEphemeralDeliveryMs = 1_000): SessionHost {
   const scoped = (service: string) => ({ scope: "adapter-test", service });
   const bindings: BrokerBindings = {
     STATE: scoped("state"),
@@ -31,6 +31,7 @@ function makeHost(): SessionHost {
   };
   return new SessionHost({
     bindings,
+    limits: { maximumEphemeralDeliveryMs },
     loader: { get: async () => ({}) },
     verifier: {
       verify: async () => ({
@@ -42,6 +43,84 @@ function makeHost(): SessionHost {
 }
 
 describe("LowLevelPiAgentEngine SessionHost adapter", () => {
+  it("commits the timeout boundary produced while the sink is still handling a delta", async () => {
+    const engine = new LowLevelPiAgentEngine(identity("session_slow_sink"), () => ({
+      async advance() {
+        return { kind: "turn_complete", state: null, result: null, assistantDeltas: ["first"] };
+      },
+    }), { budgets: { maxWallClockMs: 25 } });
+    const checkpoint = await genesis(engine);
+    const committed: DurableAgentEvent[] = [];
+    const result = await makeHost(250).startTurn(new LowLevelPiSessionHostAdapter(engine), {
+      turnId: checkpoint.turnId,
+      authority: authorityBytes(),
+      checkpoint,
+      maximumEvents: 4,
+      ephemeralSink: { emit: async () => { await new Promise((resolve) => setTimeout(resolve, 100)); } },
+      committer: { commit: async (event) => { committed.push(event); } },
+    });
+    expect(result.boundary).toMatchObject({ type: "turn_error", error: { code: "STEP_TIMEOUT" } });
+    expect(committed).toHaveLength(1);
+    expect(committed[0]).toMatchObject({ type: "turn_error", checkpoint: { checkpointSequence: 1 } });
+  });
+
+  it.each(["stalled", "rejected", "throws"] as const)(
+    "continues to a durable boundary after an ephemeral sink %s",
+    async (failure) => {
+      const engine = new LowLevelPiAgentEngine(identity(`session_sink_${failure}`), () => ({
+        async advance() {
+          return { kind: "turn_complete", state: null, result: { ok: true }, assistantDeltas: ["first", "second"] };
+        },
+      }));
+      const checkpoint = await genesis(engine);
+      let deliveries = 0;
+      const committed: DurableAgentEvent[] = [];
+      const result = await makeHost(10).startTurn(new LowLevelPiSessionHostAdapter(engine), {
+        turnId: checkpoint.turnId,
+        authority: authorityBytes(),
+        checkpoint,
+        maximumEvents: 4,
+        ephemeralSink: {
+          emit: () => {
+            deliveries += 1;
+            if (failure === "throws") throw new Error("disconnected");
+            if (failure === "rejected") return Promise.reject(new Error("disconnected"));
+            return new Promise<void>(() => {});
+          },
+        },
+        committer: { commit: async (event) => { committed.push(event); } },
+      });
+      expect(result.boundary).toMatchObject({ type: "turn_complete", result: { ok: true } });
+      expect(committed).toHaveLength(1);
+      expect(deliveries).toBe(1);
+    },
+  );
+
+  it("retains a producer failure that arrives between iterator pulls", async () => {
+    const source = new LowLevelPiAgentEngine(identity("session_pending_error"), () => ({
+      async advance() { return { kind: "turn_complete", state: null, result: null }; },
+    }));
+    const checkpoint = await genesis(source);
+    const fail = Promise.withResolvers<void>();
+    const fault = new Error("producer failed while consumer was paused");
+    const engine = {
+      async step(context: EngineStepContext) {
+        void Promise.resolve(context.emitDelta?.("delta")).catch(() => undefined);
+        await fail.promise;
+        throw fault;
+      },
+      async abortTurn() {},
+    };
+    const iterator = new LowLevelPiSessionHostAdapter(engine).startTurn({
+      turnId: checkpoint.turnId, executionId: "exec_pending_error", authority: authorityBytes(), checkpoint,
+    })[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ done: false, value: { type: "assistant_delta" } });
+    fail.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(iterator.next()).rejects.toBe(fault);
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
+  });
+
   it("rendezvous-backpressures assistant deltas and commits the checkpointed effect atomically", async () => {
     const factory: AgentCoreFactory = () => ({
       async advance(context) {

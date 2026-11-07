@@ -83,8 +83,47 @@ func TestSignedEnvironmentBindsSessionSandboxAndDeclarativeLaunch(t *testing.T) 
 	}
 }
 
+func TestPlanKeepsAgentAndNativeIsolationIndependent(t *testing.T) {
+	for _, source := range []string{"policy", "extension", "assessment"} {
+		t.Run(source, func(t *testing.T) {
+			f := newFixture(t)
+			switch source {
+			case "policy":
+				f.policy.MinimumIsolation.OuterIsolation = extensionregistry.OuterIsolationFirecracker
+			case "extension":
+				f.records[0].Revision.RequestedMinimumIsolation.OuterIsolation = extensionregistry.OuterIsolationFirecracker
+				f.sign(t, 0)
+			case "assessment":
+				f.records[0].Assessment.MinimumIsolation.OuterIsolation = extensionregistry.OuterIsolationFirecracker
+				f.sign(t, 0)
+			}
+			planner, err := sessionplan.New(f.registry(t), f.policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := planner.Plan(context.Background(), f.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := plan.RuntimeRevision()
+			if runtime.MinimumIsolation.OuterIsolation != extensionregistry.OuterIsolationFirecracker ||
+				runtime.MinimumIsolation.ProcessScope != extensionregistry.ProcessScopeSession {
+				t.Fatalf("Agent minimum was weakened: %#v", runtime.MinimumIsolation)
+			}
+			ensure, err := plan.EnsureRequest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.Backend != environment.BackendNsJail || ensure.Spec.Backend != executor.BackendNsJail ||
+				plan.SessionBinding().Backend != executor.BackendNsJail {
+				t.Fatal("Agent isolation changed the independently selected native backend")
+			}
+		})
+	}
+}
+
 func TestPlanningFailuresCannotProduceAnAdmissionOrProviderRequest(t *testing.T) {
-	for _, name := range []string{"version conflict", "missing rootfs", "missing capability", "development capability", "microvm required", "unknown extension", "foreign identity", "raw rootfs", "canceled", "unsigned revision"} {
+	for _, name := range []string{"version conflict", "missing rootfs", "missing capability", "development capability", "native backend denied", "unknown extension", "foreign identity", "raw rootfs", "canceled", "unsigned revision"} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -102,8 +141,8 @@ func TestPlanningFailuresCannotProduceAnAdmissionOrProviderRequest(t *testing.T)
 				f.policy.HostCapabilities[0].UnavailableReason = "not provisioned"
 			case "development capability":
 				f.policy.HostCapabilities[0].DevelopmentOnly = true
-			case "microvm required":
-				f.policy.MinimumIsolation.OuterIsolation = extensionregistry.OuterIsolationFirecracker
+			case "native backend denied":
+				f.policy.AllowedBackends = []executor.Backend{executor.BackendFirecracker}
 			case "unknown extension":
 				f.request.Selections[0].Version = "9.9.9"
 			case "foreign identity":

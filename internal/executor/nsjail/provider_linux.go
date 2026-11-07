@@ -620,7 +620,11 @@ func (provider *Provider) Stop(ctx context.Context, handle executor.SandboxHandl
 			return attempt.err
 		}
 
+		// Authority refresh may replace this context while the record is
+		// draining. Cancel its current value under the same mutex as Ensure.
+		provider.mu.Lock()
 		record.cancelOperations()
+		provider.mu.Unlock()
 		go func() {
 			killErr := record.runtime.instance.Kill(context.Background())
 			if killErr == nil {
