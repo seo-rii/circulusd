@@ -211,3 +211,16 @@ func TestXTextComposesEveryPrimaryComposite(t *testing.T) {
 		}
 	}
 }
+
+// The integrity guard and version pin must be used together by non-CBOR callers.
+func TestNormalizeNFCPreservesPinnedProtocolVectors(t *testing.T) {
+	t.Parallel()
+	for _, vector := range loadCanonicalTextFixture(t).Text {
+		input := string(mustDecodeHex(t, vector.InputHex))
+		want := string(mustDecodeHex(t, vector.CanonicalHex))
+		got, err := NormalizeNFC(input)
+		if err != nil || got != want {
+			t.Errorf("%s: NormalizeNFC() = %q, %v; want %q", vector.Name, got, err, want)
+		}
+	}
+}

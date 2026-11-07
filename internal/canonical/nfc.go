@@ -7,7 +7,8 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-// NormalizeNFC returns text in NFC. It fails closed with ErrInvalidValue when
+// NormalizeNFC returns text in Unicode 15.0.0 NFC, matching NormalizeText and
+// the TypeScript protocol. It fails closed with ErrInvalidValue when
 // the result of golang.org/x/text NFC is not canonically equivalent to text.
 //
 // x/text inserts U+034F after 30 consecutive non-starters (the stream-safe
