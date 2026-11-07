@@ -46,6 +46,11 @@ var (
 	// symlink target.
 	ErrInvalidEntry = errors.New("invalid workspace entry")
 
+	// ErrInvalidSymlink identifies an invalid symlink entry or an unsafe
+	// symlink target. It wraps ErrInvalidEntry and has the same text, so
+	// errors.Is matches both and messages are unchanged.
+	ErrInvalidSymlink = fmt.Errorf("%w", ErrInvalidEntry)
+
 	// ErrInvalidTree identifies a missing or non-directory parent entry.
 	ErrInvalidTree = errors.New("invalid workspace tree")
 )
@@ -196,14 +201,14 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if entry.Size != 0 || entry.ContentDigest != "" {
 				return nil, fmt.Errorf(
 					"%w: symlink %q contains file metadata",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 				)
 			}
 			if !utf8.ValidString(entry.SymlinkTarget) {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target is not valid UTF-8",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 				)
 			}
@@ -214,7 +219,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				path.IsAbs(entry.SymlinkTarget) {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target %q is not a safe relative path",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					entry.SymlinkTarget,
 				)
@@ -222,7 +227,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if len(entry.SymlinkTarget) > MaxPathBytes {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target is longer than %d bytes",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					MaxPathBytes,
 				)
@@ -231,7 +236,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				if component != "." && component != ".." && len(component) > MaxComponentBytes {
 					return nil, fmt.Errorf(
 						"%w: symlink %q target component %q is longer than %d bytes",
-						ErrInvalidEntry,
+						ErrInvalidSymlink,
 						entry.Path,
 						component,
 						MaxComponentBytes,
@@ -239,7 +244,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				}
 				for _, character := range component {
 					if unicode.IsControl(character) {
-						return nil, fmt.Errorf("%w: symlink %q target contains a control character", ErrInvalidEntry, entry.Path)
+						return nil, fmt.Errorf("%w: symlink %q target contains a control character", ErrInvalidSymlink, entry.Path)
 					}
 				}
 			}
@@ -261,7 +266,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if resolvedTarget == ".." || strings.HasPrefix(resolvedTarget, "../") {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target %q escapes the workspace",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					entry.SymlinkTarget,
 				)
@@ -331,11 +336,11 @@ func validateSymlinkTraversal(entries []Entry) error {
 		}
 		switch traversal.resolve(index + 1) {
 		case linkEscapes:
-			return fmt.Errorf("%w: symlink %q target escapes through symlink traversal", ErrInvalidEntry, entry.Path)
+			return fmt.Errorf("%w: symlink %q target escapes through symlink traversal", ErrInvalidSymlink, entry.Path)
 		case linkExceeds:
-			return fmt.Errorf("%w: symlink %q exceeds %d link expansions", ErrInvalidEntry, entry.Path, maxSymlinkExpansions)
+			return fmt.Errorf("%w: symlink %q exceeds %d link expansions", ErrInvalidSymlink, entry.Path, maxSymlinkExpansions)
 		case linkOverBudget:
-			return fmt.Errorf("%w: symlink %q exceeds the symlink traversal work budget", ErrInvalidEntry, entry.Path)
+			return fmt.Errorf("%w: symlink %q exceeds the symlink traversal work budget", ErrInvalidSymlink, entry.Path)
 		}
 	}
 	return nil
