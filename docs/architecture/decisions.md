@@ -120,7 +120,7 @@ sha256(
 )
 ```
 
-External text is NFC UTF-8. Floating-point values, NaN, infinity, unknown fields, and duplicate normalized keys are rejected. Schema-defined sets are sorted by UTF-8 bytes; sequences preserve order. Digests use `sha256:` plus lowercase hexadecimal.
+External text is NFC UTF-8, with NFC pinned to Unicode 15.0.0. Code points unassigned in Unicode 15.0.0 are normalization boundaries: Go and TypeScript normalize only the text between them, so canonical bytes do not depend on the runtime's Unicode version. A runtime older than Unicode 15.0.0 cannot produce canonical text. `scripts/generate-unicode15-table.py` generates the code point table for both languages from `DerivedAge-15.0.0.txt`. Floating-point values, NaN, infinity, unknown fields, and duplicate normalized keys are rejected. Schema-defined sets are sorted by UTF-8 bytes; sequences preserve order. Digests use `sha256:` plus lowercase hexadecimal.
 
 Workspace tree entries exclude inode, uid, gid, and timestamps. Modes normalize to `0644` or `0755` for files, `0755` for directories, and `0777` for symlinks. Flat and directory-object representations calculate the same logical root digest.
 

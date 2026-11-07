@@ -1,7 +1,7 @@
 import { encodeCanonicalCbor, normalizeProtocolValue } from "./cbor.ts";
 import { digestBytes, parseDigest } from "./digest.ts";
 import { validationError } from "./errors.ts";
-import { assertUnicodeScalarString } from "./text.ts";
+import { assertUnicodeScalarString, isCanonicalText } from "./text.ts";
 import {
   EFFECT_SERVICES,
   PROTOCOL_MAJOR,
@@ -85,7 +85,7 @@ function nfcString(
     validationError(path, "must be a string");
   }
   assertUnicodeScalarString(value, path);
-  if (value !== value.normalize("NFC")) {
+  if (!isCanonicalText(value)) {
     validationError(path, "must be NFC-normalized");
   }
   if (options.allowEmpty !== true && value.length === 0) {

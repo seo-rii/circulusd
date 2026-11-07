@@ -2,6 +2,7 @@ import {
   decodeCanonicalCbor, encodeCanonicalCbor, normalizeProtocolValue,
 } from "./cbor.ts";
 import { digestBytes, digestStructuredValue, parseDigest } from "./digest.ts";
+import { isCanonicalText } from "./text.ts";
 import type { AgentCheckpoint, Digest, NormalizedValue } from "./types.ts";
 import { PI_EXECUTION_CAPACITY as BUDGET } from "./execution-capacity.ts";
 
@@ -71,7 +72,7 @@ function natural(value: unknown, minimum = 0): number {
   return value;
 }
 function text(value: unknown, nonempty = false): string {
-  if (typeof value !== "string" || (nonempty && value.length === 0) || value !== value.normalize("NFC")) fail("invalid conversation string");
+  if (typeof value !== "string" || (nonempty && value.length === 0) || !isCanonicalText(value)) fail("invalid conversation string");
   // Existing canonical normalizer rejects non-scalar strings before any copy.
   return value;
 }

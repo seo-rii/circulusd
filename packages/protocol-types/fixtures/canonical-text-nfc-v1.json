@@ -1,0 +1,172 @@
+{
+  "format": "circulusd.canonical-text-nfc.v1-golden",
+  "description": "Canonical text is NFC as defined by Unicode 15.0.0. Code points unassigned in Unicode 15.0.0 are normalization boundaries on every runtime.",
+  "unicodeVersion": "15.0.0",
+  "unassignedRangesSha256": "452cf5ca157b02b84db4676a1b8e0c19a3b3d9737369500835ed7acebef40b5f",
+  "text": [
+    {
+      "name": "ascii",
+      "inputHex": "616263",
+      "canonicalHex": "616263",
+      "decode": "accept"
+    },
+    {
+      "name": "composed-latin",
+      "inputHex": "c3a9",
+      "canonicalHex": "c3a9",
+      "decode": "accept"
+    },
+    {
+      "name": "decomposed-latin",
+      "inputHex": "65cc81",
+      "canonicalHex": "c3a9",
+      "decode": "reject"
+    },
+    {
+      "name": "hangul-jamo",
+      "inputHex": "e18480e185a1e186a8",
+      "canonicalHex": "eab081",
+      "decode": "reject"
+    },
+    {
+      "name": "singleton-decomposition",
+      "inputHex": "e284ab",
+      "canonicalHex": "c385",
+      "decode": "reject"
+    },
+    {
+      "name": "composition-exclusion",
+      "inputHex": "e0a598",
+      "canonicalHex": "e0a495e0a4bc",
+      "decode": "reject"
+    },
+    {
+      "name": "mark-reorder-and-compose",
+      "inputHex": "61cc81cca3",
+      "canonicalHex": "e1baa1cc81",
+      "decode": "reject"
+    },
+    {
+      "name": "unicode15-mark-reorders",
+      "inputHex": "cc80f090bbbd",
+      "canonicalHex": "f090bbbdcc80",
+      "decode": "reject"
+    },
+    {
+      "name": "unicode16-todhri-decomposed",
+      "inputHex": "f0909792cc87",
+      "canonicalHex": "f0909792cc87",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-todhri-precomposed",
+      "inputHex": "f0909789",
+      "canonicalHex": "f0909789",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-arabic-mark-is-boundary",
+      "inputHex": "61e0a297cca3",
+      "canonicalHex": "61e0a297cca3",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-boundary-normalizes-both-sides",
+      "inputHex": "61cca3e0a29765cc81",
+      "canonicalHex": "e1baa1e0a297c3a9",
+      "decode": "reject"
+    },
+    {
+      "name": "unicode16-kirat-rai",
+      "inputHex": "f096b5a7f096b5a7",
+      "canonicalHex": "f096b5a7f096b5a7",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-tulu-tigalari",
+      "inputHex": "f0918e82f0918f89",
+      "canonicalHex": "f0918e82f0918f89",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-gurung-khema",
+      "inputHex": "f096849ef096849e",
+      "canonicalHex": "f096849ef096849e",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-emoji",
+      "inputHex": "f09faba9",
+      "canonicalHex": "f09faba9",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode16-emoji-boundary-reorders-before",
+      "inputHex": "cc81cca3f09faba9",
+      "canonicalHex": "cca3cc81f09faba9",
+      "decode": "reject"
+    },
+    {
+      "name": "unicode16-after-decomposed-hangul",
+      "inputHex": "e18480e185a1f0909792cc87",
+      "canonicalHex": "eab080f0909792cc87",
+      "decode": "reject"
+    },
+    {
+      "name": "unicode17-mark-is-boundary",
+      "inputHex": "61e1ab8fcca3",
+      "canonicalHex": "61e1ab8fcca3",
+      "decode": "accept"
+    },
+    {
+      "name": "unicode18-hebrew-mark-is-boundary",
+      "inputHex": "d790d788d6b0",
+      "canonicalHex": "d790d788d6b0",
+      "decode": "accept"
+    },
+    {
+      "name": "unassigned-code-point-is-boundary",
+      "inputHex": "65f1908080cc81",
+      "canonicalHex": "65f1908080cc81",
+      "decode": "accept"
+    },
+    {
+      "name": "private-use-starter",
+      "inputHex": "ee8080cc81",
+      "canonicalHex": "ee8080cc81",
+      "decode": "accept"
+    },
+    {
+      "name": "noncharacters",
+      "inputHex": "efbfbef48fbfbf",
+      "canonicalHex": "efbfbef48fbfbf",
+      "decode": "accept"
+    }
+  ],
+  "maps": [
+    {
+      "name": "nfc-duplicate-keys",
+      "keysHex": [
+        "c3a9",
+        "65cc81"
+      ],
+      "cborHex": null
+    },
+    {
+      "name": "unicode16-forms-are-distinct-keys",
+      "keysHex": [
+        "f0909792cc87",
+        "f0909789"
+      ],
+      "cborHex": "a264f09097890166f0909792cc8700"
+    },
+    {
+      "name": "unicode16-mark-orders-are-distinct-keys",
+      "keysHex": [
+        "61e0a297cca3",
+        "e1baa1e0a297"
+      ],
+      "cborHex": "a26661e0a297cca30066e1baa1e0a29701"
+    }
+  ]
+}
