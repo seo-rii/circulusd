@@ -120,7 +120,9 @@ func (resolver *RecordResolver) ResolveResult(ctx context.Context, request state
 	}
 	record, err := resolver.records.ReadCommittedResult(ctx, request)
 	if err != nil {
-		return stateappbroker.Result{}, recordError(ctx, err)
+		// Keep the fixed record classes (absent, conflicting, fenced) so the
+		// caller and the read route can tell them apart from transport loss.
+		return stateappbroker.Result{}, persistenceError(ctx, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return stateappbroker.Result{}, err

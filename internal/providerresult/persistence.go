@@ -366,7 +366,7 @@ func persistenceError(ctx context.Context, err error) error {
 		return contextErr
 	}
 	for _, safe := range []error{ErrRecordConflict, ErrRecordUnavailable, celld.ErrStorageContract, celld.ErrDurabilityBarrier,
-		broker.ErrFenceMismatch, broker.ErrInvalidRequest, broker.ErrInvalidEffectState, ErrUnsupportedService} {
+		celld.ErrStateTooLarge, broker.ErrFenceMismatch, broker.ErrInvalidRequest, broker.ErrInvalidEffectState, ErrUnsupportedService} {
 		if errors.Is(err, safe) {
 			return safe
 		}

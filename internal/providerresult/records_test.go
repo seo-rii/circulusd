@@ -287,6 +287,18 @@ func TestRecordResolverSanitizesReadAndProbeDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRecordResolverKeepsFixedRecordClasses(t *testing.T) {
+	for _, underlying := range []error{ErrRecordUnavailable, ErrRecordConflict, broker.ErrFenceMismatch} {
+		t.Run(underlying.Error(), func(t *testing.T) {
+			source, resolver := recordsFixture(t, "model_final", false)
+			source.readError = fmt.Errorf("secret implementation details: %w", underlying)
+			if _, err := resolver.ResolveResult(context.Background(), source.record.Request); err != underlying {
+				t.Fatalf("ResolveResult() error = %v, want only %v", err, underlying)
+			}
+		})
+	}
+}
+
 func TestQualifiedRecordResolverNormalizesBeforeNativeHTTPResultRead(t *testing.T) {
 	for _, name := range []string{"model_tool_call", "tool_result"} {
 		t.Run(name, func(t *testing.T) {
