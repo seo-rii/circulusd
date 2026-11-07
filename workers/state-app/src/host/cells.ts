@@ -325,6 +325,10 @@ function assertAuthorizedSessionRead(
     query.now,
     "session.read",
   );
+  // Like admission and broker authority, a Session is readable only by its owner.
+  if (authority.actorUserId !== state.userId) {
+    controlError("PERMISSION_DENIED", "session read authority belongs to another principal");
+  }
   if (authority.currentAuthorizationGeneration !== state.authorizationGeneration) {
     controlError("STALE_GENERATION", "session read authority is stale");
   }

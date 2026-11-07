@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"sort"
 	"unicode/utf8"
-
-	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -91,7 +89,7 @@ func Decode(encoded []byte, options Options) (Value, error) {
 }
 
 func StructuredDigest(domain string, schemaVersion uint64, payload Value) (string, error) {
-	if domain == "" || !utf8.ValidString(domain) || norm.NFC.String(domain) != domain {
+	if domain == "" || !utf8.ValidString(domain) || !isNFC(domain) {
 		return "", fmt.Errorf("%w: digest domain must be non-empty NFC UTF-8", ErrInvalidValue)
 	}
 	if schemaVersion == 0 || schemaVersion > maxSafeInteger {
@@ -115,7 +113,10 @@ func NormalizeStringSet(values []string) ([]string, error) {
 		if !utf8.ValidString(value) {
 			return nil, fmt.Errorf("%w: set value %d is not UTF-8", ErrInvalidValue, index)
 		}
-		value = norm.NFC.String(value)
+		value, err := NormalizeNFC(value)
+		if err != nil {
+			return nil, err
+		}
 		if _, duplicate := seen[value]; duplicate {
 			return nil, fmt.Errorf("%w: %q", ErrDuplicateKey, value)
 		}
@@ -166,7 +167,10 @@ func encode(output *writer, value Value, depth int, maxDepth int) error {
 		if !utf8.ValidString(value) {
 			return fmt.Errorf("%w: text is not UTF-8", ErrInvalidValue)
 		}
-		value = norm.NFC.String(value)
+		value, err := NormalizeNFC(value)
+		if err != nil {
+			return err
+		}
 		if err := output.appendHead(3, uint64(len(value))); err != nil {
 			return err
 		}
@@ -219,7 +223,10 @@ func encode(output *writer, value Value, depth int, maxDepth int) error {
 			if !utf8.ValidString(key) {
 				return fmt.Errorf("%w: map key is not UTF-8", ErrInvalidValue)
 			}
-			key = norm.NFC.String(key)
+			key, err := NormalizeNFC(key)
+			if err != nil {
+				return err
+			}
 			if _, duplicate := seen[key]; duplicate {
 				return fmt.Errorf("%w: %q", ErrDuplicateKey, key)
 			}
@@ -356,7 +363,7 @@ func (input *decoder) readValue(depth int) (Value, error) {
 			return nil, fmt.Errorf("%w: text is not UTF-8", ErrInvalidEncoding)
 		}
 		text := string(value)
-		if norm.NFC.String(text) != text {
+		if !isNFC(text) {
 			return nil, fmt.Errorf("%w: text is not NFC-normalized", ErrInvalidEncoding)
 		}
 		return text, nil

@@ -46,6 +46,11 @@ var (
 	// symlink target.
 	ErrInvalidEntry = errors.New("invalid workspace entry")
 
+	// ErrInvalidSymlink identifies an invalid symlink entry or an unsafe
+	// symlink target. It wraps ErrInvalidEntry and has the same text, so
+	// errors.Is matches both and messages are unchanged.
+	ErrInvalidSymlink = fmt.Errorf("%w", ErrInvalidEntry)
+
 	// ErrInvalidTree identifies a missing or non-directory parent entry.
 	ErrInvalidTree = errors.New("invalid workspace tree")
 )
@@ -82,7 +87,6 @@ type Entry struct {
 func Canonicalize(entries []Entry) ([]Entry, error) {
 	canonical := make([]Entry, len(entries))
 	kinds := make(map[string]EntryType, len(entries))
-	symlinks := make(map[string]string)
 
 	for i, entry := range entries {
 		if !utf8.ValidString(entry.Path) {
@@ -197,14 +201,14 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if entry.Size != 0 || entry.ContentDigest != "" {
 				return nil, fmt.Errorf(
 					"%w: symlink %q contains file metadata",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 				)
 			}
 			if !utf8.ValidString(entry.SymlinkTarget) {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target is not valid UTF-8",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 				)
 			}
@@ -215,7 +219,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				path.IsAbs(entry.SymlinkTarget) {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target %q is not a safe relative path",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					entry.SymlinkTarget,
 				)
@@ -223,7 +227,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if len(entry.SymlinkTarget) > MaxPathBytes {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target is longer than %d bytes",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					MaxPathBytes,
 				)
@@ -232,7 +236,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				if component != "." && component != ".." && len(component) > MaxComponentBytes {
 					return nil, fmt.Errorf(
 						"%w: symlink %q target component %q is longer than %d bytes",
-						ErrInvalidEntry,
+						ErrInvalidSymlink,
 						entry.Path,
 						component,
 						MaxComponentBytes,
@@ -240,7 +244,7 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 				}
 				for _, character := range component {
 					if unicode.IsControl(character) {
-						return nil, fmt.Errorf("%w: symlink %q target contains a control character", ErrInvalidEntry, entry.Path)
+						return nil, fmt.Errorf("%w: symlink %q target contains a control character", ErrInvalidSymlink, entry.Path)
 					}
 				}
 			}
@@ -262,13 +266,12 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 			if resolvedTarget == ".." || strings.HasPrefix(resolvedTarget, "../") {
 				return nil, fmt.Errorf(
 					"%w: symlink %q target %q escapes the workspace",
-					ErrInvalidEntry,
+					ErrInvalidSymlink,
 					entry.Path,
 					entry.SymlinkTarget,
 				)
 			}
 			entry.Mode = 0o777
-			symlinks[entry.Path] = entry.SymlinkTarget
 
 		default:
 			return nil, fmt.Errorf(
@@ -314,12 +317,8 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 		}
 	}
 
-	for _, entry := range canonical {
-		if entry.Type == Symlink {
-			if err := validateSymlinkTraversal(entry, kinds, symlinks); err != nil {
-				return nil, err
-			}
-		}
+	if err := validateSymlinkTraversal(canonical); err != nil {
+		return nil, err
 	}
 
 	return canonical, nil
@@ -328,52 +327,188 @@ func Canonicalize(entries []Entry) ([]Entry, error) {
 // validateSymlinkTraversal follows each link before processing its suffix,
 // including '..'. Missing and non-directory components stop real resolution;
 // their original target spelling is retained so dangling links stay dangling.
-// The expansion limit bounds cycles and the total pending target data.
-func validateSymlinkTraversal(entry Entry, kinds map[string]EntryType, symlinks map[string]string) error {
-	directory := path.Dir(entry.Path)
-	if directory == "." {
-		directory = ""
-	}
-	pending := strings.Split(entry.SymlinkTarget, "/")
-	expansions := 1
-	for len(pending) > 0 {
-		component := pending[0]
-		pending = pending[1:]
-		switch component {
-		case "", ".":
-			continue
-		case "..":
-			if directory == "" {
-				return fmt.Errorf("%w: symlink %q target escapes through symlink traversal", ErrInvalidEntry, entry.Path)
-			}
-			if separator := strings.LastIndexByte(directory, '/'); separator >= 0 {
-				directory = directory[:separator]
-			} else {
-				directory = ""
-			}
+// The expansion limit bounds cycles.
+func validateSymlinkTraversal(entries []Entry) error {
+	traversal := newSymlinkTraversal(entries)
+	for index, entry := range entries {
+		if entry.Type != Symlink {
 			continue
 		}
-		candidate := component
-		if directory != "" {
-			candidate = directory + "/" + component
-		}
-		switch kinds[candidate] {
-		case Symlink:
-			expansions++
-			if expansions > maxSymlinkExpansions {
-				return fmt.Errorf("%w: symlink %q exceeds %d link expansions", ErrInvalidEntry, entry.Path, maxSymlinkExpansions)
-			}
-			pending = append(strings.Split(symlinks[candidate], "/"), pending...)
-		case Directory:
-			directory = candidate
-		default:
-			// A regular file can terminate the target; any remaining suffix
-			// fails with ENOTDIR. An absent entry fails with ENOENT. Neither
-			// case can traverse another component or escape this snapshot.
-			return nil
+		switch traversal.resolve(index + 1) {
+		case linkEscapes:
+			return fmt.Errorf("%w: symlink %q target escapes through symlink traversal", ErrInvalidSymlink, entry.Path)
+		case linkExceeds:
+			return fmt.Errorf("%w: symlink %q exceeds %d link expansions", ErrInvalidSymlink, entry.Path, maxSymlinkExpansions)
+		case linkOverBudget:
+			return fmt.Errorf("%w: symlink %q exceeds the symlink traversal work budget", ErrInvalidSymlink, entry.Path)
 		}
 	}
 	return nil
+}
+
+// linkState is the memoized outcome of resolving one link's own target.
+type linkState uint8
+
+const (
+	linkUnresolved linkState = iota
+	linkResolving
+	linkDirectory
+	linkTerminal
+	linkEscapes
+	linkExceeds
+	linkOverBudget
+)
+
+// traversalNode is one canonical entry; node zero is the implicit root.
+type traversalNode struct {
+	parent     int
+	kind       EntryType
+	target     string
+	state      linkState
+	expansions int
+	directory  int
+}
+
+type traversalChild struct {
+	parent int
+	name   string
+}
+
+// traversalFrame resolves one link's target from the link's parent directory.
+type traversalFrame struct {
+	link       int
+	directory  int
+	offset     int
+	expansions int
+}
+
+// symlinkTraversal resolves the links of one canonical manifest.
+//
+// A link's target is always resolved from the link's parent directory, so its
+// outcome does not depend on how the link was reached. Each link is resolved
+// once and memoized as the directory it reaches or the outcome it stops at,
+// together with the expansions it consumed. Expansions only accumulate, so a
+// traversal reusing that result exceeds the limit exactly when replaying the
+// link would. Every target component is therefore read at most once, and
+// lookups use node ids rather than rebuilt paths; the work budget fails
+// closed should that invariant ever break.
+type symlinkTraversal struct {
+	nodes    []traversalNode
+	children map[traversalChild]int
+	stack    []traversalFrame
+	steps    int
+	budget   int
+}
+
+// newSymlinkTraversal indexes entries, which must be sorted with every parent
+// present as a directory, as nodes one through len(entries).
+func newSymlinkTraversal(entries []Entry) *symlinkTraversal {
+	traversal := &symlinkTraversal{
+		nodes:    make([]traversalNode, len(entries)+1),
+		children: make(map[traversalChild]int, len(entries)),
+	}
+	traversal.nodes[0].kind = Directory
+	ids := make(map[string]int, len(entries))
+	for index, entry := range entries {
+		node := index + 1
+		parent, name := 0, entry.Path
+		if separator := strings.LastIndexByte(entry.Path, '/'); separator >= 0 {
+			parent, name = ids[entry.Path[:separator]], entry.Path[separator+1:]
+		}
+		ids[entry.Path] = node
+		traversal.children[traversalChild{parent: parent, name: name}] = node
+		traversal.nodes[node] = traversalNode{parent: parent, kind: entry.Type, target: entry.SymlinkTarget}
+		if entry.Type == Symlink {
+			traversal.budget += strings.Count(entry.SymlinkTarget, "/") + 1
+		}
+	}
+	return traversal
+}
+
+// resolve returns the outcome of the link node's own target, first resolving
+// every link that the target reaches.
+func (traversal *symlinkTraversal) resolve(node int) linkState {
+	nodes := traversal.nodes
+	if nodes[node].state == linkUnresolved {
+		nodes[node].state = linkResolving
+		traversal.stack = append(traversal.stack, traversalFrame{link: node, directory: nodes[node].parent, expansions: 1})
+	}
+	for len(traversal.stack) > 0 {
+		frame := &traversal.stack[len(traversal.stack)-1]
+		target := nodes[frame.link].target
+		state := linkResolving
+		if frame.offset > len(target) {
+			state = linkDirectory
+		} else {
+			if traversal.steps++; traversal.steps > traversal.budget {
+				return linkOverBudget
+			}
+			end := strings.IndexByte(target[frame.offset:], '/')
+			if end < 0 {
+				end = len(target)
+			} else {
+				end += frame.offset
+			}
+			component := target[frame.offset:end]
+			frame.offset = end + 1
+			switch component {
+			case "", ".":
+			case "..":
+				if frame.directory == 0 {
+					state = linkEscapes
+				} else {
+					frame.directory = nodes[frame.directory].parent
+				}
+			default:
+				child, exists := traversal.children[traversalChild{parent: frame.directory, name: component}]
+				switch {
+				case !exists || nodes[child].kind == File:
+					// A regular file can terminate the target; any remaining suffix
+					// fails with ENOTDIR. An absent entry fails with ENOENT. Neither
+					// case can traverse another component or escape this snapshot.
+					state = linkTerminal
+				case nodes[child].kind == Directory:
+					frame.directory = child
+				case nodes[child].state == linkUnresolved:
+					nodes[child].state = linkResolving
+					traversal.stack = append(traversal.stack, traversalFrame{link: child, directory: nodes[child].parent, expansions: 1})
+				case nodes[child].state == linkResolving:
+					// The link's own target reaches the link again before any
+					// outcome, so expanding it never terminates.
+					state = linkExceeds
+				default:
+					state = frame.follow(&nodes[child])
+				}
+			}
+		}
+		for state != linkResolving {
+			link := &nodes[frame.link]
+			link.state, link.expansions, link.directory = state, frame.expansions, frame.directory
+			traversal.stack = traversal.stack[:len(traversal.stack)-1]
+			if len(traversal.stack) == 0 {
+				break
+			}
+			frame = &traversal.stack[len(traversal.stack)-1]
+			state = frame.follow(link)
+		}
+	}
+	return nodes[node].state
+}
+
+// follow continues frame past a link whose own resolution is known.
+func (frame *traversalFrame) follow(link *traversalNode) linkState {
+	if link.state == linkExceeds {
+		return linkExceeds
+	}
+	frame.expansions += link.expansions
+	if frame.expansions > maxSymlinkExpansions {
+		return linkExceeds
+	}
+	if link.state == linkDirectory {
+		frame.directory = link.directory
+		return linkResolving
+	}
+	return link.state
 }
 
 // Validate checks the expanded flat representation and its logical tree
@@ -392,21 +527,55 @@ func Validate(entries []Entry) error {
 // items. Array/text lengths and unsigned integers use the shortest RFC 8949
 // representation.
 func MarshalCanonical(entries []Entry) ([]byte, error) {
-	canonicalEntries, err := Canonicalize(entries)
+	manifest, err := NewCanonical(entries)
 	if err != nil {
 		return nil, err
 	}
-	return canonical.Encode(manifestValue(canonicalEntries), canonical.DefaultOptions())
+	return manifest.MarshalCanonical()
 }
 
 // RootDigest returns the ADR-006 structured SHA-256 digest of the deterministic
 // CBOR representation. Its textual form is sha256:<lowercase hex>.
 func RootDigest(entries []Entry) (string, error) {
-	canonicalEntries, err := Canonicalize(entries)
+	manifest, err := NewCanonical(entries)
 	if err != nil {
 		return "", err
 	}
-	return canonical.StructuredDigest(rootDigestDomain, 1, manifestValue(canonicalEntries))
+	return manifest.RootDigest()
+}
+
+// Canonical is an entry list that Canonicalize has validated. Its methods
+// encode and digest it without validating it again.
+type Canonical struct {
+	entries []Entry
+}
+
+// NewCanonical canonicalizes entries once for callers that need more than one
+// of the canonical entries, MarshalCanonical and RootDigest.
+func NewCanonical(entries []Entry) (Canonical, error) {
+	canonicalEntries, err := Canonicalize(entries)
+	if err != nil {
+		return Canonical{}, err
+	}
+	return Canonical{entries: canonicalEntries}, nil
+}
+
+// Entries returns a copy of the canonical entries, like Canonicalize.
+func (manifest Canonical) Entries() []Entry {
+	entries := make([]Entry, len(manifest.entries))
+	copy(entries, manifest.entries)
+	return entries
+}
+
+// MarshalCanonical returns the same bytes as the package-level
+// MarshalCanonical.
+func (manifest Canonical) MarshalCanonical() ([]byte, error) {
+	return canonical.Encode(manifestValue(manifest.entries), canonical.DefaultOptions())
+}
+
+// RootDigest returns the same digest as the package-level RootDigest.
+func (manifest Canonical) RootDigest() (string, error) {
+	return canonical.StructuredDigest(rootDigestDomain, 1, manifestValue(manifest.entries))
 }
 
 func manifestValue(entries []Entry) canonical.Array {

@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/hancomac/circulusd/internal/canonical"
-	"golang.org/x/text/unicode/norm"
 )
 
 const NumberWrapperKey = "$pi.number.v1"
@@ -64,7 +63,10 @@ func (walker *toolArgumentJSONWalker) value(value canonical.Value, depth int) (c
 		if !utf8.ValidString(value) {
 			return nil, ErrInvalidValue
 		}
-		value = norm.NFC.String(value)
+		value, err := canonical.NormalizeNFC(value)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidValue, err)
+		}
 		if len(value) > walker.remainingBytes {
 			return nil, ErrInvalidValue
 		}

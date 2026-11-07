@@ -20,6 +20,7 @@ import (
 
 	"github.com/hancomac/circulusd/internal/broker"
 	"github.com/hancomac/circulusd/internal/canonical"
+	"github.com/hancomac/circulusd/internal/celld"
 	"github.com/hancomac/circulusd/internal/dependency"
 	proof "github.com/hancomac/circulusd/internal/dependency/contracttest"
 	"github.com/hancomac/circulusd/internal/identity"
@@ -32,6 +33,7 @@ type resultSource struct {
 	request stateappbroker.ResultRequest
 	body    []byte
 	mode    string
+	err     error
 	calls   atomic.Int32
 	probes  atomic.Int32
 }
@@ -49,6 +51,9 @@ func (source *resultSource) ResolveResult(ctx context.Context, request stateappb
 	source.calls.Add(1)
 	if request != source.request {
 		return stateappbroker.Result{}, broker.ErrFenceMismatch
+	}
+	if source.err != nil {
+		return stateappbroker.Result{}, source.err
 	}
 	if source.mode == "context" {
 		<-ctx.Done()
@@ -188,6 +193,32 @@ func TestNativeResultRejectsChangedSourceAndSanitizesFailure(t *testing.T) {
 			var remote *stateappclient.RemoteError
 			if !errors.As(err, &remote) || remote.Code != "INTERNAL_ERROR" || result.CanonicalCBOR != nil || strings.Contains(err.Error(), "secret") {
 				t.Fatalf("unsafe source result: %v", err)
+			}
+		})
+	}
+}
+
+func TestServerReportsFixedResultFailureClasses(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		code string
+	}{
+		{ErrRecordUnavailable, "NOT_FOUND"},
+		{ErrRecordConflict, "CONFLICT"},
+		{broker.ErrFenceMismatch, "CONFLICT"},
+		{broker.ErrInvalidEffectState, "FAILED_PRECONDITION"},
+		{ErrUnsupportedService, "FAILED_PRECONDITION"},
+		{broker.ErrInvalidRequest, "INVALID_ARGUMENT"},
+		{celld.ErrStorageContract, "STORAGE_CONTRACT"},
+		{errors.New("secret provider diagnostic"), "INTERNAL_ERROR"},
+	} {
+		t.Run(test.code+"/"+test.err.Error(), func(t *testing.T) {
+			source, _, client, _ := newFixture(t)
+			source.err = fmt.Errorf("secret wrapper: %w", test.err)
+			result, err := client.ReadProviderResult(context.Background(), requestWire(source.request))
+			var remote *stateappclient.RemoteError
+			if !errors.As(err, &remote) || remote.Code != test.code || result.CanonicalCBOR != nil || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("ReadProviderResult() error = %v, want remote %s", err, test.code)
 			}
 		})
 	}

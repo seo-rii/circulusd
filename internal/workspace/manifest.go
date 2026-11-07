@@ -23,8 +23,10 @@ var (
 	ErrPathCollision    = wiremanifest.ErrPathCollision
 	ErrInvalidEntry     = wiremanifest.ErrInvalidEntry
 	ErrInvalidHierarchy = wiremanifest.ErrInvalidTree
-	ErrInvalidSymlink   = wiremanifest.ErrInvalidEntry
+	// ErrInvalidSymlink also matches ErrInvalidEntry.
+	ErrInvalidSymlink   = wiremanifest.ErrInvalidSymlink
 	ErrManifestTooLarge = errors.New("workspace: manifest exceeds configured quota")
+	ErrInvalidLimits    = errors.New("workspace: invalid manifest limits")
 )
 
 type EntryType = wiremanifest.EntryType
@@ -70,7 +72,7 @@ func (manifest Manifest) MetadataBytes() int { return manifest.metadataBytes }
 // sandbox materialization, and post-execution scans.
 func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 	if limits.MaxEntries < 0 || limits.MaxMetadataBytes < 0 {
-		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrManifestTooLarge)
+		return Manifest{}, fmt.Errorf("%w: limits cannot be negative", ErrInvalidLimits)
 	}
 	if limits.MaxEntries == 0 {
 		limits.MaxEntries = defaultMaximumEntries
@@ -82,25 +84,27 @@ func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("%w: got %d entries, limit %d", ErrManifestTooLarge, len(input), limits.MaxEntries)
 	}
 
-	entries, err := wiremanifest.Canonicalize(input)
+	canonicalManifest, err := wiremanifest.NewCanonical(input)
 	if err != nil {
 		return Manifest{}, err
 	}
-	encoded, err := wiremanifest.MarshalCanonical(entries)
+	encoded, err := canonicalManifest.MarshalCanonical()
 	if err != nil {
+		// The encoder's own size and item caps can fail before the configured
+		// metadata quota, so report the limit that was actually hit.
 		if errors.Is(err, canonical.ErrLimitExceeded) {
-			return Manifest{}, fmt.Errorf("%w: metadata limit %d bytes", ErrManifestTooLarge, limits.MaxMetadataBytes)
+			return Manifest{}, fmt.Errorf("%w: %w", ErrManifestTooLarge, err)
 		}
 		return Manifest{}, fmt.Errorf("encode workspace manifest: %w", err)
 	}
 	if len(encoded) > limits.MaxMetadataBytes {
 		return Manifest{}, fmt.Errorf("%w: metadata is %d bytes; limit %d", ErrManifestTooLarge, len(encoded), limits.MaxMetadataBytes)
 	}
-	rootDigest, err := wiremanifest.RootDigest(entries)
+	rootDigest, err := canonicalManifest.RootDigest()
 	if err != nil {
 		return Manifest{}, fmt.Errorf("digest workspace manifest: %w", err)
 	}
-	return Manifest{entries: entries, rootDigest: rootDigest, metadataBytes: len(encoded)}, nil
+	return Manifest{entries: canonicalManifest.Entries(), rootDigest: rootDigest, metadataBytes: len(encoded)}, nil
 }
 
 type MutationKind string

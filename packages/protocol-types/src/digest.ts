@@ -1,6 +1,6 @@
 import { encodeCanonicalCbor, encodeHex } from "./cbor.ts";
 import { validationError } from "./errors.ts";
-import { assertUnicodeScalarString } from "./text.ts";
+import { assertUnicodeScalarString, isCanonicalText } from "./text.ts";
 import type { Digest } from "./types.ts";
 
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
@@ -34,7 +34,7 @@ export async function digestStructuredValue(
     validationError("$domain", "must be a non-empty string");
   }
   assertUnicodeScalarString(domain, "$domain");
-  if (domain !== domain.normalize("NFC")) {
+  if (!isCanonicalText(domain)) {
     validationError("$domain", "must be NFC-normalized");
   }
   if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 1) {

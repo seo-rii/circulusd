@@ -510,6 +510,17 @@ func TestPersistentRecordsRejectsBadStorageTokensAndSanitizesFailures(t *testing
 	}
 }
 
+func TestPersistentRecordsKeepsTheStateTooLargeClass(t *testing.T) {
+	storage, _, store, record := newPersistenceFixture(t, "model_final")
+	storage.transactionError = fmt.Errorf("%w: secret implementation details", celld.ErrStateTooLarge)
+	if commit, err := store.WriteCommittedResult(context.Background(), record); commit != (RecordCommit{}) || err != celld.ErrStateTooLarge {
+		t.Fatalf("oversized cell state was not reported as its fixed class: %v", err)
+	}
+	if storage.barriers != 0 {
+		t.Fatal("failed transaction reached its barrier")
+	}
+}
+
 func TestPersistentRecordsCancellationAndCallbackRetries(t *testing.T) {
 	for _, point := range []string{"before transaction", "after commit", "after barrier"} {
 		t.Run(point, func(t *testing.T) {

@@ -54,6 +54,38 @@ func TestTrustStoreDerivesAuthenticatedProductionStateArtifactDigests(t *testing
 	}
 }
 
+func TestTrustStoreDerivesExtractedCelldExecutableDigest(t *testing.T) {
+	t.Parallel()
+
+	manifest, _, publicKey := signedArtifactManifest(t)
+	extracted := strings.Repeat("e", 64)
+	for componentIndex := range manifest.Components {
+		component := &manifest.Components[componentIndex]
+		if component.Name == "celld" {
+			component.Artifacts[0].Name = "celld-x86_64-unknown-linux-gnu.gz"
+			component.Artifacts[0].ExtractionRecipe = ExtractionRecipeGzipSingleFileV1
+			component.Artifacts[0].ExtractedExecutableSHA256 = extracted
+		}
+	}
+	resignArtifactManifest(t, &manifest)
+	store, err := NewTrustStore(map[string]ed25519.PublicKey{"release-root-1": publicKey})
+	if err != nil {
+		t.Fatalf("NewTrustStore() error = %v", err)
+	}
+
+	verified, err := store.DeriveProductionStateArtifactDigests(manifest, "x86_64")
+	if err != nil {
+		t.Fatalf("DeriveProductionStateArtifactDigests() error = %v", err)
+	}
+	if got, want := verified.CelldBuildDigest(), "sha256:"+extracted; got != want {
+		t.Fatalf("gzip celld build digest = %q, want the signed extracted executable digest %q (archive digest is %q)",
+			got, want, "sha256:"+componentArtifactSHA256(t, manifest, "celld"))
+	}
+	if got, want := verified.StateAppApplicationDigest(), "sha256:"+componentArtifactSHA256(t, manifest, "state-app"); got != want {
+		t.Fatalf("state-app application digest = %q, want %q", got, want)
+	}
+}
+
 func TestTrustStoreRejectsAmbiguousProductionStateArtifactDigests(t *testing.T) {
 	t.Parallel()
 

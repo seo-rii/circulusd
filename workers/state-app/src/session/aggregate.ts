@@ -1031,7 +1031,14 @@ export async function migrateSessionState(
         }
       : {}),
   } as unknown as SessionAggregateState;
-  if (schemaVersion === 5 || schemaVersion === 6) return { state: migrated, migrated: true };
+  // v5/v6 already externalize payloads; the rewrite must carry their blob set.
+  if (schemaVersion === 5 || schemaVersion === 6) {
+    return {
+      state: migrated,
+      migrated: true,
+      referencedBlobs: sessionReferencedBlobDigests(migrated),
+    };
+  }
   if (
     schemaVersion <= 3 &&
     (!Array.isArray(migrated.effects) ||
