@@ -199,6 +199,27 @@ func TestFinalizeRequiresCompletedTargetInitialization(t *testing.T) {
 	}
 }
 
+func TestScopeErrorsDoNotEchoUnboundedInput(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("\xff", 1<<20)
+	tests := map[string]func(*Scope){
+		"method":         func(scope *Scope) { scope.Method = huge },
+		"route template": func(scope *Scope) { scope.RouteTemplate = "/" + huge },
+	}
+	for name, mutate := range tests {
+		scope := validScope()
+		mutate(&scope)
+		_, _, err := NewCreationRegistry().Reserve(scope, validKeyDigest("6"), requestDigest, "sess_bounded")
+		if err == nil {
+			t.Fatalf("Reserve(long %s) error = nil", name)
+		}
+		if len(err.Error()) > 256 {
+			t.Fatalf("Reserve(long %s) error has %d bytes, want at most 256", name, len(err.Error()))
+		}
+	}
+}
+
 func validScope() Scope {
 	return Scope{
 		TenantID:      "tenant-a",

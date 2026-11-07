@@ -109,6 +109,30 @@ func TestDefaultGeneratorProducesUniqueConcurrentIDs(t *testing.T) {
 	}
 }
 
+func TestParseErrorsDoNotEchoUnboundedInput(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("\xff", 1<<20)
+	for name, value := range map[string]string{
+		"no separator":       huge,
+		"long kind":          huge + "_" + strings.Repeat("A", 26),
+		"long entropy":       "turn_" + huge,
+		"long declared kind": "turn" + huge + "_" + strings.Repeat("A", 26),
+	} {
+		_, parseErr := Parse(Turn, value)
+		var id ID
+		unmarshalErr := id.UnmarshalText([]byte(value))
+		for operation, err := range map[string]error{"Parse": parseErr, "UnmarshalText": unmarshalErr} {
+			if err == nil {
+				t.Fatalf("%s(%s) error = nil", operation, name)
+			}
+			if len(err.Error()) > 256 {
+				t.Fatalf("%s(%s) error has %d bytes, want at most 256", operation, name, len(err.Error()))
+			}
+		}
+	}
+}
+
 func TestEveryDeclaredKindRoundTrips(t *testing.T) {
 	t.Parallel()
 
