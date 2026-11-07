@@ -1750,6 +1750,58 @@ describe("named aggregate cells", () => {
     }
   });
 
+  it("refuses Session state, blob, and event reads by another user of the same tenant", async () => {
+    const storage = new FakeTransactionalStorage();
+    const cell = sessionCell(storage);
+    await hostRpcResult(
+      "session.initialize",
+      sessionInitialization(),
+      (request) => cell.initializeSession(request),
+    );
+    await hostRpcResult(
+      "session.execute",
+      await enqueueSessionCommand(),
+      (request) => cell.executeSessionCommand(request),
+    );
+
+    const owner = sessionAuthority();
+    const snapshot = await hostRpcResult(
+      "session.read",
+      { authority: owner, now: 200 },
+      (request) => cell.readSession(request),
+    );
+    const checkpoint = snapshot.activeTurn?.checkpoint;
+    if (checkpoint === undefined || "payloadBytes" in checkpoint) {
+      throw new Error("expected an active turn with an externalized checkpoint");
+    }
+    const digest = checkpoint.payloadDigest;
+    await expect(hostRpcResult(
+      "session.read-blob",
+      { authority: owner, now: 200, digest },
+      (request) => cell.readSessionBlob(request),
+    )).resolves.toMatchObject({ digest });
+    const ownerEvents = await readSessionPublicEvents(cell, {
+      authority: owner, now: 200, afterSequence: 0, limit: 16,
+    });
+    expect(ownerEvents.events.length).toBeGreaterThan(0);
+
+    // Same tenant, Session subject, permission and generation; only the user differs.
+    const other = sessionAuthority({ actorUserId: "user-2" });
+    await expect(hostRpcResult(
+      "session.read",
+      { authority: other, now: 200 },
+      (request) => cell.readSession(request),
+    )).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+    await expect(hostRpcResult(
+      "session.read-blob",
+      { authority: other, now: 200, digest },
+      (request) => cell.readSessionBlob(request),
+    )).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+    await expect(readSessionPublicEvents(cell, {
+      authority: other, now: 200, afterSequence: 0, limit: 16,
+    })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  });
+
   it("commits active and queued public admissions with a bounded gap-free cursor", async () => {
     const storage = new FakeTransactionalStorage();
     const cell = sessionCell(storage);
