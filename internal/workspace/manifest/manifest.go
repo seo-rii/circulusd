@@ -522,21 +522,55 @@ func Validate(entries []Entry) error {
 // items. Array/text lengths and unsigned integers use the shortest RFC 8949
 // representation.
 func MarshalCanonical(entries []Entry) ([]byte, error) {
-	canonicalEntries, err := Canonicalize(entries)
+	manifest, err := NewCanonical(entries)
 	if err != nil {
 		return nil, err
 	}
-	return canonical.Encode(manifestValue(canonicalEntries), canonical.DefaultOptions())
+	return manifest.MarshalCanonical()
 }
 
 // RootDigest returns the ADR-006 structured SHA-256 digest of the deterministic
 // CBOR representation. Its textual form is sha256:<lowercase hex>.
 func RootDigest(entries []Entry) (string, error) {
-	canonicalEntries, err := Canonicalize(entries)
+	manifest, err := NewCanonical(entries)
 	if err != nil {
 		return "", err
 	}
-	return canonical.StructuredDigest(rootDigestDomain, 1, manifestValue(canonicalEntries))
+	return manifest.RootDigest()
+}
+
+// Canonical is an entry list that Canonicalize has validated. Its methods
+// encode and digest it without validating it again.
+type Canonical struct {
+	entries []Entry
+}
+
+// NewCanonical canonicalizes entries once for callers that need more than one
+// of the canonical entries, MarshalCanonical and RootDigest.
+func NewCanonical(entries []Entry) (Canonical, error) {
+	canonicalEntries, err := Canonicalize(entries)
+	if err != nil {
+		return Canonical{}, err
+	}
+	return Canonical{entries: canonicalEntries}, nil
+}
+
+// Entries returns a copy of the canonical entries, like Canonicalize.
+func (manifest Canonical) Entries() []Entry {
+	entries := make([]Entry, len(manifest.entries))
+	copy(entries, manifest.entries)
+	return entries
+}
+
+// MarshalCanonical returns the same bytes as the package-level
+// MarshalCanonical.
+func (manifest Canonical) MarshalCanonical() ([]byte, error) {
+	return canonical.Encode(manifestValue(manifest.entries), canonical.DefaultOptions())
+}
+
+// RootDigest returns the same digest as the package-level RootDigest.
+func (manifest Canonical) RootDigest() (string, error) {
+	return canonical.StructuredDigest(rootDigestDomain, 1, manifestValue(manifest.entries))
 }
 
 func manifestValue(entries []Entry) canonical.Array {

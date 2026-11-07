@@ -82,11 +82,11 @@ func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("%w: got %d entries, limit %d", ErrManifestTooLarge, len(input), limits.MaxEntries)
 	}
 
-	entries, err := wiremanifest.Canonicalize(input)
+	canonicalManifest, err := wiremanifest.NewCanonical(input)
 	if err != nil {
 		return Manifest{}, err
 	}
-	encoded, err := wiremanifest.MarshalCanonical(entries)
+	encoded, err := canonicalManifest.MarshalCanonical()
 	if err != nil {
 		if errors.Is(err, canonical.ErrLimitExceeded) {
 			return Manifest{}, fmt.Errorf("%w: metadata limit %d bytes", ErrManifestTooLarge, limits.MaxMetadataBytes)
@@ -96,11 +96,11 @@ func BuildManifest(input []Entry, limits Limits) (Manifest, error) {
 	if len(encoded) > limits.MaxMetadataBytes {
 		return Manifest{}, fmt.Errorf("%w: metadata is %d bytes; limit %d", ErrManifestTooLarge, len(encoded), limits.MaxMetadataBytes)
 	}
-	rootDigest, err := wiremanifest.RootDigest(entries)
+	rootDigest, err := canonicalManifest.RootDigest()
 	if err != nil {
 		return Manifest{}, fmt.Errorf("digest workspace manifest: %w", err)
 	}
-	return Manifest{entries: entries, rootDigest: rootDigest, metadataBytes: len(encoded)}, nil
+	return Manifest{entries: canonicalManifest.Entries(), rootDigest: rootDigest, metadataBytes: len(encoded)}, nil
 }
 
 type MutationKind string
