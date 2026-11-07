@@ -306,3 +306,16 @@ func fixtureProtocolValue(t *testing.T, value any) canonical.Value {
 		return nil
 	}
 }
+
+func TestToolArgumentJSONRejectsTextThatXTextNormalizesIncorrectly(t *testing.T) {
+	for _, value := range []canonical.Value{
+		"\u00e1" + strings.Repeat("\u0301", 30),
+		canonical.Map{"\U00010041" + strings.Repeat("\u0301", 31): int64(1)},
+		canonical.Array{"\u00e1" + strings.Repeat("\u0301", 30)},
+		"a" + strings.Repeat("\u0301", 31),
+	} {
+		if arguments, err := NewCanonicalToolArguments(value); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("NewCanonicalToolArguments(%+q) = %x, %v, want ErrInvalidRequest", value, arguments.Bytes(), err)
+		}
+	}
+}

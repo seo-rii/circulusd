@@ -6,7 +6,7 @@
     "architectures": ["x86_64", "aarch64"]
   },
   "toolchains": {
-    "go": "1.25.3",
+    "go": "1.26.9",
     "node": "24.1.0",
     "pnpm": "10.30.0",
     "protoc": "3.21.12"

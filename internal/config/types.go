@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -149,6 +150,13 @@ func (endpoint *Endpoint) UnmarshalText(value []byte) error {
 	} else {
 		if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
 			!strings.HasPrefix(raw, parsed.Scheme+"://") || !validNetworkHost(parsed.Hostname()) {
+			return fmt.Errorf("network endpoint is invalid")
+		}
+		// An IP literal must be written canonically and must not be IPv4-mapped.
+		// url.Parse accepts some forms since Go 1.26 that it rejected before,
+		// such as [::ffff:7f00:1].
+		if address, err := netip.ParseAddr(parsed.Hostname()); err == nil &&
+			(address.Is4In6() || address.Zone() != "" || address.String() != parsed.Hostname()) {
 			return fmt.Errorf("network endpoint is invalid")
 		}
 		if port := parsed.Port(); port != "" {

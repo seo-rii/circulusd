@@ -23,7 +23,10 @@ func normalizeExtensionJSON(value any) (canonical.Value, bool, error) {
 		if !utf8.ValidString(value) {
 			return "", fmt.Errorf("JSON text must contain Unicode scalar values")
 		}
-		value = norm.NFC.String(value)
+		value, err := canonical.NormalizeNFC(value)
+		if err != nil {
+			return "", fmt.Errorf("JSON text must have a verifiable NFC form")
+		}
 		textBytes += len(value)
 		if len(value) > maximum || textBytes > 1<<20 {
 			return "", fmt.Errorf("extension JSON text exceeds its byte limit")
