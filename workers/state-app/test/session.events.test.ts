@@ -652,7 +652,12 @@ describe("Session public durable event journal", () => {
     delete active.inputRef;
     active.input = { message: "legacy-v5" };
     const migrated = await migrateSessionState(legacy);
-    expect(migrated).toEqual({ migrated: true, state: { ...legacy, schemaVersion: 7 } });
+    const checkpoint = active.checkpoint as { readonly payloadDigest: Digest };
+    expect(migrated).toEqual({
+      migrated: true,
+      state: { ...legacy, schemaVersion: 7 },
+      referencedBlobs: [checkpoint.payloadDigest],
+    });
     expect(encodeCanonicalCbor(migrated.state).byteLength).toBe(encodeCanonicalCbor(legacy).byteLength);
     await expect(validateSessionState(migrated.state)).resolves.toBeUndefined();
   });
